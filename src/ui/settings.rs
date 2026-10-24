@@ -8,12 +8,19 @@ use rust_i18n::t;
 use crate::app::Shared;
 use crate::config::Appearance;
 use crate::i18n::Language;
-use crate::ui::widgets;
+use crate::ui::{theme, widgets};
 
 /// Draws the settings panel inside the settings viewport.
 pub fn show(ui: &mut egui::Ui, shared: &Shared) {
+    // Explicit fill: the app-wide clear color is transparent (the anchor
+    // and the floating bar need it), so windows must paint their own fill.
+    let t = theme::tokens(ui.ctx());
     CentralPanel::default()
-        .frame(egui::Frame::default().inner_margin(Margin::same(14)))
+        .frame(
+            egui::Frame::default()
+                .inner_margin(Margin::same(14))
+                .fill(t.dock),
+        )
         .show(ui, |ui| {
             let mut settings = shared.lock_settings();
             row(ui, &t!("settings.language.label"), |ui| {

@@ -46,3 +46,6 @@ dialog.unsaved.body: "Esta sesión contiene capturas no guardadas."
 dialog.unsaved.save: "Guardar"
 dialog.unsaved.discard: "Descartar"
 dialog.unsaved.cancel: "Cancelar"
+overlay.copy_hint: 'Pulsa "C" para copiar'
+overlay.copied: "¡Copiado!"
+capture.default_name: "Captura {n}"

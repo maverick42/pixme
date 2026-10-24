@@ -254,3 +254,56 @@ Format: date — context — decision — consequences.
   `proc-macro-error` is a transitive proc-macro helper. Re-run
   `cargo audit` before releases; the advisory set lives at
   `~/.cargo/advisory-db`.
+
+## 2026-10-24 — Region-capture overlay and xcap coordinate semantics
+
+- **Context**: phase 3 — the functional reference's region selector
+  (frozen screen, crosshair, magnifier, eight-handle selection) on top of
+  the lifecycle built in phase 2.
+- **Decision**:
+  - `Command::Capture(mode)` → `begin_capture` parks an `OverlaySession`
+    in `Shared.capture` and moves to `Capturing`. `Region`/`FixedRegion`
+    spawn a borderless, always-on-top deferred viewport covering the
+    monitor; `FullScreen` skips the UI entirely (the anchor pass takes
+    the frame after a warm-up). Two warm-up frames run before the
+    screenshot so the floating bar's window is torn down and cannot
+    photograph itself.
+  - The overlay paints the frozen monitor frame (a `ColorImage`
+    texture), then a theme-independent dim veil — four bands leaving
+    the selection untouched. Selection is drawn with a dashed accent
+    border and eight handles (corner discs, edge pills); dragging
+    inside moves, on a handle resizes (handles mirror across), outside
+    creates. Double-click or Enter confirms; Esc cancels and returns
+    to the state the capture was launched from.
+  - The magnifier is a 176-pt card: a 21-px `NEAREST` zoom centred on
+    the cursor with a reticle, the physical-pixel selection size (or
+    cursor position), the `#RRGGBB` colour under the cursor and the
+    "Press C to copy" hint (`C` or `Cmd+C` → arboard, with a "Copied!"
+    flash). The card flips below-left/above near screen edges.
+  - **xcap semantics discovered**: `Monitor::x/y/width/height` report
+    *logical points* (`CGDisplay` bounds), while `capture_image()`
+    returns *physical pixels* (= rect × `scale_factor`).
+    `MonitorInfo.rect` is therefore documented and used as logical;
+    conversion happens only at the physical-pixel edge (`take_capture`,
+    colour sampling, loupe).
+  - **macOS `visibleFrame` clamping**: `initWithContentRect` clamps a
+    new window to the screen minus menu bar and Dock (observed:
+    2560×1593 at (0,53) for a 2560×1707 request). The overlay sends a
+    one-shot `OuterPosition`+`InnerSize` nudge after creation — macOS
+    does not re-clamp programmatic frames, so the window reaches its
+    true monitor size — *and* records `screen_offset = window_origin −
+    monitor_origin` every frame, painting the frozen image shifted by
+    `−offset` so screen point == image pixel whatever geometry the OS
+    grants. Selection, loupe and hex sampling all add the offset.
+  - Confirm → `take_capture` crops the frozen frame (physical px) →
+    `Document::new` → `Viewer::push_document` → new tab (auto-numbered
+    "Capture n", selected, marks the session dirty) → `Viewer` state.
+    The viewer displays the capture at its logical size (image px ÷
+    scale factor), fitted to the canvas, never upscaled.
+  - `PIXME_CAPTURE=region|fullscreen|fixed` env var fires that capture
+    at startup — a permanent dev/test hook that exercises the pipeline
+    without the resident menu.
+- **Consequences**: the capture path is exercised end-to-end; Windows
+  will need the same offset logic verified against per-monitor DPI
+  (DPI awareness may or may not produce the same clamping). Remaining
+  modes (`ActiveWindow`, `WindowOrObject`, `Pin`) still log only.

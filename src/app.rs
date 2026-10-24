@@ -27,7 +27,9 @@ use eframe::egui;
 use rust_i18n::t;
 
 use crate::config::Settings;
+use crate::editor::Document;
 use crate::i18n::{self, Language};
+use crate::ui::capture_overlay::OverlaySession;
 use crate::ui::toolbar::Toolbar;
 use crate::ui::viewer::Viewer;
 use crate::{platform, ui};
@@ -68,8 +70,14 @@ pub enum CaptureMode {
 /// Every user action flows through this enum and [`Shared::dispatch`].
 #[derive(Clone, Debug)]
 pub enum Command {
-    /// Start a capture (all modes).
+    /// Start a capture (all modes) — applies the configured delay first.
     Capture(CaptureMode),
+    /// Internal: the delay elapsed, run the capture for real.
+    CaptureNow(CaptureMode),
+    /// The capture overlay confirmed its selection.
+    ConfirmCapture,
+    /// The capture overlay was cancelled (Esc / window close).
+    CancelCapture,
     /// Show the floating bar (icon menu, app menu, viewer's "+").
     ShowBar,
     /// Show the viewer (icon menu's "Open PixMe").
@@ -113,6 +121,9 @@ fn viewer_id() -> egui::ViewportId {
 fn settings_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.settings")
 }
+fn overlay_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("pixme.capture_overlay")
+}
 
 /// Lock helper: recover a poisoned mutex rather than crash the UI thread.
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -136,6 +147,8 @@ pub struct Shared {
     pub bar_pos: Mutex<Option<egui::Pos2>>,
     /// Whether the settings window is open.
     pub settings_open: AtomicBool,
+    /// The live capture session while in `Capturing` (`None` otherwise).
+    pub capture: Mutex<Option<OverlaySession>>,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -199,12 +212,31 @@ impl Shared {
     fn dispatch(&self, command: Command, ctx: &egui::Context) {
         match command {
             Command::Capture(mode) => {
-                // Phase 3+: enter `Capturing`, run the pipeline, open the tab.
-                // Until then the command demonstrates the Bar -> Viewer
-                // handoff it will produce.
-                tracing::info!(?mode, "capture requested");
-                self.enter(AppState::Viewer, ctx);
+                let (delay, auto_reset) = {
+                    let s = lock(&self.settings);
+                    (s.capture_delay_secs, s.delay_auto_reset)
+                };
+                if delay > 0 {
+                    // Post the real capture after the delay; the ctx clone
+                    // wakes the (possibly windowless) pump.
+                    let wake = ctx.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(delay as u64));
+                        platform::queue_menu_command(Command::CaptureNow(mode));
+                        wake.request_repaint_of(egui::ViewportId::ROOT);
+                    });
+                    if auto_reset {
+                        let mut s = lock(&self.settings);
+                        s.capture_delay_secs = 0;
+                        s.save();
+                    }
+                } else {
+                    self.begin_capture(mode, ctx);
+                }
             }
+            Command::CaptureNow(mode) => self.begin_capture(mode, ctx),
+            Command::ConfirmCapture => self.confirm_capture(ctx),
+            Command::CancelCapture => self.cancel_capture(ctx),
             Command::ShowBar => self.enter(AppState::Bar, ctx),
             Command::OpenViewer => self.enter(AppState::Viewer, ctx),
             Command::CloseBar => {
@@ -327,6 +359,72 @@ impl Shared {
         }
     }
 
+    /// Starts `mode`: region modes spawn the selection overlay over the
+    /// frozen monitor, full-screen arms an instant capture (the bar must be
+    /// torn down first — one warm-up frame inside the overlay/anchor pass).
+    /// `ActiveWindow`, `WindowOrObject` and `Pin` land in later phases.
+    fn begin_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
+        let return_to = *lock(&self.state);
+        match mode {
+            CaptureMode::Region | CaptureMode::FixedRegion | CaptureMode::FullScreen => {
+                match crate::capture::screen::primary_monitor() {
+                    Ok(monitor) => {
+                        let mut session = OverlaySession::new(mode, return_to);
+                        session.monitor = Some(monitor);
+                        *lock(&self.capture) = Some(session);
+                        self.enter(AppState::Capturing, ctx);
+                        if !matches!(mode, CaptureMode::FullScreen) {
+                            self.request_focus(overlay_id());
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("cannot enumerate monitors: {err}");
+                    }
+                }
+            }
+            _ => tracing::info!(?mode, "capture mode not implemented yet"),
+        }
+    }
+
+    /// The overlay confirmed: crop the frozen frame to the selection (or take
+    /// the whole monitor for `FullScreen`), open it as a viewer tab.
+    fn confirm_capture(&self, ctx: &egui::Context) {
+        let outcome = {
+            let mut slot = lock(&self.capture);
+            let Some(session) = slot.as_mut() else { return };
+            let capture = if session.instant {
+                session.frozen.take()
+            } else {
+                session.take_capture()
+            };
+            let return_to = session.return_to;
+            *slot = None;
+            (capture, return_to)
+        };
+        let (Some(frame), _) = outcome else {
+            // Nothing to keep — behave like a cancel.
+            self.enter(outcome.1, ctx);
+            return;
+        };
+        let title = {
+            let mut viewer = lock(&self.viewer);
+            viewer.push_document(Document::new(frame))
+        };
+        tracing::info!(%title, "capture stored");
+        self.enter(AppState::Viewer, ctx);
+    }
+
+    /// Cancel leaves the session untouched and returns where capture began.
+    fn cancel_capture(&self, ctx: &egui::Context) {
+        let return_to = {
+            let mut slot = lock(&self.capture);
+            let return_to = slot.as_ref().map(|s| s.return_to).unwrap_or(AppState::Idle);
+            *slot = None;
+            return_to
+        };
+        self.enter(return_to, ctx);
+    }
+
     /// Closes the anchor viewport: eframe exits once the root window is gone.
     fn quit_now(ctx: &egui::Context) {
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
@@ -351,6 +449,16 @@ impl PixMeApp {
             settings.appearance.kind(cc.egui_ctx.system_theme()),
         );
         platform::install_ui(&cc.egui_ctx);
+        // Dev/test hook: `PIXME_CAPTURE=region|fullscreen|fixed` fires that
+        // capture at startup without going through the resident menu.
+        let debug_capture = std::env::var("PIXME_CAPTURE")
+            .ok()
+            .and_then(|v| match v.as_str() {
+                "region" => Some(CaptureMode::Region),
+                "fullscreen" => Some(CaptureMode::FullScreen),
+                "fixed" => Some(CaptureMode::FixedRegion),
+                _ => None,
+            });
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(AppState::Idle),
@@ -360,10 +468,20 @@ impl PixMeApp {
                 toolbar: Mutex::new(Toolbar::default()),
                 bar_pos: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
+                capture: Mutex::new(None),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
             }),
         }
+        .tap_debug_capture(debug_capture)
+    }
+
+    /// Queues the startup capture requested by `PIXME_CAPTURE`, if any.
+    fn tap_debug_capture(self, mode: Option<CaptureMode>) -> Self {
+        if let Some(mode) = mode {
+            self.shared.push(Command::Capture(mode));
+        }
+        self
     }
 }
 
@@ -408,9 +526,56 @@ impl eframe::App for PixMeApp {
                     lock(&shared.viewer).show(ui, &shared);
                 });
             }
-            // `Idle` shows nothing; `Capturing` is owned by the capture
-            // pipeline (phase 3).
-            AppState::Idle | AppState::Capturing => {}
+            AppState::Capturing => {
+                // The freeze happens here, before any capture window exists:
+                // two anchor frames let the bar tear down, then the screen is
+                // captured — registering the overlay only *after* the freeze
+                // keeps it out of the photograph.
+                enum Step {
+                    Freeze,
+                    Overlay,
+                    Confirm,
+                    Gone,
+                }
+                let step = {
+                    let mut slot = lock(&self.shared.capture);
+                    match slot.as_mut() {
+                        None => Step::Gone,
+                        Some(s) if s.frozen.is_none() => {
+                            s.warm_freeze();
+                            Step::Freeze
+                        }
+                        Some(s) if s.instant => Step::Confirm,
+                        Some(_) => Step::Overlay,
+                    }
+                };
+                match step {
+                    Step::Freeze => ctx.request_repaint(),
+                    Step::Confirm => self.shared.confirm_capture(&ctx),
+                    Step::Gone => self.shared.enter(AppState::Idle, &ctx),
+                    Step::Overlay => {
+                        let shared = Arc::clone(&self.shared);
+                        let monitor = lock(&shared.capture)
+                            .as_ref()
+                            .and_then(|s| s.monitor.clone());
+                        ctx.show_viewport_deferred(
+                            overlay_id(),
+                            overlay_builder(monitor.as_ref()),
+                            move |ui, _class| {
+                                let ctx = ui.ctx().clone();
+                                shared.pump(&ctx);
+                                shared.maybe_focus(&ctx, overlay_id());
+                                ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                                if let Some(session) = lock(&shared.capture).as_mut() {
+                                    session.show(ui, &shared);
+                                }
+                            },
+                        );
+                    }
+                }
+            }
+            // `Idle` shows nothing.
+            AppState::Idle => {}
         }
 
         if self.shared.settings_open.load(Ordering::Relaxed) {
@@ -458,6 +623,30 @@ fn viewer_builder() -> egui::ViewportBuilder {
         .with_inner_size([860.0, 560.0])
         .with_min_inner_size([420.0, 280.0])
         .with_active(true)
+}
+
+/// The capture overlay: a borderless always-on-top window covering the
+/// monitor being captured. `MonitorInfo.rect` is already in logical points
+/// (xcap reports `CGDisplay` bounds) — no scale-factor conversion here.
+fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::ViewportBuilder {
+    let (size, pos) = monitor
+        .map(|m| {
+            (
+                egui::vec2(m.rect.width as f32, m.rect.height as f32),
+                egui::pos2(m.rect.x as f32, m.rect.y as f32),
+            )
+        })
+        .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
+    egui::ViewportBuilder::default()
+        .with_title("PixMe")
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_always_on_top()
+        .with_has_shadow(false)
+        .with_taskbar(false)
+        .with_active(true)
+        .with_inner_size(size)
+        .with_position(pos)
 }
 
 /// The settings window: small, fixed size, titled, no taskbar entry.
@@ -511,6 +700,7 @@ mod tests {
             toolbar: Mutex::new(Toolbar::default()),
             bar_pos: Mutex::new(None),
             settings_open: AtomicBool::new(false),
+            capture: Mutex::new(None),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
@@ -525,11 +715,15 @@ mod tests {
     }
 
     #[test]
-    fn capture_hands_bar_over_to_viewer() {
+    fn capture_enters_the_capturing_state() {
+        // Region capture arms the selection overlay — the viewer only opens
+        // after the overlay confirms. On a headless runner monitor
+        // enumeration may fail instead: the machine must then stay in `Bar`.
         let (shared, ctx) = harness();
-        assert_eq!(
-            drive(&shared, &ctx, Command::Capture(CaptureMode::FullScreen)),
-            AppState::Viewer
+        let state = drive(&shared, &ctx, Command::Capture(CaptureMode::Region));
+        assert!(
+            matches!(state, AppState::Capturing | AppState::Bar),
+            "unexpected state {state:?}"
         );
     }
 
@@ -542,14 +736,14 @@ mod tests {
     #[test]
     fn closing_bar_with_captures_opens_viewer() {
         let (shared, ctx) = harness();
-        lock(&shared.viewer).tabs.push("capture 1".to_string());
+        lock(&shared.viewer).push_stub("capture 1");
         assert_eq!(drive(&shared, &ctx, Command::CloseBar), AppState::Viewer);
     }
 
     #[test]
     fn closing_viewer_returns_to_idle_keeping_session() {
         let (shared, ctx) = harness();
-        lock(&shared.viewer).tabs.push("capture 1".to_string());
+        lock(&shared.viewer).push_stub("capture 1");
         drive(&shared, &ctx, Command::OpenViewer);
         assert_eq!(drive(&shared, &ctx, Command::ViewerClosed), AppState::Idle);
         assert_eq!(lock(&shared.viewer).tabs.len(), 1);
@@ -586,7 +780,7 @@ mod tests {
         {
             let mut viewer = lock(&shared.viewer);
             viewer.dirty = true;
-            viewer.tabs.push("capture 1".to_string());
+            viewer.push_stub("capture 1");
         }
         drive(&shared, &ctx, Command::OpenViewer);
         drive(&shared, &ctx, Command::ViewerClosed);

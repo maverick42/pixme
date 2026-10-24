@@ -7,18 +7,29 @@
 //! on macOS the same actions live in the native PixMe/Capture/File menus.
 //! The document canvas and its View/Edit modes land in the next phase.
 
-use egui::{Align2, CentralPanel, Margin, Vec2, ViewportCommand};
+use std::collections::HashMap;
+
+use egui::{Align2, CentralPanel, Margin, Pos2, Rect, Vec2, ViewportCommand};
 use rust_i18n::t;
 
 use crate::app::{CaptureMode, Command, Shared};
+use crate::editor::Document;
 use crate::ui::icons::Icon;
 use crate::ui::{theme, widgets};
 
+/// One open capture: its document plus the (rebuilt-on-revision) texture.
+pub struct Tab {
+    /// Tab label.
+    pub title: String,
+    /// The capture + annotations.
+    pub doc: Document,
+}
+
 /// Session state rendered inside the viewer viewport.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Viewer {
-    /// One title per captured document (filled by the capture pipeline).
-    pub tabs: Vec<String>,
+    /// One tab per captured document.
+    pub tabs: Vec<Tab>,
     /// Index of the visible tab.
     pub active: usize,
     /// Whether the session holds unsaved captures or annotations.
@@ -27,9 +38,52 @@ pub struct Viewer {
     pub confirm_close: bool,
     /// After the confirmation resolves, quit instead of going Idle.
     pub confirm_then_quit: bool,
+    /// Running tab counter so titles stay unique after closes.
+    next_title: u32,
+    /// `tab index → (revision, texture)`; textures rebuild on doc changes.
+    textures: HashMap<usize, (u64, egui::TextureHandle)>,
 }
 
 impl Viewer {
+    /// Adds `doc` as a fresh tab, selects it and marks the session dirty.
+    /// Returns the generated title.
+    pub fn push_document(&mut self, doc: Document) -> String {
+        self.next_title += 1;
+        let title = t!("capture.default_name", n = self.next_title).to_string();
+        self.tabs.push(Tab {
+            title: title.clone(),
+            doc,
+        });
+        self.active = self.tabs.len() - 1;
+        self.dirty = true;
+        title
+    }
+
+    /// Test helper: a tab whose document wraps a 1×1 capture.
+    #[cfg(test)]
+    pub fn push_stub(&mut self, title: &str) {
+        use crate::capture::{Capture, MonitorInfo, PhysicalRect};
+        self.tabs.push(Tab {
+            title: title.to_string(),
+            doc: Document::new(Capture {
+                image: image::RgbaImage::new(1, 1),
+                scale_factor: 1.0,
+                monitor: MonitorInfo {
+                    id: 0,
+                    name: String::new(),
+                    rect: PhysicalRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    scale_factor: 1.0,
+                    is_primary: true,
+                },
+            }),
+        });
+    }
+
     /// Draws the viewer for this frame. `shared` routes actions back to the
     /// state machine (the deferred-viewport callback cannot borrow the app).
     pub fn show(&mut self, ui: &mut egui::Ui, shared: &Shared) {
@@ -40,8 +94,15 @@ impl Viewer {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             shared.push(Command::ViewerClosed);
         }
+        // Explicit fill: the app-wide clear color is transparent (the anchor
+        // and the floating bar need it), so windows must paint their own.
+        let t = theme::tokens(&ctx);
         CentralPanel::default()
-            .frame(egui::Frame::default().inner_margin(Margin::ZERO))
+            .frame(
+                egui::Frame::default()
+                    .inner_margin(Margin::ZERO)
+                    .fill(t.dock),
+            )
             .show(ui, |ui| {
                 if !shared.has_native_app_menu() {
                     self.menu_strip(ui, shared);
@@ -111,7 +172,7 @@ impl Viewer {
                     ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
                     for index in 0..self.tabs.len() {
                         if ui
-                            .selectable_label(index == self.active, &self.tabs[index])
+                            .selectable_label(index == self.active, &self.tabs[index].title)
                             .clicked()
                         {
                             self.active = index;
@@ -127,14 +188,61 @@ impl Viewer {
             });
     }
 
-    /// The document canvas — an empty-state hint until captures land.
+    /// The document canvas — the active capture fit to the window, or the
+    /// empty-state hint.
     fn content(&mut self, ui: &mut egui::Ui) {
         if self.tabs.is_empty() {
             let t = theme::tokens(ui.ctx());
             ui.centered_and_justified(|ui| {
                 ui.colored_label(t.text_dim, t!("viewer.empty").to_string());
             });
+            return;
         }
+        let index = self.active.min(self.tabs.len() - 1);
+        let doc = &self.tabs[index].doc;
+        let (img_w, img_h) = (
+            doc.base.image.width() as usize,
+            doc.base.image.height() as usize,
+        );
+        let revision = doc.revision;
+        let entry = self.textures.entry(index).or_insert_with(|| {
+            (
+                revision,
+                ui.ctx().load_texture(
+                    format!("doc-{index}"),
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [img_w, img_h],
+                        doc.base.image.as_raw(),
+                    ),
+                    egui::TextureOptions::LINEAR,
+                ),
+            )
+        });
+        if entry.0 != revision {
+            entry.0 = revision;
+            entry.1.set(
+                egui::ColorImage::from_rgba_unmultiplied([img_w, img_h], doc.base.image.as_raw()),
+                egui::TextureOptions::LINEAR,
+            );
+        }
+        // The capture is in physical pixels; the viewer shows it at its
+        // logical size (image px ÷ scale factor), never upscaled.
+        let sf = doc.base.scale_factor.max(0.25);
+        let logical_w = img_w as f32 / sf;
+        let logical_h = img_h as f32 / sf;
+        let avail = ui.available_rect_before_wrap();
+        // The canvas backdrop — slightly lighter than the dock, like the
+        // visual reference's editing canvas.
+        ui.painter()
+            .rect_filled(avail, 0.0, theme::tokens(ui.ctx()).canvas);
+        let scale = (avail.width() / logical_w.max(1.0))
+            .min(avail.height() / logical_h.max(1.0))
+            .min(1.0);
+        let size = Vec2::new(logical_w * scale, logical_h * scale);
+        let frame_rect = Rect::from_center_size(avail.center(), size);
+        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        ui.painter()
+            .image(entry.1.id(), frame_rect, uv, egui::Color32::WHITE);
     }
 
     /// The translated Save/Discard/Cancel confirmation for a dirty session.

@@ -46,3 +46,6 @@ dialog.unsaved.body: "Cette session contient des captures non enregistrées."
 dialog.unsaved.save: "Enregistrer"
 dialog.unsaved.discard: "Ignorer"
 dialog.unsaved.cancel: "Annuler"
+overlay.copy_hint: '« C » pour copier'
+overlay.copied: "Copié !"
+capture.default_name: "Capture {n}"

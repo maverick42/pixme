@@ -55,7 +55,9 @@ pub struct MonitorInfo {
     pub id: u32,
     /// OS display name.
     pub name: String,
-    /// Bounds in physical pixels.
+    /// Bounds in **logical points** (global display coordinates — xcap
+    /// reports `CGDisplay` bounds; captured *images* are `rect ×
+    /// scale_factor` physical pixels).
     pub rect: PhysicalRect,
     /// Device pixels per logical point.
     pub scale_factor: f32,

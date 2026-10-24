@@ -4,6 +4,7 @@
 //! Rule: no hard-coded colour, radius, spacing or font outside `theme.rs` and
 //! `widgets/` — everything reads [`theme::tokens`].
 
+pub mod capture_overlay;
 pub mod icons;
 pub mod settings;
 pub mod theme;
