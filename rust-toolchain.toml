@@ -1,0 +1,6 @@
+[toolchain]
+# Committed toolchain file: rustup (locally and on the GitHub runners, where
+# cargo/rustc are rustup shims) auto-installs this channel and these
+# components. Single source of truth for local dev and CI.
+channel = "stable"
+components = ["rustfmt", "clippy"]

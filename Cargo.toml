@@ -1,0 +1,52 @@
+[package]
+name = "pixme"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+arboard = "3.7.0"
+directories = "6.0.0"
+eframe = { version = "0.36", default-features = false, features = ["glow", "accesskit", "default_fonts", "links", "persistence", "wayland", "x11"] }
+egui = "0.36"
+egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
+global-hotkey = "0.9.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.17.2"
+rust-i18n = "4.2.4"
+serde = { version = "1.0.229", features = ["derive"] }
+sys-locale = "0.3.2"
+thiserror = "2.0.21"
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tray-icon = "0.26.1"
+xcap = "0.9.8"
+
+[dev-dependencies]
+serde_yml = "0.0.13"
+ttf-parser = "0.25.1"
+
+[profile.dev]
+# Line tables keep file:line in panic backtraces but drop variable info,
+# which roughly halves link time and debug-info size.
+debug = "line-tables-only"
+
+# Dependencies are not debugged: build them optimized so the egui UI and image
+# code stay usable in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.release]
+# Size-oriented: PixMe ships as a small standalone binary.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Dependencies keep "s": at "z" heavy code paths (image codecs, rasterizer)
+# lose measurable speed for little size gain.
+[profile.release.package."*"]
+opt-level = "s"

@@ -3,7 +3,7 @@
 PixMe's interface is inspired by **PhotoCraft**. This document is the source
 of truth for PixMe's visual tokens (rule 10): it summarises the visual
 reference's design system and states exactly what PixMe imports. PixMe keeps
-**two themes only**: Pro Medium (dark) and Pro Light.
+**two themes only**: Pro (dark) and Pro Light.
 
 ## Source and licence
 
@@ -26,7 +26,7 @@ reference's design system and states exactly what PixMe imports. PixMe keeps
 
 ## Theme model
 
-`ThemeKind { ProMedium, ProLight }` only (the reference app ships 14 themes;
+`ThemeKind { Pro, ProLight }` only (the reference app ships 14 themes;
 PixMe imports exactly these two palettes). A `Tokens` struct holds every colour
 and radius used by the UI; widgets read `Tokens::get(ctx)` (stored in egui
 context data by `apply`), never a literal colour. Both palettes fill the **same
@@ -41,32 +41,32 @@ on macOS and Windows) and falls back to **Dark** when the OS reports nothing.
 
 ### Token table
 
-| Token | Pro Medium (dark) | Pro Light | Use |
+| Token | Pro (dark) | Pro Light | Use |
 | --- | --- | --- | --- |
-| `chrome` | `#535353` | `#F0F0F0` | Window chrome, toolbar bar surface |
-| `dock` | `#424242` | `#E2E2E2` | Background behind cards |
-| `card` | `#535353` | `#F0F0F0` | Panels / floating bar fill |
-| `card_border` | `#424242` | `#D6D6D6` | Panel outline |
-| `field` | `#454545` | `#FFFFFF` | Inputs, dropdowns |
-| `field_border` | `#686868` | `#BABABA` | Input outline |
-| `hover` | `#626262` | `#E2E2E2` | Hovered control fill |
-| `pressed` | `#707070` | `#CECECE` | Pressed control fill |
-| `text` | `#EEEEEE` | `#141414` | Body text |
-| `text_dim` | `#D4D4D4` | `#404040` | Secondary text |
-| `text_faint` | `#A0A0A0` | `#787878` | Hints, disabled |
-| `icon` | `#E2E2E2` | `#2E2E2E` | Icon tint at rest |
+| `chrome` | `#323232` | `#F0F0F0` | Window chrome, toolbar bar surface |
+| `dock` | `#1E1E1E` | `#E2E2E2` | Background behind cards |
+| `card` | `#323232` | `#F0F0F0` | Panels / floating bar fill |
+| `card_border` | `#1E1E1E` | `#D6D6D6` | Panel outline |
+| `field` | `#242424` | `#FFFFFF` | Inputs, dropdowns |
+| `field_border` | `#4A4A4A` | `#BABABA` | Input outline |
+| `hover` | `#424242` | `#E2E2E2` | Hovered control fill |
+| `pressed` | `#4E4E4E` | `#CECECE` | Pressed control fill |
+| `text` | `#DEDEDE` | `#141414` | Body text |
+| `text_dim` | `#B2B2B2` | `#404040` | Secondary text |
+| `text_faint` | `#808080` | `#787878` | Hints, disabled |
+| `icon` | `#C8C8C8` | `#2E2E2E` | Icon tint at rest |
 | `accent` | `#378EF0` | `#378EF0` | Accent (selection, links, focus ring) |
-| `accent_soft` | `#6E6E6E` | `#D6D6D6` | Selected fill behind icons |
+| `accent_soft` | `#4E4E4E` | `#D6D6D6` | Selected fill behind icons |
 | `accent_border` | `#378EF0` | `#378EF0` | Selected outline |
 | `accent_text` | `#FFFFFF` | `#1062C4` | Text/glyph on accent surfaces |
-| `separator` | `#3E3E3E` | `#D6D6D6` | Hairlines |
+| `separator` | `#1E1E1E` | `#D6D6D6` | Hairlines |
 | `shadow` | `rgba(0,0,0,0.59)` | `rgba(0,0,0,0.20)` | Floating window shadow |
 | `primary_bg` | `#378EF0` | `#378EF0` | Primary button fill |
 | `primary_text` | `#FFFFFF` | `#FFFFFF` | Primary button label |
 | `danger` | `#EC5B62` | `#EC5B62` | Errors / destructive |
 | `warning` | `#E8B046` | `#E8B046` | Warnings |
-| `tab_strip` | `#4A4A4A` | `#E2E2E2` | Tab-strip background |
-| `row_selected` | `#6B6B6B` | `#CCCCCC` | Selected list row |
+| `tab_strip` | `#262626` | `#E2E2E2` | Tab-strip background |
+| `row_selected` | `#525252` | `#CCCCCC` | Selected list row |
 | `scrim` | `rgba(0,0,0,0.43)` | `rgba(0,0,0,0.43)` | Dim behind modal |
 | `caption_close` | `#C42B1C` | `#C42B1C` | Close hover (custom caption, Windows) |
 | `caption_close_text` | `#FFFFFF` | `#FFFFFF` | Close glyph on hover |

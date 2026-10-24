@@ -28,15 +28,18 @@ Format: date — context — decision — consequences.
 - **Consequences**: no clean-room rewrite needed for visuals; every copied
   asset keeps its licence file next to it and a row in `ATTRIBUTION.md`.
 
-## 2026-10-24 — Theme scope: Pro Medium (dark) + Pro Light only
+## 2026-10-24 — Theme scope: Pro (dark) + Pro Light only
 
 - **Context**: the visual reference ships 14 themes; the user does not want a
-  multi-theme PixMe. PixMe must feel like the same family.
-- **Decision**: PixMe imports exactly **Pro Medium** (dark; the reference's
-  default: #535353 panels, #378EF0 Spectrum-blue accent, 3/4/6 px radii) and
-  **Pro Light** (#F0F0F0 panels). Setting `appearance = auto | dark | light`,
-  persisted and applied at runtime; `auto` follows the OS appearance via
-  winit's `system_theme` and falls back to dark.
+  multi-theme PixMe. PixMe must feel like the same family. The Pro family has
+  four brightness levels; the user picked the darkest one for dark mode.
+- **Decision**: PixMe imports exactly **Pro** (dark; darkest Pro level:
+  #323232 panels on #1E1E1E dock, #378EF0 Spectrum-blue accent, 3/4/6 px
+  radii) and **Pro Light** (#F0F0F0 panels, the lightest level). Reference
+  screenshots of both live outside the repo with the rest of the reference
+  material. Setting `appearance = auto | dark | light`, persisted and applied
+  at runtime; `auto` follows the OS appearance via winit's `system_theme` and
+  falls back to dark.
 - **Consequences**: `docs/theme.md` documents both palettes; a single `Tokens`
   struct with exhaustive per-theme literals makes token parity
   compiler-enforced. Region-selection dim and annotation colours are
@@ -95,6 +98,25 @@ Format: date — context — decision — consequences.
   requirements that need the reference are copied into them in neutral words
   when they become actionable.
 
+## 2026-10-24 — Drag-out of captures; View vs Edit modes
+
+- **Context**: a viewed capture must be droppable into other apps. Canvas
+  drag is already reserved for tools and region selection, and the viewer
+  keeps the functional flow: re-selecting a region or importing the
+  clipboard produces another capture rather than replacing the document.
+  Actual image modification only happens in an explicit Edit mode — View
+  mode is limited to navigation, export and capture-generation actions.
+- **Decision**: captures open as named tabs; **dragging a tab** initiates an
+  OS-level drag-out of that capture as a PNG payload (canvas is never the
+  drag-out surface). The capture window has two modes: **View** (limited:
+  re-select a region, clipboard import, tab drag-out, export, navigation)
+  and **Edit** (annotation tools enabled). New region selection or
+  clipboard import while viewing creates a new document tab.
+- **Consequences**: drag-out needs OS-level drag support (winit drag-drop or
+  a dedicated crate — chosen when implemented); the `tab_strip` token is
+  already in the palette for the tab bar; the editor UI must gate tool
+  availability on the current mode.
+
 ## 2026-10-24 — i18n stack as per project rule
 
 - **Context**: en/fr/es support, runtime switching, completeness test.
@@ -103,3 +125,19 @@ Format: date — context — decision — consequences.
   listed in rule 00; recorded here for completeness.
 - **Consequences**: `locales/{en,fr,es}.yml`, English as source and fallback;
   a test fails on missing/extra keys.
+
+## 2026-10-24 — Build profiles and test-only dependencies
+
+- **Context**: rule 00 demands a size-tuned release binary and a fast dev
+  loop, and the i18n completeness test needs to parse YAML while the font
+  coverage test needs a cmap reader.
+- **Decision**: `[profile.dev]` uses `debug = "line-tables-only"` and
+  dependencies compile at `opt-level = 2` without debug info (they are not
+  debugged). Release is `opt-level = "z"` for PixMe's own code with `s` for
+  dependencies (at "z" the image codecs and rasterizer lose measurable speed
+  for little size gain), `lto = true`, `codegen-units = 1`, `strip = true`,
+  `panic = "abort"`. Dev-dependencies added: `serde_yml` (locale test) and
+  `ttf-parser` (font glyph test) — neither ships in the binary.
+- **Consequences**: `cargo test --release` cannot run (abort panics); tests
+  run in debug only, which CI already does. Release binary stays small while
+  keeping reasonable performance in pixel-heavy paths.
