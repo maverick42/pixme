@@ -25,6 +25,31 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/app-window.svg"),
     ),
     (
+        Icon::SquareDashedMousePointer,
+        "square-dashed-mouse-pointer",
+        include_bytes!("../../assets/icons/square-dashed-mouse-pointer.svg"),
+    ),
+    (
+        Icon::Crop,
+        "crop",
+        include_bytes!("../../assets/icons/crop.svg"),
+    ),
+    (
+        Icon::Pin,
+        "pin",
+        include_bytes!("../../assets/icons/pin.svg"),
+    ),
+    (
+        Icon::Clock,
+        "clock",
+        include_bytes!("../../assets/icons/clock.svg"),
+    ),
+    (
+        Icon::Folder,
+        "folder",
+        include_bytes!("../../assets/icons/folder.svg"),
+    ),
+    (
         Icon::Settings,
         "settings",
         include_bytes!("../../assets/icons/settings.svg"),

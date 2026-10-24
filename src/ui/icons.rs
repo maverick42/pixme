@@ -17,9 +17,19 @@ pub enum Icon {
     Monitor,
     /// Capture a rectangular region.
     SquareDashed,
-    /// Capture a single window.
+    /// Capture the active (frontmost) window.
     AppWindow,
-    /// Open the settings panel.
+    /// Capture a window or an object picked under the cursor.
+    SquareDashedMousePointer,
+    /// Capture a fixed-size (resizable) region.
+    Crop,
+    /// Pin a capture to the screen as a floating window.
+    Pin,
+    /// Delay before capture.
+    Clock,
+    /// File menu (capture viewer's documents).
+    Folder,
+    /// Capture options menu.
     Settings,
     /// Quit the app / close.
     X,

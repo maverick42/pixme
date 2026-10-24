@@ -159,3 +159,24 @@ Format: date — context — decision — consequences.
 - **Consequences**: a single window keeps layering and dragging trivial;
   sizing stays exact across themes and languages; the settings card reuses
   the same tokens and matches the visual reference in both themes.
+
+## 2026-10-24 — Toolbar button set, two-window model, settings relocation
+
+- **Context**: the functional reference's capture panel holds more buttons
+  than the first cut (active window, fixed region, pin-to-screen, delay,
+  capture options). The user also clarified the window model: the floating
+  bar and the tabbed capture viewer never show at once — a capture or
+  closing the bar hands over to the viewer, and the viewer's "+" tab brings
+  the bar back.
+- **Decision**: the bar exposes, left to right: Active window, Window or
+  object, Rectangular region, Full screen, Fixed-size region (resizable),
+  Pin to screen | Delay (0–9 s, auto-reset) | Capture options (include
+  pointer, copy to clipboard) | Quit. Excluded per user: freehand,
+  scrolling window, screen recorder, keep-on-top pin. Application settings
+  (language, appearance) move out of the bar — they belong to the future
+  viewer's settings UI; until then they are edited via `settings.toml`.
+  The File menu button is deferred to the viewer phase.
+- **Consequences**: `Settings` gains persisted capture options
+  (`include_pointer`, `copy_to_clipboard`, `capture_delay_secs`,
+  `delay_auto_reset`); the settings card is removed from the bar; rules 00
+  and 10 record the two-window handoff.

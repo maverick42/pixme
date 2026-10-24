@@ -47,6 +47,20 @@ pub struct Settings {
     pub language: Language,
     /// Theme preference: `auto` follows the OS appearance.
     pub appearance: Appearance,
+    /// Include the mouse pointer in captures.
+    pub include_pointer: bool,
+    /// Also copy every capture to the clipboard.
+    pub copy_to_clipboard: bool,
+    /// Seconds to wait before capturing (0 = capture immediately).
+    pub capture_delay_secs: u32,
+    /// Reset the capture delay to 0 after each capture (the reference's
+    /// default behaviour).
+    #[serde(default = "default_true")]
+    pub delay_auto_reset: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Settings {
