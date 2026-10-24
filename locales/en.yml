@@ -1,6 +1,5 @@
 _version: 1
 app.title: "PixMe"
-app.placeholder: "The capture toolbar arrives in the next milestone."
 toolbar.fullscreen.tooltip: "Capture the full screen"
 toolbar.region.tooltip: "Capture a rectangular region"
 toolbar.window.tooltip: "Capture a window"

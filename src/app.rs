@@ -1,19 +1,21 @@
 //! Application root: global state and the eframe event loop.
 //!
 //! `PixMeApp` owns the persisted [`config::Settings`] and applies them live:
-//! the UI language (`i18n`) and the active palette (`ui::theme`). Phase 2
-//! replaces the placeholder central panel with the floating capture toolbar.
+//! the UI language (`i18n`) and the active palette (`ui::theme`). Its single
+//! window is the floating capture [`ui::toolbar::Toolbar`].
 
 use eframe::egui;
-use rust_i18n::t;
 
 use crate::config::Settings;
+use crate::ui::toolbar::Toolbar;
 use crate::{i18n, ui};
 
-/// Root application state, created once in [`eframe::App::update`]'s setup.
+/// Root application state, created once in [`eframe::App::ui`]'s setup.
 pub struct PixMeApp {
     /// Persisted user settings (language, appearance).
     settings: Settings,
+    /// The floating toolbar's transient state.
+    toolbar: Toolbar,
 }
 
 impl PixMeApp {
@@ -26,7 +28,10 @@ impl PixMeApp {
             &cc.egui_ctx,
             settings.appearance.kind(cc.egui_ctx.system_theme()),
         );
-        Self { settings }
+        Self {
+            settings,
+            toolbar: Toolbar::default(),
+        }
     }
 }
 
@@ -36,25 +41,21 @@ impl eframe::App for PixMeApp {
         // Theme is reapplied every frame so a hot `appearance` change or an OS
         // theme switch under `Auto` takes effect immediately.
         ui::theme::apply(&ctx, self.settings.appearance.kind(ctx.system_theme()));
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.heading(t!("app.title"));
-                    ui.label(t!("app.placeholder"));
-                });
-            });
-        });
+        self.toolbar.show(ui, &mut self.settings);
     }
 }
 
-/// Runs the app window. Phase 2 turns this into a borderless always-on-top
-/// floating toolbar; for now it is a regular decorated window.
+/// Runs the app as a borderless, transparent, always-on-top floating bar.
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(t!("app.title"))
-            .with_inner_size([420.0, 160.0]),
+            .with_title("PixMe")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_always_on_top()
+            .with_has_shadow(false)
+            .with_inner_size([240.0, 48.0]),
         ..Default::default()
     };
     eframe::run_native(

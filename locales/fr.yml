@@ -1,6 +1,5 @@
 _version: 1
 app.title: "PixMe"
-app.placeholder: "La barre de capture arrive à la prochaine étape."
 toolbar.fullscreen.tooltip: "Capturer tout l'écran"
 toolbar.region.tooltip: "Capturer une zone rectangulaire"
 toolbar.window.tooltip: "Capturer une fenêtre"

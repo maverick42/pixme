@@ -141,3 +141,21 @@ Format: date — context — decision — consequences.
 - **Consequences**: `cargo test --release` cannot run (abort panics); tests
   run in debug only, which CI already does. Release binary stays small while
   keeping reasonable performance in pixel-heavy paths.
+
+## 2026-10-24 — Floating toolbar: single viewport, settings as a second card
+
+- **Context**: phase 2 — the floating mini toolbar plus a language and
+  appearance panel.
+- **Decision**: one borderless, transparent, always-on-top, non-resizable
+  viewport holds the capture bar drawn as a themed `card_frame`. Opening
+  Settings reveals a second card below inside the same window; the viewport
+  resizes itself each frame to the painted content plus a fixed transparent
+  margin (so the shadow is never clipped) via `ViewportCommand::InnerSize`.
+  The window is moved to the top-center of the screen exactly once, on the
+  first frame with known monitor geometry, so user drags
+  (`ViewportCommand::StartDrag`, bound to the bar background and every
+  button) are never overridden. Capture buttons only emit `tracing` logs
+  for now; Quit sends `ViewportCommand::Close`.
+- **Consequences**: a single window keeps layering and dragging trivial;
+  sizing stays exact across themes and languages; the settings card reuses
+  the same tokens and matches the visual reference in both themes.
