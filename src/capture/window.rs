@@ -96,3 +96,32 @@ mod tests {
         assert!(elapsed.as_millis() < 500);
     }
 }
+
+#[cfg(test)]
+mod capture_tests {
+    /// Every pickable window must be capturable quickly — a hang in
+    /// `capture_image` freezes the UI thread on double-click.
+    #[test]
+    #[ignore]
+    fn all_windows_capture_quickly() {
+        for w in super::windows().unwrap() {
+            let t = std::time::Instant::now();
+            match super::capture_window(w.id) {
+                Ok(c) => eprintln!(
+                    "  {:<20} {:<28} {}x{} px in {:?}",
+                    w.app_name,
+                    w.title,
+                    c.image.width(),
+                    c.image.height(),
+                    t.elapsed()
+                ),
+                Err(e) => eprintln!(
+                    "  {:<20} {:<28} ERR {e} in {:?}",
+                    w.app_name,
+                    w.title,
+                    t.elapsed()
+                ),
+            }
+        }
+    }
+}

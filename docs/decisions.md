@@ -343,3 +343,33 @@ Format: date — context — decision — consequences.
   literally. All three locales corrected.
 - **Consequences**: the pick overlay stays responsive; the freeze is
   gone. Windows needs testing on-device.
+
+## 2026-10-24 — Fullscreen capture deadlock: mutex guard held across a match
+
+- **Bug**: a fullscreen ("capture écran") capture froze the app — the
+  macOS hang report showed the main thread deadlocked on itself in
+  `__psynch_mutexwait`. Interactive captures (region, window pick)
+  worked, which made the cause non-obvious.
+- **Root cause**: the anchor pass ran `match *lock(&self.shared.state)`.
+  A scrutinee temporary lives for the whole `match`, so the `state`
+  guard stayed locked while arms dispatched. `Step::Confirm` calls
+  `confirm_capture` → `enter(Viewer)` → `lock(&self.state)` — a
+  same-thread re-lock of a `std::sync::Mutex`: permanent self-deadlock.
+  Region/pick confirms escaped it because they arrive through the
+  command queue (`push` → `pump`), where `state` is not held; only
+  instant captures call `confirm_capture` inside the match.
+  `Step::Cancel`/`Step::Gone` had the same latent deadlock via
+  `cancel_capture`/`enter`.
+- **Fixes**:
+  - The anchor snapshots the state (`let state = *lock(..)`) before
+    matching — the guard drops at the end of the statement.
+  - Same pattern fixed in `begin_capture`'s `return_to` match.
+  - `enter` always wakes the anchor (`request_repaint_of(ROOT)`) even
+    on same-state transitions.
+  - `begin_capture` inherits `return_to` from the session it replaces
+    when already `Capturing` — `Capturing` is never a return target.
+  - `confirm_capture` takes the session out of the mutex before window
+    capture (no window-server call under an app lock).
+- **Rule of thumb**: never lock a `Mutex` in a `match`/`if let`
+  scrutinee when an arm may re-lock it — bind the value first.
+

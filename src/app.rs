@@ -298,21 +298,24 @@ impl Shared {
     }
 
     /// Moves the machine to `next` and wakes the anchor so the child
-    /// viewports tracking the state are (de)registered promptly.
+    /// viewports tracking the state are (de)registered promptly. The
+    /// repaint is sent even when `next == current`: a same-state entry
+    /// still replaces sub-state (e.g. a new capture session over a live
+    /// one) that the anchor pass must re-evaluate.
     fn enter(&self, next: AppState, ctx: &egui::Context) {
-        {
+        let changed = {
             let mut state = lock(&self.state);
-            if *state == next {
-                return;
-            }
+            let changed = *state != next;
             *state = next;
-        }
-        tracing::debug!(?next, "lifecycle state");
-        // The viewer is a real application window: bring it to the front.
-        // The bar is a palette — it rides `always_on_top` and never grabs
-        // focus, so it never switches the active app.
-        if next == AppState::Viewer {
-            self.request_focus(viewer_id());
+            changed
+        };
+        if changed {
+            tracing::debug!(?next, "lifecycle state");
+            // The viewer is a real application window: bring it to the
+            // front. The bar is a palette — `always_on_top`, never focus.
+            if next == AppState::Viewer {
+                self.request_focus(viewer_id());
+            }
         }
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
@@ -364,7 +367,18 @@ impl Shared {
     /// torn down first — one warm-up frame inside the overlay/anchor pass).
     /// `Pin` lands in a later phase.
     fn begin_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
-        let return_to = *lock(&self.state);
+        // Chained capture (menu/hotkey while a session is live): Esc must
+        // land where the ORIGINAL session came from — `Capturing` itself
+        // is never a return destination. Snapshot the state first: a
+        // scrutinee-held guard would live for the whole match.
+        let current = *lock(&self.state);
+        let return_to = match current {
+            AppState::Capturing => lock(&self.capture)
+                .as_ref()
+                .map(|s| s.return_to)
+                .unwrap_or(AppState::Idle),
+            state => state,
+        };
         match mode {
             CaptureMode::Region
             | CaptureMode::FixedRegion
@@ -389,23 +403,22 @@ impl Shared {
     }
 
     /// The overlay confirmed: crop the frozen frame to the selection (or take
-    /// the whole monitor for `FullScreen`), open it as a viewer tab.
+    /// the whole monitor for `FullScreen`), open it as a viewer tab. The
+    /// capture mutex is released before any window-capture work — that path
+    /// hits the OS window server and must not hold app locks.
     fn confirm_capture(&self, ctx: &egui::Context) {
-        let outcome = {
-            let mut slot = lock(&self.capture);
-            let Some(session) = slot.as_mut() else { return };
-            let capture = if session.instant {
-                session.frozen.take()
-            } else {
-                session.take_capture()
-            };
-            let return_to = session.return_to;
-            *slot = None;
-            (capture, return_to)
+        let Some(mut session) = lock(&self.capture).take() else {
+            return;
         };
-        let (Some(frame), _) = outcome else {
+        let capture = if session.instant {
+            session.frozen.take()
+        } else {
+            session.take_capture()
+        };
+        let return_to = session.return_to;
+        let Some(frame) = capture else {
             // Nothing to keep — behave like a cancel.
-            self.enter(outcome.1, ctx);
+            self.enter(return_to, ctx);
             return;
         };
         let title = {
@@ -433,6 +446,17 @@ impl Shared {
     }
 }
 
+/// Dev-hook capture mode name → enum (`PIXME_CAPTURE` / `PIXME_CAPTURE_AFTER`).
+fn debug_mode(name: &str) -> Option<CaptureMode> {
+    Some(match name {
+        "region" => CaptureMode::Region,
+        "fullscreen" => CaptureMode::FullScreen,
+        "fixed" => CaptureMode::FixedRegion,
+        "window" => CaptureMode::WindowOrObject,
+        _ => return None,
+    })
+}
+
 /// Root application state, created once in [`eframe::App::ui`]'s setup.
 pub struct PixMeApp {
     /// Everything the deferred-viewport callbacks reach.
@@ -455,13 +479,7 @@ impl PixMeApp {
         // capture at startup without going through the resident menu.
         let debug_capture = std::env::var("PIXME_CAPTURE")
             .ok()
-            .and_then(|v| match v.as_str() {
-                "region" => Some(CaptureMode::Region),
-                "fullscreen" => Some(CaptureMode::FullScreen),
-                "fixed" => Some(CaptureMode::FixedRegion),
-                "window" => Some(CaptureMode::WindowOrObject),
-                _ => None,
-            });
+            .and_then(|v| debug_mode(&v));
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(AppState::Idle),
@@ -476,13 +494,28 @@ impl PixMeApp {
                 pending: Mutex::new(Vec::new()),
             }),
         }
-        .tap_debug_capture(debug_capture)
+        .tap_debug_capture(&cc.egui_ctx, debug_capture)
     }
 
     /// Queues the startup capture requested by `PIXME_CAPTURE`, if any.
-    fn tap_debug_capture(self, mode: Option<CaptureMode>) -> Self {
+    /// `PIXME_CAPTURE_AFTER=<mode>:<secs>` fires one after a delay — used
+    /// to reproduce captures triggered while a session is already live.
+    /// The queue only stores the command: the loop must be woken too, or
+    /// the pending capture sleeps forever while all windows are idle.
+    fn tap_debug_capture(self, ctx: &egui::Context, mode: Option<CaptureMode>) -> Self {
         if let Some(mode) = mode {
             self.shared.push(Command::Capture(mode));
+        }
+        if let Some((mode, secs)) = std::env::var("PIXME_CAPTURE_AFTER").ok().and_then(|v| {
+            let (m, s) = v.split_once(':')?;
+            Some((debug_mode(m)?, s.parse::<u64>().ok()?))
+        }) {
+            let wake = ctx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                platform::queue_menu_command(Command::Capture(mode));
+                wake.request_repaint();
+            });
         }
         self
     }
@@ -502,7 +535,12 @@ impl eframe::App for PixMeApp {
         let ctx = _ui.ctx().clone();
         self.shared.pump(&ctx);
 
-        match *lock(&self.shared.state) {
+        // Snapshot the state: holding the `state` guard across the match
+        // would self-deadlock the main thread — arms call `enter` /
+        // `confirm_capture` / `cancel_capture`, which lock `state` again
+        // (a fullscreen confirm deadlocked exactly this way).
+        let state = *lock(&self.shared.state);
+        match state {
             AppState::Bar => {
                 let shared = Arc::clone(&self.shared);
                 let builder = bar_builder(*lock(&shared.bar_pos));
