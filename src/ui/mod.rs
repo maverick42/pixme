@@ -6,6 +6,8 @@
 
 pub mod capture_overlay;
 pub mod icons;
+pub mod pin;
+pub mod save_dialog;
 pub mod settings;
 pub mod theme;
 pub mod toolbar;

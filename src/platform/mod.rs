@@ -136,3 +136,10 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
         _ => return None,
     })
 }
+
+/// Reveals a file selected in the OS file manager after saving.
+#[cfg(target_os = "macos")]
+pub use macos::reveal_in_file_manager;
+/// Reveals a file selected in the OS file manager (see above).
+#[cfg(target_os = "windows")]
+pub use windows::reveal_in_file_manager;

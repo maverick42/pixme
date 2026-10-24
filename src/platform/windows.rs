@@ -151,3 +151,10 @@ pub fn relabel_menus() {
         }
     });
 }
+
+/// Reveals `path` selected in Explorer (`explorer /select,<path>`).
+pub fn reveal_in_file_manager(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .status();
+}

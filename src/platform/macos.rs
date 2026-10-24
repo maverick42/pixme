@@ -381,3 +381,16 @@ pub fn window_list() -> Vec<super::WindowRecord> {
     }
     out
 }
+
+/// Reveals `path` in Finder (`open -R` selects the file); falls back to
+/// opening its parent folder.
+pub fn reveal_in_file_manager(path: &std::path::Path) {
+    let ok = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok && let Some(parent) = path.parent() {
+        let _ = std::process::Command::new("open").arg(parent).status();
+    }
+}

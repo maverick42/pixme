@@ -108,6 +108,12 @@ pub enum Command {
     ConfirmDiscard,
     /// Unsaved-session confirmation: cancel.
     ConfirmCancel,
+    /// Close a pinned capture window.
+    ClosePin(u32),
+    /// Copy a pinned capture's image to the clipboard.
+    CopyPin(u32),
+    /// Save a pinned capture via a file dialog.
+    SavePin(u32),
 }
 
 /// `egui::ViewportId` of the child windows (`from_hash_of` is not a const fn
@@ -123,6 +129,13 @@ fn settings_id() -> egui::ViewportId {
 }
 fn overlay_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.capture_overlay")
+}
+/// One id per pinned window — autonomous floating captures.
+fn pin_id(id: u32) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("pixme.pin", id))
+}
+fn save_dialog_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("pixme.save_dialog")
 }
 
 /// Lock helper: recover a poisoned mutex rather than crash the UI thread.
@@ -152,6 +165,19 @@ pub struct Shared {
     /// The last confirmed fixed-region rect, in monitor-logical space:
     /// the next fixed capture opens at the same size and position.
     pub last_fixed_region: Mutex<Option<egui::Rect>>,
+    /// The last confirmed capture rect of ANY mode (monitor-logical
+    /// space): the `Pin` capture's selection opens there.
+    pub last_capture_rect: Mutex<Option<egui::Rect>>,
+    /// Pinned captures — autonomous always-on-top windows, each backed
+    /// by a deferred viewport. They outlive every state transition and
+    /// die with the app.
+    pub pins: Mutex<Vec<crate::ui::pin::PinWindow>>,
+    /// Id source for pinned windows.
+    next_pin_id: Mutex<u32>,
+    /// The pin save-as window, open while Some.
+    pub save_dialog: Mutex<Option<crate::ui::save_dialog::SaveDialog>>,
+    /// Last folder a capture was saved to (defaults to ~/Pictures).
+    pub last_save_dir: Mutex<Option<std::path::PathBuf>>,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -264,7 +290,10 @@ impl Shared {
                 self.settings_open.store(true, Ordering::Relaxed);
                 self.request_focus(settings_id());
             }
-            Command::CloseSettings => self.settings_open.store(false, Ordering::Relaxed),
+            Command::CloseSettings => {
+                self.settings_open.store(false, Ordering::Relaxed);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
             Command::Quit => {
                 let mut viewer = lock(&self.viewer);
                 if viewer.dirty {
@@ -288,6 +317,41 @@ impl Shared {
                 let mut viewer = lock(&self.viewer);
                 viewer.confirm_close = false;
                 viewer.confirm_then_quit = false;
+            }
+            Command::ClosePin(id) => {
+                // Deregistering the viewport next pass destroys the window.
+                lock(&self.pins).retain(|p| p.id != id);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            Command::CopyPin(id) => {
+                let capture = lock(&self.pins)
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| Arc::clone(&p.capture));
+                if let Some(capture) = capture
+                    && let Err(e) = crate::export::clipboard::copy_capture(&capture)
+                {
+                    tracing::warn!("pin copy failed: {e}");
+                }
+            }
+            Command::SavePin(id) => {
+                // Opens the save-as window; the dialog writes the file.
+                let capture = lock(&self.pins)
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| Arc::clone(&p.capture));
+                if let Some(capture) = capture {
+                    let folder = lock(&self.last_save_dir).clone().or_else(|| {
+                        directories::UserDirs::new()
+                            .and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
+                    });
+                    if let Some(folder) = folder {
+                        *lock(&self.save_dialog) =
+                            Some(crate::ui::save_dialog::SaveDialog::new(capture, folder));
+                        self.request_focus(save_dialog_id());
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                }
             }
             Command::ImportClipboard
             | Command::OpenFile
@@ -386,11 +450,16 @@ impl Shared {
             CaptureMode::Region
             | CaptureMode::FixedRegion
             | CaptureMode::FullScreen
-            | CaptureMode::WindowOrObject => match crate::capture::screen::primary_monitor() {
+            | CaptureMode::WindowOrObject
+            | CaptureMode::Pin => match crate::capture::screen::primary_monitor() {
                 Ok(monitor) => {
-                    let remembered = matches!(mode, CaptureMode::FixedRegion)
-                        .then(|| *lock(&self.last_fixed_region))
-                        .flatten();
+                    // Fixed region recalls ITS memory; Pin recalls the last
+                    // confirmed capture rect whatever the mode was.
+                    let remembered = match mode {
+                        CaptureMode::FixedRegion => *lock(&self.last_fixed_region),
+                        CaptureMode::Pin => *lock(&self.last_capture_rect),
+                        _ => None,
+                    };
                     let mut session = OverlaySession::new(mode, return_to, remembered);
                     session.monitor = Some(monitor);
                     let instant = session.instant;
@@ -404,7 +473,6 @@ impl Shared {
                     tracing::error!("cannot enumerate monitors: {err}");
                 }
             },
-            _ => tracing::info!(?mode, "capture mode not implemented yet"),
         }
     }
 
@@ -432,12 +500,54 @@ impl Shared {
         if matches!(session.mode, CaptureMode::FixedRegion) {
             *lock(&self.last_fixed_region) = session.monitor_space_selection();
         }
+        // Pin prefill memory: the confirmed rect whatever the mode — a
+        // full screen counts as the whole monitor.
+        let confirmed_rect = session.monitor_space_selection().or_else(|| {
+            session.monitor.as_ref().map(|m| {
+                egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(m.rect.width as f32, m.rect.height as f32),
+                )
+            })
+        });
+        if let Some(sel) = confirmed_rect {
+            *lock(&self.last_capture_rect) = Some(sel);
+        }
+        // A Pin capture becomes an autonomous floating window — nothing
+        // is added to the viewer.
+        if matches!(session.mode, CaptureMode::Pin) {
+            self.push_pin(frame, &session, ctx);
+            self.enter(return_to, ctx);
+            return;
+        }
         let title = {
             let mut viewer = lock(&self.viewer);
             viewer.push_document(Document::new(frame))
         };
         tracing::info!(%title, "capture stored");
         self.enter(AppState::Viewer, ctx);
+    }
+
+    /// A confirmed Pin becomes an autonomous floating window at the
+    /// on-screen spot its source region occupied — no viewer document.
+    fn push_pin(
+        &self,
+        frame: crate::capture::Capture,
+        session: &OverlaySession,
+        ctx: &egui::Context,
+    ) {
+        let monitor = frame.monitor.rect;
+        let origin = session
+            .monitor_space_selection()
+            .map(|r| egui::pos2(monitor.x as f32 + r.min.x, monitor.y as f32 + r.min.y))
+            .unwrap_or(egui::pos2(monitor.x as f32 + 80.0, monitor.y as f32 + 80.0));
+        let id = {
+            let mut n = lock(&self.next_pin_id);
+            *n += 1;
+            *n
+        };
+        lock(&self.pins).push(crate::ui::pin::PinWindow::new(id, frame, origin));
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
     /// Cancel leaves the session untouched and returns where capture began.
@@ -464,6 +574,7 @@ fn debug_mode(name: &str) -> Option<CaptureMode> {
         "fullscreen" => CaptureMode::FullScreen,
         "fixed" => CaptureMode::FixedRegion,
         "window" => CaptureMode::WindowOrObject,
+        "pin" => CaptureMode::Pin,
         _ => return None,
     })
 }
@@ -502,6 +613,11 @@ impl PixMeApp {
                 settings_open: AtomicBool::new(false),
                 capture: Mutex::new(None),
                 last_fixed_region: Mutex::new(None),
+                last_capture_rect: Mutex::new(None),
+                pins: Mutex::new(Vec::new()),
+                next_pin_id: Mutex::new(0),
+                save_dialog: Mutex::new(None),
+                last_save_dir: Mutex::new(None),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
             }),
@@ -634,6 +750,79 @@ impl eframe::App for PixMeApp {
             AppState::Idle => {}
         }
 
+        // Pinned captures: autonomous always-on-top windows living outside
+        // the state machine — they survive bar/viewer/idle cycles and die
+        // with the app (closing the root closes every child viewport).
+        let pin_meta: Vec<(u32, egui::Pos2, egui::Vec2)> = lock(&self.shared.pins)
+            .iter()
+            .map(|p| (p.id, p.origin, p.logical_size()))
+            .collect();
+        for (id, origin, size) in pin_meta {
+            let shared = Arc::clone(&self.shared);
+            ctx.show_viewport_deferred(pin_id(id), pin_builder(origin, size), move |ui, _class| {
+                let ctx = ui.ctx().clone();
+                shared.pump(&ctx);
+                ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    shared.push(Command::ClosePin(id));
+                }
+                if let Some(pin) = lock(&shared.pins).iter_mut().find(|p| p.id == id) {
+                    pin.show(ui, &shared);
+                }
+            });
+        }
+
+        // The pin save-as window: a decorated modal-style panel; its state
+        // owns the image so it outlives the pin it came from.
+        if lock(&self.shared.save_dialog).is_some() {
+            let shared = Arc::clone(&self.shared);
+            ctx.show_viewport_deferred(
+                save_dialog_id(),
+                save_dialog_builder(),
+                move |ui, _class| {
+                    let ctx = ui.ctx().clone();
+                    shared.pump(&ctx);
+                    shared.maybe_focus(&ctx, save_dialog_id());
+                    ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                    // Closing only clears the flag: the ROOT anchor pass is
+                    // what deregisters this viewport — it must be woken or
+                    // the window lingers as a ghost.
+                    let close = |ctx: &egui::Context| {
+                        *lock(&shared.save_dialog) = None;
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    };
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        close(&ctx);
+                        return;
+                    }
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close(&ctx);
+                        return;
+                    }
+                    let mut guard = lock(&shared.save_dialog);
+                    if let Some(dialog) = guard.as_mut() {
+                        match ui::save_dialog::show(ui, dialog) {
+                            ui::save_dialog::Outcome::Confirm => match dialog.save(&shared) {
+                                Ok(path) => {
+                                    tracing::info!(?path, "pin saved");
+                                    drop(guard);
+                                    close(&ctx);
+                                }
+                                Err(e) => dialog.error = Some(e.to_string()),
+                            },
+                            ui::save_dialog::Outcome::Cancel => {
+                                drop(guard);
+                                close(&ctx);
+                            }
+                            ui::save_dialog::Outcome::Open => {}
+                        }
+                    }
+                },
+            );
+        }
+
         if self.shared.settings_open.load(Ordering::Relaxed) {
             let shared = Arc::clone(&self.shared);
             ctx.show_viewport_deferred(settings_id(), settings_builder(), move |ui, _class| {
@@ -644,6 +833,9 @@ impl eframe::App for PixMeApp {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     shared.settings_open.store(false, Ordering::Relaxed);
+                    // Wake the anchor so the viewport gets deregistered —
+                    // same ghost-window trap as the save dialog.
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
                 ui::settings::show(ui, &shared);
             });
@@ -705,6 +897,36 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
         .with_position(pos)
 }
 
+/// A pinned capture: borderless, transparent, always on top, not a
+/// taskbar entry — the image itself is the chrome; hover reveals the
+/// close dot and the control strip. The builder position/size only apply
+/// at creation: user drags and zoom resizes use viewport commands.
+fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_title("PixMe")
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_resizable(false)
+        .with_always_on_top()
+        .with_has_shadow(true)
+        .with_taskbar(false)
+        .with_active(true)
+        .with_inner_size(size)
+        .with_position(origin)
+}
+
+/// The pin save-as window: a small decorated form floating above the
+/// (always-on-top) pins it saves, not a taskbar entry.
+fn save_dialog_builder() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_title(t!("save.title"))
+        .with_inner_size([560.0, 205.0])
+        .with_resizable(false)
+        .with_always_on_top()
+        .with_taskbar(false)
+        .with_active(true)
+}
+
 /// The settings window: small, fixed size, titled, no taskbar entry.
 fn settings_builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
@@ -758,6 +980,11 @@ mod tests {
             settings_open: AtomicBool::new(false),
             capture: Mutex::new(None),
             last_fixed_region: Mutex::new(None),
+            last_capture_rect: Mutex::new(None),
+            pins: Mutex::new(Vec::new()),
+            next_pin_id: Mutex::new(0),
+            save_dialog: Mutex::new(None),
+            last_save_dir: Mutex::new(None),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),

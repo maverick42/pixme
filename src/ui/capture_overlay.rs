@@ -100,10 +100,11 @@ pub struct OverlaySession {
     /// once after the freeze, and the currently proposed window id.
     window_list: Option<Vec<WindowInfo>>,
     picked_window_id: Option<u32>,
-    /// Fixed-region memory (monitor-logical space): materialized into
-    /// `selection` once `screen_offset` is known — the previous fixed
-    /// capture's exact size and position.
-    restore_fixed: Option<Rect>,
+    /// Pre-seeded selection (monitor-logical space): materialized into
+    /// `selection` once `screen_offset` is known. The fixed-region memory
+    /// recalls the previous fixed capture's exact size and position; the
+    /// pin prefill recalls the last confirmed capture rect of any mode.
+    restore_sel: Option<Rect>,
     /// Full-screen frozen frame texture.
     texture: Option<egui::TextureHandle>,
     /// Magnifier source texture (rebuilt around the cursor each frame).
@@ -134,7 +135,7 @@ impl OverlaySession {
             failed: false,
             window_list: None,
             picked_window_id: None,
-            restore_fixed: if matches!(mode, CaptureMode::FixedRegion) {
+            restore_sel: if matches!(mode, CaptureMode::FixedRegion | CaptureMode::Pin) {
                 remembered
             } else {
                 None
@@ -205,7 +206,7 @@ impl OverlaySession {
             self.screen_offset = outer.min.to_vec2() - egui::vec2(m.rect.x as f32, m.rect.y as f32);
             // Materialize the remembered fixed region now that the
             // monitor↔window mapping is known (stored in monitor space).
-            if let Some(stored) = self.restore_fixed.take() {
+            if let Some(stored) = self.restore_sel.take() {
                 self.selection = Some(slide_inside(stored.translate(-self.screen_offset), rect));
             }
             if !self.nudged {

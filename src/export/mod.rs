@@ -1,7 +1,6 @@
 //! Quick export of the rendered document: file and clipboard.
 //!
-//! File dialogs via `rfd`, clipboard via `arboard`, encoding via `image`
-//! (PNG and JPEG only).
+//! Clipboard via `arboard`, encoding via `image` (PNG, JPEG, WebP).
 
 pub mod clipboard;
 pub mod file;
@@ -13,6 +12,28 @@ pub enum ImageFormat {
     Png,
     /// JPEG at 90% quality.
     Jpeg,
+    /// Lossless WebP.
+    Webp,
+}
+
+impl ImageFormat {
+    /// The file extension (without dot).
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Webp => "webp",
+        }
+    }
+
+    /// The short label shown in save dialogs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG",
+            Self::Jpeg => "JPG",
+            Self::Webp => "WEBP",
+        }
+    }
 }
 
 /// Export failure (surfaced to the user via i18n at the UI layer).

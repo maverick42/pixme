@@ -43,6 +43,10 @@ pub enum Icon {
     Scan,
     /// Drag handle on the left edge of the floating bar.
     GripVertical,
+    /// Copy to clipboard (overlapping rectangles).
+    Copy,
+    /// Save to file (download arrow).
+    Download,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

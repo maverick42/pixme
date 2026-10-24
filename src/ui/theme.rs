@@ -199,6 +199,21 @@ pub mod annotation {
     pub const ALL: [Color32; 7] = [RED, YELLOW, GREEN, BLUE, MAGENTA, WHITE, BLACK];
 }
 
+/// Fixed colours for the pinned-window hover chrome: white controls stay
+/// legible on arbitrary screenshots whatever the theme.
+pub mod pin_chrome {
+    use egui::Color32;
+
+    /// Control fill: white buttons like the functional reference's.
+    pub const BG: Color32 = Color32::WHITE;
+    /// Control fill while hovered.
+    pub const BG_HOVER: Color32 = Color32::from_rgb(0xE8, 0xE8, 0xE8);
+    /// Icon / glyph tint on the white controls.
+    pub const ICON: Color32 = Color32::from_rgb(0x24, 0x24, 0x24);
+    /// Hairline around the white controls (crisp on light images).
+    pub const BORDER: Color32 = Color32::from_black_alpha(60);
+}
+
 /// Dim veil drawn over the frozen screen during region selection.
 pub const REGION_SCRIM: Color32 = Color32::from_black_alpha(110);
 

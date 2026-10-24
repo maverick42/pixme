@@ -391,3 +391,70 @@ Format: date — context — decision — consequences.
 - **Scope**: session memory only (survives bar/viewer cycles, cleared on
   quit). Persisting to `settings.toml` like FastStone is a possible
   follow-up.
+
+
+## 2026-10-24 — Pin capture: autonomous floating windows, image-level export
+
+- **User requirement**: `Pin` selects a region (prefilled with the last
+  confirmed capture rect of any mode), then the cropped image opens as a
+  borderless, always-on-top **floating window fully independent from the
+  viewer** — "Rien n'est ajouté au viewer". Hover shows a macOS-red close
+  dot, a zoom menu (50 % / 100 % / 200 %), drag grip, Copy and Save-As
+  actions. All pins die with the app.
+- **Implementation**: `Shared.pins: Vec<PinWindow>` lives outside the
+  state machine; each pin is a deferred viewport (`pixme.pin.<id>`,
+  borderless + transparent + always-on-top, no taskbar entry) registered
+  by the anchor pass every frame. `Shared.last_capture_rect` (monitor-
+  logical space) records every confirmed capture's rect — fullscreen
+  counts as the whole monitor — and seeds the next Pin's overlay via the
+  session's `restore_sel` (renamed from `restore_fixed`). `push_pin`
+  positions the window at the region's on-screen spot (selection +
+  monitor origin). Closing the root viewport closes every child viewport
+  → pins die on Quit with no extra code; a pin's own close routes through
+  `ClosePin`, which deregisters it next pass.
+- **Export**: `copy_capture`/`save_capture_with_dialog` operate on a
+  `Capture` (RGBA pixels via `arboard`, PNG/JPEG via `rfd`+`image`),
+  separate from the `Document`-level stubs that land with the editor
+  pipeline — a pin is not a document.
+- **Consequences**: pins survive every bar/viewer/idle transition; multi-
+  monitor correctness comes for free (all space math is monitor-logical);
+  zoom changes the viewport's `InnerSize` rather than the texture, so
+  scaling stays pixel-accurate.
+
+
+## 2026-10-24 — Pin resize, white chrome, and a real save-as window
+
+- **User requirements**: pins must be resizable (corner drags, aspect
+  locked); the hover chrome's drag pill and copy/save buttons must be
+  white with dark icons; the pin save action must open a proper dialog —
+  folder + browse, format radio, file name, "show in folder" — offering
+  **WEBP** where the reference offers PDF.
+- **Resize**: `winit`'s `drag_resize_window` is `NotSupported` on macOS,
+  so `ViewportCommand::BeginResize` is out. Instead, 20 px corner zones
+  latch a resize geometrically (`pointer.press_origin` inside the zone +
+  `primary_down` — no egui `dragged()` dependency, which never fired
+  reliably here), then `apply_zoom` sends `InnerSize`/`OuterPosition`
+  straight to the pin's own viewport — the dragged corner follows the
+  pointer, the OPPOSITE corner stays bolted. Zoom clamps so no edge goes
+  below 64 logical px.
+- **Chrome**: `theme::pin_chrome` constants (white fill, near-black icon,
+  faint border) — theme-independent like the selection veil; the zoom
+  pill stays theme-tinted.
+- **Save dialog**: `ui::save_dialog` is a small decorated viewport
+  (`pixme.save_dialog`) holding an `Arc<Capture>` — the pin may close
+  while the dialog is open. It writes via `export::file::save_capture_to`
+  (new non-dialog variant), dedups file names (`capture 2.png`), strips
+  path-hostile characters, and reveals the file through
+  `platform::reveal_in_file_manager` (`open -R` / `explorer /select,`).
+- **Formats**: `ImageFormat` gains `Webp` (lossless encoder via the
+  `image` crate's `webp` feature — a feature flag on an existing dep,
+  no new top-level dependency).
+  Save-dialog follow-ups (same date): default file name is
+  `capture`+YYMMDDHHMMSS via `chrono` (new dep: date/time formatting
+  must not be hand-rolled); an already-existing destination disables
+  the Save button with an inline warning instead of silently renaming;
+  JPEG export flattens RGBA→RGB first (the encoder rejects Rgba8);
+  the dialog floats `always_on_top` above the pins; closing it (Cancel,
+  Esc, window X, successful save) wakes the ROOT anchor — forgetting to
+  left the viewport registered and produced a ghost window (the same
+  latent trap existed on the settings window, fixed too).

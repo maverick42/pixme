@@ -80,4 +80,14 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         "grip-vertical",
         include_bytes!("../../assets/icons/grip-vertical.svg"),
     ),
+    (
+        Icon::Copy,
+        "copy",
+        include_bytes!("../../assets/icons/copy.svg"),
+    ),
+    (
+        Icon::Download,
+        "download",
+        include_bytes!("../../assets/icons/download.svg"),
+    ),
 ];
