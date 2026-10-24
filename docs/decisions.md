@@ -373,3 +373,21 @@ Format: date — context — decision — consequences.
 - **Rule of thumb**: never lock a `Mutex` in a `match`/`if let`
   scrutinee when an arm may re-lock it — bind the value first.
 
+
+## 2026-10-24 — Fixed-region capture remembers its rect (session memory)
+
+- **User requirement**: the first `FixedRegion` call shows the placement
+  frame (rides the cursor until clicked, then resizable). After any
+  confirmed fixed capture, the next `FixedRegion` must open the zone at
+  the **same size and position** as the previous one (FastStone parity).
+- **Implementation**: `Shared.last_fixed_region` stores the confirmed
+  selection in monitor-logical space (`selection + screen_offset`).
+  `begin_capture` passes it to `OverlaySession` as `restore_fixed`; the
+  overlay materializes it (`translate(-screen_offset)`) once the real
+  window↔monitor offset is known, clamped to the visible bounds via
+  `slide_inside`. `placed` starts `true` so the frame never rides the
+  cursor — it stays movable/resizable; whatever is confirmed becomes the
+  new memory.
+- **Scope**: session memory only (survives bar/viewer cycles, cleared on
+  quit). Persisting to `settings.toml` like FastStone is a possible
+  follow-up.

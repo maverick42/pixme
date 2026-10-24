@@ -100,6 +100,10 @@ pub struct OverlaySession {
     /// once after the freeze, and the currently proposed window id.
     window_list: Option<Vec<WindowInfo>>,
     picked_window_id: Option<u32>,
+    /// Fixed-region memory (monitor-logical space): materialized into
+    /// `selection` once `screen_offset` is known — the previous fixed
+    /// capture's exact size and position.
+    restore_fixed: Option<Rect>,
     /// Full-screen frozen frame texture.
     texture: Option<egui::TextureHandle>,
     /// Magnifier source texture (rebuilt around the cursor each frame).
@@ -110,7 +114,10 @@ pub struct OverlaySession {
 
 impl OverlaySession {
     /// A fresh session for `mode`; `return_to` is where Esc lands.
-    pub fn new(mode: CaptureMode, return_to: AppState) -> Self {
+    /// `remembered` is the previous fixed-region rect (monitor-logical
+    /// space): when present, the fixed frame reappears exactly there
+    /// instead of riding the cursor.
+    pub fn new(mode: CaptureMode, return_to: AppState, remembered: Option<Rect>) -> Self {
         Self {
             mode,
             return_to,
@@ -120,12 +127,18 @@ impl OverlaySession {
             monitor: None,
             selection: None,
             drag: None,
-            placed: !matches!(mode, CaptureMode::FixedRegion),
+            placed: !matches!(mode, CaptureMode::FixedRegion)
+                || (matches!(mode, CaptureMode::FixedRegion) && remembered.is_some()),
             screen_offset: Vec2::ZERO,
             nudged: false,
             failed: false,
             window_list: None,
             picked_window_id: None,
+            restore_fixed: if matches!(mode, CaptureMode::FixedRegion) {
+                remembered
+            } else {
+                None
+            },
             texture: None,
             loupe: None,
             copied_at: None,
@@ -190,6 +203,11 @@ impl OverlaySession {
             (ctx.input(|i| i.viewport().outer_rect), self.monitor.clone())
         {
             self.screen_offset = outer.min.to_vec2() - egui::vec2(m.rect.x as f32, m.rect.y as f32);
+            // Materialize the remembered fixed region now that the
+            // monitor↔window mapping is known (stored in monitor space).
+            if let Some(stored) = self.restore_fixed.take() {
+                self.selection = Some(slide_inside(stored.translate(-self.screen_offset), rect));
+            }
             if !self.nudged {
                 self.nudged = true;
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
@@ -567,6 +585,12 @@ impl OverlaySession {
         }
         let p = img.get_pixel(x as u32, y as u32).0;
         Some(format!("#{:02X}{:02X}{:02X}", p[0], p[1], p[2]))
+    }
+
+    /// The selection in monitor-logical space — the space in which the
+    /// fixed-region memory is kept across captures.
+    pub fn monitor_space_selection(&self) -> Option<Rect> {
+        self.selection.map(|s| s.translate(self.screen_offset))
     }
 
     /// Crops the selection (physical px) out of the frozen frame — or, in

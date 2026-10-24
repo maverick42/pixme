@@ -149,6 +149,9 @@ pub struct Shared {
     pub settings_open: AtomicBool,
     /// The live capture session while in `Capturing` (`None` otherwise).
     pub capture: Mutex<Option<OverlaySession>>,
+    /// The last confirmed fixed-region rect, in monitor-logical space:
+    /// the next fixed capture opens at the same size and position.
+    pub last_fixed_region: Mutex<Option<egui::Rect>>,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -385,7 +388,10 @@ impl Shared {
             | CaptureMode::FullScreen
             | CaptureMode::WindowOrObject => match crate::capture::screen::primary_monitor() {
                 Ok(monitor) => {
-                    let mut session = OverlaySession::new(mode, return_to);
+                    let remembered = matches!(mode, CaptureMode::FixedRegion)
+                        .then(|| *lock(&self.last_fixed_region))
+                        .flatten();
+                    let mut session = OverlaySession::new(mode, return_to, remembered);
                     session.monitor = Some(monitor);
                     let instant = session.instant;
                     *lock(&self.capture) = Some(session);
@@ -421,6 +427,11 @@ impl Shared {
             self.enter(return_to, ctx);
             return;
         };
+        // Fixed-region memory: the next fixed capture reopens exactly here
+        // (same size, same position — monitor-logical space).
+        if matches!(session.mode, CaptureMode::FixedRegion) {
+            *lock(&self.last_fixed_region) = session.monitor_space_selection();
+        }
         let title = {
             let mut viewer = lock(&self.viewer);
             viewer.push_document(Document::new(frame))
@@ -490,6 +501,7 @@ impl PixMeApp {
                 bar_pos: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
                 capture: Mutex::new(None),
+                last_fixed_region: Mutex::new(None),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
             }),
@@ -745,6 +757,7 @@ mod tests {
             bar_pos: Mutex::new(None),
             settings_open: AtomicBool::new(false),
             capture: Mutex::new(None),
+            last_fixed_region: Mutex::new(None),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
