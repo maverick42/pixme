@@ -307,3 +307,39 @@ Format: date — context — decision — consequences.
   will need the same offset logic verified against per-monitor DPI
   (DPI awareness may or may not produce the same clamping). Remaining
   modes (`ActiveWindow`, `WindowOrObject`, `Pin`) still log only.
+
+## 2026-10-24 — Window pick via single-pass CGWindow enumeration
+
+- **Context**: `xcap::Window::all()` enumerates every on-screen
+  `CGWindow` — including the Dock, menu bar, ~20 status items,
+  notification banners and Stage-Manager icons. Worse, every `xcap`
+  accessor (`pid()`, `x()`, `title()`, `is_focused()`…) re-runs the
+  whole `CGWindowListCopyWindowInfo` enumeration internally: ~50
+  windows × ~10 accessors = O(n²) system calls, enough to freeze the
+  UI for seconds when the pick overlay first hit-tests.
+- **Decision**: `platform::window_list()` does ONE enumeration and
+  returns `WindowRecord`s with id, pid, app name, title, bounds and
+  `kCGWindowLayer` (macOS: `core-graphics`/`core-foundation` FFI — same
+  crates winit already links; Windows: `xcap`, whose EnumWindows path
+  is already cheap). `capture::window::windows()` keeps only layers
+  0–8 (normal, floating, modal): Dock=20, menubar=24, status
+  items=25, notifications (negative) are dropped; PixMe's own pid is
+  excluded so the bar/overlay are never pickable.
+- **Scope cut (user decision)**: the separate `ActiveWindow` mode is
+  removed — the hover pick covers its use with explicit intent, and
+  the toolbar keeps one window-related button. `CaptureMode` is now:
+  `WindowOrObject`, `Region`, `FixedRegion`, `FullScreen`, `Pin`.
+- **`WindowOrObject` mode**: frozen-screen overlay; each frame
+  hit-tests the cursor against the cached window list (front-to-back,
+  first hit wins); the hit rect becomes the proposed selection —
+  undimmed, dashed border, no handles, pointing-hand cursor.
+  Double-click or Enter captures via `xcap::Window::capture_image`
+  (the window's own pixels — complete even if partially occluded),
+  falling back to the frozen-frame crop; Esc cancels. Sub-object
+  picking (buttons/menus inside a window) would need Accessibility
+  APIs — out of scope for now.
+- **i18n fix**: placeholders use `%{name}` syntax (rust-i18n 4.x), not
+  `{name}` — `delay.*` and `capture.default_name` were rendering
+  literally. All three locales corrected.
+- **Consequences**: the pick overlay stays responsive; the freeze is
+  gone. Windows needs testing on-device.

@@ -65,11 +65,6 @@ impl Toolbar {
                 grip_resp.on_hover_cursor(egui::CursorIcon::Grab);
                 for (icon, tip, mode) in [
                     (
-                        Icon::AppWindow,
-                        "toolbar.active_window.tooltip",
-                        CaptureMode::ActiveWindow,
-                    ),
-                    (
                         Icon::SquareDashedMousePointer,
                         "toolbar.window.tooltip",
                         CaptureMode::WindowOrObject,

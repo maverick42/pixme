@@ -194,7 +194,6 @@ pub fn install_ui(ctx: &egui::Context) {
     let capture = Submenu::new(t!("menu.capture").as_ref(), true);
     labels.subs.push((capture.clone(), "menu.capture"));
     for (id, key) in [
-        ("capture.active_window", "toolbar.active_window.tooltip"),
         ("capture.window", "toolbar.window.tooltip"),
         ("capture.region", "toolbar.region.tooltip"),
         ("capture.fullscreen", "toolbar.fullscreen.tooltip"),
@@ -296,4 +295,89 @@ fn install_status_item(menu: Menu) -> Option<TrayIcon> {
             None
         }
     }
+}
+
+/// All on-screen windows, front-to-back, gathered in ONE
+/// `CGWindowListCopyWindowInfo` pass.
+///
+/// `xcap::Window` re-runs this enumeration inside every accessor
+/// (`pid()`, `x()`, `title()`…), so collecting window info through it
+/// costs O(n²) system calls and freezes the UI for seconds. The record
+/// also carries `kCGWindowLayer`, which `xcap` drops: without it the
+/// Dock (20), menu bar (24), status items (25) and notification banners
+/// are indistinguishable from real windows.
+pub fn window_list() -> Vec<super::WindowRecord> {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType, ToVoid};
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly,
+    };
+
+    let Some(info) = copy_window_info(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        0,
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(info.len() as usize);
+    for i in 0..info.len() {
+        let Some(ptr) = info.get(i) else { continue };
+        // Elements are CFDictionaryRefs borrowed from the array —
+        // wrap_under_get_rule keeps ownership with the array.
+        let dict: CFDictionary<*const std::ffi::c_void, *const std::ffi::c_void> =
+            unsafe { CFDictionary::wrap_under_get_rule(*ptr as CFDictionaryRef) };
+        let number = |key: &str| -> Option<i64> {
+            dict.find(CFString::new(key).to_void())
+                .and_then(|v| unsafe {
+                    CFType::wrap_under_get_rule(*v as CFTypeRef).downcast::<CFNumber>()
+                })
+                .and_then(|n| n.to_i64())
+        };
+        let text = |key: &str| -> String {
+            dict.find(CFString::new(key).to_void())
+                .and_then(|v| unsafe {
+                    CFType::wrap_under_get_rule(*v as CFTypeRef).downcast::<CFString>()
+                })
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        };
+        let Some(id) = number("kCGWindowNumber") else {
+            continue;
+        };
+        // kCGWindowBounds is a nested {X,Y,Width,Height} dictionary.
+        let rect = dict
+            .find(CFString::new("kCGWindowBounds").to_void())
+            .and_then(|v| unsafe {
+                CFType::wrap_under_get_rule(*v as CFTypeRef)
+                    .downcast::<CFDictionary<*const std::ffi::c_void, *const std::ffi::c_void>>()
+            })
+            .and_then(|bounds| {
+                let b = |k: &str| -> Option<i64> {
+                    bounds
+                        .find(CFString::new(k).to_void())
+                        .and_then(|v| unsafe {
+                            CFType::wrap_under_get_rule(*v as CFTypeRef).downcast::<CFNumber>()
+                        })
+                        .and_then(|n| n.to_i64())
+                };
+                Some(crate::capture::PhysicalRect {
+                    x: b("X")? as i32,
+                    y: b("Y")? as i32,
+                    width: b("Width")? as u32,
+                    height: b("Height")? as u32,
+                })
+            });
+        let Some(rect) = rect else { continue };
+        out.push(super::WindowRecord {
+            id: id as u32,
+            pid: number("kCGWindowOwnerPID").unwrap_or_default() as u32,
+            app_name: text("kCGWindowOwnerName"),
+            title: text("kCGWindowName"),
+            rect,
+            layer: number("kCGWindowLayer").unwrap_or_default() as i32,
+        });
+    }
+    out
 }

@@ -44,6 +44,22 @@ pub fn primary_monitor() -> Result<MonitorInfo, CaptureError> {
         .ok_or(CaptureError::Failed("no monitor".into()))
 }
 
+/// One `xcap` monitor as our [`MonitorInfo`] (logical-point bounds).
+pub fn monitor_info(m: &Monitor) -> Result<MonitorInfo, CaptureError> {
+    Ok(MonitorInfo {
+        id: m.id().unwrap_or_default(),
+        name: m.name().unwrap_or_default(),
+        rect: PhysicalRect {
+            x: m.x().unwrap_or_default(),
+            y: m.y().unwrap_or_default(),
+            width: m.width().unwrap_or_default(),
+            height: m.height().unwrap_or_default(),
+        },
+        scale_factor: m.scale_factor().unwrap_or(1.0),
+        is_primary: m.is_primary().unwrap_or(false),
+    })
+}
+
 /// Captures the full frame of monitor `id` (physical pixels).
 pub fn capture_monitor(id: u32) -> Result<Capture, CaptureError> {
     let monitor = Monitor::all()
@@ -51,18 +67,7 @@ pub fn capture_monitor(id: u32) -> Result<Capture, CaptureError> {
         .into_iter()
         .find(|m| m.id().ok() == Some(id))
         .ok_or(CaptureError::Failed("monitor disappeared".into()))?;
-    let info = MonitorInfo {
-        id,
-        name: monitor.name().unwrap_or_default(),
-        rect: PhysicalRect {
-            x: monitor.x().unwrap_or_default(),
-            y: monitor.y().unwrap_or_default(),
-            width: monitor.width().unwrap_or_default(),
-            height: monitor.height().unwrap_or_default(),
-        },
-        scale_factor: monitor.scale_factor().unwrap_or(1.0),
-        is_primary: monitor.is_primary().unwrap_or(false),
-    };
+    let info = monitor_info(&monitor)?;
     let image = monitor
         .capture_image()
         .map_err(|e| CaptureError::Failed(e.to_string()))?;

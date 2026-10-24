@@ -67,6 +67,34 @@ pub use macos::apply_native_options;
 #[cfg(target_os = "windows")]
 pub use windows::apply_native_options;
 
+/// One on-screen window as reported by the OS window list — the fields
+/// the pick overlay needs, gathered in a single enumeration pass.
+/// `xcap::Window` accessor methods each re-enumerate the whole list on
+/// macOS, so asking it for ~10 fields × ~50 windows stalls the UI for
+/// seconds; this record comes from one `CGWindowListCopyWindowInfo` call.
+pub struct WindowRecord {
+    /// OS window id (`kCGWindowNumber` on macOS, `HWND` on Windows).
+    pub id: u32,
+    /// Owning process id.
+    pub pid: u32,
+    /// Owning application name.
+    pub app_name: String,
+    /// Window title.
+    pub title: String,
+    /// Global logical bounds (same space as `MonitorInfo::rect`).
+    pub rect: crate::capture::PhysicalRect,
+    /// Window-server layer: 0 = normal, 3 = floating palette, 8 = modal;
+    /// Dock/menubar/status items sit at 20+. Always 0 on Windows.
+    pub layer: i32,
+}
+
+/// All on-screen windows, front-to-back, in one enumeration pass.
+#[cfg(target_os = "macos")]
+pub use macos::window_list;
+/// All on-screen windows (see above).
+#[cfg(target_os = "windows")]
+pub use windows::window_list;
+
 /// Lock helper: recover a poisoned mutex rather than crash a menu callback.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -93,7 +121,6 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
     Some(match id {
         "take_capture" => Command::ShowBar,
         "open_viewer" => Command::OpenViewer,
-        "capture.active_window" => Command::Capture(CaptureMode::ActiveWindow),
         "capture.window" => Command::Capture(CaptureMode::WindowOrObject),
         "capture.region" => Command::Capture(CaptureMode::Region),
         "capture.fullscreen" => Command::Capture(CaptureMode::FullScreen),

@@ -145,7 +145,6 @@ impl Viewer {
             });
             menu_button(ui, t!("menu.capture").as_ref(), |ui| {
                 for (tip, mode) in [
-                    ("toolbar.active_window.tooltip", CaptureMode::ActiveWindow),
                     ("toolbar.window.tooltip", CaptureMode::WindowOrObject),
                     ("toolbar.region.tooltip", CaptureMode::Region),
                     ("toolbar.fullscreen.tooltip", CaptureMode::FullScreen),

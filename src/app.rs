@@ -54,7 +54,7 @@ pub enum AppState {
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureMode {
     /// The frontmost window.
-    ActiveWindow,
+
     /// A window or object picked under the cursor.
     WindowOrObject,
     /// A user-drawn rectangle.
@@ -362,26 +362,28 @@ impl Shared {
     /// Starts `mode`: region modes spawn the selection overlay over the
     /// frozen monitor, full-screen arms an instant capture (the bar must be
     /// torn down first — one warm-up frame inside the overlay/anchor pass).
-    /// `ActiveWindow`, `WindowOrObject` and `Pin` land in later phases.
+    /// `Pin` lands in a later phase.
     fn begin_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
         let return_to = *lock(&self.state);
         match mode {
-            CaptureMode::Region | CaptureMode::FixedRegion | CaptureMode::FullScreen => {
-                match crate::capture::screen::primary_monitor() {
-                    Ok(monitor) => {
-                        let mut session = OverlaySession::new(mode, return_to);
-                        session.monitor = Some(monitor);
-                        *lock(&self.capture) = Some(session);
-                        self.enter(AppState::Capturing, ctx);
-                        if !matches!(mode, CaptureMode::FullScreen) {
-                            self.request_focus(overlay_id());
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!("cannot enumerate monitors: {err}");
+            CaptureMode::Region
+            | CaptureMode::FixedRegion
+            | CaptureMode::FullScreen
+            | CaptureMode::WindowOrObject => match crate::capture::screen::primary_monitor() {
+                Ok(monitor) => {
+                    let mut session = OverlaySession::new(mode, return_to);
+                    session.monitor = Some(monitor);
+                    let instant = session.instant;
+                    *lock(&self.capture) = Some(session);
+                    self.enter(AppState::Capturing, ctx);
+                    if !instant {
+                        self.request_focus(overlay_id());
                     }
                 }
-            }
+                Err(err) => {
+                    tracing::error!("cannot enumerate monitors: {err}");
+                }
+            },
             _ => tracing::info!(?mode, "capture mode not implemented yet"),
         }
     }
@@ -457,6 +459,7 @@ impl PixMeApp {
                 "region" => Some(CaptureMode::Region),
                 "fullscreen" => Some(CaptureMode::FullScreen),
                 "fixed" => Some(CaptureMode::FixedRegion),
+                "window" => Some(CaptureMode::WindowOrObject),
                 _ => None,
             });
         Self {
@@ -535,12 +538,14 @@ impl eframe::App for PixMeApp {
                     Freeze,
                     Overlay,
                     Confirm,
+                    Cancel,
                     Gone,
                 }
                 let step = {
                     let mut slot = lock(&self.shared.capture);
                     match slot.as_mut() {
                         None => Step::Gone,
+                        Some(s) if s.failed => Step::Cancel,
                         Some(s) if s.frozen.is_none() => {
                             s.warm_freeze();
                             Step::Freeze
@@ -552,6 +557,7 @@ impl eframe::App for PixMeApp {
                 match step {
                     Step::Freeze => ctx.request_repaint(),
                     Step::Confirm => self.shared.confirm_capture(&ctx),
+                    Step::Cancel => self.shared.cancel_capture(&ctx),
                     Step::Gone => self.shared.enter(AppState::Idle, &ctx),
                     Step::Overlay => {
                         let shared = Arc::clone(&self.shared);

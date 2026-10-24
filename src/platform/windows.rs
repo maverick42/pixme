@@ -112,6 +112,35 @@ pub fn install_ui(ctx: &egui::Context) {
     });
 }
 
+/// All on-screen windows, front-to-back. On Windows `xcap` enumerates
+/// real top-level windows with direct `EnumWindows`/`GetWindow*` calls —
+/// no per-accessor re-enumeration like the macOS backend, so reading
+/// through it is cheap. `layer` is always 0 (no layer concept).
+pub fn window_list() -> Vec<super::WindowRecord> {
+    let mut out = Vec::new();
+    for w in xcap::Window::all().unwrap_or_default() {
+        let Ok(rect) = (|| {
+            Ok::<crate::capture::PhysicalRect, xcap::XCapError>(crate::capture::PhysicalRect {
+                x: w.x()?,
+                y: w.y()?,
+                width: w.width()?,
+                height: w.height()?,
+            })
+        })() else {
+            continue;
+        };
+        out.push(super::WindowRecord {
+            id: w.id().unwrap_or_default(),
+            pid: w.pid().unwrap_or_default(),
+            app_name: w.app_name().unwrap_or_default(),
+            title: w.title().unwrap_or_default(),
+            rect,
+            layer: 0,
+        });
+    }
+    out
+}
+
 /// Rewrites the tray menu labels in the current language.
 pub fn relabel_menus() {
     INSTALLED.with(|cell| {

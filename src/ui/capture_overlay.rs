@@ -13,6 +13,7 @@ use rust_i18n::t;
 
 use crate::app::{AppState, CaptureMode, Command, Shared};
 use crate::capture::screen;
+use crate::capture::window::{self, WindowInfo};
 use crate::capture::{Capture, MonitorInfo, PhysicalRect};
 use crate::ui::theme;
 
@@ -93,6 +94,12 @@ pub struct OverlaySession {
     /// Whether the post-creation fullscreen nudge was sent (macOS clamps at
     /// init; a programmatic setFrame may escape it).
     nudged: bool,
+    /// Freeze failed permanently (permission, window gone) — cancel out.
+    pub failed: bool,
+    /// Pick mode (`WindowOrObject`): the on-screen window list, enumerated
+    /// once after the freeze, and the currently proposed window id.
+    window_list: Option<Vec<WindowInfo>>,
+    picked_window_id: Option<u32>,
     /// Full-screen frozen frame texture.
     texture: Option<egui::TextureHandle>,
     /// Magnifier source texture (rebuilt around the cursor each frame).
@@ -116,6 +123,9 @@ impl OverlaySession {
             placed: !matches!(mode, CaptureMode::FixedRegion),
             screen_offset: Vec2::ZERO,
             nudged: false,
+            failed: false,
+            window_list: None,
+            picked_window_id: None,
             texture: None,
             loupe: None,
             copied_at: None,
@@ -132,8 +142,9 @@ impl OverlaySession {
         if self.warm_frames < 2 {
             return false;
         }
-        if self.frozen.is_none() {
-            match screen::primary_monitor().and_then(|m| screen::capture_monitor(m.id)) {
+        if self.frozen.is_none() && !self.failed {
+            let res = screen::primary_monitor().and_then(|m| screen::capture_monitor(m.id));
+            match res {
                 Ok(frame) => {
                     // Dev hook: PIXME_DUMP_FROZEN=/path.png dumps the frozen frame.
                     if let Some(path) = std::env::var_os("PIXME_DUMP_FROZEN") {
@@ -142,7 +153,10 @@ impl OverlaySession {
                     self.monitor = Some(frame.monitor.clone());
                     self.frozen = Some(frame);
                 }
-                Err(err) => tracing::error!("capture failed: {err}"),
+                Err(err) => {
+                    tracing::error!("capture failed: {err}");
+                    self.failed = true;
+                }
             }
         }
         self.frozen.is_some()
@@ -233,17 +247,22 @@ impl OverlaySession {
 
         // -- input ---------------------------------------------------------
         let resp = ui.interact(rect, ui.id().with("overlay"), Sense::click_and_drag());
-        // Fixed-region: the frame follows the cursor until a press places it.
-        if !self.placed {
-            if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
-                self.selection = Some(slide_inside(Rect::from_center_size(pos, FIXED_SIZE), rect));
+        if matches!(self.mode, CaptureMode::WindowOrObject) {
+            self.pick_window(&ctx);
+        } else {
+            // Fixed-region: the frame follows the cursor until placed.
+            if !self.placed {
+                if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                    self.selection =
+                        Some(slide_inside(Rect::from_center_size(pos, FIXED_SIZE), rect));
+                }
+                if resp.drag_started() || resp.clicked() {
+                    self.placed = true;
+                }
             }
-            if resp.drag_started() || resp.clicked() {
-                self.placed = true;
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                self.handle_drag(pos, &resp, rect);
             }
-        }
-        if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-            self.handle_drag(pos, &resp, rect);
         }
         if resp.double_clicked() && self.selection.is_some() {
             shared.push(Command::ConfirmCapture);
@@ -313,6 +332,49 @@ impl OverlaySession {
         }
     }
 
+    /// Pick mode (`WindowOrObject`): the hovered topmost window becomes the
+    /// selection — undimmed and bordered; double-click captures it.
+    fn pick_window(&mut self, ctx: &egui::Context) {
+        if self.window_list.is_none() {
+            self.window_list = window::windows().ok();
+        }
+        let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
+            self.selection = None;
+            return;
+        };
+        let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+            return;
+        };
+        // Window-local → global logical point, hit-test front-to-back.
+        let global = pos + outer.min.to_vec2();
+        let origin = outer.min.to_vec2();
+        let hit = self.window_list.as_ref().and_then(|list| {
+            list.iter().find(|w| {
+                let r = w.rect;
+                Rect::from_min_max(
+                    Pos2::new(r.x as f32, r.y as f32),
+                    Pos2::new(
+                        (r.x + r.width as i32) as f32,
+                        (r.y + r.height as i32) as f32,
+                    ),
+                )
+                .contains(global)
+            })
+        });
+        self.picked_window_id = hit.map(|w| w.id);
+        self.selection = hit.map(|w| {
+            let r = w.rect;
+            Rect::from_min_max(
+                Pos2::new(r.x as f32, r.y as f32),
+                Pos2::new(
+                    (r.x + r.width as i32) as f32,
+                    (r.y + r.height as i32) as f32,
+                ),
+            )
+            .translate(-origin)
+        });
+    }
+
     /// Esc cancels, Enter confirms, C copies the cursor colour.
     fn keys(&mut self, ctx: &egui::Context, shared: &Shared) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -339,8 +401,10 @@ impl OverlaySession {
     /// Selection, crosshair, magnifier.
     fn paint(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let rect = ui.max_rect();
+        let pick = matches!(self.mode, CaptureMode::WindowOrObject);
         if let Some(sel) = self.selection {
-            paint_selection(ui, sel);
+            // Pick mode proposes a fixed rect: dashed border, no handles.
+            paint_selection(ui, sel, !pick);
         }
         let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
             return;
@@ -348,8 +412,14 @@ impl OverlaySession {
         if !rect.contains(pos) {
             return;
         }
-        // Crosshair: thin accent lines across the monitor through the cursor.
-        if self.selection.is_none() && self.drag.is_none() {
+        if pick {
+            ctx.set_cursor_icon(if self.selection.is_some() {
+                egui::CursorIcon::PointingHand
+            } else {
+                egui::CursorIcon::Crosshair
+            });
+        } else if self.selection.is_none() && self.drag.is_none() {
+            // Crosshair: thin accent lines across the monitor.
             let stroke = Stroke::new(1.0, ACCENT);
             ui.painter().hline(rect.x_range(), pos.y, stroke);
             ui.painter().vline(pos.x, rect.y_range(), stroke);
@@ -499,10 +569,18 @@ impl OverlaySession {
         Some(format!("#{:02X}{:02X}{:02X}", p[0], p[1], p[2]))
     }
 
-    /// Crops the selection (physical px) out of the frozen frame.
+    /// Crops the selection (physical px) out of the frozen frame — or, in
+    /// pick mode, asks the OS for the window's own image (complete even if
+    /// part of it was occluded), falling back to the crop on failure.
     pub fn take_capture(&self) -> Option<Capture> {
         let frozen = self.frozen.as_ref()?;
         let sel = self.selection?;
+        if matches!(self.mode, CaptureMode::WindowOrObject)
+            && let Some(id) = self.picked_window_id
+            && let Ok(capture) = window::capture_window(id)
+        {
+            return Some(capture);
+        }
         let s = frozen.scale_factor;
         let min = sel.min.to_vec2() + self.screen_offset;
         let rect = PhysicalRect {
@@ -515,8 +593,9 @@ impl OverlaySession {
     }
 }
 
-/// The dashed accent border + eight handles of the live selection.
-fn paint_selection(ui: &mut egui::Ui, sel: Rect) {
+/// The dashed accent border + eight handles of the live selection
+/// (`handles = false` for the pick mode's proposed window rect).
+fn paint_selection(ui: &mut egui::Ui, sel: Rect, handles: bool) {
     let painter = ui.painter();
     let stroke = Stroke::new(1.5, ACCENT);
     for (a, b) in [
@@ -526,6 +605,9 @@ fn paint_selection(ui: &mut egui::Ui, sel: Rect) {
         (sel.left_bottom(), sel.min),
     ] {
         painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 6.0, 4.0));
+    }
+    if !handles {
+        return;
     }
     for h in [
         Handle::Nw,
