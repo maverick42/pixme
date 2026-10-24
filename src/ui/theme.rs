@@ -379,6 +379,8 @@ pub fn install_fonts(ctx: &Context) {
 
 #[cfg(test)]
 mod tests {
+    use owned_ttf_parser::AsFaceRef;
+
     use super::*;
 
     /// WCAG 2.x relative luminance, in sRGB.
@@ -443,7 +445,9 @@ mod tests {
             ("Inter-Medium", INTER_MEDIUM),
             ("Inter-SemiBold", INTER_SEMIBOLD),
         ] {
-            let face = ttf_parser::Face::parse(bytes, 0).expect("embedded font must parse");
+            let face = owned_ttf_parser::OwnedFace::from_vec(bytes.to_vec(), 0)
+                .expect("embedded font must parse");
+            let face = face.as_face_ref();
             for ch in REQUIRED.chars() {
                 assert!(
                     face.glyph_index(ch).is_some(),

@@ -23,10 +23,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.26.1"
 xcap = "0.9.8"
 
-[dev-dependencies]
-serde_yml = "0.0.13"
-ttf-parser = "0.25.1"
-
 [profile.dev]
 # Line tables keep file:line in panic backtraces but drop variable info,
 # which roughly halves link time and debug-info size.
@@ -50,3 +46,7 @@ panic = "abort"
 # lose measurable speed for little size gain.
 [profile.release.package."*"]
 opt-level = "s"
+
+[dev-dependencies]
+owned_ttf_parser = "0.25.1"
+serde_yaml_ng = "0.10"

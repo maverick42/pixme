@@ -9,8 +9,9 @@
 use egui::{CentralPanel, Frame, Margin, Rect, Vec2, ViewportCommand};
 use rust_i18n::t;
 
+use crate::app::{CaptureMode, Command, Shared};
 use crate::config::Settings;
-use crate::ui::icons::Icon;
+use crate::ui::icons::{self, Icon};
 use crate::ui::{theme, widgets};
 
 /// Transparent margin kept around the bar so its painted shadow is not
@@ -29,13 +30,14 @@ pub struct Toolbar {
 }
 
 impl Toolbar {
-    /// Draws the toolbar for this frame.
-    pub fn show(&mut self, ui: &mut egui::Ui, settings: &mut Settings) {
+    /// Draws the toolbar for this frame. Actions are pushed as [`Command`]s
+    /// on `shared` — the state machine dispatches them.
+    pub fn show(&mut self, ui: &mut egui::Ui, settings: &mut Settings, shared: &Shared) {
         let ctx = ui.ctx().clone();
         CentralPanel::default()
             .frame(Frame::NONE.inner_margin(Margin::same(SHADOW_MARGIN)))
             .show(ui, |ui| {
-                let content = self.capture_bar(ui, settings);
+                let content = self.capture_bar(ui, settings, shared);
                 self.sync_viewport(&ctx, content.response.rect);
             });
     }
@@ -45,30 +47,52 @@ impl Toolbar {
         &mut self,
         ui: &mut egui::Ui,
         settings: &mut Settings,
+        shared: &Shared,
     ) -> egui::InnerResponse<()> {
         let t = theme::tokens(ui.ctx());
         let frame = widgets::card_frame(t).shadow(widgets::card_shadow(t));
         let inner = frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-                for (icon, tip, kind) in [
+                // Drag handle (functional reference's dotted grip): an
+                // explicit grab affordance so the bar reads as movable.
+                let (grip_rect, grip_resp) =
+                    ui.allocate_exact_size(Vec2::new(10.0, 26.0), egui::Sense::drag());
+                icons::paint(ui, grip_rect, Icon::GripVertical, 12.0, t.text_faint);
+                if grip_resp.drag_started() {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                grip_resp.on_hover_cursor(egui::CursorIcon::Grab);
+                for (icon, tip, mode) in [
                     (
                         Icon::AppWindow,
                         "toolbar.active_window.tooltip",
-                        "active_window",
+                        CaptureMode::ActiveWindow,
                     ),
                     (
                         Icon::SquareDashedMousePointer,
                         "toolbar.window.tooltip",
-                        "window",
+                        CaptureMode::WindowOrObject,
                     ),
-                    (Icon::SquareDashed, "toolbar.region.tooltip", "region"),
-                    (Icon::Monitor, "toolbar.fullscreen.tooltip", "fullscreen"),
-                    (Icon::Crop, "toolbar.fixed_region.tooltip", "fixed_region"),
-                    (Icon::Pin, "toolbar.pin.tooltip", "pin"),
+                    (
+                        Icon::SquareDashed,
+                        "toolbar.region.tooltip",
+                        CaptureMode::Region,
+                    ),
+                    (
+                        Icon::Monitor,
+                        "toolbar.fullscreen.tooltip",
+                        CaptureMode::FullScreen,
+                    ),
+                    (
+                        Icon::Crop,
+                        "toolbar.fixed_region.tooltip",
+                        CaptureMode::FixedRegion,
+                    ),
+                    (Icon::Pin, "toolbar.pin.tooltip", CaptureMode::Pin),
                 ] {
                     if cap_button(ui, icon, tip, false).clicked() {
-                        tracing::info!(kind, "capture requested");
+                        shared.push(Command::Capture(mode));
                     }
                 }
                 widgets::vline(ui, 18.0);
@@ -78,8 +102,8 @@ impl Toolbar {
                 let opts_btn = cap_button(ui, Icon::Settings, "toolbar.options.tooltip", false);
                 Self::options_menu(&opts_btn, settings);
                 widgets::vline(ui, 18.0);
-                if cap_button(ui, Icon::X, "toolbar.quit.tooltip", false).clicked() {
-                    ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                if cap_button(ui, Icon::X, "toolbar.close.tooltip", false).clicked() {
+                    shared.push(Command::CloseBar);
                 }
             });
         });
@@ -122,8 +146,8 @@ impl Toolbar {
         }
     }
 
-    /// Menu on the gear button: capture-related toggles only (application
-    /// settings like language and appearance live in the viewer window).
+    /// Menu on the gear button: capture-related toggles only — application
+    /// settings live in the viewer menus / app menu, never in the bar.
     fn options_menu(btn: &egui::Response, settings: &mut Settings) {
         let mut changed = false;
         egui::Popup::menu(btn).show(|ui| {

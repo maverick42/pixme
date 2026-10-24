@@ -20,7 +20,8 @@ fn load(locale: &str) -> Locale {
         "_version: 1",
         "{locale}.yml must start with `_version: 1`"
     );
-    serde_yml::from_str(body).unwrap_or_else(|e| panic!("invalid YAML in {}: {e}", path.display()))
+    serde_yaml_ng::from_str(body)
+        .unwrap_or_else(|e| panic!("invalid YAML in {}: {e}", path.display()))
 }
 
 #[test]

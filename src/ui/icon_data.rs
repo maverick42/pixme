@@ -65,4 +65,19 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         "check",
         include_bytes!("../../assets/icons/check.svg"),
     ),
+    (
+        Icon::Plus,
+        "plus",
+        include_bytes!("../../assets/icons/plus.svg"),
+    ),
+    (
+        Icon::Scan,
+        "scan",
+        include_bytes!("../../assets/icons/scan.svg"),
+    ),
+    (
+        Icon::GripVertical,
+        "grip-vertical",
+        include_bytes!("../../assets/icons/grip-vertical.svg"),
+    ),
 ];

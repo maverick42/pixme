@@ -180,3 +180,77 @@ Format: date — context — decision — consequences.
   (`include_pointer`, `copy_to_clipboard`, `capture_delay_secs`,
   `delay_auto_reset`); the settings card is removed from the bar; rules 00
   and 10 record the two-window handoff.
+
+## 2026-10-24 — App lifecycle, OS entry points and command dispatch
+
+- **Context**: PixMe needs the reference's two-window flow before capture
+  lands, plus OS-native residency (menu-bar icon on macOS, tray on
+  Windows).
+- **Decision**: one shared state machine — `Idle`, `Bar`, `Capturing`,
+  `Viewer` — identical on both OSes, with `Bar`/`Viewer` strictly
+  exclusive. Every user action is a `Command` dispatched through one path
+  (bar buttons, icon menu, app menus, future global hotkeys).
+  - **Both OSes**: launch shows no window — the app is resident in the
+    macOS menu bar (template status item) or the Windows tray (accent-
+    coloured icon); the icon menu carries exactly "Take a capture" →
+    `Bar` and "Open PixMe" → `Viewer`. Closing the bar goes to `Viewer`
+    when the session has captures, else `Idle`. Closing the viewer goes
+    to `Idle` (session kept). Quitting exists only in the app menus —
+    PixMe menu on macOS, the viewer's own menu strip on Windows.
+  - **macOS**: default `regular` activation policy kept — a permanent
+    Dock icon, launcher-style (clicking it activates the app, shows
+    nothing; the status item is the only entry point). The `accessory`
+    policy was tried first and rejected: an accessory app can never own
+    the menu bar, so the PixMe/File/… menus could not exist. Native app
+    menus (PixMe / Capture / File / Window) via `muda` (`init_for_nsapp`).
+  - **Windows**: tray icon via the same `tray-icon` crate, plus a
+    permanent taskbar button on the invisible anchor window — the
+    functional twin of the always-present Dock icon (clicking it focuses
+    the app without showing anything). The viewer draws an egui menu
+    strip inside the window (no global menu bar exists), dispatching
+    the same commands.
+  - Foregrounding: child viewports re-send `ViewportCommand::Focus`
+    until their window reports focused (a `Focus` sent before the window
+    is visible is dropped by winit), capped ~1.5 s so a window the user
+    deliberately backgrounds is not re-focused forever. The floating bar
+    is a palette: it never requests focus and rides `always_on_top`
+    above the current app.
+  - Menus are built with `muda` — no new dependency: it is re-exported
+    as `tray_icon::menu` and powers the status item too. Menu labels
+    come from i18n and are re-set on language change; `Cmd+Shift+3/4/5`
+    are never used (reserved by macOS).
+  - A dirty session (unsaved captures/annotations) blocks closing behind
+    a translated Save/Discard/Cancel confirmation.
+  - Known caveat: when the macOS menu bar is crowded, the system hides
+    overflow status items — ours may be invisible until space frees up
+    (the item is still installed and functional).
+- **Consequences**: no extra platform dependency — the menu-bar work
+  rides `muda` (re-exported by `tray-icon`) and the regular policy is
+  winit's default. Viewports: the
+  root is a permanent 1×1 transparent "anchor" window (`taskbar(false)`,
+  no decorations) — egui/winit never repaints a window that was never
+  shown, so an always-visible anchor keeps the command pump alive; bar,
+  viewer and settings are deferred child viewports registered while
+  their state requires them (the bar's position is persisted in
+  `Shared::bar_pos` across hide/show). muda/tray handles are
+  `Rc`-backed (not `Send`) so they live in a `thread_local` inside
+  `platform/`, never in shared app state.
+  Capture-testing on macOS will require the app packaged as a signed
+  `.app` bundle (ad-hoc signature suffices) because Screen Recording
+  permission binds to the application identity.
+
+## 2026-10-24 — Dependency hygiene: `cargo audit` baseline
+
+- **Context**: `cargo audit` on the 565-package lockfile found one real
+  vulnerability (`noyalib` RUSTSEC-2026-0333, via the `serde_yml` dev-dep,
+  itself flagged unsound/unmaintained) plus unmaintained warnings.
+- **Decision**: dev-deps moved to maintained crates — `serde_yml` →
+  `serde_yaml_ng`, `ttf-parser` → `owned_ttf_parser` (the maintained
+  successor by the same author). The vulnerability is gone.
+- **Consequences**: 7 warnings remain, all transitive and unactionable:
+  `ttf-parser` and `unsafe-libyaml` are pulled *by* the maintained crates
+  themselves; `zbus*`/`zvariant*`/`glib` belong to the Linux D-Bus stack
+  of `xcap`/`arboard` (never compiled on macOS/Windows);
+  `proc-macro-error` is a transitive proc-macro helper. Re-run
+  `cargo audit` before releases; the advisory set lives at
+  `~/.cargo/advisory-db`.

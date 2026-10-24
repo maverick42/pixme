@@ -5,8 +5,10 @@
 //! `widgets/` — everything reads [`theme::tokens`].
 
 pub mod icons;
+pub mod settings;
 pub mod theme;
 pub mod toolbar;
+pub mod viewer;
 pub mod widgets;
 
 mod icon_data;

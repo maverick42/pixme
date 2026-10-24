@@ -37,6 +37,12 @@ pub enum Icon {
     ChevronDown,
     /// Checkmark (selected menu item).
     Check,
+    /// Add a tab / start a new capture (viewer's "+").
+    Plus,
+    /// Viewfinder frame (menu-bar status item glyph).
+    Scan,
+    /// Drag handle on the left edge of the floating bar.
+    GripVertical,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes
@@ -92,8 +98,36 @@ pub fn paint(ui: &Ui, rect: Rect, icon: Icon, size: f32, tint: Color32) {
     image(icon, size, tint).paint_at(ui, r);
 }
 
-/// Rasterizes `icon` at `size` px — used by tests and offscreen rendering.
-#[cfg(test)]
+/// Rasterizes `icon` to raw RGBA8 bytes at `size` px — used for OS surfaces
+/// that need pixel data instead of an egui image (macOS status item icon,
+/// white strokes work fine for a template icon).
+pub fn rgba(icon: Icon, size: u32) -> Vec<u8> {
+    rasterize(icon, size).as_raw().to_vec()
+}
+
+/// Rasterizes `icon` recoloured to `color` (a `#rrggbb` hex string) — for OS
+/// surfaces without a template mode (the Windows tray, where pure-white
+/// strokes would vanish on a light taskbar).
+pub fn rgba_with(icon: Icon, size: u32, color: &str) -> Vec<u8> {
+    let Some(&(_, _, raw)) = icon_data::DATA.iter().find(|&&(i, _, _)| i == icon) else {
+        return Vec::new();
+    };
+    let svg = String::from_utf8_lossy(raw).replace("currentColor", color);
+    egui_extras::image::load_svg_bytes_with_size(
+        svg.as_bytes(),
+        egui::load::SizeHint::Size {
+            width: size,
+            height: size,
+            maintain_aspect_ratio: true,
+        },
+        &Default::default(),
+    )
+    .map(|img| img.as_raw().to_vec())
+    .unwrap_or_default()
+}
+
+/// Rasterizes `icon` at `size` px — used by tests, offscreen rendering and
+/// OS surfaces that need pixel data (status item icon).
 fn rasterize(icon: Icon, size: u32) -> egui::ColorImage {
     let styled = &styled_icons()[&icon];
     egui_extras::image::load_svg_bytes_with_size(
@@ -105,7 +139,9 @@ fn rasterize(icon: Icon, size: u32) -> egui::ColorImage {
         },
         &Default::default(),
     )
-    .expect("bundled icons must rasterize")
+    // A bundled, compile-time-verified SVG cannot fail; fall back to an
+    // empty image rather than panic if the loader ever disagrees.
+    .unwrap_or_else(|_| egui::ColorImage::filled([size as usize; 2], Color32::TRANSPARENT))
 }
 
 /// Texture handle for `icon` at `size` px (public API for custom painting).
