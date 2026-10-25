@@ -11,15 +11,15 @@
 use std::collections::VecDeque;
 
 use egui::{
-    Align, CentralPanel, CornerRadius, Layout, Margin, Pos2, Rect, Response, Sense, Stroke,
-    StrokeKind, Vec2, ViewportCommand,
+    Align, CentralPanel, Color32, CornerRadius, Layout, Margin, Pos2, Rect, Response, Sense,
+    Stroke, StrokeKind, Vec2, ViewportCommand,
 };
 use rust_i18n::t;
 
 use crate::app::{CaptureMode, Command, Shared};
 use crate::editor::Document;
 use crate::editor::history::AnnoEdit;
-use crate::ui::icons::Icon;
+use crate::ui::icons::{self, Icon};
 use crate::ui::{theme, widgets};
 
 /// One open capture: its document plus the (rebuilt-on-revision) texture.
@@ -47,6 +47,10 @@ pub struct Tab {
     pub anno_undo: VecDeque<AnnoEdit>,
     /// Redo side of the annotation stacks.
     pub anno_redo: VecDeque<AnnoEdit>,
+    /// Password accepted while this tab is visible — leaving the tab
+    /// re-locks it (`false` again), so a protected capture asks for its
+    /// password on every activation.
+    pub unlocked: bool,
 }
 
 /// How many pixel mutations stay undoable per tab. Full-image ops keep
@@ -226,7 +230,71 @@ pub struct Viewer {
     /// The resize dialog, open while Some.
     resize: Option<ResizeDialog>,
     /// The rename prompt's draft, open while Some.
-    rename: Option<String>,
+    rename: Option<RenameState>,
+    /// The protection dialog (set/change/remove password), open while Some.
+    protect: Option<ProtectDialog>,
+    /// The "delete the file on disk" confirmation, open while Some.
+    confirm_delete: Option<DeleteFileDialog>,
+    /// Draft of the locked tab's password prompt.
+    unlock_draft: String,
+    /// The last unlock attempt failed — show the inline error.
+    unlock_error: bool,
+    /// Last measured horizontal offset of the tab strip — the ◀ ▶
+    /// buttons scroll relative to it.
+    tab_scroll_pos: f32,
+    /// One-shot horizontal offset applied to the tab strip next frame.
+    tab_scroll_to: Option<f32>,
+    /// A tab activation asks the strip to scroll it into view once.
+    scroll_active_into_view: bool,
+    /// The chips were wider than the strip last frame — shows ◀ ▶.
+    tabs_overflow: bool,
+    /// Same scroll bookkeeping for the toolbar band.
+    tool_scroll_pos: f32,
+    /// One-shot horizontal offset applied to the toolbar next frame.
+    tool_scroll_to: Option<f32>,
+    /// The toolbar was wider than its band last frame — shows ◀ ▶.
+    tools_overflow: bool,
+}
+
+/// The rename prompt: draft + whether it already failed uniqueness.
+struct RenameState {
+    /// Field content.
+    draft: String,
+    /// Last Apply hit a duplicate/empty name — inline error shown.
+    taken: bool,
+}
+
+/// Which field of the protection dialog failed validation.
+enum ProtectError {
+    /// The current password did not match.
+    Current,
+    /// New and confirm differ.
+    Mismatch,
+}
+
+/// The Protection… dialog: set a password on an unprotected tab, or —
+/// after proving the current one — change it or clear it (blank new
+/// password = remove).
+struct ProtectDialog {
+    /// The tab it edits.
+    tab: usize,
+    /// "Current password" field (protected tabs only).
+    current: String,
+    /// "New password" field.
+    new: String,
+    /// Confirmation field.
+    confirm: String,
+    /// Last Apply failed — which error to show.
+    error: Option<ProtectError>,
+}
+
+/// The "Supprimer le fichier" confirmation — the file on disk is the
+/// only thing at stake; the tab stays open either way.
+struct DeleteFileDialog {
+    /// The tab whose `source_path` would be deleted.
+    tab: usize,
+    /// The last delete attempt failed — inline error shown.
+    error: Option<String>,
 }
 
 impl Tab {
@@ -266,7 +334,9 @@ impl Viewer {
 
     /// Adds `doc` as a tab with an explicit title and saved flag — used by
     /// Open (file name, already on disk) and Paste (untitled, unsaved).
+    /// Two captures can never share a name: a clash gets a ` (n)` suffix.
     pub fn push_named_document(&mut self, doc: Document, title: String, saved: bool) {
+        let title = self.unique_title(&title);
         self.tabs.push(Tab {
             title,
             doc,
@@ -277,20 +347,23 @@ impl Viewer {
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
             anno_redo: VecDeque::new(),
+            unlocked: false,
         });
-        self.active = self.tabs.len() - 1;
         // A new document gets a fresh view — a stale marquee/zoom would
-        // leak onto unrelated pixels.
-        self.reset_view();
+        // leak onto unrelated pixels — and the tab we leave re-locks.
+        let new = self.tabs.len() - 1;
+        self.set_active(new);
         self.recompute_dirty();
     }
 
-    /// Test helper: a tab whose document wraps a 1×1 capture.
+    /// Test helper: a tab whose document wraps a 1×1 capture (goes
+    /// through the unique-title rule like the real push paths).
     #[cfg(test)]
     pub fn push_stub(&mut self, title: &str) {
         use crate::capture::{Capture, MonitorInfo, PhysicalRect};
+        let title = self.unique_title(title);
         self.tabs.push(Tab {
-            title: title.to_string(),
+            title,
             doc: Document::new(Capture {
                 image: image::RgbaImage::new(1, 1),
                 scale_factor: 1.0,
@@ -314,6 +387,7 @@ impl Viewer {
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
             anno_redo: VecDeque::new(),
+            unlocked: false,
         });
     }
 
@@ -322,11 +396,15 @@ impl Viewer {
         self.dirty = self.tabs.iter().any(|t| !t.saved);
     }
 
-    /// Marks `index` saved and refreshes the session flag — called after a
-    /// save-as dialog completes for a viewer document.
-    pub fn mark_saved(&mut self, index: usize) {
+    /// Marks `index` saved at `path` and refreshes the session flag —
+    /// called after a save-as dialog completes for a viewer document.
+    /// The meta records the location and the timestamp ("was saved at
+    /// least once, and when") for the future database restore.
+    pub fn mark_saved(&mut self, index: usize, path: std::path::PathBuf) {
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.saved = true;
+            tab.doc.meta.source_path = Some(path);
+            tab.doc.meta.saved_at = Some(chrono::Local::now());
             // Saving a drawn-on document bakes pixels the op history
             // knows nothing about — the chronology ends there.
             if !tab.doc.annotations.is_empty() {
@@ -404,17 +482,25 @@ impl Viewer {
     /// `(index, title, base capture)` of the active tab — everything the
     /// save-as dialog needs to own (the capture is cloned).
     pub fn save_target(&self) -> Option<(usize, String, crate::capture::Capture)> {
-        let i = self.active_index()?;
-        let tab = &self.tabs[i];
+        self.save_target_at(self.active_index()?)
+    }
+
+    /// Same as [`Self::save_target`] for an explicit tab — the
+    /// close-request confirmation saves a tab that is not the active one.
+    pub fn save_target_at(&self, index: usize) -> Option<(usize, String, crate::capture::Capture)> {
+        let tab = self.tabs.get(index)?;
         let mut capture = tab.doc.base.clone();
         capture.image = crate::editor::render::render_to_image(&tab.doc);
-        Some((i, tab.title.clone(), capture))
+        Some((index, tab.title.clone(), capture))
     }
 
     /// Opens the rename prompt on the active tab (File → Rename).
     pub fn open_rename(&mut self) {
         if let Some(title) = self.active_title() {
-            self.rename = Some(title);
+            self.rename = Some(RenameState {
+                draft: title,
+                taken: false,
+            });
         }
     }
 
@@ -676,6 +762,136 @@ impl Viewer {
         self.marquee_anchor = None;
     }
 
+    /// Makes `index` the visible tab. Leaving a tab re-locks it: a
+    /// protected capture asks for its password on EVERY activation, not
+    /// once per session (the spec's rule).
+    fn set_active(&mut self, index: usize) {
+        self.active = index;
+        for tab in &mut self.tabs {
+            tab.unlocked = false;
+        }
+        self.unlock_draft.clear();
+        self.unlock_error = false;
+        self.scroll_active_into_view = true;
+        self.reset_view();
+    }
+
+    /// Whether `index` is a protected tab still waiting for its password.
+    fn is_locked(&self, index: usize) -> bool {
+        self.tabs
+            .get(index)
+            .is_some_and(|t| t.doc.meta.is_protected() && !t.unlocked)
+    }
+
+    /// `true` when another tab already carries `name` (trimmed,
+    /// case-insensitive) — two captures can never share a name.
+    fn title_taken(&self, name: &str, except: Option<usize>) -> bool {
+        let name = name.trim().to_lowercase();
+        self.tabs
+            .iter()
+            .enumerate()
+            .any(|(i, t)| Some(i) != except && t.title.trim().to_lowercase() == name)
+    }
+
+    /// `name` if free, else `name (2)`, `name (3)`, … — the unique-name
+    /// rule enforced at every tab creation path.
+    fn unique_title(&self, base: &str) -> String {
+        let base = base.trim();
+        if !self.title_taken(base, None) {
+            return base.to_owned();
+        }
+        for n in 2.. {
+            let candidate = format!("{base} ({n})");
+            if !self.title_taken(&candidate, None) {
+                return candidate;
+            }
+        }
+        unreachable!()
+    }
+
+    /// Drops `indices` (sorted or not), keeps `active` valid and relocks
+    /// the newly surfaced tab when the active one was removed. A capture
+    /// ALWAYS closes without a warning — the red marker already told the
+    /// user the tab was unsaved (the reference's rule).
+    pub fn close_tabs(&mut self, indices: &[usize]) {
+        let mut sorted: Vec<usize> = indices.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        sorted.dedup();
+        let below_active = sorted.iter().filter(|&&i| i < self.active).count();
+        let active_removed = sorted.contains(&self.active);
+        for i in sorted {
+            if i < self.tabs.len() {
+                self.tabs.remove(i);
+            }
+        }
+        if active_removed {
+            self.active = self.active.min(self.tabs.len().saturating_sub(1));
+            for tab in &mut self.tabs {
+                tab.unlocked = false;
+            }
+            self.unlock_draft.clear();
+            self.unlock_error = false;
+            self.reset_view();
+        } else {
+            // `active` counted the removed tabs below it.
+            self.active = self
+                .active
+                .saturating_sub(below_active)
+                .min(self.tabs.len().saturating_sub(1));
+        }
+        self.recompute_dirty();
+    }
+
+    /// Duplicates `index` into a new tab: new id and capture date, same
+    /// password (a copy of protected content stays protected), a ` (n)`
+    /// unique title — the document clone carries annotations and history.
+    fn duplicate_tab(&mut self, index: usize) {
+        let Some(src) = self.tabs.get(index) else {
+            return;
+        };
+        let mut doc = src.doc.clone();
+        doc.meta.id = crate::editor::meta::new_id();
+        doc.meta.captured_at = chrono::Local::now();
+        // The copy has never been written itself.
+        doc.meta.saved_at = None;
+        doc.meta.source_path = None;
+        let title = self.unique_title(&src.title);
+        self.tabs.push(Tab {
+            title,
+            doc,
+            saved: false,
+            texture: None,
+            pasted: None,
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            anno_undo: src.anno_undo.clone(),
+            anno_redo: src.anno_redo.clone(),
+            unlocked: false,
+        });
+        let new = self.tabs.len() - 1;
+        self.set_active(new);
+        self.dirty = true;
+    }
+
+    /// Deletes `tab`'s file on disk — the tab itself stays open, now
+    /// unsaved again (the file it pointed at is gone).
+    fn delete_tab_file(&mut self, tab: usize) -> Result<(), std::io::Error> {
+        let Some(path) = self
+            .tabs
+            .get(tab)
+            .and_then(|t| t.doc.meta.source_path.clone())
+        else {
+            return Ok(());
+        };
+        std::fs::remove_file(&path)?;
+        let t = &mut self.tabs[tab];
+        t.doc.meta.source_path = None;
+        t.doc.meta.saved_at = None;
+        t.saved = false;
+        self.recompute_dirty();
+        Ok(())
+    }
+
     /// Draws the viewer for this frame. `shared` routes actions back to the
     /// state machine (the deferred-viewport callback cannot borrow the app).
     pub fn show(&mut self, ui: &mut egui::Ui, shared: &Shared) {
@@ -689,6 +905,8 @@ impl Viewer {
         let modal_open = self.confirm_close
             || self.resize.is_some()
             || self.rename.is_some()
+            || self.protect.is_some()
+            || self.confirm_delete.is_some()
             || shared.modal_child_open();
         // Canvas keyboard: Enter commits the floating paste or crops the
         // marquee, Esc discards the paste or clears the selection. The
@@ -781,6 +999,8 @@ impl Viewer {
         self.confirm_dialog(&ctx, shared);
         self.resize_dialog(&ctx);
         self.rename_dialog(&ctx);
+        self.protect_dialog(&ctx);
+        self.delete_file_dialog(&ctx);
     }
 
     /// The action band: large icon-over-label buttons — the functional
@@ -799,11 +1019,28 @@ impl Viewer {
         egui::Frame::default()
             .inner_margin(Margin::symmetric(8, 4))
             .show(ui, |ui| {
-                // The band scrolls sideways when the window gets too
-                // narrow for every button.
-                egui::ScrollArea::horizontal()
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
+                // Identical to `tab_strip`: wheel scrolls without a
+                // scrollbar, ◀ ▶ appear at the right edge on overflow.
+                ui.style_mut().always_scroll_the_only_direction = true;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                    let right_w = if self.tools_overflow {
+                        2.0 * (widgets::BUTTON_SIZE + 4.0)
+                    } else {
+                        0.0
+                    };
+                    let strip_w = (ui.available_width() - right_w).max(60.0);
+                    let mut area = egui::ScrollArea::horizontal()
+                        .id_salt("pixme-toolbar")
+                        .auto_shrink([true, true])
+                        .max_width(strip_w)
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        );
+                    if let Some(x) = self.tool_scroll_to.take() {
+                        area = area.scroll_offset(egui::vec2(x, 0.0));
+                    }
+                    let out = area.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
                             // Ouvrir ▾ — file picker on the main click.
@@ -985,6 +1222,22 @@ impl Viewer {
                             }
                         });
                     });
+                    self.tool_scroll_pos = out.state.offset.x;
+                    self.tools_overflow = out.content_size.x > out.inner_rect.width() + 0.5;
+                    if self.tools_overflow {
+                        let max_off = (out.content_size.x - out.inner_rect.width()).max(0.0);
+                        ui.add_enabled_ui(self.tool_scroll_pos > 0.5, |ui| {
+                            if widgets::icon_button(ui, Icon::ChevronLeft, false).clicked() {
+                                self.tool_scroll_to = Some((self.tool_scroll_pos - 200.0).max(0.0));
+                            }
+                        });
+                        ui.add_enabled_ui(self.tool_scroll_pos < max_off - 0.5, |ui| {
+                            if widgets::icon_button(ui, Icon::ChevronRight, false).clicked() {
+                                self.tool_scroll_to = Some(self.tool_scroll_pos + 200.0);
+                            }
+                        });
+                    }
+                });
             });
     }
 
@@ -1073,22 +1326,60 @@ impl Viewer {
         });
     }
 
-    /// The capture tab strip: one selectable label per capture, then "+".
+    /// The capture tab strip: one selectable label per capture — red
+    /// diamond when unsaved-or-modified, padlock when protected, a close
+    /// cross, and the right-click options menu — then "+".
+    /// The capture tab strip: chips in a wheel-scrollable area (no
+    /// scrollbar — the reference's behaviour), overflow arrows and "+"
+    /// pinned at the right edge.
     fn tab_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         egui::Frame::default()
             .inner_margin(Margin::symmetric(8, 6))
             .show(ui, |ui| {
+                // egui maps the wheel onto horizontal scrolling only when
+                // this flag is on; the scrollbar itself stays hidden.
+                ui.style_mut().always_scroll_the_only_direction = true;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                    for index in 0..self.tabs.len() {
-                        if ui
-                            .selectable_label(index == self.active, &self.tabs[index].title)
-                            .clicked()
-                            && index != self.active
-                        {
-                            self.active = index;
-                            self.reset_view();
-                        }
+                    // ◀ ▶ only exist while the chips overflow; max_width
+                    // keeps the scroll area from pushing them off-screen.
+                    let step = widgets::BUTTON_SIZE + 4.0;
+                    let right_w =
+                        widgets::BUTTON_SIZE + if self.tabs_overflow { 2.0 * step } else { 0.0 };
+                    let strip_w = (ui.available_width() - right_w).max(60.0);
+                    let mut area = egui::ScrollArea::horizontal()
+                        .id_salt("pixme-tabs")
+                        .auto_shrink([true, true])
+                        .max_width(strip_w)
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        );
+                    if let Some(x) = self.tab_scroll_to.take() {
+                        area = area.scroll_offset(egui::vec2(x, 0.0));
+                    }
+                    let out = area.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                            for index in 0..self.tabs.len() {
+                                self.tab_item(ui, index, shared);
+                            }
+                        });
+                    });
+                    self.tab_scroll_pos = out.state.offset.x;
+                    self.scroll_active_into_view = false;
+                    self.tabs_overflow = out.content_size.x > out.inner_rect.width() + 0.5;
+                    if self.tabs_overflow {
+                        let max_off = (out.content_size.x - out.inner_rect.width()).max(0.0);
+                        ui.add_enabled_ui(self.tab_scroll_pos > 0.5, |ui| {
+                            if widgets::icon_button(ui, Icon::ChevronLeft, false).clicked() {
+                                self.tab_scroll_to = Some((self.tab_scroll_pos - 160.0).max(0.0));
+                            }
+                        });
+                        ui.add_enabled_ui(self.tab_scroll_pos < max_off - 0.5, |ui| {
+                            if widgets::icon_button(ui, Icon::ChevronRight, false).clicked() {
+                                self.tab_scroll_to = Some(self.tab_scroll_pos + 160.0);
+                            }
+                        });
                     }
                     if widgets::icon_button(ui, Icon::Plus, false)
                         .on_hover_text(t!("viewer.new_capture.tooltip"))
@@ -1098,6 +1389,184 @@ impl Viewer {
                     }
                 });
             });
+    }
+
+    /// One tab chip: red dot when unsaved-or-modified, padlock when
+    /// protected, unique title, close cross. Left/right click selects;
+    /// the cross closes (never a warning — the red dot is the warning);
+    /// secondary click opens the options menu at the pointer.
+    fn tab_item(&mut self, ui: &mut egui::Ui, index: usize, shared: &Shared) {
+        let t = theme::tokens(ui.ctx());
+        let tab = &self.tabs[index];
+        let (title, dirty, protected) =
+            (tab.title.clone(), !tab.saved, tab.doc.meta.is_protected());
+        let selected = index == self.active;
+        // The cross is reserved inside the chip but registered and
+        // painted AFTER the chip interact, so it sits above it and
+        // keeps its own hover/click (egui: the topmost widget wins).
+        let mut close_rect = Rect::NOTHING;
+        let inner = egui::Frame::default()
+            .inner_margin(Margin::symmetric(7, 2))
+            .fill(if selected { t.accent_soft } else { t.card })
+            .stroke(Stroke::new(
+                1.0,
+                if selected {
+                    t.accent_border
+                } else {
+                    t.card_border
+                },
+            ))
+            .corner_radius(CornerRadius::same(t.radius_md))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    if dirty {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 3.0, t.danger);
+                    }
+                    if protected {
+                        let (lock_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                        icons::image(
+                            Icon::Lock,
+                            11.0,
+                            if selected { t.accent } else { t.text_dim },
+                        )
+                        .paint_at(ui, lock_rect);
+                    }
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(title).color(if selected {
+                            t.text
+                        } else {
+                            t.text_dim
+                        }))
+                        .selectable(false),
+                    );
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                    close_rect = rect;
+                })
+                .inner
+            });
+        // Whole-chip click target (the label itself is inert) — covers
+        // the padding too so clicks between markers and title count.
+        let mut resp = ui.interact(
+            inner.response.rect,
+            ui.id().with(("pixme-tab", index)),
+            Sense::click(),
+        );
+        // Register the cross above the chip, then paint it with the
+        // resulting hover state — this is the clickable close button.
+        let close = ui.interact(
+            close_rect,
+            ui.id().with(("pixme-tab-close", index)),
+            Sense::click(),
+        );
+        paint_tab_close(ui, close_rect, close.hovered());
+        if resp.hovered() && !selected {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if self.scroll_active_into_view && selected {
+            resp.scroll_to_me(None);
+        }
+        resp = resp.union(close.clone());
+        if close.clicked() {
+            self.close_tabs(&[index]);
+            return;
+        }
+        if (resp.clicked() || resp.secondary_clicked()) && index != self.active {
+            // Selecting another tab re-locks every protected one.
+            self.set_active(index);
+        }
+        egui::Popup::context_menu(&resp).show(|ui| {
+            ui.set_min_width(200.0);
+            self.tab_menu(ui, index, shared);
+        });
+    }
+
+    /// The right-click options of tab `index` — the reference's menu,
+    /// plus Protection (no keyboard shortcuts, per spec).
+    fn tab_menu(&mut self, ui: &mut egui::Ui, index: usize, shared: &Shared) {
+        let has_file = self.tabs[index].doc.meta.source_path.is_some();
+        let has_saved = self.tabs.iter().any(|t| t.saved);
+        let item = |ui: &mut egui::Ui, key: &str| -> Response { ui.button(t!(key).to_string()) };
+        if item(ui, "viewer.tab.save").clicked() {
+            if index != self.active {
+                self.set_active(index);
+            }
+            shared.push(Command::SaveActive);
+            ui.close();
+        }
+        if item(ui, "viewer.tab.rename").clicked() {
+            if index != self.active {
+                self.set_active(index);
+            }
+            self.open_rename();
+            ui.close();
+        }
+        ui.add_enabled_ui(has_file, |ui| {
+            if item(ui, "viewer.tab.delete_file").clicked() {
+                self.confirm_delete = Some(DeleteFileDialog {
+                    tab: index,
+                    error: None,
+                });
+                ui.close();
+            }
+        });
+        ui.separator();
+        if item(ui, "viewer.tab.close").clicked() {
+            self.close_tabs(&[index]);
+            ui.close();
+            return;
+        }
+        if item(ui, "viewer.tab.close_others").clicked() {
+            let others: Vec<usize> = (0..self.tabs.len()).filter(|&i| i != index).collect();
+            self.close_tabs(&others);
+            ui.close();
+            return;
+        }
+        ui.add_enabled_ui(has_saved, |ui| {
+            if item(ui, "viewer.tab.close_saved").clicked() {
+                let saved: Vec<usize> = (0..self.tabs.len())
+                    .filter(|&i| self.tabs[i].saved)
+                    .collect();
+                self.close_tabs(&saved);
+                ui.close();
+            }
+        });
+        ui.add_enabled_ui(index > 0, |ui| {
+            if item(ui, "viewer.tab.close_left").clicked() {
+                self.close_tabs(&(0..index).collect::<Vec<_>>());
+                ui.close();
+            }
+        });
+        ui.add_enabled_ui(index + 1 < self.tabs.len(), |ui| {
+            if item(ui, "viewer.tab.close_right").clicked() {
+                self.close_tabs(&((index + 1)..self.tabs.len()).collect::<Vec<_>>());
+                ui.close();
+            }
+        });
+        if item(ui, "viewer.tab.close_all").clicked() {
+            self.close_tabs(&(0..self.tabs.len()).collect::<Vec<_>>());
+            ui.close();
+            return;
+        }
+        ui.separator();
+        if item(ui, "viewer.tab.duplicate").clicked() {
+            self.duplicate_tab(index);
+            ui.close();
+        }
+        // The only entry point for the screen lock — deliberately menu-
+        // only (a rarely used feature keeps no dedicated chrome).
+        if item(ui, "viewer.tab.protect").clicked() {
+            self.protect = Some(ProtectDialog {
+                tab: index,
+                current: String::new(),
+                new: String::new(),
+                confirm: String::new(),
+                error: None,
+            });
+            ui.close();
+        }
     }
 
     /// The document canvas: the active capture fit to the window (or at the
@@ -1111,6 +1580,12 @@ impl Viewer {
             return;
         }
         let index = self.active.min(self.tabs.len() - 1);
+        // A protected capture only unlocks by password — the canvas
+        // (and its marquee/paste interactions) shows nothing until then.
+        if self.is_locked(index) {
+            self.locked_content(ui, index);
+            return;
+        }
         let tab = &mut self.tabs[index];
         let (img_w, img_h) = (
             tab.doc.base.image.width() as usize,
@@ -1181,6 +1656,63 @@ impl Viewer {
                     self.marquee(ui, img_rect, px_per_pt);
                 }
             });
+    }
+
+    /// The locked tab's stand-in: canvas background plus a centred
+    /// password prompt — icon, title, field, Unlock. Enter submits.
+    fn locked_content(&mut self, ui: &mut egui::Ui, index: usize) {
+        let t = theme::tokens(ui.ctx());
+        let avail = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(avail, 0.0, t.canvas);
+        let mut submit = false;
+        egui::Area::new(egui::Id::new("pixme-unlock"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::default()
+                    .inner_margin(Margin::symmetric(20, 16))
+                    .fill(t.card)
+                    .stroke(Stroke::new(1.0, t.card_border))
+                    .corner_radius(CornerRadius::same(t.radius_lg))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            let (_, lock_rect) = ui.allocate_space(Vec2::splat(24.0));
+                            icons::image(Icon::Lock, 20.0, t.accent).paint_at(ui, lock_rect);
+                            ui.label(
+                                egui::RichText::new(t!("unlock.title").to_string())
+                                    .font(theme::semibold(14.0)),
+                            );
+                            ui.add_space(2.0);
+                            ui.colored_label(t.text_dim, t!("unlock.hint").to_string());
+                            ui.add_space(8.0);
+                            let edit = egui::TextEdit::singleline(&mut self.unlock_draft)
+                                .password(true)
+                                .desired_width(200.0)
+                                .font(theme::medium(12.0));
+                            let field = ui.add(edit);
+                            if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                submit = true;
+                            }
+                            if self.unlock_error {
+                                ui.add_space(4.0);
+                                ui.colored_label(t.danger, t!("unlock.wrong").to_string());
+                            }
+                            ui.add_space(10.0);
+                            if widgets::primary_button(ui, &t!("unlock.button")).clicked() {
+                                submit = true;
+                            }
+                        });
+                    });
+            });
+        if submit {
+            if self.tabs[index].doc.meta.check_password(&self.unlock_draft) {
+                self.tabs[index].unlocked = true;
+                self.unlock_draft.clear();
+                self.unlock_error = false;
+            } else {
+                self.unlock_draft.clear();
+                self.unlock_error = true;
+            }
+        }
     }
 
     /// Rectangle tool: marquee drag on the canvas (coordinates mapped back
@@ -1416,13 +1948,14 @@ impl Viewer {
         }
     }
 
-    /// The rename prompt (File → Rename): a title field over a window.
-    /// The draft is taken out for the frame; on Apply the tab is renamed,
-    /// on Cancel/close the draft is dropped.
+    /// The rename prompt (File → Rename / tab menu): a title field over a
+    /// window. Two captures can never share a name — a taken (or empty)
+    /// draft flags the dialog instead of applying.
     fn rename_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut draft) = self.rename.take() else {
+        let Some(mut state) = self.rename.take() else {
             return;
         };
+        let t = theme::tokens(ctx);
         let mut apply = false;
         let mut cancel = false;
         let resp = egui::Modal::new(egui::Id::new("pixme-rename")).show(ctx, |ui| {
@@ -1435,12 +1968,20 @@ impl Viewer {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(t!("dialog.rename.label").to_string());
-                ui.add(
-                    egui::TextEdit::singleline(&mut draft)
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut state.draft)
                         .desired_width(200.0)
                         .font(theme::medium(12.0)),
                 );
+                // Enter applies, like the Rename button.
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
             });
+            if state.taken {
+                ui.add_space(4.0);
+                ui.colored_label(t.danger, t!("dialog.rename.taken").to_string());
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
@@ -1457,12 +1998,173 @@ impl Viewer {
             cancel = true;
         }
         if apply {
-            let name = draft.trim();
-            if !name.is_empty() {
+            let name = state.draft.trim();
+            let taken = name.is_empty() || self.title_taken(name, self.active_index());
+            if taken {
+                state.taken = true;
+            } else {
                 self.set_active_title(name.to_owned());
             }
-        } else if !cancel {
-            self.rename = Some(draft);
+            if !taken {
+                return;
+            }
+        }
+        if !(cancel || (apply && !state.taken)) {
+            self.rename = Some(state);
+        }
+    }
+
+    /// The Protection… dialog — the context menu's only entry to the
+    /// screen lock. Unprotected tab: two fields (new + confirm).
+    /// Protected tab: the current password must prove itself first, then
+    /// a non-empty new pair re-arms, an empty new pair disarms.
+    fn protect_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.protect.take() else {
+            return;
+        };
+        let t = theme::tokens(ctx);
+        let Some(tab) = self.tabs.get(state.tab) else {
+            return; // the tab went away — drop the dialog
+        };
+        let already = tab.doc.meta.is_protected();
+        let mut apply = false;
+        let mut cancel = false;
+        let resp = egui::Modal::new(egui::Id::new("pixme-protect")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(
+                egui::RichText::new(t!("protect.title").to_string()).font(theme::semibold(14.0)),
+            );
+            widgets::hairline(ui);
+            ui.add_space(6.0);
+            let field = |ui: &mut egui::Ui, key: &str, buf: &mut String| {
+                ui.horizontal(|ui| {
+                    ui.label(t!(key).to_string());
+                    ui.add(
+                        egui::TextEdit::singleline(buf)
+                            .password(true)
+                            .desired_width(160.0)
+                            .font(theme::medium(12.0)),
+                    );
+                });
+            };
+            if already {
+                field(ui, "protect.current", &mut state.current);
+            }
+            field(ui, "protect.new", &mut state.new);
+            field(ui, "protect.confirm", &mut state.confirm);
+            if already {
+                ui.add_space(4.0);
+                ui.colored_label(t.text_dim, t!("protect.hint_remove").to_string());
+            }
+            match state.error {
+                Some(ProtectError::Current) => {
+                    ui.add_space(4.0);
+                    ui.colored_label(t.danger, t!("protect.wrong_current").to_string());
+                }
+                Some(ProtectError::Mismatch) => {
+                    ui.add_space(4.0);
+                    ui.colored_label(t.danger, t!("protect.mismatch").to_string());
+                }
+                None => {}
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                    cancel = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Nothing to apply while an unprotected tab has an
+                    // empty new password.
+                    ui.add_enabled_ui(already || !state.new.is_empty(), |ui| {
+                        if widgets::primary_button(ui, &t!("protect.apply")).clicked() {
+                            apply = true;
+                        }
+                    });
+                });
+            });
+        });
+        if resp.should_close() {
+            cancel = true;
+        }
+        if apply {
+            state.error = None;
+            if already && !self.tabs[state.tab].doc.meta.check_password(&state.current) {
+                state.error = Some(ProtectError::Current);
+            } else if !state.new.is_empty() && state.new != state.confirm {
+                state.error = Some(ProtectError::Mismatch);
+            } else {
+                let tab = &mut self.tabs[state.tab];
+                tab.doc.meta.set_password(state.new.trim());
+                // Proving (or setting) the password unlocks for as long
+                // as the tab stays active.
+                tab.unlocked = true;
+                self.protect = None;
+                return;
+            }
+        }
+        if !cancel {
+            self.protect = Some(state);
+        }
+    }
+
+    /// The "Supprimer le fichier" confirmation — deletes the tab's file
+    /// on disk; the tab stays open (unsaved again) either way.
+    fn delete_file_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.confirm_delete.take() else {
+            return;
+        };
+        let t = theme::tokens(ctx);
+        let Some(tab) = self.tabs.get(state.tab) else {
+            return;
+        };
+        let name = tab
+            .doc
+            .meta
+            .source_path
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        let mut confirm = false;
+        let mut cancel = false;
+        let resp = egui::Modal::new(egui::Id::new("pixme-delete-file")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(
+                egui::RichText::new(t!("dialog.delete_file.title").to_string())
+                    .font(theme::semibold(14.0)),
+            );
+            widgets::hairline(ui);
+            ui.add_space(4.0);
+            ui.label(t!("dialog.delete_file.body", name = name.as_str()).to_string());
+            if let Some(err) = &state.error {
+                ui.add_space(4.0);
+                ui.colored_label(t.danger, err.clone());
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                    cancel = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::primary_button(ui, &t!("dialog.delete_file.confirm")).clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+        });
+        if resp.should_close() {
+            cancel = true;
+        }
+        if confirm {
+            match self.delete_tab_file(state.tab) {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!("cannot delete file: {e}");
+                    state.error = Some(e.to_string());
+                }
+            }
+        }
+        if !cancel {
+            self.confirm_delete = Some(state);
         }
     }
 
@@ -1502,8 +2204,37 @@ impl Viewer {
     }
 }
 
-/// Pointer position in canvas space → image physical px, clamped to the
-/// image bounds.
+/// The tab's close cross: a transparent square, hover-filled, the X
+/// tinted like an icon (danger on hover) with a pointing-hand cursor.
+/// Paints the tab's close cross inside `rect` — the hovered state
+/// comes from the interact registered above the chip (see `tab_item`).
+fn paint_tab_close(ui: &mut egui::Ui, rect: Rect, hovered: bool) {
+    let t = theme::tokens(ui.ctx());
+    if ui.is_rect_visible(rect) {
+        if hovered {
+            // A red soft fill + outline makes the hover unmistakable.
+            let fill =
+                Color32::from_rgba_unmultiplied(t.danger.r(), t.danger.g(), t.danger.b(), 34);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(t.radius_sm), fill);
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(t.radius_sm),
+                Stroke::new(1.0, t.danger),
+                StrokeKind::Inside,
+            );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        icons::paint(
+            ui,
+            rect,
+            Icon::X,
+            if hovered { 14.0 } else { 12.0 },
+            if hovered { t.danger } else { t.icon },
+        );
+    }
+}
+
 fn image_pos(pos: Pos2, img_rect: Rect, px_per_pt: f32) -> Pos2 {
     let px = (pos - img_rect.min) * px_per_pt;
     Pos2::new(px.x.max(0.0), px.y.max(0.0))
@@ -1777,6 +2508,7 @@ mod tests {
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
             anno_redo: VecDeque::new(),
+            unlocked: false,
         });
         v.active = v.tabs.len() - 1;
     }
@@ -1894,6 +2626,117 @@ mod tests {
     }
 
     #[test]
+    fn titles_stay_unique_on_push_and_duplicate() {
+        let mut v = Viewer::default();
+        v.push_stub("shot");
+        v.push_stub("shot");
+        assert_eq!(v.tabs[0].title, "shot");
+        assert_eq!(v.tabs[1].title, "shot (2)");
+        v.duplicate_tab(0);
+        assert_eq!(v.tabs[2].title, "shot (3)");
+    }
+
+    #[test]
+    fn title_taken_is_case_insensitive_and_self_exempt() {
+        let mut v = Viewer::default();
+        v.push_stub("Shot");
+        v.push_stub("other");
+        assert!(v.title_taken("shot", None));
+        assert!(v.title_taken("  SHOT ", None));
+        assert!(
+            !v.title_taken("shot", Some(0)),
+            "a tab may keep its own name"
+        );
+    }
+
+    #[test]
+    fn close_left_right_others_track_active() {
+        let mut v = Viewer::default();
+        for t in ["a", "b", "c", "d", "e"] {
+            v.push_stub(t);
+        }
+        v.set_active(3); // "d"
+        v.close_tabs(&[4]); // close right of active
+        assert_eq!(v.active, 3);
+        v.close_tabs(&[0, 1]); // close left
+        assert_eq!(v.active, 1, "active shifts left over removed tabs");
+        assert_eq!(v.tabs[v.active].title, "d");
+        // Close others: only the active tab remains.
+        let others: Vec<usize> = (0..v.tabs.len()).filter(|&i| i != v.active).collect();
+        v.close_tabs(&others);
+        assert_eq!(v.tabs.len(), 1);
+        assert_eq!(v.tabs[0].title, "d");
+        // Closing the active tab clamps and resets the view.
+        v.close_tabs(&[0]);
+        assert!(v.tabs.is_empty());
+        assert_eq!(v.active, 0);
+    }
+
+    #[test]
+    fn close_saved_only_drops_saved_tabs() {
+        let mut v = Viewer::default();
+        for t in ["a", "b", "c"] {
+            v.push_stub(t);
+        }
+        v.mark_saved(1, std::path::PathBuf::from("/tmp/pixme-test.png"));
+        assert!(v.tabs[1].doc.meta.saved_at.is_some());
+        assert_eq!(
+            v.tabs[1].doc.meta.source_path.as_deref(),
+            Some(std::path::Path::new("/tmp/pixme-test.png"))
+        );
+        let saved: Vec<usize> = (0..v.tabs.len()).filter(|&i| v.tabs[i].saved).collect();
+        v.close_tabs(&saved);
+        assert_eq!(v.tabs.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_keeps_protection_but_gets_fresh_identity() {
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.tabs[0].doc.meta.set_password("pw");
+        v.tabs[0].doc.meta.saved_at = Some(chrono::Local::now());
+        v.duplicate_tab(0);
+        let copy = &v.tabs[1];
+        assert_ne!(copy.doc.meta.id, v.tabs[0].doc.meta.id);
+        assert!(copy.doc.meta.is_protected(), "a copy stays protected");
+        assert!(copy.doc.meta.saved_at.is_none(), "the copy is unsaved");
+        assert!(copy.doc.meta.source_path.is_none());
+    }
+
+    #[test]
+    fn protected_tab_relocks_on_switch() {
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.push_stub("b");
+        v.tabs[0].doc.meta.set_password("pw");
+        v.set_active(0);
+        assert!(v.is_locked(0));
+        // Right password unlocks while the tab stays active.
+        assert!(v.tabs[0].doc.meta.check_password("pw"));
+        v.tabs[0].unlocked = true;
+        assert!(!v.is_locked(0));
+        // Leaving the tab re-locks it.
+        v.set_active(1);
+        assert!(v.is_locked(0));
+        assert!(!v.is_locked(1));
+    }
+
+    #[test]
+    fn delete_tab_file_unlinks_and_marks_unsaved() {
+        let path = std::env::temp_dir().join("pixme-delete-test.png");
+        std::fs::write(&path, b"png").expect("fixture");
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.mark_saved(0, path.clone());
+        assert!(v.tabs[0].saved);
+        v.delete_tab_file(0).expect("delete");
+        assert!(!path.exists());
+        assert!(!v.tabs[0].saved);
+        assert!(v.tabs[0].doc.meta.source_path.is_none());
+        assert!(v.dirty);
+    }
+
+    #[test]
     fn undo_discards_floating_paste_first() {
         let mut v = Viewer::default();
         push_doc(&mut v, 10, 10);
@@ -1949,6 +2792,7 @@ mod clipboard_chain_tests {
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
             anno_redo: VecDeque::new(),
+            unlocked: false,
         });
         v.active = 0;
         v.selection = Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(20.0, 20.0)));

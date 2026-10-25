@@ -61,6 +61,16 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/chevron-down.svg"),
     ),
     (
+        Icon::ChevronLeft,
+        "chevron-left",
+        include_bytes!("../../assets/icons/chevron-left.svg"),
+    ),
+    (
+        Icon::ChevronRight,
+        "chevron-right",
+        include_bytes!("../../assets/icons/chevron-right.svg"),
+    ),
+    (
         Icon::Check,
         "check",
         include_bytes!("../../assets/icons/check.svg"),
@@ -304,6 +314,11 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         Icon::AlignEndVertical,
         "align-end-vertical",
         include_bytes!("../../assets/icons/align-end-vertical.svg"),
+    ),
+    (
+        Icon::Lock,
+        "lock",
+        include_bytes!("../../assets/icons/lock.svg"),
     ),
 ];
 

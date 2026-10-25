@@ -502,10 +502,18 @@ impl Shared {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "image".to_owned());
+                    let mut doc = Document::new(synthetic_capture(image));
+                    // The file's mtime is the best capture/save date we
+                    // have for an opened image.
+                    let mtime = std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .map(chrono::DateTime::<chrono::Local>::from);
+                    doc.meta.captured_at = mtime.unwrap_or_else(chrono::Local::now);
+                    doc.meta.saved_at = mtime;
+                    doc.meta.source_path = Some(path.clone());
                     lock(&self.viewer).push_named_document(
-                        Document::new(synthetic_capture(image)),
-                        title,
-                        // From disk = clean until edited.
+                        doc, title, // From disk = clean until edited.
                         true,
                     );
                     opened = true;
@@ -547,6 +555,8 @@ impl Shared {
             ) {
                 Ok(()) => {
                     tab.saved = true;
+                    tab.doc.meta.source_path = Some(path.clone());
+                    tab.doc.meta.saved_at = Some(chrono::Local::now());
                     tracing::info!(?path, "tab saved");
                 }
                 Err(e) => tracing::warn!(?path, "save-all failed: {e}"),
@@ -1062,9 +1072,10 @@ impl eframe::App for PixMeApp {
                                 Ok(path) => {
                                     tracing::info!(?path, "saved");
                                     // A viewer document is now on disk:
-                                    // the tab flips to clean.
+                                    // the tab flips to clean and records
+                                    // where/when it was written.
                                     if let Some(i) = dialog.viewer_tab {
-                                        lock(&shared.viewer).mark_saved(i);
+                                        lock(&shared.viewer).mark_saved(i, path);
                                     }
                                     drop(guard);
                                     close(&ctx);

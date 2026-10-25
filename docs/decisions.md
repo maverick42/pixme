@@ -579,3 +579,48 @@ Format: date — context — decision — consequences.
 - **Stamps** recolour embedded Lucide SVGs (`stamp_icon` map + `raw_svg` accessor) — no FastStone assets.
 - **Options bar**: per-tool fields mirror the reference's bottom bar; the Select tool additionally exposes the selected object's own style fields (re-editable).
 - Text is rendered with the embedded Inter faces (bold → SemiBold, italic → faux shear), outline via 4-direction offset pass.
+
+## 2026-10-25 — Tab context menu, capture metadata, screen-lock protection
+
+- **Context**: captures open as tabs and needed the reference's
+  right-click options menu (save/rename/delete-file/close-*/duplicate),
+  plus a rare "Protection" option locking a tab behind a password, and
+  per-capture metadata (internal id, capture date, save date, source
+  path) preparing a future database restore of captures.
+- **Decision**:
+  - `Document` gains `meta: CaptureMeta` (`id`, `captured_at`,
+    `saved_at`, `source_path`, `password_hash`) so the record travels
+    with the document through Draw's clone/commit and duplication —
+    the unit the future DB stores. `saved_at.is_some()` means "saved
+    at least once"; every save path (`mark_saved`, `save_all`, Open)
+    refreshes `source_path`/`saved_at` (Open takes the file mtime for
+    `captured_at`).
+  - **No new dependency** (user's call): `editor::meta::new_id()` mints
+    a UUIDv4-shaped string from `RandomState` entropy + nanos + counter
+    + pid; `hash_password` is a salted iterated FNV-1a stored as
+    `v1:salt:hash`. The lock is a *screen lock*, not encryption — pixels
+    stay in memory and saved files are unprotected.
+  - Tab strip: red dot on the left marks unsaved-or-modified tabs
+    (reference-style indicator), a small padlock marks protected tabs,
+    a 14 px `×` closes the tab. `egui::Popup::context_menu` gives the
+    right-click menu (handles macOS Ctrl+click natively); no keyboard
+    shortcuts are shown or bound.
+  - **Closing a tab never warns** (user decision): the red dot is the
+    warning. The session-level Save/Discard/Cancel confirmation still
+    guards closing the whole viewer / quitting.
+  - Unique names everywhere: `unique_title` appends ` (n)` on clashes
+    (push, duplicate), Rename validates case-insensitively against the
+    other tabs.
+  - **Protection**: menu-only entry ("Protection…"), per the feature's
+    rarity. Set = password + confirmation; on a protected tab the
+    current password must be proven, then a new pair re-arms or a blank
+    new password disarms. The lock re-arms the moment the tab loses
+    focus (`set_active` clears `unlocked`); a locked tab shows a centred
+    password card instead of the canvas. Per user decision the lock
+    only gates the *display* — copy/save/print/draw stay possible.
+  - "Supprimer le fichier" deletes the tab's `source_path` behind a
+    confirmation; the tab stays open, unsaved again.
+- **Consequences**: `uuid`/`sha2` were considered and rejected — binary
+  stays lean; the lock offers casual privacy only (documented in
+  `editor/meta.rs` docs). Duplicate keeps the password hash but gets a
+  fresh id/date. Drag-out payloads of a locked tab remain unrestricted.

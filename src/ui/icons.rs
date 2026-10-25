@@ -35,6 +35,10 @@ pub enum Icon {
     X,
     /// Dropdown affordance.
     ChevronDown,
+    /// Tab strip scroll-left arrow.
+    ChevronLeft,
+    /// Tab strip scroll-right arrow.
+    ChevronRight,
     /// Checkmark (selected menu item).
     Check,
     /// Add a tab / start a new capture (viewer's "+").
@@ -133,6 +137,8 @@ pub enum Icon {
     AlignCenterVertical,
     /// Vertical align: bottom.
     AlignEndVertical,
+    /// Password-protected tab.
+    Lock,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

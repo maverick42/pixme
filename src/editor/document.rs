@@ -758,6 +758,9 @@ fn points_bounds(points: &[Pos2]) -> PhysicalRect {
 /// The open document: base capture + annotations in z-order.
 #[derive(Clone, Debug)]
 pub struct Document {
+    /// Internal id, provenance and optional password — the record a
+    /// future database round-trip restores the capture from.
+    pub meta: super::meta::CaptureMeta,
     /// The frozen screenshot.
     pub base: Capture,
     /// Annotations, bottom to top.
@@ -772,6 +775,7 @@ impl Document {
     /// Wraps a capture in an empty document.
     pub fn new(base: Capture) -> Self {
         Self {
+            meta: super::meta::CaptureMeta::fresh(),
             base,
             annotations: Vec::new(),
             revision: 0,

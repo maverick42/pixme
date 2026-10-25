@@ -7,11 +7,14 @@
 
 pub mod document;
 pub mod history;
+pub mod meta;
 pub mod render;
 pub mod tools;
 
 // Re-exports are the public editor API; consumed from phase 4 on.
 #[allow(unused_imports)]
 pub use document::{Annotation, AnnotationId, AnnotationKind, Document};
+#[allow(unused_imports)]
+pub use meta::CaptureMeta;
 #[allow(unused_imports)]
 pub use tools::ToolId;
