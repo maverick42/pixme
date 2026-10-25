@@ -3577,6 +3577,7 @@ dependencies = [
  "rfd",
  "rust-i18n",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "sys-locale",
  "thiserror 2.0.21",

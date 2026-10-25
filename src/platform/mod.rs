@@ -128,10 +128,15 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
         "capture.pin" => Command::Capture(CaptureMode::Pin),
         "settings" => Command::OpenSettings,
         "import_clipboard" => Command::ImportClipboard,
+        "edit.undo" => Command::UndoActive,
+        "edit.redo" => Command::RedoActive,
+        "edit.copy" => Command::CopyActive,
+        "edit.paste" => Command::PasteActive,
         "file.open" => Command::OpenFile,
         "file.save" => Command::SaveActive,
         "file.save_all" => Command::SaveAll,
         "file.rename" => Command::RenameActive,
+        "file.print" => Command::PrintActive,
         "quit" => Command::Quit,
         _ => return None,
     })
@@ -143,3 +148,10 @@ pub use macos::reveal_in_file_manager;
 /// Reveals a file selected in the OS file manager (see above).
 #[cfg(target_os = "windows")]
 pub use windows::reveal_in_file_manager;
+
+/// Sends a file to the OS default printer.
+#[cfg(target_os = "macos")]
+pub use macos::print_file;
+/// Sends a file to the OS default printer (see above).
+#[cfg(target_os = "windows")]
+pub use windows::print_file;

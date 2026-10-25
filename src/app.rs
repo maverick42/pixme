@@ -96,12 +96,27 @@ pub enum Command {
     ImportClipboard,
     /// Open an image file into the viewer.
     OpenFile,
+    /// File picker pre-opened in the last used folder (Ouvrir ▾ menu).
+    OpenLastDir,
+    /// A blank white document (Ouvrir ▾ → Nouveau).
+    NewDocument,
     /// Save the active capture.
     SaveActive,
     /// Save all captures.
     SaveAll,
     /// Rename the active capture.
     RenameActive,
+    /// Copy the active document (or its live selection) to the clipboard.
+    CopyActive,
+    /// Paste the clipboard image onto the active document (Coller —
+    /// ImportClipboard is the variant that opens a new tab).
+    PasteActive,
+    /// Revert the newest pixel mutation of the active document.
+    UndoActive,
+    /// Re-apply the newest reverted mutation.
+    RedoActive,
+    /// Print the active document on the OS default printer.
+    PrintActive,
     /// Unsaved-session confirmation: save then close.
     ConfirmSave,
     /// Unsaved-session confirmation: discard then close.
@@ -176,8 +191,6 @@ pub struct Shared {
     next_pin_id: Mutex<u32>,
     /// The pin save-as window, open while Some.
     pub save_dialog: Mutex<Option<crate::ui::save_dialog::SaveDialog>>,
-    /// Last folder a capture was saved to (defaults to ~/Pictures).
-    pub last_save_dir: Mutex<Option<std::path::PathBuf>>,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -205,6 +218,12 @@ impl Shared {
     /// viewer must draw its own menu strip (Windows).
     pub fn has_native_app_menu(&self) -> bool {
         platform::current().has_native_app_menu()
+    }
+
+    /// A modal child viewport is up (save-as, settings) — other windows
+    /// dim themselves and refuse input while one is open.
+    pub fn modal_child_open(&self) -> bool {
+        lock(&self.save_dialog).is_some() || self.settings_open.load(Ordering::Relaxed)
     }
 
     /// The concrete theme for the current appearance setting and OS theme.
@@ -307,9 +326,8 @@ impl Shared {
                 }
             }
             Command::ConfirmSave => {
-                // Real saving lands with the export pipeline; until then the
-                // confirmation is exercised as: log + close as if saved.
-                tracing::info!("unsaved-session confirmation: save (stub)");
+                // "Save" in the unsaved-session dialog = save-all, then close.
+                self.save_all();
                 self.finish_confirmation(ctx);
             }
             Command::ConfirmDiscard => self.finish_confirmation(ctx),
@@ -341,7 +359,7 @@ impl Shared {
                     .find(|p| p.id == id)
                     .map(|p| Arc::clone(&p.capture));
                 if let Some(capture) = capture {
-                    let folder = lock(&self.last_save_dir).clone().or_else(|| {
+                    let folder = lock(&self.settings).last_save_dir.clone().or_else(|| {
                         directories::UserDirs::new()
                             .and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
                     });
@@ -353,15 +371,163 @@ impl Shared {
                     }
                 }
             }
-            Command::ImportClipboard
-            | Command::OpenFile
-            | Command::SaveActive
-            | Command::SaveAll
-            | Command::RenameActive => {
-                // Viewer document commands land with the capture pipeline.
-                tracing::info!(?command, "command not implemented yet");
+            Command::ImportClipboard => match crate::export::clipboard::clipboard_image() {
+                // Import opens a NEW tab — it never replaces the current
+                // document (the functional reference's rule).
+                Ok(Some(image)) => {
+                    lock(&self.viewer).push_document(Document::new(synthetic_capture(image)));
+                    self.enter(AppState::Viewer, ctx);
+                }
+                Ok(None) => tracing::info!("clipboard holds no image"),
+                Err(e) => tracing::warn!("clipboard import failed: {e}"),
+            },
+            Command::PasteActive => match crate::export::clipboard::clipboard_image() {
+                // Coller drops a floating layer on the ACTIVE document;
+                // with no document at all it falls back to a new tab.
+                Ok(Some(image)) => {
+                    let mut viewer = lock(&self.viewer);
+                    if viewer.tabs.is_empty() {
+                        viewer.push_document(Document::new(synthetic_capture(image)));
+                    } else {
+                        viewer.paste_active(image);
+                    }
+                }
+                Ok(None) => tracing::info!("clipboard holds no image"),
+                Err(e) => tracing::warn!("paste failed: {e}"),
+            },
+            Command::OpenFile => self.open_files(None, ctx),
+            // Same picker, pre-opened in the last used folder.
+            Command::OpenLastDir => {
+                let dir = lock(&self.settings)
+                    .last_open_dir
+                    .clone()
+                    .or_else(|| lock(&self.settings).last_save_dir.clone());
+                self.open_files(dir, ctx);
+            }
+            Command::NewDocument => {
+                // Blank white canvas — the functional reference's "New".
+                let image =
+                    image::RgbaImage::from_pixel(800, 600, image::Rgba([255, 255, 255, 255]));
+                lock(&self.viewer).push_blank_document(Document::new(synthetic_capture(image)));
+                self.enter(AppState::Viewer, ctx);
+            }
+            Command::SaveActive => {
+                // Reuses the pin save-as window — `viewer_tab` lets the app
+                // mark the tab clean when the write lands.
+                let target = lock(&self.viewer).save_target();
+                let folder = lock(&self.settings).last_save_dir.clone().or_else(|| {
+                    directories::UserDirs::new()
+                        .and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
+                });
+                if let (Some((index, title, capture)), Some(folder)) = (target, folder) {
+                    let mut dialog =
+                        crate::ui::save_dialog::SaveDialog::new(Arc::new(capture), folder);
+                    // The tab title seeds the file name (sanitized later).
+                    dialog.filename = title;
+                    dialog.viewer_tab = Some(index);
+                    *lock(&self.save_dialog) = Some(dialog);
+                    self.request_focus(save_dialog_id());
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
+            Command::SaveAll => self.save_all(),
+            Command::RenameActive => lock(&self.viewer).open_rename(),
+            Command::CopyActive => {
+                if let Some(img) = lock(&self.viewer).copy_image()
+                    && let Err(e) = crate::export::clipboard::copy_image(&img)
+                {
+                    tracing::warn!("copy failed: {e}");
+                }
+            }
+            Command::UndoActive => {
+                lock(&self.viewer).undo_active();
+            }
+            Command::RedoActive => {
+                lock(&self.viewer).redo_active();
+            }
+            Command::PrintActive => {
+                if let Some(img) = lock(&self.viewer).active_image()
+                    && let Err(e) = crate::export::file::print_image(&img)
+                {
+                    tracing::warn!("print failed: {e}");
+                }
             }
         }
+    }
+
+    /// Writes every unsaved tab to the last-used folder (or ~/Pictures) as
+    /// timestamped PNGs — the "Save All" / unsaved-confirmation path has no
+    /// per-tab dialog, each file is unique via the index suffix.
+    /// The File → Open picker (seeded with `dir` when given) — one tab per
+    /// image, and the picked folder is persisted for next time.
+    fn open_files(&self, dir: Option<std::path::PathBuf>, ctx: &egui::Context) {
+        let mut dialog =
+            rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "webp"]);
+        if let Some(dir) = dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(paths) = dialog.pick_files() else {
+            return;
+        };
+        let mut opened = false;
+        for path in &paths {
+            match crate::export::file::load_image(path) {
+                Ok(image) => {
+                    let title = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "image".to_owned());
+                    lock(&self.viewer).push_named_document(
+                        Document::new(synthetic_capture(image)),
+                        title,
+                        // From disk = clean until edited.
+                        true,
+                    );
+                    opened = true;
+                }
+                Err(e) => tracing::warn!(?path, "cannot open image: {e}"),
+            }
+        }
+        if opened {
+            if let Some(dir) = paths
+                .first()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            {
+                let mut s = lock(&self.settings);
+                s.last_open_dir = Some(dir);
+                s.save();
+            }
+            self.enter(AppState::Viewer, ctx);
+        }
+    }
+
+    fn save_all(&self) {
+        let Some(folder) = lock(&self.settings).last_save_dir.clone().or_else(|| {
+            directories::UserDirs::new().and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
+        }) else {
+            tracing::warn!("save-all: no writable folder known");
+            return;
+        };
+        let stamp = chrono::Local::now().format("%y%m%d_%H%M%S");
+        let mut viewer = lock(&self.viewer);
+        for (i, tab) in viewer.tabs.iter_mut().enumerate() {
+            if tab.saved {
+                continue;
+            }
+            let path = folder.join(format!("capture_{stamp}_{}.png", i + 1));
+            match crate::export::file::save_capture_to(
+                &tab.doc.base,
+                &path,
+                crate::export::ImageFormat::Png,
+            ) {
+                Ok(()) => {
+                    tab.saved = true;
+                    tracing::info!(?path, "tab saved");
+                }
+                Err(e) => tracing::warn!(?path, "save-all failed: {e}"),
+            }
+        }
+        viewer.recompute_dirty();
     }
 
     /// Moves the machine to `next` and wakes the anchor so the child
@@ -567,6 +733,29 @@ impl Shared {
     }
 }
 
+/// Wraps a file/clipboard image in a `Capture` for a viewer document:
+/// 1:1 physical-to-logical pixels and a synthetic monitor record (only
+/// the image and scale factor reach the canvas).
+fn synthetic_capture(image: image::RgbaImage) -> crate::capture::Capture {
+    use crate::capture::{MonitorInfo, PhysicalRect};
+    crate::capture::Capture {
+        scale_factor: 1.0,
+        monitor: MonitorInfo {
+            id: 0,
+            name: String::new(),
+            rect: PhysicalRect {
+                x: 0,
+                y: 0,
+                width: image.width(),
+                height: image.height(),
+            },
+            scale_factor: 1.0,
+            is_primary: true,
+        },
+        image,
+    }
+}
+
 /// Dev-hook capture mode name → enum (`PIXME_CAPTURE` / `PIXME_CAPTURE_AFTER`).
 fn debug_mode(name: &str) -> Option<CaptureMode> {
     Some(match name {
@@ -617,7 +806,6 @@ impl PixMeApp {
                 pins: Mutex::new(Vec::new()),
                 next_pin_id: Mutex::new(0),
                 save_dialog: Mutex::new(None),
-                last_save_dir: Mutex::new(None),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
             }),
@@ -806,7 +994,12 @@ impl eframe::App for PixMeApp {
                         match ui::save_dialog::show(ui, dialog) {
                             ui::save_dialog::Outcome::Confirm => match dialog.save(&shared) {
                                 Ok(path) => {
-                                    tracing::info!(?path, "pin saved");
+                                    tracing::info!(?path, "saved");
+                                    // A viewer document is now on disk:
+                                    // the tab flips to clean.
+                                    if let Some(i) = dialog.viewer_tab {
+                                        lock(&shared.viewer).mark_saved(i);
+                                    }
                                     drop(guard);
                                     close(&ctx);
                                 }
@@ -984,7 +1177,6 @@ mod tests {
             pins: Mutex::new(Vec::new()),
             next_pin_id: Mutex::new(0),
             save_dialog: Mutex::new(None),
-            last_save_dir: Mutex::new(None),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),

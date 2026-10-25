@@ -90,4 +90,44 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         "download",
         include_bytes!("../../assets/icons/download.svg"),
     ),
+    (
+        Icon::FolderOpen,
+        "folder-open",
+        include_bytes!("../../assets/icons/folder-open.svg"),
+    ),
+    (
+        Icon::Save,
+        "save",
+        include_bytes!("../../assets/icons/save.svg"),
+    ),
+    (
+        Icon::ZoomIn,
+        "zoom-in",
+        include_bytes!("../../assets/icons/zoom-in.svg"),
+    ),
+    (
+        Icon::ZoomOut,
+        "zoom-out",
+        include_bytes!("../../assets/icons/zoom-out.svg"),
+    ),
+    (
+        Icon::Pencil,
+        "pencil",
+        include_bytes!("../../assets/icons/pencil.svg"),
+    ),
+    (
+        Icon::Scaling,
+        "scaling",
+        include_bytes!("../../assets/icons/scaling.svg"),
+    ),
+    (
+        Icon::ClipboardPaste,
+        "clipboard-paste",
+        include_bytes!("../../assets/icons/clipboard-paste.svg"),
+    ),
+    (
+        Icon::Printer,
+        "printer",
+        include_bytes!("../../assets/icons/printer.svg"),
+    ),
 ];

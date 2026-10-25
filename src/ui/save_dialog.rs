@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use egui::{Align, Layout, Ui, Vec2};
 
-use crate::app::{Shared, lock};
+use crate::app::Shared;
 use crate::capture::Capture;
 use crate::export::{ExportError, ImageFormat, file::save_capture_to};
 use crate::platform;
@@ -42,6 +42,9 @@ pub struct SaveDialog {
     pub reveal: bool,
     /// Error shown inline after a failed save.
     pub error: Option<String>,
+    /// When the dialog serves a viewer document (Save Active), the saved
+    /// tab index — the app marks it clean on success. `None` for pins.
+    pub viewer_tab: Option<usize>,
 }
 
 impl SaveDialog {
@@ -54,6 +57,7 @@ impl SaveDialog {
             format: ImageFormat::Png,
             reveal: false,
             error: None,
+            viewer_tab: None,
         }
     }
 
@@ -78,7 +82,10 @@ impl SaveDialog {
         if self.reveal {
             platform::reveal_in_file_manager(&path);
         }
-        *lock(&shared.last_save_dir) = Some(dir);
+        // Persist the folder so the next save (and next session) reopens here.
+        let mut s = shared.lock_settings();
+        s.last_save_dir = Some(dir);
+        s.save();
         Ok(path)
     }
 }

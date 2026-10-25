@@ -233,7 +233,54 @@ pub fn install_ui(ctx: &egui::Context) {
     );
     separator(&file);
     item(&mut labels, &file, "file.rename", "menu.file.rename", None);
+    separator(&file);
+    item(
+        &mut labels,
+        &file,
+        "file.print",
+        "menu.file.print",
+        Some(Accelerator::new(Modifiers::META, Code::KeyP)),
+    );
     append(&app_menu, &file);
+
+    // The Edit submenu carries the OS copy/paste conventions (⌘C/⌘V):
+    // key equivalents go through AppKit, so they reach us no matter
+    // which egui viewport holds focus.
+    let edit = Submenu::new(t!("menu.edit").as_ref(), true);
+    labels.subs.push((edit.clone(), "menu.edit"));
+    item(
+        &mut labels,
+        &edit,
+        "edit.undo",
+        "menu.edit.undo",
+        Some(Accelerator::new(Modifiers::META, Code::KeyZ)),
+    );
+    item(
+        &mut labels,
+        &edit,
+        "edit.redo",
+        "menu.edit.redo",
+        Some(Accelerator::new(
+            Modifiers::META | Modifiers::SHIFT,
+            Code::KeyZ,
+        )),
+    );
+    separator(&edit);
+    item(
+        &mut labels,
+        &edit,
+        "edit.copy",
+        "menu.edit.copy",
+        Some(Accelerator::new(Modifiers::META, Code::KeyC)),
+    );
+    item(
+        &mut labels,
+        &edit,
+        "edit.paste",
+        "menu.edit.paste",
+        Some(Accelerator::new(Modifiers::META, Code::KeyV)),
+    );
+    append(&app_menu, &edit);
 
     let window = Submenu::new(t!("menu.window").as_ref(), true);
     labels.subs.push((window.clone(), "menu.window"));
@@ -393,4 +440,20 @@ pub fn reveal_in_file_manager(path: &std::path::Path) {
     if !ok && let Some(parent) = path.parent() {
         let _ = std::process::Command::new("open").arg(parent).status();
     }
+}
+
+/// Prints `path` on the default printer via `lp` (CUPS scales the image
+/// to the page). Returns `Err` when the job could not be queued.
+pub fn print_file(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("lp")
+        .arg(path)
+        .status()
+        .map_err(|e| e.to_string())
+        .and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err(format!("lp exited with {s}"))
+            }
+        })
 }

@@ -158,3 +158,20 @@ pub fn reveal_in_file_manager(path: &std::path::Path) {
         .arg(format!("/select,{}", path.display()))
         .status();
 }
+
+/// Prints `path` on the default printer via `mspaint /p`. V1 has no
+/// print dialog — a richer path (printer picker, margins) lands later.
+pub fn print_file(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("mspaint")
+        .arg("/p")
+        .arg(path)
+        .status()
+        .map_err(|e| e.to_string())
+        .and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err(format!("mspaint exited with {s}"))
+            }
+        })
+}

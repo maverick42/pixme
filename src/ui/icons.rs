@@ -47,6 +47,22 @@ pub enum Icon {
     Copy,
     /// Save to file (download arrow).
     Download,
+    /// Open an image file (viewer toolbar).
+    FolderOpen,
+    /// Save the active document (floppy).
+    Save,
+    /// Zoom the canvas in.
+    ZoomIn,
+    /// Zoom the canvas out.
+    ZoomOut,
+    /// Draw mode toggle (annotation tools).
+    Pencil,
+    /// Resize the image (diagonal arrows).
+    Scaling,
+    /// Paste from the clipboard into a new tab.
+    ClipboardPaste,
+    /// Print the active document.
+    Printer,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

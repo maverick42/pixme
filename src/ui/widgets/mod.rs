@@ -10,6 +10,7 @@ mod dropdown;
 mod elided_label;
 mod icon_button;
 mod separator;
+mod tool_button;
 
 pub use button::{primary_button, secondary_button};
 pub use card::{card_frame, card_shadow};
@@ -17,3 +18,4 @@ pub use dropdown::dropdown_button;
 pub use elided_label::elided_label;
 pub use icon_button::icon_button;
 pub use separator::{hairline, vline};
+pub use tool_button::{TOOL_H, caret_hit, tool_button};

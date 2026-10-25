@@ -458,3 +458,113 @@ Format: date — context — decision — consequences.
   Esc, window X, successful save) wakes the ROOT anchor — forgetting to
   left the viewport registered and produced a ghost window (the same
   latent trap existed on the settings window, fixed too).
+
+
+## 2026-10-24 — Viewer toolbar: file/edit actions, zoom, marquee, resize
+
+- **The toolbar** sits between the (Windows-only) menu strip and the tab
+  strip: Open, Save | Rectangle + zoom in/out + "1:1" | Draw (disabled,
+  next phase), Resize | Copy, Paste | Print | Close. Exactly the user's
+  list — no extras. Zoom/selection are viewer-local state (no Command
+  round-trip); clipboard, file and print actions stay Commands so OS
+  menus and the strip share one path.
+- **Rectangle** is a marquee tool, not just a crop button: drag on the
+  canvas selects (image-physical-px coords, `px_per_pt` mapping inside
+  the ScrollArea), the dashed accent border + white halo mirrors the
+  capture overlay, double-click inside or Enter crops. Esc / re-click
+  clears. Copier prefers the live selection, else the whole document.
+- **Zoom**: `Viewer.zoom: Option<f32>` — `None` = fit-to-window (never
+  upscales, previous behaviour); ± buttons step ×1.25, "1:1" = actual
+  size; explicit zoom shows scrollbars via `ScrollArea::both`.
+- **Tab.saved** replaces the session-only dirty flag for real: captures
+  and pastes open dirty, opened files clean, crop/resize mark dirty,
+  Save Active (`SaveDialog.viewer_tab`) and Save All mark clean.
+  `Viewer::recompute_dirty` recomputes after every transition.
+- **SaveAll / ConfirmSave** write every unsaved tab to the last-used
+  folder (or ~/Pictures) as `capture_YYMMDD_HHMMSS_<i>.png` — no dialog
+  storm; uniqueness via index suffix.
+- **Crop/resize are destructive on the base image** (Lanczos3 resample);
+  annotations are dropped — the editor model has no coordinate
+  translation yet (draw phase will need it or a history entry).
+- **Texture cache lives on `Tab`** (not an index-keyed map): a closed
+  tab can never leave a stale texture aliasing a later document.
+- **Print** is v1-simple: temp PNG → `platform::print_file` (`lp` on
+  macOS — CUPS fits to page; `mspaint /p` on Windows). No print dialog
+  yet; margins/printer picker deferred.
+- **Open** loads only compiled codecs (PNG/JPEG/WebP) via `image::open`;
+  multi-select opens one tab each, title = file stem, `saved = true`.
+- **File menu** gains Print (⌘P macOS, same item in the Windows strip).
+- New Lucide icons: `folder-open`, `pencil`, `scaling`, `zoom-in` copied
+  from the visual reference's set (ISC); `save`, `zoom-out`,
+  `clipboard-paste`, `printer` added from upstream Lucide (same licence,
+  added to ATTRIBUTION.md list).
+
+## 2026-10-25 — prefs.json persistence, band toolbar with dropdown menus
+
+- **Settings move to `prefs.json`** (was `settings.toml` in the OS config
+  dir): the file lives **next to the executable** on both OSes — the
+  user's portable-mode requirement (`C:\portable\pixme\prefs.json` on
+  Windows; on macOS the same rule applies, except a binary inside a
+  `.app` bundle cannot write beside itself and falls back to
+  `~/Library/Application Support/pixme`). A legacy `settings.toml` is
+  migrated once, silently. `serde_json` added (the format change needs
+  a JSON codec — `toml` stays for the one-shot migration read).
+- **New persisted fields**: `last_save_dir` (moved off `Shared`, where
+  it was session-only) and `last_open_dir` — both feed the save dialog,
+  File → Open seeding, and the new "open last used folder" item.
+- **Band toolbar**: `widgets::tool_button` (18px icon over a 10pt
+  caption, 56×44) replaces the compact icon row — the functional
+  reference's band layout in our widget style. `has_menu` buttons
+  (Ouvrir, Rectangle, zoom) get a right-edge caret zone:
+  `caret_hit(&response)` distinguishes menu-open clicks from the main
+  action. No keyboard shortcuts are exposed anywhere in the band.
+- **Ouvrir ▾**: New (blank 800×600 canvas via `push_blank_document`),
+  Open, Import from clipboard, "open last used folder" — the last item
+  is disabled until a folder has actually been used once.
+- **Rectangle ▾**: Rectangle / Oval / Rounded rectangle — only the
+  marquee outline changes (`EllipseShape` / rounded `rect_stroke`);
+  crop and copy still use the bounding rect, matching the reference.
+- **Zoom**: `Viewer.zoom: ZoomMode` — Fit, FitWidth (new: fills the
+  window width, scrolls vertically), or Factor. The button caption is
+  the live percent (`eff_scale`, measured in `content()`); its menu
+  lists actual size / fit window / fit width / 100→500% presets; the
+  main click still means 100%.
+- **Resize dialog**: pixels-only now (percent presets return later as
+  a menu on the button); shows original/new dimensions live and keeps
+  the aspect-ratio link.
+
+## 2026-10-25 — Modal dialogs, paste-into-document, resize anti-aliasing
+
+- **Modality**: internal dialogs (resize, rename, unsaved-confirm) are
+  `egui::Modal` — dimmed backdrop that eats input, Esc/backdrop =
+  cancel (confirm maps it to Cancel, the ambiguous-dismissal case).
+  The separate save-as/settings *viewports* can't use Modal, so the
+  viewer dims its own panel and allocates a click-eating rect while
+  `Shared::modal_child_open()` — same visual+functional result.
+- **Paste ≠ Import**: `Command::PasteActive` (toolbar Coller) drops the
+  clipboard image onto the ACTIVE document as a floating layer —
+  draggable, flattened by any outside press or Enter (`imageops::
+  overlay`, alpha-composited, clamps to bounds), discarded by Esc.
+  `Command::ImportClipboard` (Ouvrir ▾ / File menu) keeps its rule:
+  always a NEW tab. The floating layer lives on `Tab`, so it survives
+  tab switches and flattens before crop/resize.
+- **Resize dialog**: gains the reference's remaining params — original /
+  new dimensions with MP count and an "anti-aliasing" checkbox
+  (Lanczos3 vs Nearest). Still pixels-only; percent presets stay on the
+  future button menu.
+- **Pixel-op undo/redo** (per tab, session-only): `Tab.undo`/`Tab.redo`
+  store `PixelOp` records, not full snapshots — a flattened paste keeps
+  only the covered patch + the pasted bitmap (~small), crops/resizes
+  keep one pre-image (~20 MB on Retina). Capped at 10 ops/tab (worst
+  case ≈ 200 MB only on a 10-full-image chain). Undo while a layer
+  floats just abandons it. ⌘Z/⇧⌘Z/Ctrl+Y + native Edit menu (⌘Z/⇧⌘Z
+  through AppKit); Windows strip gains an Édition menu. The stack is
+  cleared when a save bakes annotations (the file then diverges from
+  every stored step).
+- **Paste outline = copied shape**: the paste layer records the shape
+  of the last in-app copy (`copy_shape`, remembered across pastes so
+  repeated Coller keeps its outline). Opaque-cornered bitmaps always
+  outline as rects (external content); a transparent-cornered bitmap
+  with no recorded shape probes the top edge to tell oval from round.
+- **Select button**: the former "Rectangle" tool button is renamed
+  "Sélection" (the menu items keep their shape names).

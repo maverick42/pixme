@@ -23,6 +23,24 @@ pub fn save_capture_to(
     res.map_err(|e| ExportError::Failed(e.to_string()))
 }
 
+/// Loads an image file into an RGBA buffer — the viewer's Open command.
+/// Only the compiled codecs are readable (PNG, JPEG, WebP).
+pub fn load_image(path: &Path) -> Result<image::RgbaImage, ExportError> {
+    image::open(path)
+        .map(|img| img.to_rgba8())
+        .map_err(|e| ExportError::Failed(e.to_string()))
+}
+
+/// Writes `img` to a temporary PNG and sends it to the OS default printer
+/// — the viewer's Print button. V1 prints the whole image fit to the page.
+pub fn print_image(img: &image::RgbaImage) -> Result<(), ExportError> {
+    let path = std::env::temp_dir().join("pixme-print.png");
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .map_err(|e| ExportError::Failed(e.to_string()))?;
+    crate::platform::print_file(&path)
+        .map_err(|e| ExportError::Failed(format!("print failed: {e}")))
+}
+
 /// Asks for a destination and writes `capture`'s pixels (PNG or JPEG).
 /// Kept for the plain OS-dialog path; the pin save window uses
 /// [`save_capture_to`].
