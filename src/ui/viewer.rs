@@ -34,9 +34,6 @@ pub struct Tab {
     /// `(revision, texture)` cache living with the tab — closing a tab
     /// drops its texture and a later tab can never inherit a stale one.
     texture: Option<(u64, egui::TextureHandle)>,
-    /// A clipboard image dropped onto this document (Coller) — floats
-    /// until the user clicks outside it, which flattens it in place.
-    pasted: Option<PastedLayer>,
     /// Reversible pixel mutations, oldest → newest (session-only).
     undo: VecDeque<PixelOp>,
     /// Ops undone, reappliable until the next mutation clears them.
@@ -55,24 +52,11 @@ pub struct Tab {
 
 /// How many pixel mutations stay undoable per tab. Full-image ops keep
 /// one pre-image each (~20 MB on a Retina capture), so the cap bounds
-/// the worst case; paste steps only store the covered patch.
+/// the worst case.
 const HISTORY_CAP: usize = 10;
 
-/// One reversible pixel-level mutation of a tab's base image — stored
-/// per op rather than as full snapshots wherever a small patch suffices.
+/// One reversible pixel-level mutation of a tab's base image.
 enum PixelOp {
-    /// `pasted` was alpha-overlaid at `pos`; `under` is what it covered
-    /// (the visible part only, so both stay small).
-    Flatten {
-        pos: (u32, u32),
-        pasted: image::RgbaImage,
-        under: image::RgbaImage,
-    },
-    /// Cropped to `rect`; `before` is the whole pre-crop image.
-    Crop {
-        before: image::RgbaImage,
-        rect: (u32, u32, u32, u32),
-    },
     /// Resampled to `size`; `before` is the whole pre-resize image.
     Resize {
         before: image::RgbaImage,
@@ -85,13 +69,7 @@ impl PixelOp {
     /// Reverts the mutation on `doc`'s base image.
     fn undo(&self, doc: &mut Document) {
         match self {
-            Self::Flatten { pos, under, .. } => image::imageops::replace(
-                &mut doc.base.image,
-                under,
-                i64::from(pos.0),
-                i64::from(pos.1),
-            ),
-            Self::Crop { before, .. } | Self::Resize { before, .. } => {
+            Self::Resize { before, .. } => {
                 doc.base.image = before.clone();
             }
         }
@@ -100,17 +78,6 @@ impl PixelOp {
     /// Re-applies the mutation on `doc`'s base image after an undo.
     fn redo(&self, doc: &mut Document) {
         match self {
-            Self::Flatten { pos, pasted, .. } => image::imageops::overlay(
-                &mut doc.base.image,
-                pasted,
-                i64::from(pos.0),
-                i64::from(pos.1),
-            ),
-            Self::Crop { rect, .. } => {
-                doc.base.image =
-                    image::imageops::crop_imm(&doc.base.image, rect.0, rect.1, rect.2, rect.3)
-                        .to_image();
-            }
             Self::Resize {
                 size, antialias, ..
             } => {
@@ -127,31 +94,6 @@ impl PixelOp {
             }
         }
     }
-}
-
-/// What `content()` hands to `paste_layer` — everything it needs to
-/// paint and place the floating paste without re-borrowing the tab.
-struct PasteView {
-    /// The layer's texture.
-    tex: egui::TextureId,
-    /// Bitmap size in image physical px.
-    size: Vec2,
-    /// The copied marquee shape, for the outline.
-    shape: SelectShape,
-}
-
-/// The floating pasted bitmap: draggable, flattened on click-outside
-/// or Enter, discarded on Escape — the functional reference's paste.
-struct PastedLayer {
-    /// The pixels to composite (corners transparent for shaped copies).
-    image: image::RgbaImage,
-    /// Top-left corner in image physical px (drag updates it).
-    pos: Pos2,
-    /// The marquee shape the bitmap was copied with — drives the
-    /// outline only (the pixels already carry the shape).
-    shape: SelectShape,
-    /// Display texture, loaded lazily once.
-    tex: Option<egui::TextureHandle>,
 }
 
 /// The Redimensionner dialog's draft — explicit pixels only (the percent
@@ -181,19 +123,6 @@ enum ZoomMode {
     Factor(f32),
 }
 
-/// The marquee outline the Rectangle tool draws — crop is always the
-/// bounding rect whatever the shape.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-enum SelectShape {
-    /// Plain rectangle (dashed outline).
-    #[default]
-    Rect,
-    /// Ellipse inside the drag bounds.
-    Oval,
-    /// Rounded rectangle.
-    Round,
-}
-
 /// Session state rendered inside the viewer viewport.
 #[derive(Default)]
 pub struct Viewer {
@@ -213,20 +142,6 @@ pub struct Viewer {
     zoom: ZoomMode,
     /// Scale applied last frame — drives the zoom label and ± steps.
     eff_scale: f32,
-    /// The Rectangle tool: armed, a marquee drag on the canvas selects.
-    select_tool: bool,
-    /// Marquee outline shape chosen in the tool's menu.
-    select_shape: SelectShape,
-    /// The live marquee selection, in image physical px.
-    selection: Option<Rect>,
-    /// The shape the live selection was drawn with — Copier masks by
-    /// this, not by whatever shape is armed now.
-    selection_shape: Option<SelectShape>,
-    /// The shape of the last in-app copy — remembered (not consumed) so
-    /// repeated pastes of the same clipboard keep their outline.
-    copy_shape: Option<SelectShape>,
-    /// Marquee drag anchor (image px) while drawing.
-    marquee_anchor: Option<Pos2>,
     /// The resize dialog, open while Some.
     resize: Option<ResizeDialog>,
     /// The rename prompt's draft, open while Some.
@@ -342,14 +257,13 @@ impl Viewer {
             doc,
             saved,
             texture: None,
-            pasted: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
             anno_redo: VecDeque::new(),
             unlocked: false,
         });
-        // A new document gets a fresh view — a stale marquee/zoom would
+        // A new document gets a fresh view — a stale zoom would
         // leak onto unrelated pixels — and the tab we leave re-locks.
         let new = self.tabs.len() - 1;
         self.set_active(new);
@@ -382,7 +296,6 @@ impl Viewer {
             }),
             saved: false,
             texture: None,
-            pasted: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
@@ -443,9 +356,6 @@ impl Viewer {
         VecDeque<AnnoEdit>,
     )> {
         let i = self.active_index()?;
-        if self.tabs[i].pasted.is_some() {
-            self.commit_paste(i);
-        }
         let tab = &self.tabs[i];
         Some((
             i,
@@ -473,10 +383,7 @@ impl Viewer {
         t.anno_undo = undo;
         t.anno_redo = redo;
         t.saved = false;
-        t.pasted = None;
         self.dirty = true;
-        self.selection = None;
-        self.selection_shape = None;
     }
 
     /// `(index, title, base capture)` of the active tab — everything the
@@ -504,51 +411,13 @@ impl Viewer {
         }
     }
 
-    /// What Copier puts on the clipboard: the marquee selection when one
-    /// is live, the whole document otherwise.
+    /// What Copier puts on the clipboard: the whole document image.
     pub fn copy_image(&mut self) -> Option<image::RgbaImage> {
         let i = self.active_index()?;
-        let img = crate::editor::render::render_to_image(&self.tabs[i].doc);
-        let img = &img;
-        let mut out = match self.selection {
-            Some(sel) => {
-                let sel = clamp_to_image(sel, img.width(), img.height());
-                if sel.width() < 1.0 || sel.height() < 1.0 {
-                    img.clone()
-                } else {
-                    image::imageops::crop_imm(
-                        img,
-                        sel.min.x as u32,
-                        sel.min.y as u32,
-                        sel.width() as u32,
-                        sel.height() as u32,
-                    )
-                    .to_image()
-                }
-            }
-            None => img.clone(),
-        };
-        // A shaped marquee copies shaped pixels: outside the ellipse /
-        // rounded corners goes transparent, which is what the paste then
-        // composites — the functional reference behaves the same way.
-        if self.selection.is_some() {
-            match self.selection_shape.unwrap_or_default() {
-                SelectShape::Rect => {}
-                SelectShape::Oval => mask_ellipse(&mut out),
-                SelectShape::Round => mask_rounded(
-                    &mut out,
-                    // The marquee's 8pt corners, in image physical px.
-                    8.0 * f64::from(self.tabs[i].doc.base.scale_factor.max(0.25)),
-                ),
-            }
-        }
-        // The shape survives the paste: repeated Coller of the same
-        // clipboard still outlines like the copy that produced it.
-        self.copy_shape = self.selection_shape;
-        Some(out)
+        Some(crate::editor::render::render_to_image(&self.tabs[i].doc))
     }
 
-    /// The whole document image, for print (selections don't apply).
+    /// The whole document image, for print.
     pub fn active_image(&self) -> Option<image::RgbaImage> {
         let i = self.active_index()?;
         Some(crate::editor::render::render_to_image(&self.tabs[i].doc))
@@ -566,84 +435,11 @@ impl Viewer {
         }
     }
 
-    /// Drops `image` onto the active document as a floating pasted layer
-    /// (the Coller action — paste never creates a tab, only
-    /// File→Import does). `false` when there is no document.
-    pub fn paste_active(&mut self, image: image::RgbaImage) -> bool {
-        let Some(i) = self.active_index() else {
-            return false;
-        };
-        // A still-floating layer flattens before the new one drops.
-        self.commit_paste(i);
-        // The live marquee yields to the layer. The outline comes from
-        // the shape the copy recorded — solid-cornered bitmaps (external
-        // content) always read as plain rects.
-        let shape = paste_outline_shape(&image, self.copy_shape);
-        self.selection = None;
-        self.selection_shape = None;
-        self.tabs[i].pasted = Some(PastedLayer {
-            image,
-            pos: Pos2::ZERO,
-            shape,
-            tex: None,
-        });
-        true
-    }
-
-    /// Flattens the floating paste of tab `index` into its document —
-    /// alpha-composited at its position, clipped to the image bounds.
-    fn commit_paste(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get_mut(index) else {
-            return;
-        };
-        let Some(pasted) = tab.pasted.take() else {
-            return;
-        };
-        let (x, y) = (pasted.pos.x as u32, pasted.pos.y as u32);
-        // The layer can overflow the image when it's larger than the
-        // document — the undo patch only covers the visible part.
-        let vis_w = pasted
-            .image
-            .width()
-            .min(tab.doc.base.image.width().saturating_sub(x));
-        let vis_h = pasted
-            .image
-            .height()
-            .min(tab.doc.base.image.height().saturating_sub(y));
-        tab.flatten();
-        let under = image::imageops::crop_imm(&tab.doc.base.image, x, y, vis_w, vis_h).to_image();
-        image::imageops::overlay(
-            &mut tab.doc.base.image,
-            &pasted.image,
-            i64::from(x),
-            i64::from(y),
-        );
-        tab.push_op(PixelOp::Flatten {
-            pos: (x, y),
-            pasted: pasted.image,
-            under,
-        });
-        tab.doc.revision += 1;
-        tab.saved = false;
-        self.dirty = true;
-    }
-
-    /// Whether the active tab carries a floating paste — the marquee
-    /// steps aside while one floats.
-    fn active_has_paste(&self) -> bool {
-        self.active_index()
-            .is_some_and(|i| self.tabs[i].pasted.is_some())
-    }
-
-    /// ⌘Z — reverts the newest pixel mutation of the active tab. A
-    /// floating paste counts as the freshest edit: undo abandons it.
+    /// ⌘Z — reverts the newest pixel mutation of the active tab.
     pub fn undo_active(&mut self) -> bool {
         let Some(i) = self.active_index() else {
             return false;
         };
-        if self.tabs[i].pasted.take().is_some() {
-            return true;
-        }
         let Some(op) = self.tabs[i].undo.pop_back() else {
             return false;
         };
@@ -653,8 +449,6 @@ impl Viewer {
         tab.saved = false;
         tab.redo.push_back(op);
         self.dirty = true;
-        self.selection = None;
-        self.selection_shape = None;
         true
     }
 
@@ -672,53 +466,18 @@ impl Viewer {
         tab.saved = false;
         tab.undo.push_back(op);
         self.dirty = true;
-        self.selection = None;
-        self.selection_shape = None;
         true
-    }
-
-    /// Crops the active document to `sel` (image physical px) — the
-    /// Rectangle tool's double-click/Enter action. Annotations are dropped:
-    /// their physical-px coordinates would need a translation pass the
-    /// editor model doesn't have yet.
-    fn crop_active(&mut self, sel: Rect) {
-        let Some(i) = self.active_index() else { return };
-        // A floating paste flattens before the image changes under it.
-        self.commit_paste(i);
-        let tab = &mut self.tabs[i];
-        tab.flatten();
-        let sel = clamp_to_image(sel, tab.doc.base.image.width(), tab.doc.base.image.height());
-        if sel.width() < 1.0 || sel.height() < 1.0 {
-            return;
-        }
-        let before = tab.doc.base.image.clone();
-        let rect = (
-            sel.min.x as u32,
-            sel.min.y as u32,
-            sel.width() as u32,
-            sel.height() as u32,
-        );
-        tab.doc.base.image =
-            image::imageops::crop_imm(&tab.doc.base.image, rect.0, rect.1, rect.2, rect.3)
-                .to_image();
-        tab.push_op(PixelOp::Crop { before, rect });
-        tab.doc.revision += 1;
-        tab.saved = false;
-        self.dirty = true;
-        self.selection = None;
-        self.selection_shape = None;
     }
 
     /// Resamples the active document to `w × h` physical px (the resize
     /// dialog's Apply); `antialias` picks Lanczos3 over nearest-neighbour.
-    /// Same annotation caveat as [`Self::crop_active`].
+    /// Annotations are dropped: their physical-px coordinates would need
+    /// a translation pass the editor model doesn't have yet.
     fn resize_active(&mut self, w: u32, h: u32, antialias: bool) {
         let Some(i) = self.active_index() else { return };
         if w == 0 || h == 0 {
             return;
         }
-        // A floating paste flattens before the image changes under it.
-        self.commit_paste(i);
         let tab = &mut self.tabs[i];
         tab.flatten();
         let before = tab.doc.base.image.clone();
@@ -740,8 +499,6 @@ impl Viewer {
         tab.doc.revision += 1;
         tab.saved = false;
         self.dirty = true;
-        self.selection = None;
-        self.selection_shape = None;
     }
 
     /// Adds a blank document ("Nouveau") — auto-titled by the shared
@@ -756,10 +513,6 @@ impl Viewer {
     /// Resets the per-view transient state (tab switch / doc mutation).
     fn reset_view(&mut self) {
         self.zoom = ZoomMode::Fit;
-        self.select_tool = false;
-        self.selection = None;
-        self.selection_shape = None;
-        self.marquee_anchor = None;
     }
 
     /// Makes `index` the visible tab. Leaving a tab re-locks it: a
@@ -861,7 +614,6 @@ impl Viewer {
             doc,
             saved: false,
             texture: None,
-            pasted: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             anno_undo: src.anno_undo.clone(),
@@ -908,63 +660,33 @@ impl Viewer {
             || self.protect.is_some()
             || self.confirm_delete.is_some()
             || shared.modal_child_open();
-        // Canvas keyboard: Enter commits the floating paste or crops the
-        // marquee, Esc discards the paste or clears the selection. The
-        // OS copy/paste conventions (⌘/Ctrl+C/V) work everywhere in the
-        // window — text edits keep their own handling.
-        if !modal_open {
-            if !ctx.egui_wants_keyboard_input() {
-                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::C)) {
-                    shared.push(Command::CopyActive);
-                    // The push lands mid-frame: wake the next pass so
-                    // pump() dispatches it even without mouse activity.
-                    ctx.request_repaint();
-                }
-                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)) {
-                    shared.push(Command::PasteActive);
-                    ctx.request_repaint();
-                }
-                // ⇧⌘Z before ⌘Z — the consumed press must not fall
-                // through to the plain-undo arm.
-                if ctx.input_mut(|i| {
-                    i.consume_key(
-                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                        egui::Key::Z,
-                    )
-                }) {
-                    shared.push(Command::RedoActive);
-                    ctx.request_repaint();
-                } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
-                    shared.push(Command::UndoActive);
-                    ctx.request_repaint();
-                } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)) {
-                    // Ctrl+Y — the Windows redo convention.
-                    shared.push(Command::RedoActive);
-                    ctx.request_repaint();
-                }
+        // Canvas keyboard: ⌘/Ctrl+C copies the document. The copy
+        // convention works everywhere in the window — text edits keep
+        // their own handling.
+        if !modal_open && !ctx.egui_wants_keyboard_input() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::C)) {
+                shared.push(Command::CopyActive);
+                // The push lands mid-frame: wake the next pass so
+                // pump() dispatches it even without mouse activity.
+                ctx.request_repaint();
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Some(i) = self
-                    .active_index()
-                    .filter(|i| self.tabs[*i].pasted.is_some())
-                {
-                    self.commit_paste(i);
-                } else if let Some(sel) = self.selection {
-                    self.crop_active(sel);
-                }
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if let Some(i) = self
-                    .active_index()
-                    .filter(|i| self.tabs[*i].pasted.is_some())
-                {
-                    self.tabs[i].pasted = None;
-                } else {
-                    self.selection = None;
-                    self.selection_shape = None;
-                    self.select_tool = false;
-                    self.marquee_anchor = None;
-                }
+            // ⇧⌘Z before ⌘Z — the consumed press must not fall
+            // through to the plain-undo arm.
+            if ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                )
+            }) {
+                shared.push(Command::RedoActive);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+                shared.push(Command::UndoActive);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)) {
+                // Ctrl+Y — the Windows redo convention.
+                shared.push(Command::RedoActive);
+                ctx.request_repaint();
             }
         }
         // Explicit fill: the app-wide clear color is transparent (the anchor
@@ -1072,24 +794,6 @@ impl Viewer {
                                 shared.push(Command::SaveActive);
                             }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            // Rectangle ▾ — arms the marquee, caret picks the shape.
-                            let r = widgets::tool_button(
-                                ui,
-                                Icon::SquareDashed,
-                                &t!("vbar.select.label"),
-                                true,
-                                self.select_tool,
-                                has_doc,
-                            );
-                            let menu_clicked = r.clicked() && widgets::caret_hit(&r, true);
-                            if r.clicked() && !menu_clicked {
-                                self.select_tool = !self.select_tool;
-                                if !self.select_tool {
-                                    self.selection = None;
-                                    self.selection_shape = None;
-                                }
-                            }
-                            shape_menu(ui, &r, self, menu_clicked);
                             if widgets::tool_button(
                                 ui,
                                 Icon::ZoomIn,
@@ -1180,20 +884,6 @@ impl Viewer {
                             .clicked()
                             {
                                 shared.push(Command::CopyActive);
-                            }
-                            if widgets::tool_button(
-                                ui,
-                                Icon::ClipboardPaste,
-                                &t!("vbar.paste.label"),
-                                false,
-                                false,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                // Coller = floating layer on the active
-                                // document (ImportClipboard opens a tab).
-                                shared.push(Command::PasteActive);
                             }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
                             if widgets::tool_button(
@@ -1302,9 +992,6 @@ impl Viewer {
                 ui.separator();
                 menu_item(ui, t!("menu.edit.copy").as_ref(), || {
                     shared.push(Command::CopyActive)
-                });
-                menu_item(ui, t!("menu.edit.paste").as_ref(), || {
-                    shared.push(Command::PasteActive)
                 });
             });
             menu_button(ui, t!("menu.capture").as_ref(), |ui| {
@@ -1603,27 +1290,7 @@ impl Viewer {
             );
             tab.texture = Some((tab.doc.revision, handle));
         }
-        // Copy the ids out: `tab`'s borrow ends here so the scroll
-        // closure can take `&mut self` (marquee / paste interaction).
         let tex = tab.texture.as_ref().map(|(_, h)| h.id());
-        // The floating paste gets its own texture, loaded once per drop.
-        let pasted = tab.pasted.as_mut().map(|p| {
-            if p.tex.is_none() {
-                p.tex = Some(ui.ctx().load_texture(
-                    format!("paste-{index}"),
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [p.image.width() as usize, p.image.height() as usize],
-                        p.image.as_raw(),
-                    ),
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
-            PasteView {
-                tex: p.tex.as_ref().map(|h| h.id()).unwrap_or_default(),
-                size: Vec2::new(p.image.width() as f32, p.image.height() as f32),
-                shape: p.shape,
-            }
-        });
         let Some(tex) = tex else { return };
         let logical = Vec2::new(img_w as f32 / sf, img_h as f32 / sf);
         let avail = ui.available_rect_before_wrap();
@@ -1639,7 +1306,6 @@ impl Viewer {
         };
         self.eff_scale = scale;
         let size = logical * scale;
-        let px_per_pt = img_w as f32 / size.x.max(1.0);
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         egui::ScrollArea::both()
             .auto_shrink([false; 2])
@@ -1648,13 +1314,6 @@ impl Viewer {
                 let (canvas_rect, _) = ui.allocate_exact_size(canvas, Sense::hover());
                 let img_rect = Rect::from_center_size(canvas_rect.center(), size);
                 ui.painter().image(tex, img_rect, uv, egui::Color32::WHITE);
-                // A floating paste takes over the canvas: drag to
-                // position, click-outside/Enter flattens, Esc discards.
-                if let Some(view) = pasted {
-                    self.paste_layer(ui, index, img_rect, px_per_pt, &view);
-                } else {
-                    self.marquee(ui, img_rect, px_per_pt);
-                }
             });
     }
 
@@ -1713,123 +1372,6 @@ impl Viewer {
                 self.unlock_error = true;
             }
         }
-    }
-
-    /// Rectangle tool: marquee drag on the canvas (coordinates mapped back
-    /// to image physical px), dashed accent border, double-click crops.
-    fn marquee(&mut self, ui: &mut egui::Ui, img_rect: Rect, px_per_pt: f32) {
-        if !self.select_tool {
-            // A live selection still paints — the tool can be disarmed while
-            // a pending crop choice remains.
-        } else {
-            let resp = ui.interact(
-                img_rect,
-                ui.id().with("pixme-viewer-marquee"),
-                Sense::click_and_drag(),
-            );
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-            }
-            if resp.drag_started()
-                && let Some(pos) = resp.interact_pointer_pos()
-            {
-                self.marquee_anchor = Some(image_pos(pos, img_rect, px_per_pt));
-                self.selection = None;
-                self.selection_shape = None;
-            }
-            if resp.dragged()
-                && let (Some(anchor), Some(pos)) =
-                    (self.marquee_anchor, resp.interact_pointer_pos())
-            {
-                let cur = image_pos(pos, img_rect, px_per_pt);
-                self.selection = Some(Rect::from_two_pos(anchor, cur));
-                self.selection_shape = Some(self.select_shape);
-            }
-            if resp.drag_stopped() {
-                self.marquee_anchor = None;
-                // Keep only a real drag — a stray click clears instead.
-                if self
-                    .selection
-                    .is_some_and(|s| s.width() < 2.0 || s.height() < 2.0)
-                {
-                    self.selection = None;
-                    self.selection_shape = None;
-                }
-            }
-            if resp.double_clicked()
-                && let (Some(sel), Some(pos)) = (self.selection, resp.interact_pointer_pos())
-                && sel.contains(image_pos(pos, img_rect, px_per_pt))
-            {
-                self.crop_active(sel);
-                return;
-            }
-        }
-        let Some(sel) = self.selection else { return };
-        let canvas_sel = Rect::from_min_size(
-            img_rect.min + sel.min.to_vec2() / px_per_pt,
-            sel.size() / px_per_pt,
-        );
-        let t = theme::tokens(ui.ctx());
-        marquee_outline(ui.painter(), canvas_sel, self.select_shape, t.accent);
-    }
-
-    /// The floating paste on tab `index`: painted at its position with
-    /// the marquee's chrome in the shape it was copied with, draggable
-    /// to reposition. Any press outside flattens it onto the document.
-    fn paste_layer(
-        &mut self,
-        ui: &mut egui::Ui,
-        index: usize,
-        img_rect: Rect,
-        px_per_pt: f32,
-        view: &PasteView,
-    ) {
-        let tab = &self.tabs[index];
-        let (doc_w, doc_h) = (
-            tab.doc.base.image.width() as f32,
-            tab.doc.base.image.height() as f32,
-        );
-        let pos = tab.pasted.as_ref().map(|p| p.pos).unwrap_or_default();
-        let layer_rect = Rect::from_min_size(
-            img_rect.min + pos.to_vec2() / px_per_pt,
-            view.size / px_per_pt,
-        );
-        // A press landing outside the layer flattens it (toolbar clicks
-        // included — the layer's own drag is exempt).
-        let outside = ui.input(|i| {
-            i.pointer.primary_pressed()
-                && i.pointer
-                    .press_origin()
-                    .is_some_and(|p| !layer_rect.contains(p))
-        });
-        if outside {
-            self.commit_paste(index);
-            return;
-        }
-        let resp = ui.interact(
-            layer_rect,
-            ui.id().with("pixme-pasted-layer"),
-            Sense::drag(),
-        );
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
-        }
-        if resp.dragged()
-            && let Some(p) = &mut self.tabs[index].pasted
-        {
-            // Screen-pt drag delta → image-physical px, clamped so the
-            // layer stays inside the document.
-            let delta = resp.drag_delta() * px_per_pt;
-            p.pos.x = (p.pos.x + delta.x).clamp(0.0, (doc_w - view.size.x).max(0.0));
-            p.pos.y = (p.pos.y + delta.y).clamp(0.0, (doc_h - view.size.y).max(0.0));
-        }
-        let t = theme::tokens(ui.ctx());
-        let painter = ui.painter();
-        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        painter.image(view.tex, layer_rect, uv, egui::Color32::WHITE);
-        // Same chrome as the marquee, in the copied shape: an oval
-        // paste reads as an oval, not its bounding rect.
-        marquee_outline(painter, layer_rect, view.shape, t.accent);
     }
 
     /// The Redimensionner window: explicit pixels only, original/new
@@ -2235,11 +1777,6 @@ fn paint_tab_close(ui: &mut egui::Ui, rect: Rect, hovered: bool) {
     }
 }
 
-fn image_pos(pos: Pos2, img_rect: Rect, px_per_pt: f32) -> Pos2 {
-    let px = (pos - img_rect.min) * px_per_pt;
-    Pos2::new(px.x.max(0.0), px.y.max(0.0))
-}
-
 /// One dropdown popup anchored to a tool button. Must be called EVERY
 /// frame — `Popup::menu` only renders while its id is open in memory,
 /// so gating the call on the click frame would flash it for a single
@@ -2286,26 +1823,6 @@ fn open_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_last_dir: bool
     });
 }
 
-/// Rectangle's shape menu — also arms the tool.
-fn shape_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) {
-    tool_popup(ui, resp, "shape-menu", open, |ui| {
-        for (shape, key) in [
-            (SelectShape::Rect, "vbar.select.rectangle"),
-            (SelectShape::Oval, "vbar.select.oval"),
-            (SelectShape::Round, "vbar.select.rounded"),
-        ] {
-            if ui
-                .selectable_label(v.select_shape == shape, t!(key))
-                .clicked()
-            {
-                v.select_shape = shape;
-                v.select_tool = true;
-                ui.close();
-            }
-        }
-    });
-}
-
 /// The zoom menu: actual size, fit window/width, then the 100→500%
 /// presets the functional reference lists.
 fn zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) {
@@ -2334,131 +1851,6 @@ fn zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) {
     });
 }
 
-/// The marquee chrome — a white halo under the accent outline so it
-/// stays readable on arbitrary screenshots — in the requested shape.
-/// Shared by the live marquee and the floating paste's outline.
-fn marquee_outline(painter: &egui::Painter, rect: Rect, shape: SelectShape, accent: egui::Color32) {
-    match shape {
-        SelectShape::Rect => {
-            painter.rect_stroke(
-                rect,
-                CornerRadius::ZERO,
-                Stroke::new(2.0, egui::Color32::WHITE),
-                StrokeKind::Outside,
-            );
-            let a = rect.min;
-            let b = rect.max;
-            let stroke = Stroke::new(1.0, accent);
-            // `dashed_line` yields a Vec<Shape>: extend per edge.
-            for (p, q) in [
-                (a, Pos2::new(b.x, a.y)),
-                (Pos2::new(b.x, a.y), b),
-                (b, Pos2::new(a.x, b.y)),
-                (Pos2::new(a.x, b.y), a),
-            ] {
-                painter.extend(egui::Shape::dashed_line(&[p, q], stroke, 6.0, 4.0));
-            }
-        }
-        SelectShape::Round => {
-            let radii = CornerRadius::same(8);
-            painter.rect_stroke(
-                rect,
-                radii,
-                Stroke::new(3.0, egui::Color32::WHITE),
-                StrokeKind::Middle,
-            );
-            painter.rect_stroke(rect, radii, Stroke::new(1.5, accent), StrokeKind::Middle);
-        }
-        SelectShape::Oval => {
-            let outline = |stroke: Stroke| {
-                egui::Shape::from(egui::epaint::EllipseShape {
-                    center: rect.center(),
-                    radius: rect.size() * 0.5,
-                    fill: egui::Color32::TRANSPARENT,
-                    stroke,
-                    angle: 0.0,
-                })
-            };
-            painter.add(outline(Stroke::new(3.0, egui::Color32::WHITE)));
-            painter.add(outline(Stroke::new(1.5, accent)));
-        }
-    }
-}
-
-/// The outline a pasted layer gets. A bitmap with opaque corners is
-/// solid content — it reads as a plain rect whatever was recorded.
-/// Transparent corners mean a shaped copy: the recorded shape wins, or
-/// (external content, nothing recorded) the top edge is probed — a
-/// rounded rect turns opaque past its corner radius while an ellipse
-/// stays transparent until the curve peaks.
-fn paste_outline_shape(img: &image::RgbaImage, recorded: Option<SelectShape>) -> SelectShape {
-    let (w, h) = (img.width(), img.height());
-    if w < 2 || h < 2 {
-        return SelectShape::Rect;
-    }
-    let opaque = |x: u32, y: u32| img.get_pixel(x.min(w - 1), y.min(h - 1)).0[3] > 127;
-    if [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
-        .into_iter()
-        .all(|(x, y)| opaque(x, y))
-    {
-        return SelectShape::Rect;
-    }
-    match recorded {
-        Some(shape @ (SelectShape::Oval | SelectShape::Round)) => shape,
-        _ => {
-            if opaque(w / 4, 0) {
-                SelectShape::Round
-            } else {
-                SelectShape::Oval
-            }
-        }
-    }
-}
-
-/// Clamps a selection rect to image bounds (physical px).
-fn clamp_to_image(sel: Rect, w: u32, h: u32) -> Rect {
-    let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32));
-    sel.intersect(bounds)
-}
-
-/// Pixels outside the inscribed ellipse go transparent (oval-selection
-/// copy — the paste composites them back over the document).
-fn mask_ellipse(img: &mut image::RgbaImage) {
-    let (w, h) = (img.width() as f64, img.height() as f64);
-    if w <= 0.0 || h <= 0.0 {
-        return;
-    }
-    let (rx, ry, cx, cy) = (w / 2.0, h / 2.0, w / 2.0, h / 2.0);
-    for (x, y, p) in img.enumerate_pixels_mut() {
-        let dx = (x as f64 + 0.5 - cx) / rx;
-        let dy = (y as f64 + 0.5 - cy) / ry;
-        if dx * dx + dy * dy > 1.0 {
-            p.0[3] = 0;
-        }
-    }
-}
-
-/// Pixels outside the rounded rect go transparent — signed distance to
-/// the shrunk inner rect vs the corner radius.
-fn mask_rounded(img: &mut image::RgbaImage, radius: f64) {
-    let (w, h) = (img.width() as f64, img.height() as f64);
-    let r = radius.min(w / 2.0).min(h / 2.0);
-    if r <= 0.0 {
-        return;
-    }
-    for (x, y, p) in img.enumerate_pixels_mut() {
-        let px = x as f64 + 0.5;
-        let py = y as f64 + 0.5;
-        // Nearest point of the shrunk rect; corners read as a circle.
-        let qx = px.clamp(r, w - r);
-        let qy = py.clamp(r, h - r);
-        let (dx, dy) = (px - qx, py - qy);
-        if dx * dx + dy * dy > r * r {
-            p.0[3] = 0;
-        }
-    }
-}
-
 /// One top-level menu label opening a popup (egui menu strip style).
 fn menu_button(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     let resp = ui.button(label);
@@ -2481,7 +1873,7 @@ mod tests {
     use super::*;
     use crate::capture::{Capture, MonitorInfo, PhysicalRect};
 
-    /// A tab backed by an `n × n` opaque document (big enough to mask).
+    /// A tab backed by an `n × n` opaque document.
     fn push_doc(v: &mut Viewer, w: u32, h: u32) {
         v.tabs.push(Tab {
             title: "t".to_owned(),
@@ -2503,7 +1895,6 @@ mod tests {
             }),
             saved: false,
             texture: None,
-            pasted: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
@@ -2514,104 +1905,19 @@ mod tests {
     }
 
     #[test]
-    fn oval_selection_copies_transparent_corners() {
+    fn copy_returns_the_whole_document() {
         let mut v = Viewer::default();
         push_doc(&mut v, 10, 10);
-        v.selection = Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(10.0, 10.0)));
-        v.selection_shape = Some(SelectShape::Oval);
         let img = v.copy_image().expect("copy");
-        assert_eq!(img.get_pixel(0, 0)[3], 0, "corner must be transparent");
-        assert_eq!(img.get_pixel(9, 9)[3], 0, "corner must be transparent");
-        assert_eq!(img.get_pixel(5, 5)[3], 255, "centre stays opaque");
+        assert_eq!((img.width(), img.height()), (10, 10));
+        assert_eq!(img.get_pixel(0, 0).0, [10, 20, 30, 255]);
     }
 
     #[test]
-    fn rounded_selection_copies_transparent_corners() {
+    fn undo_redo_resize_restores_dimensions() {
         let mut v = Viewer::default();
         push_doc(&mut v, 20, 20);
-        v.selection = Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(20.0, 20.0)));
-        v.selection_shape = Some(SelectShape::Round);
-        let img = v.copy_image().expect("copy");
-        assert_eq!(img.get_pixel(0, 0)[3], 0, "corner must be transparent");
-        assert_eq!(img.get_pixel(10, 10)[3], 255, "centre stays opaque");
-    }
-
-    #[test]
-    fn rect_selection_copies_opaque() {
-        let mut v = Viewer::default();
-        push_doc(&mut v, 10, 10);
-        v.selection = Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(10.0, 10.0)));
-        v.selection_shape = Some(SelectShape::Rect);
-        let img = v.copy_image().expect("copy");
-        assert_eq!(img.get_pixel(0, 0)[3], 255, "rect keeps its corners");
-    }
-
-    #[test]
-    fn repeat_paste_keeps_copied_shape() {
-        let mut v = Viewer::default();
-        push_doc(&mut v, 10, 10);
-        v.selection = Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(10.0, 10.0)));
-        v.selection_shape = Some(SelectShape::Oval);
-        let img = v.copy_image().expect("copy");
-        // Two Coller in a row: the copied shape survives the first drop.
-        assert!(v.paste_active(img.clone()));
-        assert_eq!(
-            v.tabs[0].pasted.as_ref().map(|p| p.shape),
-            Some(SelectShape::Oval)
-        );
-        assert!(v.paste_active(img));
-        assert_eq!(
-            v.tabs[0].pasted.as_ref().map(|p| p.shape),
-            Some(SelectShape::Oval)
-        );
-    }
-
-    #[test]
-    fn external_solid_paste_outlines_rect() {
-        let mut v = Viewer::default();
-        push_doc(&mut v, 10, 10);
-        // A stale copied shape must not dress up opaque-cornered
-        // (external) content — it reads as a plain rectangle.
-        v.copy_shape = Some(SelectShape::Oval);
-        let solid = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
-        assert!(v.paste_active(solid));
-        assert_eq!(
-            v.tabs[0].pasted.as_ref().map(|p| p.shape),
-            Some(SelectShape::Rect)
-        );
-    }
-
-    #[test]
-    fn undo_redo_flatten_restores_pixels() {
-        let mut v = Viewer::default();
-        push_doc(&mut v, 10, 10);
-        let layer = image::RgbaImage::from_pixel(4, 4, image::Rgba([250, 250, 250, 255]));
-        assert!(v.paste_active(layer));
-        v.commit_paste(0);
-        assert_eq!(v.tabs[0].doc.base.image.get_pixel(0, 0)[0], 250);
-        // Undo restores the covered patch; everything else untouched.
-        assert!(v.undo_active());
-        assert_eq!(
-            v.tabs[0].doc.base.image.get_pixel(0, 0).0,
-            [10, 20, 30, 255]
-        );
-        assert_eq!(
-            v.tabs[0].doc.base.image.get_pixel(9, 9).0,
-            [10, 20, 30, 255]
-        );
-        // Redo re-applies the same composite.
-        assert!(v.redo_active());
-        assert_eq!(v.tabs[0].doc.base.image.get_pixel(0, 0)[0], 250);
-    }
-
-    #[test]
-    fn undo_redo_crop_restores_dimensions() {
-        let mut v = Viewer::default();
-        push_doc(&mut v, 20, 20);
-        v.crop_active(Rect::from_min_max(
-            Pos2::new(2.0, 2.0),
-            Pos2::new(10.0, 10.0),
-        ));
+        v.resize_active(8, 8, true);
         let dims = |v: &Viewer| {
             (
                 v.tabs[0].doc.base.image.width(),
@@ -2734,85 +2040,5 @@ mod tests {
         assert!(!v.tabs[0].saved);
         assert!(v.tabs[0].doc.meta.source_path.is_none());
         assert!(v.dirty);
-    }
-
-    #[test]
-    fn undo_discards_floating_paste_first() {
-        let mut v = Viewer::default();
-        push_doc(&mut v, 10, 10);
-        assert!(v.paste_active(image::RgbaImage::from_pixel(
-            4,
-            4,
-            image::Rgba([9, 9, 9, 255])
-        )));
-        // ⌘Z while a layer floats abandons it — the doc never changed.
-        assert!(v.undo_active());
-        assert!(v.tabs[0].pasted.is_none());
-        assert_eq!(
-            v.tabs[0].doc.base.image.get_pixel(0, 0).0,
-            [10, 20, 30, 255]
-        );
-        assert!(!v.undo_active());
-    }
-}
-
-#[cfg(test)]
-mod clipboard_chain_tests {
-    use super::*;
-
-    /// Full Copy → OS clipboard → Coller chain, minus egui rendering:
-    /// the floating layer must carry the selection's transparency.
-    #[test]
-    #[ignore = "touches the real OS clipboard"]
-    fn oval_copy_paste_keeps_transparency() {
-        let backup = crate::export::clipboard::clipboard_image().ok().flatten();
-        let mut v = Viewer::default();
-        v.tabs.push(Tab {
-            title: "t".to_owned(),
-            doc: Document::new(crate::capture::Capture {
-                image: image::RgbaImage::from_pixel(20, 20, image::Rgba([10, 20, 30, 255])),
-                scale_factor: 1.0,
-                monitor: crate::capture::MonitorInfo {
-                    id: 0,
-                    name: String::new(),
-                    rect: crate::capture::PhysicalRect {
-                        x: 0,
-                        y: 0,
-                        width: 1,
-                        height: 1,
-                    },
-                    scale_factor: 1.0,
-                    is_primary: true,
-                },
-            }),
-            saved: false,
-            texture: None,
-            pasted: None,
-            undo: VecDeque::new(),
-            redo: VecDeque::new(),
-            anno_undo: VecDeque::new(),
-            anno_redo: VecDeque::new(),
-            unlocked: false,
-        });
-        v.active = 0;
-        v.selection = Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(20.0, 20.0)));
-        v.selection_shape = Some(SelectShape::Oval);
-        // The exact app path: CopyActive → copy_image → clipboard.
-        let img = v.copy_image().expect("copy");
-        crate::export::clipboard::copy_image(&img).expect("set clipboard");
-        // …then Coller → clipboard_image → paste_active.
-        let back = crate::export::clipboard::clipboard_image()
-            .expect("get clipboard")
-            .expect("image on clipboard");
-        assert!(v.paste_active(back));
-        let layer = v.tabs[0].pasted.as_ref().expect("floating layer");
-        assert_eq!(
-            layer.image.get_pixel(0, 0)[3],
-            0,
-            "pasted layer lost the selection's transparency"
-        );
-        if let Some(img) = backup {
-            let _ = crate::export::clipboard::copy_image(&img);
-        }
     }
 }

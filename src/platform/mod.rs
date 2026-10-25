@@ -131,7 +131,6 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
         "edit.undo" => Command::UndoActive,
         "edit.redo" => Command::RedoActive,
         "edit.copy" => Command::CopyActive,
-        "edit.paste" => Command::PasteActive,
         "file.open" => Command::OpenFile,
         "file.save" => Command::SaveActive,
         "file.save_all" => Command::SaveAll,

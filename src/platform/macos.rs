@@ -273,13 +273,6 @@ pub fn install_ui(ctx: &egui::Context) {
         "menu.edit.copy",
         Some(Accelerator::new(Modifiers::META, Code::KeyC)),
     );
-    item(
-        &mut labels,
-        &edit,
-        "edit.paste",
-        "menu.edit.paste",
-        Some(Accelerator::new(Modifiers::META, Code::KeyV)),
-    );
     append(&app_menu, &edit);
 
     let window = Submenu::new(t!("menu.window").as_ref(), true);

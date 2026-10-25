@@ -106,11 +106,8 @@ pub enum Command {
     SaveAll,
     /// Rename the active capture.
     RenameActive,
-    /// Copy the active document (or its live selection) to the clipboard.
+    /// Copy the active document to the clipboard.
     CopyActive,
-    /// Paste the clipboard image onto the active document (Coller —
-    /// ImportClipboard is the variant that opens a new tab).
-    PasteActive,
     /// Open the Draw (Dessiner) editor on the active document.
     OpenDraw,
     /// Revert the newest pixel mutation of the active document.
@@ -393,20 +390,6 @@ impl Shared {
                 }
                 Ok(None) => tracing::info!("clipboard holds no image"),
                 Err(e) => tracing::warn!("clipboard import failed: {e}"),
-            },
-            Command::PasteActive => match crate::export::clipboard::clipboard_image() {
-                // Coller drops a floating layer on the ACTIVE document;
-                // with no document at all it falls back to a new tab.
-                Ok(Some(image)) => {
-                    let mut viewer = lock(&self.viewer);
-                    if viewer.tabs.is_empty() {
-                        viewer.push_document(Document::new(synthetic_capture(image)));
-                    } else {
-                        viewer.paste_active(image);
-                    }
-                }
-                Ok(None) => tracing::info!("clipboard holds no image"),
-                Err(e) => tracing::warn!("paste failed: {e}"),
             },
             Command::OpenFile => self.open_files(None, ctx),
             // Same picker, pre-opened in the last used folder.
