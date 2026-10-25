@@ -111,6 +111,8 @@ pub enum Command {
     /// Paste the clipboard image onto the active document (Coller —
     /// ImportClipboard is the variant that opens a new tab).
     PasteActive,
+    /// Open the Draw (Dessiner) editor on the active document.
+    OpenDraw,
     /// Revert the newest pixel mutation of the active document.
     UndoActive,
     /// Re-apply the newest reverted mutation.
@@ -152,6 +154,10 @@ fn pin_id(id: u32) -> egui::ViewportId {
 fn save_dialog_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.save_dialog")
 }
+/// The Draw (Dessiner) editor window.
+fn draw_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("pixme.draw")
+}
 
 /// Lock helper: recover a poisoned mutex rather than crash the UI thread.
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -191,6 +197,8 @@ pub struct Shared {
     next_pin_id: Mutex<u32>,
     /// The pin save-as window, open while Some.
     pub save_dialog: Mutex<Option<crate::ui::save_dialog::SaveDialog>>,
+    /// The Draw editor session, open while Some — modal to the viewer.
+    pub draw: Mutex<Option<crate::ui::draw::DrawSession>>,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -223,7 +231,9 @@ impl Shared {
     /// A modal child viewport is up (save-as, settings) — other windows
     /// dim themselves and refuse input while one is open.
     pub fn modal_child_open(&self) -> bool {
-        lock(&self.save_dialog).is_some() || self.settings_open.load(Ordering::Relaxed)
+        lock(&self.save_dialog).is_some()
+            || self.settings_open.load(Ordering::Relaxed)
+            || lock(&self.draw).is_some()
     }
 
     /// The concrete theme for the current appearance setting and OS theme.
@@ -297,6 +307,9 @@ impl Shared {
                 }
             }
             Command::ViewerClosed => {
+                if lock(&self.draw).is_some() {
+                    return;
+                }
                 let mut viewer = lock(&self.viewer);
                 if viewer.dirty {
                     viewer.confirm_close = true;
@@ -437,6 +450,18 @@ impl Shared {
                     && let Err(e) = crate::export::clipboard::copy_image(&img)
                 {
                     tracing::warn!("copy failed: {e}");
+                }
+            }
+            Command::OpenDraw => {
+                if lock(&self.draw).is_none()
+                    && let Some((tab, title, doc, undo, redo)) = lock(&self.viewer).draw_parts()
+                {
+                    let prefs = lock(&self.settings).clone();
+                    *lock(&self.draw) = Some(crate::ui::draw::DrawSession::open(
+                        doc, tab, title, undo, redo, &prefs,
+                    ));
+                    self.request_focus(draw_id());
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             }
             Command::UndoActive => {
@@ -806,6 +831,7 @@ impl PixMeApp {
                 pins: Mutex::new(Vec::new()),
                 next_pin_id: Mutex::new(0),
                 save_dialog: Mutex::new(None),
+                draw: Mutex::new(None),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
             }),
@@ -957,6 +983,46 @@ impl eframe::App for PixMeApp {
                 }
                 if let Some(pin) = lock(&shared.pins).iter_mut().find(|p| p.id == id) {
                     pin.show(ui, &shared);
+                }
+            });
+        }
+
+        // The Draw editor: modal to the viewer, edits a document clone —
+        // OK writes it (and the history stacks) back into the tab so
+        // re-entry keeps selection + chronological undo; Annuler/close
+        // drops the clone untouched.
+        if let Some(title) = lock(&self.shared.draw).as_ref().map(|d| d.title.clone()) {
+            let shared = Arc::clone(&self.shared);
+            ctx.show_viewport_deferred(draw_id(), draw_builder(&title), move |ui, _class| {
+                let ctx = ui.ctx().clone();
+                shared.pump(&ctx);
+                shared.maybe_focus(&ctx, draw_id());
+                ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    *lock(&shared.draw) = None;
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    return;
+                }
+                let outcome = {
+                    let mut guard = lock(&shared.draw);
+                    if let Some(session) = guard.as_mut() {
+                        session.show(ui, &shared);
+                    }
+                    guard.as_ref().and_then(|s| s.outcome())
+                };
+                if let Some(outcome) = outcome
+                    && let Some(session) = lock(&shared.draw).take()
+                {
+                    if outcome == crate::ui::draw::Outcome::Ok {
+                        lock(&shared.viewer).commit_draw(
+                            session.tab,
+                            session.doc,
+                            session.undo,
+                            session.redo,
+                        );
+                    }
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             });
         }
@@ -1120,6 +1186,17 @@ fn save_dialog_builder() -> egui::ViewportBuilder {
         .with_active(true)
 }
 
+/// The Draw editor: a regular resizable window (the reference opens it
+/// nearly maximised; 1100×700 reads well with the strip + options bar).
+fn draw_builder(title: &str) -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_app_id("pixme")
+        .with_inner_size([1100.0, 700.0])
+        .with_min_inner_size([640.0, 420.0])
+        .with_active(true)
+}
+
 /// The settings window: small, fixed size, titled, no taskbar entry.
 fn settings_builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
@@ -1177,6 +1254,7 @@ mod tests {
             pins: Mutex::new(Vec::new()),
             next_pin_id: Mutex::new(0),
             save_dialog: Mutex::new(None),
+            draw: Mutex::new(None),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),

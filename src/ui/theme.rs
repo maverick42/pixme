@@ -271,6 +271,7 @@ fn apply_visuals(v: &mut Visuals, dark: bool, t: Tokens) {
     v.text_edit_bg_color = Some(t.field);
     v.selection.bg_fill = t.selection;
     v.selection.stroke = Stroke::new(1.0, t.accent_text);
+    v.slider_trailing_fill = true;
 
     let shadow = Shadow {
         offset: [0, 6],
@@ -292,7 +293,7 @@ fn apply_visuals(v: &mut Visuals, dark: bool, t: Tokens) {
         expansion: 0.0,
     };
     v.widgets.inactive = egui::style::WidgetVisuals {
-        bg_fill: t.card,
+        bg_fill: t.field_border,
         weak_bg_fill: t.field,
         bg_stroke: Stroke::new(1.0, t.field_border),
         fg_stroke: text,

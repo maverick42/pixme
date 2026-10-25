@@ -568,3 +568,14 @@ Format: date — context — decision — consequences.
   with no recorded shape probes the top edge to tell oval from round.
 - **Select button**: the former "Rectangle" tool button is renamed
   "Sélection" (the menu items keep their shape names).
+
+## Draw (Dessiner) annotation editor — architecture
+
+- **Deps**: `imageproc` (default-features off, `text` feature only) + `ab_glyph` — rasterizing annotations (strokes, fills, flood fill, text, blur) to `image::RgbaImage`. One render path for canvas/viewer/export (`editor::render::render_to_image`) so WYSIWYG holds by construction.
+- **Model**: `Document.annotations: Vec<Annotation>` (non-destructive, z-ordered, stable ids); `AnnoEdit` (Add/Remove/Replace) is the only mutation channel — chronological undo/redo stacks live on the viewer `Tab` (`anno_undo`/`anno_redo`, cap 50) so they survive Draw close/reopen.
+- **Session**: `DrawSession` clones the document + stacks at open; OK writes them back (`Viewer::commit_draw`), Annuler/close drops the clone — the tab is untouched.
+- **Flatten rule**: viewer pixel ops (paste-flatten, crop, resize, opening Draw with a floating paste) bake annotations into `base.image` via `Tab::flatten()` and clear the annotation stacks — objects become non-reselectable by design.
+- **Eraser** is an opaque-colour stroke object (stays selectable/undoable); **Fill** stores its flood-fill mask computed at placement; **Blur** is a parameterized region object (Blur/Pixelate × Rect/Round/Oval).
+- **Stamps** recolour embedded Lucide SVGs (`stamp_icon` map + `raw_svg` accessor) — no FastStone assets.
+- **Options bar**: per-tool fields mirror the reference's bottom bar; the Select tool additionally exposes the selected object's own style fields (re-editable).
+- Text is rendered with the embedded Inter faces (bold → SemiBold, italic → faux shear), outline via 4-direction offset pass.

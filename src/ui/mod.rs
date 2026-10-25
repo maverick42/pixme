@@ -5,6 +5,7 @@
 //! `widgets/` — everything reads [`theme::tokens`].
 
 pub mod capture_overlay;
+pub mod draw;
 pub mod icons;
 pub mod pin;
 pub mod save_dialog;
@@ -14,7 +15,7 @@ pub mod toolbar;
 pub mod viewer;
 pub mod widgets;
 
-mod icon_data;
+pub(crate) mod icon_data;
 
 /// One-time egui setup: custom fonts and the image (SVG) loaders.
 pub fn install(ctx: &egui::Context) {

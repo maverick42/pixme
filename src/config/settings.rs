@@ -45,7 +45,7 @@ impl Appearance {
 }
 
 /// The complete persisted settings file.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// UI language: `auto` follows the OS locale.
@@ -68,10 +68,62 @@ pub struct Settings {
     /// Last folder a file was opened from — seeds File → Open and the
     /// "open last used folder" menu item.
     pub last_open_dir: Option<PathBuf>,
+    /// Text-tool colour `[r, g, b]` persisted across sessions.
+    #[serde(default = "default_text_color")]
+    pub text_color: [u8; 3],
+    /// Text-tool font family ("Arial", "Inter", …).
+    #[serde(default = "default_text_font")]
+    pub text_font: String,
+    /// Text-tool font size in px (menu 8..=72, default 12).
+    #[serde(default = "default_text_size")]
+    pub text_size: u8,
+    /// Text-tool bold toggle.
+    pub text_bold: bool,
+    /// Text-tool italic toggle.
+    pub text_italic: bool,
+    /// Text-tool outline width (0..=10).
+    pub text_outline: u8,
+    /// Text-tool outline colour `[r, g, b]`.
+    #[serde(default = "default_outline_color")]
+    pub text_outline_color: [u8; 3],
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_text_color() -> [u8; 3] {
+    [220, 40, 40]
+}
+fn default_text_font() -> String {
+    "Arial".to_owned()
+}
+fn default_text_size() -> u8 {
+    12
+}
+fn default_outline_color() -> [u8; 3] {
+    [255, 255, 255]
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            language: Language::default(),
+            appearance: Appearance::default(),
+            include_pointer: false,
+            copy_to_clipboard: false,
+            capture_delay_secs: 0,
+            delay_auto_reset: true,
+            last_save_dir: None,
+            last_open_dir: None,
+            text_color: default_text_color(),
+            text_font: default_text_font(),
+            text_size: default_text_size(),
+            text_bold: false,
+            text_italic: false,
+            text_outline: 0,
+            text_outline_color: default_outline_color(),
+        }
+    }
 }
 
 impl Settings {

@@ -63,6 +63,76 @@ pub enum Icon {
     ClipboardPaste,
     /// Print the active document.
     Printer,
+    /// Draw: select/move objects.
+    MousePointer,
+    /// Draw: rectangular text box.
+    MessageSquare,
+    /// Draw: oval text box.
+    MessageCircle,
+    /// Draw: text tool.
+    Type,
+    /// Draw: step badge tool + Info stamp.
+    Info,
+    /// Draw: straight line/arrow.
+    ArrowUpRight,
+    /// Draw: fancy arrow.
+    ArrowBigUp,
+    /// Draw: eraser.
+    Eraser,
+    /// Draw: outlined rectangle.
+    Square,
+    /// Draw: filled rectangle / highlight area.
+    SquareFill,
+    /// Draw: outlined ellipse.
+    Circle,
+    /// Draw: filled ellipse.
+    CircleFill,
+    /// Draw: line highlighter.
+    Highlighter,
+    /// Draw: bucket fill.
+    PaintBucket,
+    /// Draw: blur/pixelate.
+    Pixelate,
+    /// Draw: emoji stamps.
+    Smile,
+    /// Draw: cursor stamps.
+    MousePointerClick,
+    /// Draw: insert an image object.
+    Image,
+    /// Draw: undo.
+    Undo2,
+    /// Draw: redo.
+    Redo2,
+    /// Stamp glyph: hand.
+    Hand,
+    /// Stamp glyph: I-beam.
+    TextCursor,
+    /// Stamp glyph: ruler/dimension.
+    Ruler,
+    /// Stamp glyph: busy spinner.
+    LoaderCircle,
+    /// Stamp glyph: question badge.
+    CircleHelp,
+    /// Stamp glyph: error badge.
+    CircleX,
+    /// Stamp glyph: light-bulb note.
+    Lightbulb,
+    /// Stamp glyph: plain mouse (right button).
+    Mouse,
+    /// Text justify: left.
+    AlignLeft,
+    /// Text justify: centre.
+    AlignCenter,
+    /// Text justify: right.
+    AlignRight,
+    /// Text justify: justified.
+    AlignJustify,
+    /// Vertical align: top.
+    AlignStartVertical,
+    /// Vertical align: middle.
+    AlignCenterVertical,
+    /// Vertical align: bottom.
+    AlignEndVertical,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes
@@ -98,6 +168,28 @@ fn styled_icons() -> &'static HashMap<Icon, StyledIcon> {
 /// Whether `icon` has embedded bytes (always true; used by tests).
 pub fn exists(icon: Icon) -> bool {
     styled_icons().contains_key(&icon)
+}
+
+/// The [`Icon`] glyph a draw-mode stamp renders with.
+pub fn stamp_icon(stamp: crate::editor::document::StampId) -> Icon {
+    use crate::editor::document::StampId as S;
+    match stamp {
+        S::ArrowCursor => Icon::MousePointer,
+        S::Hand => Icon::Hand,
+        S::TextCursor => Icon::TextCursor,
+        S::Cross => Icon::Plus,
+        S::ClickLeft => Icon::MousePointerClick,
+        S::ClickRight => Icon::Mouse,
+        S::Busy => Icon::LoaderCircle,
+        S::Dimension => Icon::Ruler,
+        S::Info => Icon::Info,
+        S::Question => Icon::CircleHelp,
+        S::Error => Icon::CircleX,
+        S::Ok => Icon::Check,
+        S::Cancel => Icon::X,
+        S::Note => Icon::Lightbulb,
+        S::Smile => Icon::Smile,
+    }
 }
 
 /// An egui image for `icon`, tinted. Relies on

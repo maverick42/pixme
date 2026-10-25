@@ -18,6 +18,7 @@ use rust_i18n::t;
 
 use crate::app::{CaptureMode, Command, Shared};
 use crate::editor::Document;
+use crate::editor::history::AnnoEdit;
 use crate::ui::icons::Icon;
 use crate::ui::{theme, widgets};
 
@@ -40,6 +41,12 @@ pub struct Tab {
     undo: VecDeque<PixelOp>,
     /// Ops undone, reappliable until the next mutation clears them.
     redo: VecDeque<PixelOp>,
+    /// Chronological annotation edits — the Draw window moves them in
+    /// and out on open/commit so they survive editor re-entry; a
+    /// pixel-level flatten clears them for good.
+    pub anno_undo: VecDeque<AnnoEdit>,
+    /// Redo side of the annotation stacks.
+    pub anno_redo: VecDeque<AnnoEdit>,
 }
 
 /// How many pixel mutations stay undoable per tab. Full-image ops keep
@@ -223,6 +230,19 @@ pub struct Viewer {
 }
 
 impl Tab {
+    /// Bakes annotations into the base image and discards object-level
+    /// history — the documented "aplatie" semantics of viewer pixel ops.
+    fn flatten(&mut self) {
+        if self.doc.annotations.is_empty() && self.anno_undo.is_empty() && self.anno_redo.is_empty()
+        {
+            return;
+        }
+        self.doc.base.image = crate::editor::render::render_to_image(&self.doc);
+        self.doc.annotations.clear();
+        self.anno_undo.clear();
+        self.anno_redo.clear();
+    }
+
     /// Stacks a reversible mutation — redo dies, the oldest op beyond
     /// the cap drops off.
     fn push_op(&mut self, op: PixelOp) {
@@ -255,6 +275,8 @@ impl Viewer {
             pasted: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
+            anno_undo: VecDeque::new(),
+            anno_redo: VecDeque::new(),
         });
         self.active = self.tabs.len() - 1;
         // A new document gets a fresh view — a stale marquee/zoom would
@@ -290,6 +312,8 @@ impl Viewer {
             pasted: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
+            anno_undo: VecDeque::new(),
+            anno_redo: VecDeque::new(),
         });
     }
 
@@ -327,12 +351,64 @@ impl Viewer {
         self.active_index().map(|i| &self.tabs[i].doc)
     }
 
+    /// `(tab index, doc clone, anno stacks)` — opening Draw snapshots
+    /// the document while its history stays on the tab until commit.
+    /// A floating paste flattens first so it isn't lost by the session.
+    #[allow(clippy::type_complexity)]
+    pub fn draw_parts(
+        &mut self,
+    ) -> Option<(
+        usize,
+        String,
+        Document,
+        VecDeque<AnnoEdit>,
+        VecDeque<AnnoEdit>,
+    )> {
+        let i = self.active_index()?;
+        if self.tabs[i].pasted.is_some() {
+            self.commit_paste(i);
+        }
+        let tab = &self.tabs[i];
+        Some((
+            i,
+            tab.title.clone(),
+            tab.doc.clone(),
+            tab.anno_undo.clone(),
+            tab.anno_redo.clone(),
+        ))
+    }
+
+    /// Draw's OK: the session's document and annotation stacks replace
+    /// the tab's — objects stay re-editable on the next entry.
+    pub fn commit_draw(
+        &mut self,
+        tab: usize,
+        doc: Document,
+        undo: VecDeque<AnnoEdit>,
+        redo: VecDeque<AnnoEdit>,
+    ) {
+        let Some(t) = self.tabs.get_mut(tab) else {
+            return;
+        };
+        t.doc = doc;
+        t.doc.revision += 1;
+        t.anno_undo = undo;
+        t.anno_redo = redo;
+        t.saved = false;
+        t.pasted = None;
+        self.dirty = true;
+        self.selection = None;
+        self.selection_shape = None;
+    }
+
     /// `(index, title, base capture)` of the active tab — everything the
     /// save-as dialog needs to own (the capture is cloned).
     pub fn save_target(&self) -> Option<(usize, String, crate::capture::Capture)> {
         let i = self.active_index()?;
         let tab = &self.tabs[i];
-        Some((i, tab.title.clone(), tab.doc.base.clone()))
+        let mut capture = tab.doc.base.clone();
+        capture.image = crate::editor::render::render_to_image(&tab.doc);
+        Some((i, tab.title.clone(), capture))
     }
 
     /// Opens the rename prompt on the active tab (File → Rename).
@@ -346,7 +422,8 @@ impl Viewer {
     /// is live, the whole document otherwise.
     pub fn copy_image(&mut self) -> Option<image::RgbaImage> {
         let i = self.active_index()?;
-        let img = &self.tabs[i].doc.base.image;
+        let img = crate::editor::render::render_to_image(&self.tabs[i].doc);
+        let img = &img;
         let mut out = match self.selection {
             Some(sel) => {
                 let sel = clamp_to_image(sel, img.width(), img.height());
@@ -388,7 +465,7 @@ impl Viewer {
     /// The whole document image, for print (selections don't apply).
     pub fn active_image(&self) -> Option<image::RgbaImage> {
         let i = self.active_index()?;
-        Some(self.tabs[i].doc.base.image.clone())
+        Some(crate::editor::render::render_to_image(&self.tabs[i].doc))
     }
 
     /// The active tab's title, for the rename prompt's initial value.
@@ -447,6 +524,7 @@ impl Viewer {
             .image
             .height()
             .min(tab.doc.base.image.height().saturating_sub(y));
+        tab.flatten();
         let under = image::imageops::crop_imm(&tab.doc.base.image, x, y, vis_w, vis_h).to_image();
         image::imageops::overlay(
             &mut tab.doc.base.image,
@@ -459,7 +537,6 @@ impl Viewer {
             pasted: pasted.image,
             under,
         });
-        tab.doc.annotations.clear();
         tab.doc.revision += 1;
         tab.saved = false;
         self.dirty = true;
@@ -523,6 +600,7 @@ impl Viewer {
         // A floating paste flattens before the image changes under it.
         self.commit_paste(i);
         let tab = &mut self.tabs[i];
+        tab.flatten();
         let sel = clamp_to_image(sel, tab.doc.base.image.width(), tab.doc.base.image.height());
         if sel.width() < 1.0 || sel.height() < 1.0 {
             return;
@@ -538,7 +616,6 @@ impl Viewer {
             image::imageops::crop_imm(&tab.doc.base.image, rect.0, rect.1, rect.2, rect.3)
                 .to_image();
         tab.push_op(PixelOp::Crop { before, rect });
-        tab.doc.annotations.clear();
         tab.doc.revision += 1;
         tab.saved = false;
         self.dirty = true;
@@ -557,6 +634,7 @@ impl Viewer {
         // A floating paste flattens before the image changes under it.
         self.commit_paste(i);
         let tab = &mut self.tabs[i];
+        tab.flatten();
         let before = tab.doc.base.image.clone();
         tab.doc.base.image = image::imageops::resize(
             &tab.doc.base.image,
@@ -573,7 +651,6 @@ impl Viewer {
             size: (w, h),
             antialias,
         });
-        tab.doc.annotations.clear();
         tab.doc.revision += 1;
         tab.saved = false;
         self.dirty = true;
@@ -819,15 +896,18 @@ impl Viewer {
                             }
                             zoom_menu(ui, &r, self, menu_clicked);
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            // Draw mode lands in the next phase: visible, disabled.
-                            widgets::tool_button(
+                            if widgets::tool_button(
                                 ui,
                                 Icon::Pencil,
                                 &t!("vbar.draw.label"),
                                 false,
                                 false,
-                                false,
-                            );
+                                has_doc,
+                            )
+                            .clicked()
+                            {
+                                shared.push(crate::app::Command::OpenDraw);
+                            }
                             if widgets::tool_button(
                                 ui,
                                 Icon::Scaling,
@@ -1040,12 +1120,10 @@ impl Viewer {
         // logical size (image px ÷ scale factor). Fit mode never upscales.
         let sf = tab.doc.base.scale_factor.max(0.25);
         if tab.texture.as_ref().map(|(rev, _)| *rev) != Some(tab.doc.revision) {
+            let composited = crate::editor::render::render_to_image(&tab.doc);
             let handle = ui.ctx().load_texture(
                 format!("doc-{index}-{}", tab.doc.revision),
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [img_w, img_h],
-                    tab.doc.base.image.as_raw(),
-                ),
+                egui::ColorImage::from_rgba_unmultiplied([img_w, img_h], composited.as_raw()),
                 egui::TextureOptions::LINEAR,
             );
             tab.texture = Some((tab.doc.revision, handle));
@@ -1697,6 +1775,8 @@ mod tests {
             pasted: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
+            anno_undo: VecDeque::new(),
+            anno_redo: VecDeque::new(),
         });
         v.active = v.tabs.len() - 1;
     }
@@ -1867,6 +1947,8 @@ mod clipboard_chain_tests {
             pasted: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
+            anno_undo: VecDeque::new(),
+            anno_redo: VecDeque::new(),
         });
         v.active = 0;
         v.selection = Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(20.0, 20.0)));

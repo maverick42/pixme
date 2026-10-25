@@ -1,32 +1,189 @@
-//! Undo/redo: edits are reversible operations on the [`Document`].
+//! Undo/redo for the annotation list — chronological, reversible edits.
 //!
-//! Every mutation goes through [`History::push`], which applies the edit,
-//! records it for undo and clears the redo stack.
+//! Every draw-window mutation goes through [`AnnoEdit`]: apply performs
+//! it, `revert` undoes exactly what apply did. The stacks themselves
+//! live on the viewer `Tab` (they survive draw-window re-entry and die
+//! with the tab, or when a pixel op flattens the document).
 
-use super::Document;
+use super::document::{Annotation, AnnotationId, Document};
 
-/// A reversible document mutation.
-pub trait Edit {
-    /// Applies the edit.
-    fn apply(&self, doc: &mut Document);
-    /// Undoes exactly what [`Edit::apply`] did.
-    fn revert(&self, doc: &mut Document);
-    /// Short description for debugging (`tracing`), not user-facing.
-    fn describe(&self) -> &'static str;
+/// How many annotation edits stay undoable per tab. Annotation payloads
+/// are small (a few KB; bitmap-carrying objects a few MB at most), so a
+/// generous cap costs little.
+pub const ANNO_HISTORY_CAP: usize = 50;
+
+/// A reversible edit of a [`Document`]'s annotation list.
+#[derive(Clone, Debug)]
+pub enum AnnoEdit {
+    /// `anno` was inserted at `index`.
+    Add { anno: Annotation, index: usize },
+    /// `anno` was removed from `index`.
+    Remove { anno: Annotation, index: usize },
+    /// `before` was mutated into `after` (style, geometry, content).
+    Replace {
+        before: Annotation,
+        after: Annotation,
+    },
 }
 
-/// The undo/redo stacks of one document.
-#[derive(Default)]
-pub struct History {
-    past: Vec<Box<dyn Edit>>,
-    future: Vec<Box<dyn Edit>>,
+impl AnnoEdit {
+    /// Performs the edit on `doc`'s annotation list.
+    pub fn apply(&self, doc: &mut Document) {
+        match self {
+            Self::Add { anno, index } => {
+                doc.annotations
+                    .insert((*index).min(doc.annotations.len()), anno.clone());
+            }
+            Self::Remove { anno, .. } => remove_by_id(doc, anno.id),
+            Self::Replace { after, .. } => {
+                if let Some(slot) = doc.annotations.iter_mut().find(|a| a.id == after.id) {
+                    *slot = after.clone();
+                }
+            }
+        }
+    }
+
+    /// Undoes exactly what [`Self::apply`] did.
+    pub fn revert(&self, doc: &mut Document) {
+        match self {
+            Self::Add { anno, .. } => remove_by_id(doc, anno.id),
+            Self::Remove { anno, index } => {
+                doc.annotations
+                    .insert((*index).min(doc.annotations.len()), anno.clone());
+            }
+            Self::Replace { before, .. } => {
+                if let Some(slot) = doc.annotations.iter_mut().find(|a| a.id == before.id) {
+                    *slot = before.clone();
+                }
+            }
+        }
+    }
 }
 
-impl History {
-    /// Applies `edit` and records it for undo. (Phase 4: apply + push.)
-    pub fn push(&mut self, _doc: &mut Document, _edit: Box<dyn Edit>) {}
-    /// Reverts the most recent edit, if any. (Phase 4.)
-    pub fn undo(&mut self, _doc: &mut Document) {}
-    /// Re-applies the most recently undone edit, if any. (Phase 4.)
-    pub fn redo(&mut self, _doc: &mut Document) {}
+/// Removes the annotation with `id`, if present.
+fn remove_by_id(doc: &mut Document, id: AnnotationId) {
+    if let Some(i) = doc.annotations.iter().position(|a| a.id == id) {
+        doc.annotations.remove(i);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{Capture, MonitorInfo, PhysicalRect};
+    use crate::editor::document::{AnnotationKind, AreaShape, BlurObj, BlurStyle, RectObj};
+    use egui::Color32;
+
+    fn doc() -> Document {
+        Document::new(Capture {
+            image: image::RgbaImage::from_pixel(40, 40, image::Rgba([20, 30, 40, 255])),
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        })
+    }
+
+    fn rect_anno(id: u64) -> Annotation {
+        Annotation {
+            id,
+            kind: AnnotationKind::Rect(RectObj {
+                rect: PhysicalRect {
+                    x: 4,
+                    y: 4,
+                    width: 10,
+                    height: 10,
+                },
+                stroke: Color32::RED,
+                stroke_w: 2.0,
+                dash: super::super::document::Dash::Solid,
+                fill: None,
+                radius: 0.0,
+                opacity: 1.0,
+                shadow: 0.0,
+            }),
+        }
+    }
+
+    /// Add → Replace → Remove round-trips through apply/revert.
+    #[test]
+    fn anno_edit_round_trip() {
+        let mut d = doc();
+        let add = AnnoEdit::Add {
+            anno: rect_anno(7),
+            index: 0,
+        };
+        add.apply(&mut d);
+        assert_eq!(d.annotations.len(), 1);
+        let mut after = rect_anno(7);
+        if let AnnotationKind::Rect(o) = &mut after.kind {
+            o.stroke = Color32::BLUE;
+        }
+        let before = d.annotation(7).unwrap().clone();
+        AnnoEdit::Replace { before, after }.apply(&mut d);
+        let mut hit_blue = false;
+        if let AnnotationKind::Rect(o) = &d.annotation(7).unwrap().kind {
+            hit_blue = o.stroke == Color32::BLUE;
+        }
+        assert!(hit_blue);
+        AnnoEdit::Remove {
+            anno: rect_anno(7),
+            index: 0,
+        }
+        .apply(&mut d);
+        assert!(d.annotations.is_empty());
+        // Revert chain restores each step exactly.
+        AnnoEdit::Remove {
+            anno: rect_anno(7),
+            index: 0,
+        }
+        .revert(&mut d);
+        AnnoEdit::Replace {
+            before: d.annotation(7).unwrap().clone(),
+            after: {
+                let mut a = rect_anno(7);
+                if let AnnotationKind::Rect(o) = &mut a.kind {
+                    o.stroke = Color32::BLUE;
+                }
+                a
+            },
+        }
+        .revert(&mut d);
+        if let AnnotationKind::Rect(o) = &d.annotation(7).unwrap().kind {
+            assert_eq!(o.stroke, Color32::RED);
+        }
+    }
+
+    /// A blur annotation actually changes the pixels it covers.
+    #[test]
+    fn blur_renders() {
+        let mut d = doc();
+        d.annotations.push(Annotation {
+            id: 0,
+            kind: AnnotationKind::Blur(BlurObj {
+                rect: PhysicalRect {
+                    x: 5,
+                    y: 5,
+                    width: 20,
+                    height: 20,
+                },
+                style: BlurStyle::Pixelate,
+                shape: AreaShape::Rect,
+                strength: 30,
+            }),
+        });
+        let out = crate::editor::render::render_to_image(&d);
+        assert_eq!(out.get_pixel(0, 0).0, [20, 30, 40, 255]);
+        // Pixelated region shows averaged colour (uniform here → same).
+        assert_eq!(out.get_pixel(10, 10).0[3], 255);
+    }
 }
