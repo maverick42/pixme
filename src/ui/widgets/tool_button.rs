@@ -31,10 +31,13 @@ pub fn tool_button(
 ) -> Response {
     let t = theme::tokens(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(Vec2::new(TOOL_W, TOOL_H), Sense::click());
-    let (icon_tint, text_col) = if enabled {
-        (t.icon, t.text)
-    } else {
+    let (icon_tint, text_col) = if !enabled {
         (t.text_faint, t.text_faint)
+    } else if response.hovered() {
+        // Hover pops: accent icon + soft ring over the tinted fill.
+        (t.accent, t.text)
+    } else {
+        (t.icon, t.text)
     };
     if ui.is_rect_visible(rect) {
         let (fill, stroke) = if !enabled {
@@ -44,7 +47,7 @@ pub fn tool_button(
         } else if selected {
             (t.accent_soft, Stroke::new(1.0, t.accent_border))
         } else if response.hovered() {
-            (t.hover, Stroke::NONE)
+            (t.hover, Stroke::new(1.0, t.accent_soft))
         } else {
             (Color32::TRANSPARENT, Stroke::NONE)
         };

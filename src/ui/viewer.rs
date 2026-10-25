@@ -698,6 +698,15 @@ impl Viewer {
         // Explicit fill: the app-wide clear color is transparent (the anchor
         // and the floating bar need it), so windows must paint their own.
         let t = theme::tokens(&ctx);
+        egui::Panel::bottom("viewer.status")
+            .frame(
+                egui::Frame::default()
+                    .inner_margin(Margin::symmetric(12, 4))
+                    .fill(t.dock),
+            )
+            .show(ui, |ui| {
+                self.status_strip(ui);
+            });
         CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -729,6 +738,42 @@ impl Viewer {
         self.rename_dialog(&ctx);
         self.protect_dialog(&ctx);
         self.delete_file_dialog(&ctx);
+    }
+
+    /// The bottom status strip: capture count, active image dimensions
+    /// and the app version.
+    fn status_strip(&mut self, ui: &mut egui::Ui) {
+        let t = theme::tokens(ui.ctx());
+        ui.horizontal(|ui| {
+            let n = self.tabs.len();
+            let i = self.active_index().map(|x| x + 1).unwrap_or(0);
+            ui.label(
+                egui::RichText::new(t!("vbar.status.count", i = i, n = n).to_string())
+                    .color(t.text_dim)
+                    .size(10.0),
+            );
+            if let Some((w, h)) = self.active_dims() {
+                ui.label(
+                    egui::RichText::new(format!("{w}×{h}"))
+                        .color(t.text_dim)
+                        .size(10.0),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .color(t.text_faint)
+                        .size(10.0),
+                );
+            });
+        });
+    }
+
+    /// The active tab's image dimensions, in physical pixels.
+    fn active_dims(&self) -> Option<(u32, u32)> {
+        let index = self.active_index()?;
+        let tab = &self.tabs[index];
+        Some((tab.doc.base.image.width(), tab.doc.base.image.height()))
     }
 
     /// The action band: large icon-over-label buttons — the functional
@@ -1089,6 +1134,12 @@ impl Viewer {
     /// the cross closes (never a warning — the red dot is the warning);
     /// secondary click opens the options menu at the pointer.
     fn tab_item(&mut self, ui: &mut egui::Ui, index: usize, shared: &Shared) {
+        // A previous chip in this same frame may have closed tabs (the
+        // cross or the context menu mutate the list mid-iteration) —
+        // the index is only valid while the tab still exists.
+        if index >= self.tabs.len() {
+            return;
+        }
         let t = theme::tokens(ui.ctx());
         let tab = &self.tabs[index];
         let (title, dirty, protected) =
