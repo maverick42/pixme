@@ -664,7 +664,13 @@ impl Viewer {
         // convention works everywhere in the window — text edits keep
         // their own handling.
         if !modal_open && !ctx.egui_wants_keyboard_input() {
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::C)) {
+            // `egui_winit` translates ⌘/Ctrl+C into `Event::Copy` instead of
+            // `Event::Key(Key::C)`, so check both.
+            let copy = ctx.input(|i| {
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                    || (i.modifiers.command && i.key_pressed(egui::Key::C))
+            });
+            if copy {
                 shared.push(Command::CopyActive);
                 // The push lands mid-frame: wake the next pass so
                 // pump() dispatches it even without mouse activity.

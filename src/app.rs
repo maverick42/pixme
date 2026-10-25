@@ -448,10 +448,20 @@ impl Shared {
                 }
             }
             Command::UndoActive => {
-                lock(&self.viewer).undo_active();
+                if let Some(draw) = lock(&self.draw).as_mut() {
+                    draw.undo_once();
+                    ctx.request_repaint_of(draw_id());
+                } else {
+                    lock(&self.viewer).undo_active();
+                }
             }
             Command::RedoActive => {
-                lock(&self.viewer).redo_active();
+                if let Some(draw) = lock(&self.draw).as_mut() {
+                    draw.redo_once();
+                    ctx.request_repaint_of(draw_id());
+                } else {
+                    lock(&self.viewer).redo_active();
+                }
             }
             Command::PrintActive => {
                 if let Some(img) = lock(&self.viewer).active_image()
@@ -993,9 +1003,11 @@ impl eframe::App for PixMeApp {
                 ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
                 if ctx.input(|i| i.viewport().close_requested()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    *lock(&shared.draw) = None;
-                    ctx.request_repaint_of(egui::ViewportId::ROOT);
-                    return;
+                    // The session decides: quit silently when clean, or
+                    // warn about pending edits first.
+                    if let Some(session) = lock(&shared.draw).as_mut() {
+                        session.request_cancel();
+                    }
                 }
                 let outcome = {
                     let mut guard = lock(&shared.draw);

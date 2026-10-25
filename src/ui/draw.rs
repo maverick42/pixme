@@ -32,6 +32,8 @@ use crate::ui::{theme, widgets};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
     Select,
+    /// The marquee: frames a region for cut/copy/paste/delete/blur/fill.
+    SelectArea,
     TextBoxRect,
     TextBoxOval,
     Text,
@@ -54,8 +56,9 @@ enum Tool {
 
 impl Tool {
     /// The strip grid in display order (row-major, two columns).
-    const ALL: [Tool; 19] = [
+    const ALL: [Tool; 20] = [
         Self::Select,
+        Self::SelectArea,
         Self::TextBoxRect,
         Self::TextBoxOval,
         Self::Text,
@@ -79,6 +82,7 @@ impl Tool {
     fn icon(self) -> Icon {
         match self {
             Self::Select => Icon::MousePointer,
+            Self::SelectArea => Icon::SquareDashed,
             Self::TextBoxRect => Icon::MessageSquare,
             Self::TextBoxOval => Icon::MessageCircle,
             Self::Text => Icon::Type,
@@ -103,6 +107,7 @@ impl Tool {
     fn tip(self) -> std::borrow::Cow<'static, str> {
         match self {
             Self::Select => t!("draw.tool.select"),
+            Self::SelectArea => t!("draw.tool.selarea"),
             Self::TextBoxRect => t!("draw.tool.textbox_rect"),
             Self::TextBoxOval => t!("draw.tool.textbox_oval"),
             Self::Text => t!("draw.tool.text"),
@@ -265,6 +270,25 @@ enum Drag {
         id: AnnotationId,
         before: Annotation,
     },
+    /// Framing a marquee region (SelectArea tool).
+    Marquee { anchor: Pos2 },
+    /// Press inside a live marquee — becomes a pixel move once the drag
+    /// travels (a plain click keeps the selection).
+    MoveSel { start: Pos2 },
+    /// Dragging one of the marquee's 8 resize anchors (0..=7, same
+    /// order as object handles).
+    SelResize { handle: usize },
+}
+
+/// The marquee's live region (SelectArea tool) — a transient frame over
+/// the canvas, not an annotation: its ops act on the rendered pixels.
+#[derive(Clone, Copy, Debug)]
+struct SelArea {
+    /// Selected bounds, image physical px (normalised).
+    rect: Rect,
+    /// Colour of the pixel where the drag started — the fill colour
+    /// painted under the region on move / cut / delete.
+    seed: Color32,
 }
 
 /// The floating "Texte" edit panel: edits the object live and commits
@@ -303,11 +327,23 @@ pub struct DrawSession {
     opts: Opts,
     selected: Option<AnnotationId>,
     drag: Option<Drag>,
+    /// The live marquee (SelectArea) — cleared on tool switch, Escape,
+    /// click-outside, or when the region is lifted into an object.
+    sel_area: Option<SelArea>,
+    /// Ids of the fill patches painted under moved/cut regions: they are
+    /// annotations (chronological undo) but pixel-like — not pickable.
+    sel_patches: Vec<AnnotationId>,
+    /// True when `Event::Paste` already fired on the key-down of ⌘/Ctrl+V,
+    /// so the matching `Key::V` release does not paste a second time.
+    paste_on_press: bool,
     text_panel: Option<TextPanel>,
     zoom: Option<f32>,
     texture: Option<TextureHandle>,
     rendered_rev: u64,
     outcome: Option<Outcome>,
+    /// The unsaved-changes confirmation is up (Échap/Annuler/close with
+    /// edits pending).
+    confirm_quit: bool,
     /// Last pointer position in image coords (shape-drag end point).
     last_pointer: Option<Pos2>,
     /// The canvas rect of the document image (set every frame).
@@ -336,11 +372,15 @@ impl DrawSession {
             opts: Opts::from_settings(prefs),
             selected: None,
             drag: None,
+            sel_area: None,
+            sel_patches: Vec::new(),
+            paste_on_press: false,
             text_panel: None,
             zoom: None,
             texture: None,
             rendered_rev: u64::MAX,
             outcome: None,
+            confirm_quit: false,
             last_pointer: None,
             img_rect: Rect::NOTHING,
             canvas_scale: 1.0,
@@ -350,6 +390,17 @@ impl DrawSession {
     /// The resolved end-of-session, if any.
     pub fn outcome(&self) -> Option<Outcome> {
         self.outcome
+    }
+
+    /// Cancels the session — discarding edits is only silent when there
+    /// are none; otherwise the user confirms through a warning box.
+    /// Called by Annuler, Escape and the window's close control.
+    pub fn request_cancel(&mut self) {
+        if self.undo.is_empty() {
+            self.outcome = Some(Outcome::Cancel);
+        } else {
+            self.confirm_quit = true;
+        }
     }
 
     /// Applies an edit chronologically (kills redo, bumps revision).
@@ -363,7 +414,7 @@ impl DrawSession {
         self.doc.revision += 1;
     }
 
-    fn undo_once(&mut self) {
+    pub fn undo_once(&mut self) {
         if let Some(edit) = self.undo.pop_back() {
             edit.revert(&mut self.doc);
             self.redo.push_back(edit);
@@ -372,7 +423,7 @@ impl DrawSession {
         }
     }
 
-    fn redo_once(&mut self) {
+    pub fn redo_once(&mut self) {
         if let Some(edit) = self.redo.pop_back() {
             edit.apply(&mut self.doc);
             self.undo.push_back(edit);
@@ -404,6 +455,10 @@ impl DrawSession {
     /// Topmost annotation under `p` (image coords), inflated by stroke.
     fn hit(&self, p: Pos2, scale: f32) -> Option<AnnotationId> {
         for a in self.doc.annotations.iter().rev() {
+            // Marquee fill patches read as pixels, not objects.
+            if self.sel_patches.contains(&a.id) {
+                continue;
+            }
             let extra = match &a.kind {
                 AnnotationKind::Line(o) => o.width + 6.0,
                 AnnotationKind::Fancy(o) => o.width * 2.0 + 8.0,
@@ -486,6 +541,37 @@ impl DrawSession {
             .show(ui, |ui| self.options_bar(ui, shared));
         egui::CentralPanel::default().show(ui, |ui| self.canvas(ui));
         self.text_panel_window(ui.ctx(), shared);
+        self.quit_dialog(ui.ctx());
+    }
+
+    /// The unsaved-changes warning — Discard drops the whole clone,
+    /// Continue editing stays in the session.
+    fn quit_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_quit {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(t!("draw.quit.title").to_string())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(t!("draw.quit.body").to_string());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t!("draw.quit.stay").to_string()).clicked() {
+                        self.confirm_quit = false;
+                    }
+                    if ui.button(t!("draw.quit.discard").to_string()).clicked() {
+                        self.confirm_quit = false;
+                        self.outcome = Some(Outcome::Cancel);
+                    }
+                });
+            });
+        if !open {
+            self.confirm_quit = false;
+        }
     }
 
     /// Keyboard: ⌘Z/⇧⌘Z/Ctrl+Y, Delete/Backspace, Esc = Annuler.
@@ -493,25 +579,64 @@ impl DrawSession {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let undo = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z));
+        // ⇧⌘Z before ⌘Z — `consume_key(COMMAND, Z)` ignores extra Shift
+        // and would swallow ⇧⌘Z if checked first.
         let redo = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::Z)
-                || i.consume_key(egui::Modifiers::CTRL, Key::Y)
+                || i.consume_key(egui::Modifiers::COMMAND, Key::Y)
         });
-        if undo {
-            self.undo_once();
-        }
+        let undo = !redo && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z));
         if redo {
             self.redo_once();
+        } else if undo {
+            self.undo_once();
+        }
+        // `egui_winit` intercepts ⌘/Ctrl+X/C/V before emitting `Event::Key`:
+        // it emits `Event::Cut` / `Event::Copy` on press, and for paste it
+        // only emits `Event::Paste` when the clipboard holds non-empty text
+        // (for an image-only clipboard the press is swallowed and only the
+        // `Key::V` release reaches egui).
+        let (copy, cut, paste) = ctx.input(|i| {
+            let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                || (i.modifiers.command && i.key_pressed(Key::C));
+            let cut = i.events.iter().any(|e| matches!(e, egui::Event::Cut))
+                || (i.modifiers.command && i.key_pressed(Key::X));
+            let paste_ev = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+                || (i.modifiers.command && i.key_pressed(Key::V));
+            let v_rel = i.modifiers.command && i.key_released(Key::V);
+            let paste = if paste_ev {
+                self.paste_on_press = true;
+                true
+            } else if v_rel {
+                !std::mem::replace(&mut self.paste_on_press, false)
+            } else {
+                false
+            };
+            (copy, cut, paste)
+        });
+        if copy && self.sel_area.is_some() {
+            self.sel_copy();
+        }
+        if cut && self.sel_area.is_some() {
+            self.sel_cut();
+        }
+        if paste {
+            self.sel_paste();
         }
         if ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
-            self.delete_selected();
+            if self.sel_area.is_some() {
+                self.sel_delete();
+            } else {
+                self.delete_selected();
+            }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             if self.text_panel.is_some() {
                 self.close_text_panel();
+            } else if self.sel_area.is_some() {
+                self.sel_area = None;
             } else {
-                self.outcome = Some(Outcome::Cancel);
+                self.request_cancel();
             }
         }
     }
@@ -596,6 +721,7 @@ impl DrawSession {
             return;
         }
         self.tool = tool;
+        self.sel_area = None;
         self.close_text_panel();
     }
 
@@ -626,6 +752,220 @@ impl DrawSession {
                 opacity: 1.0,
                 shadow: 0.0,
             }));
+        }
+    }
+
+    // ── Marquee selection (SelectArea) ─────────────────────────────
+
+    /// Colour of the rendered document pixel at `p` — what the marquee
+    /// memorises to fill the hole a move/cut/delete leaves behind.
+    fn pixel_at(&self, p: Pos2) -> Color32 {
+        let img = render::render_to_image(&self.doc);
+        let (w, h) = (img.width() as i64, img.height() as i64);
+        let x = (p.x as i64).clamp(0, (w - 1).max(0)) as u32;
+        let y = (p.y as i64).clamp(0, (h - 1).max(0)) as u32;
+        let px = img.get_pixel(x, y).0;
+        Color32::from_rgba_unmultiplied(px[0], px[1], px[2], 255)
+    }
+
+    /// Which of the marquee's 8 resize anchors sits under `p` (image
+    /// coords) — same index order as object handles.
+    fn sel_handle_at(&self, p: Pos2, scale: f32) -> Option<usize> {
+        let sel = self.sel_area?;
+        let r = sel.rect;
+        let grab = 10.0 / scale.max(0.05);
+        let pts = [
+            r.left_top(),
+            pos2(r.center().x, r.top()),
+            r.right_top(),
+            pos2(r.right(), r.center().y),
+            r.right_bottom(),
+            pos2(r.center().x, r.bottom()),
+            r.left_bottom(),
+            pos2(r.left(), r.center().y),
+        ];
+        pts.iter().position(|q| p.distance(*q) < grab)
+    }
+
+    /// The live marquee clamped to the image bounds, as a physical rect.
+    fn sel_phys(&self) -> Option<PhysicalRect> {
+        let sel = self.sel_area?;
+        let bounds = Rect::from_min_size(
+            Pos2::ZERO,
+            vec2(
+                self.doc.base.image.width() as f32,
+                self.doc.base.image.height() as f32,
+            ),
+        );
+        let r = sel.rect.intersect(bounds);
+        if r.width() < 1.0 || r.height() < 1.0 {
+            return None;
+        }
+        Some(PhysicalRect {
+            x: r.min.x as i32,
+            y: r.min.y as i32,
+            width: r.width() as u32,
+            height: r.height() as u32,
+        })
+    }
+
+    /// The marquee's rendered pixels (base + annotations), cropped.
+    fn sel_pixels(&self) -> Option<image::RgbaImage> {
+        let r = self.sel_phys()?;
+        let img = render::render_to_image(&self.doc);
+        Some(image::imageops::crop_imm(&img, r.x as u32, r.y as u32, r.width, r.height).to_image())
+    }
+
+    /// Paints `color` over `r` — a plain filled-rect annotation, so it
+    /// stays a chronological undoable edit. The patch reads as pixels:
+    /// its id is recorded so hit-testing skips it.
+    fn fill_rect(&mut self, r: PhysicalRect, color: Color32) {
+        let index = self.doc.annotations.len();
+        let id = self.doc.alloc_id();
+        self.sel_patches.push(id);
+        self.apply(AnnoEdit::Add {
+            anno: Annotation {
+                id,
+                kind: AnnotationKind::Rect(RectObj {
+                    rect: r,
+                    stroke: color,
+                    stroke_w: 0.0,
+                    dash: Dash::Solid,
+                    fill: Some(color),
+                    radius: 0.0,
+                    opacity: 1.0,
+                    shadow: 0.0,
+                }),
+            },
+            index,
+        });
+    }
+
+    /// Paints `color` over the live marquee.
+    fn sel_fill(&mut self, color: Color32) {
+        if let Some(r) = self.sel_phys() {
+            self.fill_rect(r, color);
+        }
+    }
+
+    /// Copier: the marquee's pixels go to the OS clipboard. The frame
+    /// stays live so another op can follow.
+    fn sel_copy(&mut self) {
+        if let Some(img) = self.sel_pixels()
+            && let Err(e) = crate::export::clipboard::copy_image(&img)
+        {
+            tracing::warn!("selection copy failed: {e}");
+        }
+    }
+
+    /// Couper: copy, then fill the hole with the seed colour.
+    fn sel_cut(&mut self) {
+        let Some(sel) = self.sel_area else { return };
+        if let Some(img) = self.sel_pixels()
+            && let Err(e) = crate::export::clipboard::copy_image(&img)
+        {
+            tracing::warn!("selection cut failed: {e}");
+        }
+        self.sel_fill(sel.seed);
+        self.sel_area = None;
+    }
+
+    /// Supprimer: the region is filled with the seed colour.
+    fn sel_delete(&mut self) {
+        let Some(sel) = self.sel_area else { return };
+        self.sel_fill(sel.seed);
+        self.sel_area = None;
+    }
+
+    /// Flou: a parametric blur annotation covering the marquee.
+    fn sel_blur(&mut self, pct: u8) {
+        let Some(r) = self.sel_phys() else { return };
+        let index = self.doc.annotations.len();
+        let id = self.doc.alloc_id();
+        self.apply(AnnoEdit::Add {
+            anno: Annotation {
+                id,
+                kind: AnnotationKind::Blur(BlurObj {
+                    rect: r,
+                    style: BlurStyle::Blur,
+                    shape: AreaShape::Rect,
+                    strength: pct,
+                }),
+            },
+            index,
+        });
+    }
+
+    /// Coller: the clipboard image drops in as a movable Picture object
+    /// (at the marquee's corner when one is live, centred otherwise).
+    fn sel_paste(&mut self) {
+        let Ok(Some(img)) = crate::export::clipboard::clipboard_image() else {
+            return;
+        };
+        let (doc_w, doc_h) = (
+            self.doc.base.image.width() as i32,
+            self.doc.base.image.height() as i32,
+        );
+        let pos = self
+            .sel_area
+            .map(|s| (s.rect.min.x as i32, s.rect.min.y as i32));
+        self.sel_area = None;
+        // The pasted object is meant to be moved right away — hand the
+        // pointer tool over so a drag grabs it instead of framing a new
+        // marquee.
+        self.tool = Tool::Select;
+        let (w, h) = (img.width(), img.height());
+        let (x, y) = pos.unwrap_or((
+            ((doc_w - w as i32) / 2).max(0),
+            ((doc_h - h as i32) / 2).max(0),
+        ));
+        self.add(AnnotationKind::Picture(PicObj {
+            rect: PhysicalRect {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+            image: img,
+            opacity: 1.0,
+            shadow: 0.0,
+        }));
+    }
+
+    /// A drag inside the marquee lifts its pixels: the region is cropped
+    /// out of the rendered document, the hole is filled with the seed
+    /// colour, and the pixels become a movable Picture object.
+    fn sel_lift(&mut self, start: Pos2) {
+        let Some(sel) = self.sel_area else {
+            return;
+        };
+        let Some(r) = self.sel_phys() else {
+            return;
+        };
+        let Some(img) = self.sel_pixels() else {
+            return;
+        };
+        self.sel_area = None;
+        // The hole left behind is painted with the seed pixel's colour —
+        // the rect was computed while the marquee was still live.
+        self.fill_rect(r, sel.seed);
+        self.add(AnnotationKind::Picture(PicObj {
+            rect: r,
+            image: img,
+            opacity: 1.0,
+            shadow: 0.0,
+        }));
+        // Continue the press as a plain object move on the new picture;
+        // after release the pointer tool keeps it re-grabbable.
+        self.tool = Tool::Select;
+        if let Some(id) = self.selected
+            && let Some(before) = self.doc.annotation(id).cloned()
+        {
+            self.drag = Some(Drag::Moving {
+                id,
+                before,
+                last: start,
+            });
         }
     }
 
@@ -722,17 +1062,25 @@ impl DrawSession {
             .as_ref()
             .is_some_and(|p| p.is_box && Some(p.id) == self.selected);
         let on_handle = !panel_hides_chrome
-            && self
+            && (self
                 .selected
                 .and_then(|id| self.handle_at(id, img_p, scale))
-                .is_some();
+                .is_some()
+                || self.sel_handle_at(img_p, scale).is_some());
         let hit_id = self.hit(img_p, scale);
-        let can_pick_existing = !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::Fill)
-            && !matches!(self.drag, Some(Drag::Shape { .. } | Drag::Freehand { .. }));
+        // The marquee tool works on regions, not objects — it never
+        // picks them (same for the pure pixel tools).
+        let can_pick_existing =
+            !matches!(
+                self.tool,
+                Tool::Eraser | Tool::Blur | Tool::Fill | Tool::SelectArea
+            ) && !matches!(self.drag, Some(Drag::Shape { .. } | Drag::Freehand { .. }));
+        let in_sel = self.sel_area.is_some_and(|s| s.rect.contains(img_p));
         let cursor = if on_handle {
             egui::CursorIcon::PointingHand
-        } else if matches!(self.drag, Some(Drag::Moving { .. }))
+        } else if matches!(self.drag, Some(Drag::Moving { .. } | Drag::MoveSel { .. }))
             || (can_pick_existing && hit_id.is_some())
+            || in_sel
         {
             egui::CursorIcon::Move
         } else if self.tool == Tool::Select {
@@ -809,9 +1157,12 @@ impl DrawSession {
             self.close_text_panel();
         }
         // Dragging over an existing object selects and moves it, regardless
-        // of which creation tool is armed (except pure pixel tools).
-        if !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::Fill)
-            && let Some(id) = self.hit(p, self.canvas_scale)
+        // of which creation tool is armed (except pure pixel tools and the
+        // marquee, which frames regions rather than grabbing objects).
+        if !matches!(
+            self.tool,
+            Tool::Eraser | Tool::Blur | Tool::Fill | Tool::SelectArea
+        ) && let Some(id) = self.hit(p, self.canvas_scale)
             && let Some(before) = self.doc.annotation(id).cloned()
         {
             self.selected = Some(id);
@@ -824,6 +1175,23 @@ impl DrawSession {
         }
         self.selected = None;
         match self.tool {
+            Tool::SelectArea => {
+                // A press on an anchor resizes the frame; inside it
+                // lifts the pixels on move; anywhere else starts a new
+                // frame and memorises the pressed pixel's colour.
+                if let Some(h) = self.sel_handle_at(p, self.canvas_scale) {
+                    self.drag = Some(Drag::SelResize { handle: h });
+                } else if self.sel_area.is_some_and(|s| s.rect.contains(p)) {
+                    self.drag = Some(Drag::MoveSel { start: p });
+                } else {
+                    let seed = self.pixel_at(p);
+                    self.sel_area = Some(SelArea {
+                        rect: Rect::from_min_max(p, p),
+                        seed,
+                    });
+                    self.drag = Some(Drag::Marquee { anchor: p });
+                }
+            }
             Tool::Select
             | Tool::Text
             | Tool::Fill
@@ -839,6 +1207,13 @@ impl DrawSession {
 
     /// Move: apply the drag delta or extend a stroke.
     fn continue_drag(&mut self, p: Pos2) {
+        // A drag that started inside the marquee lifts the region's
+        // pixels into a movable Picture once it has really travelled.
+        if let Some(Drag::MoveSel { start }) = self.drag
+            && p.distance(start) > 2.0
+        {
+            self.sel_lift(start);
+        }
         match &mut self.drag {
             Some(Drag::Freehand { points }) => points.push(p),
             Some(Drag::Moving { id, last, .. }) => {
@@ -911,7 +1286,17 @@ impl DrawSession {
                     self.doc.revision += 1;
                 }
             }
-            Some(Drag::Shape { .. }) | None => {}
+            Some(Drag::Marquee { anchor }) => {
+                if let Some(sel) = &mut self.sel_area {
+                    sel.rect = Rect::from_two_pos(*anchor, p);
+                }
+            }
+            Some(Drag::SelResize { handle }) => {
+                if let Some(sel) = &mut self.sel_area {
+                    resize_sel(&mut sel.rect, *handle, p);
+                }
+            }
+            Some(Drag::MoveSel { .. } | Drag::Shape { .. }) | None => {}
         }
     }
 
@@ -937,6 +1322,17 @@ impl DrawSession {
                 }
             }
             Drag::Freehand { points } => self.finish_freehand(points),
+            Drag::Marquee { .. } => {
+                // Keep only a real frame — a stray click leaves no
+                // selection behind.
+                if self
+                    .sel_area
+                    .is_some_and(|s| s.rect.width() < 2.0 || s.rect.height() < 2.0)
+                {
+                    self.sel_area = None;
+                }
+            }
+            Drag::MoveSel { .. } | Drag::SelResize { .. } => {}
             Drag::Shape { anchor } => {
                 // Release position is implicit: the last pointer move
                 // already gave the preview; use the release point via
@@ -1121,8 +1517,10 @@ impl DrawSession {
         if had_panel {
             self.close_text_panel();
         }
-        if !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::Fill)
-            && let Some(id) = self.hit(p, self.canvas_scale)
+        if !matches!(
+            self.tool,
+            Tool::Eraser | Tool::Blur | Tool::Fill | Tool::SelectArea
+        ) && let Some(id) = self.hit(p, self.canvas_scale)
         {
             self.selected = Some(id);
             self.sync_text_panel();
@@ -1135,6 +1533,12 @@ impl DrawSession {
         match self.tool {
             Tool::Select => {
                 self.sync_text_panel();
+            }
+            Tool::SelectArea => {
+                // Inside the frame it stays; a click elsewhere drops it.
+                if self.sel_area.is_some_and(|s| !s.rect.contains(p)) {
+                    self.sel_area = None;
+                }
             }
             Tool::Text => {
                 let id = self.doc.alloc_id();
@@ -1284,6 +1688,16 @@ impl DrawSession {
         }
         let to_canvas =
             |p: Pos2, rect: Rect| pos2(rect.min.x + p.x * scale, rect.min.y + p.y * scale);
+        // The marquee-in-progress paints the same dashed chrome as the
+        // live selection.
+        if let Drag::Marquee { anchor } = drag {
+            let r = Rect::from_two_pos(
+                to_canvas(*anchor, self.img_rect),
+                to_canvas(cur, self.img_rect),
+            );
+            sel_chrome(painter, r, theme::tokens(painter.ctx()).accent);
+            return;
+        }
         // Shapes preview from anchor → current point.
         if let Drag::Shape { anchor } = drag {
             let o = &self.opts;
@@ -1339,6 +1753,33 @@ impl DrawSession {
     /// Selection chrome + handles + text edit overlay.
     fn draw_overlay(&mut self, painter: &egui::Painter, img_rect: Rect, scale: f32) {
         self.img_rect = img_rect;
+        let accent = theme::tokens(painter.ctx()).accent;
+        // The live marquee frames its region above the document — with
+        // 8 resize anchors once the initial framing drag is over.
+        if let Some(sel) = self.sel_area {
+            let r = Rect::from_min_max(
+                pos2(
+                    img_rect.min.x + sel.rect.min.x * scale,
+                    img_rect.min.y + sel.rect.min.y * scale,
+                ),
+                pos2(
+                    img_rect.min.x + sel.rect.max.x * scale,
+                    img_rect.min.y + sel.rect.max.y * scale,
+                ),
+            );
+            sel_chrome(painter, r, accent);
+            if !matches!(self.drag, Some(Drag::Marquee { .. })) {
+                for c in handle_centers(r) {
+                    painter.rect_filled(c, CornerRadius::same(2), Color32::WHITE);
+                    painter.rect_stroke(
+                        c,
+                        CornerRadius::same(2),
+                        Stroke::new(1.0, accent),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
+        }
         let Some(id) = self.selected else { return };
         // While a box's floating editor is open its selection frame
         // stays hidden (matches the reference editor).
@@ -1352,7 +1793,6 @@ impl DrawSession {
         let Some(a) = self.doc.annotation(id).cloned() else {
             return;
         };
-        let accent = theme::tokens(painter.ctx()).accent;
         let to_canvas = |p: Pos2| pos2(img_rect.min.x + p.x * scale, img_rect.min.y + p.y * scale);
         let b = a.kind.bounds();
         let cb = Rect::from_min_max(
@@ -1811,6 +2251,18 @@ impl DrawSession {
     /// Title of the bottom tab: the selected object's kind when one is
     /// selected ("Texte", …), otherwise the armed tool's name.
     fn bottom_tab_title(&self) -> std::borrow::Cow<'static, str> {
+        // A live marquee owns the tab — its ops act on pixels, not an
+        // object. The frame's W×H rides the title and stays in sync
+        // while its anchors resize it.
+        if let Some(sel) = self.sel_area {
+            return format!(
+                "{} {}×{}",
+                t!("draw.sel.title"),
+                sel.rect.width().round() as u32,
+                sel.rect.height().round() as u32
+            )
+            .into();
+        }
         if let Some(id) = self.selected
             && let Some(a) = self.doc.annotation(id)
         {
@@ -1844,7 +2296,7 @@ impl DrawSession {
                 }
                 AnnotationKind::Step(_) => t!("draw.tool.step"),
                 AnnotationKind::Stamp(_) => t!("draw.tool.stamps"),
-                AnnotationKind::Picture(_) => t!("draw.tool.insert"),
+                AnnotationKind::Picture(_) => t!("draw.tab.image"),
                 AnnotationKind::Fill(_) => t!("draw.tool.fill"),
                 AnnotationKind::Blur(_) => t!("draw.tool.blur"),
             };
@@ -1892,7 +2344,7 @@ impl DrawSession {
                     ui.spacing_mut().interact_size.y = 22.0;
                     ui.add_space(6.0);
                     if widgets::secondary_button(ui, &t!("draw.cancel")).clicked() {
-                        self.outcome = Some(Outcome::Cancel);
+                        self.request_cancel();
                     }
                     if widgets::primary_button(ui, &t!("draw.ok")).clicked() {
                         self.outcome = Some(Outcome::Ok);
@@ -1912,14 +2364,48 @@ impl DrawSession {
         });
     }
 
-    /// Content of the bottom tab: when an object is selected its own
-    /// properties are shown (regardless of the armed tool); otherwise
-    /// the armed tool's defaults.
+    /// Content of the bottom tab: a live marquee shows its pixel ops,
+    /// a selected object its properties (regardless of the armed tool);
+    /// otherwise the armed tool's defaults.
     fn bottom_content(&mut self, ui: &mut Ui, shared: &Shared) {
-        if self.selected.is_some() {
+        if self.sel_area.is_some() {
+            self.sel_options(ui);
+        } else if self.selected.is_some() {
             self.selected_options(ui, shared);
         } else {
             self.tool_options(ui, shared);
+        }
+    }
+
+    /// The marquee's option strip (frame W×H rides the tab title):
+    /// blur presets, cut/copy/paste/delete, and a Remplissage button
+    /// applying the swatch's colour — the swatch itself just picks it.
+    fn sel_options(&mut self, ui: &mut Ui) {
+        let Some(_sel) = self.sel_area else { return };
+        ui.menu_button(t!("draw.opt.blur"), |ui| {
+            for pct in [25u8, 50, 75, 100] {
+                if ui.button(format!("{pct}%")).clicked() {
+                    self.sel_blur(pct);
+                    ui.close();
+                }
+            }
+        });
+        if ui.button(t!("draw.sel.cut")).clicked() {
+            self.sel_cut();
+        }
+        if ui.button(t!("draw.sel.copy")).clicked() {
+            self.sel_copy();
+        }
+        if ui.button(t!("draw.sel.paste")).clicked() {
+            self.sel_paste();
+        }
+        if ui.button(t!("draw.sel.delete")).clicked() {
+            self.sel_delete();
+        }
+        ui.separator();
+        color_btn(ui, &mut self.opts.fill_color);
+        if ui.button(t!("draw.opt.fill_c")).clicked() {
+            self.sel_fill(self.opts.fill_color);
         }
     }
 
@@ -2138,6 +2624,9 @@ impl DrawSession {
             Tool::InsertImage => {
                 ui.label(t!("draw.opt.insert_hint"));
             }
+            Tool::SelectArea => {
+                ui.label(t!("draw.sel.hint"));
+            }
         }
     }
 
@@ -2286,8 +2775,12 @@ impl DrawSession {
                     changed |= slider(ui, t!("draw.opt.size"), &mut o.size, 8.0..=96.0).changed();
                 }
                 AnnotationKind::Picture(o) => {
-                    changed |=
-                        slider(ui, t!("draw.opt.opacity"), &mut o.opacity, 0.1..=1.0).changed();
+                    changed |= opacity_pct_slider(ui, &mut o.opacity);
+                    let mut sh_on = o.shadow > 0.0;
+                    if ui.checkbox(&mut sh_on, t!("draw.opt.shadow")).changed() {
+                        o.shadow = if sh_on { 3.0 } else { 0.0 };
+                        changed = true;
+                    }
                 }
                 AnnotationKind::Fill(o) => {
                     changed |= color_btn(ui, &mut o.color).changed();
@@ -2437,6 +2930,67 @@ fn seg_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 }
 
 // ---------- options-bar widget helpers ----------
+
+/// The marquee chrome — alternating white / accent dashes (marching
+/// ants), readable on any screenshot.
+fn sel_chrome(painter: &egui::Painter, rect: Rect, accent: Color32) {
+    let (a, b) = (rect.min, rect.max);
+    for (p, q) in [
+        (a, pos2(b.x, a.y)),
+        (pos2(b.x, a.y), b),
+        (b, pos2(a.x, b.y)),
+        (pos2(a.x, b.y), a),
+    ] {
+        let d = q - p;
+        let len = d.length();
+        if len < 1.0 {
+            continue;
+        }
+        let dir = d / len;
+        let (mut s, mut i) = (0.0, 0u32);
+        while s < len {
+            let e = (s + 6.0).min(len);
+            let color = if i % 2 == 0 { Color32::WHITE } else { accent };
+            painter.line_segment([p + dir * s, p + dir * e], Stroke::new(1.5, color));
+            s += 9.0; // 6 px dash + 3 px gap
+            i += 1;
+        }
+    }
+}
+
+/// Applies handle `h` drag of `p` onto marquee `r` (image px, f32) —
+/// same 0..=7 index order as `handle_centers`.
+fn resize_sel(r: &mut Rect, h: usize, p: Pos2) {
+    let (mut x1, mut y1) = (r.min.x, r.min.y);
+    let (mut x2, mut y2) = (r.max.x, r.max.y);
+    match h {
+        0 => {
+            x1 = p.x;
+            y1 = p.y;
+        }
+        1 => y1 = p.y,
+        2 => {
+            x2 = p.x;
+            y1 = p.y;
+        }
+        3 => x2 = p.x,
+        4 => {
+            x2 = p.x;
+            y2 = p.y;
+        }
+        5 => y2 = p.y,
+        6 => {
+            x1 = p.x;
+            y2 = p.y;
+        }
+        7 => x1 = p.x,
+        _ => {}
+    }
+    let nr = Rect::from_min_max(pos2(x1.min(x2), y1.min(y2)), pos2(x1.max(x2), y1.max(y2)));
+    if nr.width() >= 2.0 && nr.height() >= 2.0 {
+        *r = nr;
+    }
+}
 
 /// Label + dragger bound to an f32 in `range` — FS "Epaisseur" style.
 fn w_edit(

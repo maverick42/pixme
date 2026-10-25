@@ -266,13 +266,7 @@ pub fn install_ui(ctx: &egui::Context) {
         )),
     );
     separator(&edit);
-    item(
-        &mut labels,
-        &edit,
-        "edit.copy",
-        "menu.edit.copy",
-        Some(Accelerator::new(Modifiers::META, Code::KeyC)),
-    );
+    item(&mut labels, &edit, "edit.copy", "menu.edit.copy", None);
     append(&app_menu, &edit);
 
     let window = Submenu::new(t!("menu.window").as_ref(), true);
