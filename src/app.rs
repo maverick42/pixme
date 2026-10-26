@@ -779,7 +779,8 @@ impl Shared {
         };
         if needed {
             let session = lock(&self.store).load_session();
-            lock(&self.viewer).restore_session(session);
+            let sort = lock(&self.settings).tab_sort;
+            lock(&self.viewer).restore_session(session, sort);
         }
     }
 

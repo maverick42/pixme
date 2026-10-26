@@ -789,7 +789,7 @@ mod tests {
         let session = store.load_session();
 
         let mut restored = Viewer::default();
-        restored.restore_session(session);
+        restored.restore_session(session, None);
         assert!(restored.dirty, "an unsaved tab keeps the session dirty");
         assert!(restored.session_restored());
         assert!(

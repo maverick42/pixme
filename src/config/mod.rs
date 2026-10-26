@@ -7,4 +7,4 @@ mod settings;
 
 // `Appearance` is re-exported for the settings UI (phase 2).
 #[allow(unused_imports)]
-pub use settings::{Appearance, DbRetention, Settings};
+pub use settings::{Appearance, DbRetention, Settings, TabSort};

@@ -748,3 +748,8 @@ Format: date — context — decision — consequences.
   across offsets.
 - **Consequences**: `document_count()` and `apply_retention()` on the
   store; schema v3 wipes v2 files (still a cache, never migrated).
+- **Tab sort**: `settings.tab_sort` (`None|name|date`) persists the tab
+  ordering chosen from the tab context menu — deliberately menu-only,
+  never in the settings window. `Tab.insertion` keeps the original
+  order restorable; re-sort happens on push, rename, duplicate, and
+  restore. Numeric-aware compare keeps `Capture 9` before `Capture 10`.

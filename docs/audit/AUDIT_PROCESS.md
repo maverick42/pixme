@@ -90,3 +90,6 @@ Windows.
   write at quit); `today` drops pre-today captures at launch; switching
   to a more restrictive option with captures stored asks "captures
   will be lost" — Confirm applies + prunes, Cancel reverts.
+- MT-22 — Tab sort: context menu second zone toggles by-name/by-date
+  (re-click returns to insertion order); ordering persists across
+  restarts and re-sorts on capture, rename and duplicate.

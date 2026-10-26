@@ -17,6 +17,7 @@ use egui::{
 use rust_i18n::t;
 
 use crate::app::{CaptureMode, Command, Shared};
+use crate::config::TabSort;
 use crate::editor::Document;
 use crate::editor::history::AnnoEdit;
 use crate::ui::icons::{self, Icon};
@@ -44,6 +45,9 @@ pub struct Tab {
     pub anno_undo: VecDeque<AnnoEdit>,
     /// Redo side of the annotation stacks.
     pub anno_redo: VecDeque<AnnoEdit>,
+    /// Insertion-order key — survives re-sorting so "insertion order"
+    /// can always be restored.
+    pub insertion: usize,
     /// Password accepted while this tab is visible — leaving the tab
     /// re-locks it (`false` again), so a protected capture asks for its
     /// password on every activation.
@@ -138,6 +142,10 @@ pub struct Viewer {
     pub confirm_then_quit: bool,
     /// Running tab counter so titles stay unique after closes.
     next_title: u32,
+    /// Running insertion counter — the "insertion order" sort key.
+    next_insertion: usize,
+    /// Current tab ordering (persisted via `settings.tab_sort`).
+    sort_mode: Option<TabSort>,
     /// Canvas zoom: fit, fit-width, or an explicit factor.
     zoom: ZoomMode,
     /// Scale applied last frame — drives the zoom label and ± steps.
@@ -259,6 +267,8 @@ impl Viewer {
     /// Two captures can never share a name: a clash gets a ` (n)` suffix.
     pub fn push_named_document(&mut self, doc: Document, title: String, saved: bool) {
         let title = self.unique_title(&title);
+        let insertion = self.next_insertion;
+        self.next_insertion += 1;
         self.tabs.push(Tab {
             title,
             doc,
@@ -269,11 +279,15 @@ impl Viewer {
             anno_undo: VecDeque::new(),
             anno_redo: VecDeque::new(),
             unlocked: false,
+            insertion,
         });
         // A new document gets a fresh view — a stale zoom would
         // leak onto unrelated pixels — and the tab we leave re-locks.
         let new = self.tabs.len() - 1;
         self.set_active(new);
+        // Sorting may move the new tab; set_active ran first so
+        // sort_tabs remaps `active` by document id.
+        self.sort_tabs();
         self.recompute_dirty();
     }
 
@@ -435,10 +449,12 @@ impl Viewer {
         self.active_index().map(|i| self.tabs[i].title.clone())
     }
 
-    /// Renames the active tab (the File → Rename command).
+    /// Renames the active tab (the File → Rename command). A rename is
+    /// a sort key under `ByName` — re-sort right away.
     pub fn set_active_title(&mut self, title: String) {
         if let Some(i) = self.active_index() {
             self.tabs[i].title = title;
+            self.sort_tabs();
         }
     }
 
@@ -627,8 +643,13 @@ impl Viewer {
     /// comes back with its document, title, saved flag and annotation
     /// history; protected tabs restore LOCKED (`unlocked: false`, the
     /// password is asked on activation like any tab switch).
-    pub fn restore_session(&mut self, session: crate::store::StoredSession) {
+    pub fn restore_session(
+        &mut self,
+        session: crate::store::StoredSession,
+        sort_mode: Option<TabSort>,
+    ) {
         self.restored = true;
+        self.sort_mode = sort_mode;
         // An empty restore changes nothing — most importantly it must
         // not recompute `dirty` over an untouched session.
         if session.tabs.is_empty() {
@@ -636,6 +657,8 @@ impl Viewer {
         }
         self.next_title = self.next_title.max(session.next_title as u32);
         for t in session.tabs {
+            let insertion = self.next_insertion;
+            self.next_insertion += 1;
             self.tabs.push(Tab {
                 title: t.title,
                 doc: t.doc,
@@ -646,12 +669,37 @@ impl Viewer {
                 anno_undo: t.anno_undo,
                 anno_redo: t.anno_redo,
                 unlocked: false,
+                insertion,
             });
         }
         if !self.tabs.is_empty() {
             self.set_active(session.active.min(self.tabs.len() - 1));
         }
+        self.sort_tabs();
         self.recompute_dirty();
+    }
+
+    /// Reorders tabs per `sort_mode` (`None` = insertion order). The
+    /// active tab keeps its selection — remapped by document id since
+    /// sorting moves indices.
+    fn sort_tabs(&mut self) {
+        let active_id = self
+            .active_index()
+            .map(|i| self.tabs[i].doc.meta.id.clone());
+        match self.sort_mode {
+            Some(TabSort::ByName) => self.tabs.sort_by(|a, b| {
+                natural_cmp(&a.title, &b.title).then(a.insertion.cmp(&b.insertion))
+            }),
+            Some(TabSort::ByDate) => self
+                .tabs
+                .sort_by_key(|t| (t.doc.meta.captured_at, t.insertion)),
+            None => self.tabs.sort_by_key(|t| t.insertion),
+        }
+        if let Some(id) = active_id
+            && let Some(pos) = self.tabs.iter().position(|t| t.doc.meta.id == id)
+        {
+            self.active = pos;
+        }
     }
 
     /// Duplicates `index` into a new tab: new id and capture date, same
@@ -678,7 +726,9 @@ impl Viewer {
             anno_undo: src.anno_undo.clone(),
             anno_redo: src.anno_redo.clone(),
             unlocked: false,
+            insertion: self.next_insertion,
         });
+        self.next_insertion += 1;
         let new = self.tabs.len() - 1;
         self.set_active(new);
         self.dirty = true;
@@ -904,6 +954,25 @@ impl Viewer {
             if let Some((w, h)) = self.active_dims() {
                 ui.label(
                     egui::RichText::new(format!("{w}×{h}"))
+                        .color(t.text_dim)
+                        .size(10.0),
+                );
+            }
+            if let Some(index) = self.active_index() {
+                // Capture date in the active language's local format,
+                // then the current sort mode after a bullet separator.
+                let fmt = match &*rust_i18n::locale() {
+                    "fr" | "es" => "%d/%m/%Y %H:%M",
+                    _ => "%b %d, %Y %H:%M",
+                };
+                let date = self.tabs[index].doc.meta.captured_at.format(fmt);
+                let mode = match self.sort_mode {
+                    Some(TabSort::ByName) => t!("viewer.tab.sort_name"),
+                    Some(TabSort::ByDate) => t!("viewer.tab.sort_date"),
+                    None => t!("viewer.sort.insertion"),
+                };
+                ui.label(
+                    egui::RichText::new(format!("{date} · {mode}"))
                         .color(t.text_dim)
                         .size(10.0),
                 );
@@ -1460,6 +1529,24 @@ impl Viewer {
             });
             ui.close();
         }
+        ui.separator();
+        // Tab ordering — persisted through settings but deliberately
+        // menu-only (never shown in the settings window). Re-clicking
+        // the active mode toggles back to insertion order.
+        for (mode, key) in [
+            (TabSort::ByName, "viewer.tab.sort_name"),
+            (TabSort::ByDate, "viewer.tab.sort_date"),
+        ] {
+            let selected = self.sort_mode == Some(mode);
+            if ui.selectable_label(selected, t!(key).to_string()).clicked() {
+                self.sort_mode = if selected { None } else { Some(mode) };
+                self.sort_tabs();
+                let mut settings = shared.lock_settings();
+                settings.tab_sort = self.sort_mode;
+                settings.save();
+                ui.close();
+            }
+        }
     }
 
     /// The document canvas: the active capture fit to the window (or at the
@@ -1721,6 +1808,9 @@ impl Viewer {
                         .desired_width(200.0)
                         .font(theme::medium(12.0)),
                 );
+                // The only input in this dialog — keep it focused from
+                // the moment the prompt opens so typing starts at once.
+                field.request_focus();
                 // Enter applies, like the Rename button.
                 if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     apply = true;
@@ -1956,6 +2046,41 @@ impl Viewer {
 /// tinted like an icon (danger on hover) with a pointing-hand cursor.
 /// Paints the tab's close cross inside `rect` — the hovered state
 /// comes from the interact registered above the chip (see `tab_item`).
+/// Numeric-aware title compare so `Capture 9` sorts before `Capture 10`.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering::Equal;
+    let (mut a, mut b) = (a, b);
+    while let (Some(ca), Some(cb)) = (a.chars().next(), b.chars().next()) {
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let (na, ta) = take_digits(a);
+            let (nb, tb) = take_digits(b);
+            match na
+                .parse::<u64>()
+                .unwrap_or(0)
+                .cmp(&nb.parse::<u64>().unwrap_or(0))
+            {
+                Equal => {
+                    a = ta;
+                    b = tb;
+                }
+                o => return o,
+            }
+        } else if ca == cb {
+            a = &a[ca.len_utf8()..];
+            b = &b[cb.len_utf8()..];
+        } else {
+            return ca.cmp(&cb);
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Splits the leading ASCII-digit run off `s`.
+fn take_digits(s: &str) -> (&str, &str) {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s.split_at(end)
+}
+
 fn paint_tab_close(ui: &mut egui::Ui, rect: Rect, hovered: bool) {
     let t = theme::tokens(ui.ctx());
     if ui.is_rect_visible(rect) {

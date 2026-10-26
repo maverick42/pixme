@@ -74,6 +74,17 @@ impl DbRetention {
     }
 }
 
+/// How capture tabs are ordered in the viewer — chosen from the tab
+/// context menu only (deliberately not a settings-window option).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabSort {
+    /// Alphabetically by tab title (numeric runs compare naturally).
+    ByName,
+    /// Chronologically by capture date, oldest first.
+    ByDate,
+}
+
 /// The complete persisted settings file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -100,6 +111,8 @@ pub struct Settings {
     pub last_open_dir: Option<PathBuf>,
     /// Session-database retention (never / today / always).
     pub db_retention: DbRetention,
+    /// Tab ordering — `None` = insertion order.
+    pub tab_sort: Option<TabSort>,
     /// Text-tool colour `[r, g, b]` persisted across sessions.
     #[serde(default = "default_text_color")]
     pub text_color: [u8; 3],
@@ -148,6 +161,7 @@ impl Default for Settings {
             last_save_dir: None,
             last_open_dir: None,
             db_retention: DbRetention::default(),
+            tab_sort: None,
             text_color: default_text_color(),
             text_font: default_text_font(),
             text_size: default_text_size(),
