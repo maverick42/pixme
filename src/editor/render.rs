@@ -153,7 +153,7 @@ fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
     match &anno.kind {
         AnnotationKind::Rect(o) => (o.shadow, o.opacity),
         AnnotationKind::Ellipse(o) => (o.shadow, o.opacity),
-        AnnotationKind::Line(o) => (o.shadow, o.opacity),
+        AnnotationKind::Line(o) => (0.0, o.opacity),
         AnnotationKind::Fancy(o) => (o.shadow, o.opacity),
         AnnotationKind::Freehand(_) | AnnotationKind::HighlightStroke(_) => (0.0, 1.0),
         AnnotationKind::HighlightArea(o) => (0.0, o.opacity),
@@ -193,28 +193,7 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
             o.dash,
             1.0,
         ),
-        AnnotationKind::Line(o) => {
-            if o.outline > 0.0 {
-                stroke_polyline(
-                    &mut layer,
-                    &[o.a, o.b],
-                    o.width + 2.0 * o.outline,
-                    Color32::WHITE,
-                    TipShape::Round,
-                    Dash::Solid,
-                );
-            }
-            stroke_polyline(
-                &mut layer,
-                &[o.a, o.b],
-                o.width,
-                o.color,
-                TipShape::Round,
-                o.dash,
-            );
-            draw_line_end(&mut layer, o.a, o.b, o.width, o.color, o.start, true);
-            draw_line_end(&mut layer, o.a, o.b, o.width, o.color, o.end, false);
-        }
+        AnnotationKind::Line(o) => draw_line_obj(&mut layer, o),
         AnnotationKind::Fancy(o) => draw_fancy(&mut layer, o),
         AnnotationKind::Freehand(o) => {
             stroke_freehand(&mut layer, o);
@@ -406,54 +385,208 @@ fn lerp(a: Pos2, b: Pos2, t: f32) -> Pos2 {
     Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 }
 
-/// A line-end glyph (arrow head, dot, ring) at one end of `a→b`.
-#[allow(clippy::too_many_arguments)]
-fn draw_line_end(
-    img: &mut RgbaImage,
-    a: Pos2,
-    b: Pos2,
-    width: f32,
-    color: Color32,
-    end: LineEnd,
-    at_a: bool,
-) {
-    if end == LineEnd::None {
+/// Signed distance from `p` to a closed 2D polygon (`verts` in order).
+fn sd_polygon(p: Pos2, verts: &[Pos2]) -> f32 {
+    let n = verts.len();
+    if n < 3 {
+        return f32::INFINITY;
+    }
+    let mut d2 = (p - verts[0]).length_sq();
+    let mut s = 1.0_f32;
+    let mut j = n - 1;
+    for i in 0..n {
+        let vi = verts[i];
+        let vj = verts[j];
+        let e = vj - vi;
+        let w = p - vi;
+        let proj = (w.dot(e) / e.length_sq().max(1e-6)).clamp(0.0, 1.0);
+        let b = w - e * proj;
+        d2 = d2.min(b.length_sq());
+        let c1 = p.y >= vi.y;
+        let c2 = p.y < vj.y;
+        let c3 = e.x * w.y > e.y * w.x;
+        if (c1 && c2 && c3) || (!c1 && !c2 && !c3) {
+            s = -s;
+        }
+        j = i;
+    }
+    s * d2.sqrt()
+}
+
+/// Signed distance from `p` to segment `a..b`.
+fn pt_seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let l2 = ab.length_sq();
+    if l2 < 1e-6 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / l2).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+/// Cubic-Bézier line/arrow rendered with analytical SDF anti-aliasing,
+/// barbed arrowheads, unified outline (0–10) and soft drop shadow.
+fn draw_line_obj(img: &mut RgbaImage, o: &super::document::LineObj) {
+    let tab = cubic_table(o.a, o.ka, o.kb, o.b, 96);
+    let total = tab.last().map_or(0.0, |e| e.0);
+    if total < 0.5 {
         return;
     }
-    let (tip, tail) = if at_a { (a, b) } else { (b, a) };
-    let (dx, dy) = (tip.x - tail.x, tip.y - tail.y);
-    let len = dx.hypot(dy).max(0.001);
-    let (ux, uy) = (dx / len, dy / len);
-    let (nx, ny) = (-uy, ux);
-    let c = c32(color);
-    match end {
-        LineEnd::Arrow => {
-            let (hl, hw) = (width * 3.0 + 8.0, width * 1.2 + 4.0);
-            drw::draw_polygon_mut(
-                img,
-                &points_i32(&[
-                    imageproc::point::Point::new(tip.x, tip.y),
-                    imageproc::point::Point::new(
-                        tip.x + ux * hl + nx * hw,
-                        tip.y + uy * hl + ny * hw,
-                    ),
-                    imageproc::point::Point::new(
-                        tip.x + ux * hl - nx * hw,
-                        tip.y + uy * hl - ny * hw,
-                    ),
-                ]),
-                c,
-            );
+    let w = o.width.max(1.0);
+    let hw = w * 0.5;
+    let out_px = o.outline.max(0.0) * 0.65;
+
+    // End geometry: outward unit direction at `a` and `b`.
+    let (_, pa, da0) = tab[0];
+    let (_, pb, db0) = tab[tab.len() - 1];
+    // Average tangent over a few pixels near the tip so curved arrows aim cleanly.
+    let da_in = sample_at(&tab, (w * 2.5 + 6.0).min(total * 0.35)).1;
+    let db_in = sample_at(&tab, (total - (w * 2.5 + 6.0).min(total * 0.35)).max(0.0)).1;
+    let dir_a = {
+        let v = -(da0 + da_in);
+        if v.length() > 1e-3 {
+            v / v.length()
+        } else {
+            -da0
         }
-        LineEnd::Dot => {
-            let r = (width * 1.6 + 3.0) as i32;
-            drw::draw_filled_circle_mut(img, (tip.x as i32, tip.y as i32), r, c);
+    };
+    let dir_b = {
+        let v = db0 + db_in;
+        if v.length() > 1e-3 {
+            v / v.length()
+        } else {
+            db0
         }
-        LineEnd::Ring => {
-            let r = (width * 1.6 + 3.0) as i32;
-            drw::draw_hollow_circle_mut(img, (tip.x as i32, tip.y as i32), r, c);
+    };
+
+    let arrow_dims = |width: f32| -> (f32, f32, f32) {
+        let hl = (width * 3.4 + 11.0).min(total * 0.55);
+        let ahw = width * 1.45 + 4.5;
+        let neck = hl * 0.76;
+        (hl, ahw, neck)
+    };
+    let (hl, ahw, neck) = arrow_dims(w);
+    let dot_r = w * 1.35 + 2.5;
+    let ring_r = w * 1.45 + 3.0;
+    let ring_th = (w * 0.45).max(1.25);
+
+    let trim_for = |end: LineEnd| -> f32 {
+        match end {
+            LineEnd::None | LineEnd::Dot => 0.0,
+            LineEnd::Arrow => neck * 0.85,
+            LineEnd::Ring => ring_r,
         }
-        LineEnd::None => {}
+    };
+    let s0 = trim_for(o.start).min(total * 0.48);
+    let s1 = (total - trim_for(o.end)).max(s0 + 0.1);
+
+    // Build active polyline sub-segments along [s0, s1] according to `o.dash`.
+    let span = (s1 - s0).max(0.1);
+    let runs = dash_runs(span, w, o.dash);
+    let mut segs: Vec<(Pos2, Pos2)> = Vec::new();
+    for (u0, u1) in runs {
+        let sa = s0 + u0 * span;
+        let sb = s0 + u1 * span;
+        let steps = (((sb - sa) / 3.0).ceil() as usize).clamp(1, 64);
+        let mut prev = sample_at(&tab, sa).0;
+        for k in 1..=steps {
+            let s = sa + (sb - sa) * (k as f32 / steps as f32);
+            let cur = sample_at(&tab, s).0;
+            segs.push((prev, cur));
+            prev = cur;
+        }
+    }
+
+    let arrow_verts = |tip: Pos2, dir: egui::Vec2| -> [Pos2; 4] {
+        let n = egui::vec2(-dir.y, dir.x);
+        [
+            tip,
+            tip - dir * hl + n * ahw,
+            tip - dir * neck,
+            tip - dir * hl - n * ahw,
+        ]
+    };
+    let va = (o.start == LineEnd::Arrow).then(|| arrow_verts(pa, dir_a));
+    let vb = (o.end == LineEnd::Arrow).then(|| arrow_verts(pb, dir_b));
+
+    let end_sdf = |p: Pos2, tip: Pos2, end: LineEnd, verts: Option<&[Pos2; 4]>| -> f32 {
+        match end {
+            LineEnd::None => f32::INFINITY,
+            LineEnd::Arrow => verts.map_or(f32::INFINITY, |v| sd_polygon(p, v)),
+            LineEnd::Dot => (p - tip).length() - dot_r,
+            LineEnd::Ring => ((p - tip).length() - ring_r).abs() - ring_th,
+        }
+    };
+
+    let shape_sdf = |p: Pos2| -> f32 {
+        let mut d = f32::INFINITY;
+        for &(a, b) in &segs {
+            d = d.min(pt_seg_dist(p, a, b) - hw);
+        }
+        d = d.min(end_sdf(p, pa, o.start, va.as_ref()));
+        d = d.min(end_sdf(p, pb, o.end, vb.as_ref()));
+        d
+    };
+
+    // Bounding box of the curve + heads + outline + shadow.
+    let mut x0f = pa.x.min(pb.x);
+    let mut y0f = pa.y.min(pb.y);
+    let mut x1f = pa.x.max(pb.x);
+    let mut y1f = pa.y.max(pb.y);
+    for (_, p, _) in &tab {
+        x0f = x0f.min(p.x);
+        y0f = y0f.min(p.y);
+        x1f = x1f.max(p.x);
+        y1f = y1f.max(p.y);
+    }
+    let pad = (hl.max(ring_r + ring_th).max(hw) + out_px + if o.shadow > 0.0 { 8.0 } else { 3.0 })
+        .ceil() as i32;
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let x0 = (x0f.floor() as i32 - pad).max(0);
+    let y0 = (y0f.floor() as i32 - pad).max(0);
+    let x1 = (x1f.ceil() as i32 + pad).min(iw - 1);
+    let y1 = (y1f.ceil() as i32 + pad).min(ih - 1);
+
+    let (fc, rc) = (o.color, o.outline_color);
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let p = Pos2::new(px as f32, py as f32);
+            let din = shape_sdf(p);
+            let dout = din - out_px;
+            let cov_out = (0.5 - dout).clamp(0.0, 1.0);
+
+            let sh_a = if o.shadow > 0.0 && cov_out < 1.0 {
+                let dsh = shape_sdf(Pos2::new(p.x - 1.2, p.y - 2.0)) - out_px;
+                let t = (1.0 - (dsh + 0.8) / 5.2).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t) * 0.42
+            } else {
+                0.0
+            };
+
+            let total_a = cov_out + sh_a * (1.0 - cov_out);
+            if total_a <= 1.0 / 255.0 {
+                continue;
+            }
+
+            let (mut br, mut bg_c, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
+            if cov_out > 0.0 {
+                let cov_in = if out_px > 0.0 {
+                    (0.5 - din).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                br = f32::from(rc.r()) * (1.0 - cov_in) + f32::from(fc.r()) * cov_in;
+                bg_c = f32::from(rc.g()) * (1.0 - cov_in) + f32::from(fc.g()) * cov_in;
+                bb = f32::from(rc.b()) * (1.0 - cov_in) + f32::from(fc.b()) * cov_in;
+            }
+
+            let w_body = cov_out / total_a;
+            let out_r = (br * w_body).round().clamp(0.0, 255.0) as u8;
+            let out_g = (bg_c * w_body).round().clamp(0.0, 255.0) as u8;
+            let out_b = (bb * w_body).round().clamp(0.0, 255.0) as u8;
+            let out_a = (total_a * 255.0).round().clamp(0.0, 255.0) as u8;
+            img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
+        }
     }
 }
 
@@ -526,42 +659,59 @@ pub fn text_layout(o: &super::document::TextObj) -> (egui::Pos2, egui::Vec2, f32
     (egui::pos2(gl.x + d.y * h, gl.y - d.x * h), d, w, h)
 }
 
-/// Point + unit tangent on the cubic Bézier baseline (`a`, `ka`, `kb`, `b`).
-pub fn bezier_eval(o: &super::document::TextObj, t: f32) -> (egui::Pos2, egui::Vec2) {
+/// Point + unit tangent on the cubic Bézier (`a`, `ka`, `kb`, `b`).
+pub fn cubic_eval(a: Pos2, ka: Pos2, kb: Pos2, b: Pos2, t: f32) -> (egui::Pos2, egui::Vec2) {
     let u = 1.0 - t;
     let p = egui::pos2(
-        u * u * u * o.a.x + 3.0 * u * u * t * o.ka.x + 3.0 * u * t * t * o.kb.x + t * t * t * o.b.x,
-        u * u * u * o.a.y + 3.0 * u * u * t * o.ka.y + 3.0 * u * t * t * o.kb.y + t * t * t * o.b.y,
+        u * u * u * a.x + 3.0 * u * u * t * ka.x + 3.0 * u * t * t * kb.x + t * t * t * b.x,
+        u * u * u * a.y + 3.0 * u * u * t * ka.y + 3.0 * u * t * t * kb.y + t * t * t * b.y,
     );
-    let dx = 3.0 * u * u * (o.ka.x - o.a.x)
-        + 6.0 * u * t * (o.kb.x - o.ka.x)
-        + 3.0 * t * t * (o.b.x - o.kb.x);
-    let dy = 3.0 * u * u * (o.ka.y - o.a.y)
-        + 6.0 * u * t * (o.kb.y - o.ka.y)
-        + 3.0 * t * t * (o.b.y - o.kb.y);
+    let dx = 3.0 * u * u * (ka.x - a.x) + 6.0 * u * t * (kb.x - ka.x) + 3.0 * t * t * (b.x - kb.x);
+    let dy = 3.0 * u * u * (ka.y - a.y) + 6.0 * u * t * (kb.y - ka.y) + 3.0 * t * t * (b.y - kb.y);
     let v = egui::vec2(dx, dy);
     let d = if v.length() < 1e-3 {
-        egui::vec2(1.0, 0.0)
+        let ab = b - a;
+        if ab.length() < 1e-3 {
+            egui::vec2(1.0, 0.0)
+        } else {
+            ab / ab.length()
+        }
     } else {
         v / v.length()
     };
     (p, d)
 }
 
-/// Samples the cubic Bézier into `(arc_s, point, unit_tangent)`.
-pub fn bezier_table(o: &super::document::TextObj, n: usize) -> Vec<(f32, egui::Pos2, egui::Vec2)> {
+/// Samples a cubic Bézier (`a`, `ka`, `kb`, `b`) into `(arc_s, point, unit_tangent)`.
+pub fn cubic_table(
+    a: Pos2,
+    ka: Pos2,
+    kb: Pos2,
+    b: Pos2,
+    n: usize,
+) -> Vec<(f32, egui::Pos2, egui::Vec2)> {
     let mut out = Vec::with_capacity(n + 1);
     let mut s = 0.0f32;
-    let (mut prev, d0) = bezier_eval(o, 0.0);
+    let (mut prev, d0) = cubic_eval(a, ka, kb, b, 0.0);
     out.push((0.0, prev, d0));
     for i in 1..=n {
         let t = i as f32 / n as f32;
-        let (p, d) = bezier_eval(o, t);
+        let (p, d) = cubic_eval(a, ka, kb, b, t);
         s += (p - prev).length();
         out.push((s, p, d));
         prev = p;
     }
     out
+}
+
+/// Point + unit tangent on the cubic Bézier baseline (`a`, `ka`, `kb`, `b`).
+pub fn bezier_eval(o: &super::document::TextObj, t: f32) -> (egui::Pos2, egui::Vec2) {
+    cubic_eval(o.a, o.ka, o.kb, o.b, t)
+}
+
+/// Samples the cubic Bézier into `(arc_s, point, unit_tangent)`.
+pub fn bezier_table(o: &super::document::TextObj, n: usize) -> Vec<(f32, egui::Pos2, egui::Vec2)> {
+    cubic_table(o.a, o.ka, o.kb, o.b, n)
 }
 
 fn sample_at(tab: &[(f32, egui::Pos2, egui::Vec2)], s: f32) -> (egui::Pos2, egui::Vec2) {

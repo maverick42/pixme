@@ -209,13 +209,19 @@ pub struct EllipseObj {
     pub shadow: f32,
 }
 
-/// Straight segment with styled ends (the ↗ arrow tool).
+/// Cubic-Bézier line/arrow with styled ends (the ↗ arrow tool).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LineObj {
-    /// Start point.
+    /// Start point (grey anchor).
     pub a: Pos2,
-    /// End point.
+    /// End point (grey anchor).
     pub b: Pos2,
+    /// First green Bézier control knob (near `a`).
+    #[serde(default)]
+    pub ka: Pos2,
+    /// Second green Bézier control knob (near `b`).
+    #[serde(default)]
+    pub kb: Pos2,
     /// Stroke colour.
     pub color: Color32,
     /// Stroke width px.
@@ -228,6 +234,9 @@ pub struct LineObj {
     pub end: LineEnd,
     /// Outline stroke around the whole line (FS "Contour").
     pub outline: f32,
+    /// Outline colour.
+    #[serde(default = "default_step_ring")]
+    pub outline_color: Color32,
     /// Object opacity 0–1.
     pub opacity: f32,
     /// Drop-shadow offset px.
@@ -554,7 +563,25 @@ impl AnnotationKind {
         match self {
             Self::Rect(o) => o.rect,
             Self::Ellipse(o) => o.rect,
-            Self::Line(o) => rect_of_points(o.a, o.b),
+            Self::Line(o) => {
+                let pad = (o.width * 2.2 + o.outline + 10.0) as i32;
+                let mut x1 = f32::INFINITY;
+                let mut y1 = f32::INFINITY;
+                let mut x2 = f32::NEG_INFINITY;
+                let mut y2 = f32::NEG_INFINITY;
+                for (_, p, _) in crate::editor::render::cubic_table(o.a, o.ka, o.kb, o.b, 24) {
+                    x1 = x1.min(p.x);
+                    y1 = y1.min(p.y);
+                    x2 = x2.max(p.x);
+                    y2 = y2.max(p.y);
+                }
+                PhysicalRect {
+                    x: x1 as i32 - pad,
+                    y: y1 as i32 - pad,
+                    width: ((x2 - x1).max(1.0) as i32 + pad * 2).max(1) as u32,
+                    height: ((y2 - y1).max(1.0) as i32 + pad * 2).max(1) as u32,
+                }
+            }
             Self::Fancy(o) => rect_of_points(o.a, o.b),
             Self::Freehand(o) | Self::HighlightStroke(o) => points_bounds(&o.points),
             Self::HighlightArea(o) => o.rect,
@@ -633,6 +660,8 @@ impl AnnotationKind {
             Self::Line(o) => {
                 shift(&mut o.a);
                 shift(&mut o.b);
+                shift(&mut o.ka);
+                shift(&mut o.kb);
             }
             Self::Fancy(o) => {
                 shift(&mut o.a);
@@ -692,6 +721,8 @@ impl AnnotationKind {
             Self::Line(o) => {
                 scale_pt(&mut o.a, &b);
                 scale_pt(&mut o.b, &b);
+                scale_pt(&mut o.ka, &b);
+                scale_pt(&mut o.kb, &b);
             }
             Self::Fancy(o) => {
                 scale_pt(&mut o.a, &b);

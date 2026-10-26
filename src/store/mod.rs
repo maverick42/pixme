@@ -29,7 +29,7 @@ use crate::ui::viewer::Tab;
 
 /// Current layout — a file carrying another version is wiped clean
 /// rather than migrated (the session is a convenience, not an archive).
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Days a `.bak` recovery copy survives a rebuild — the captures it
 /// contains must not linger forever.

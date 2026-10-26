@@ -145,6 +145,8 @@ struct Opts {
     line_start: LineEnd,
     line_end: LineEnd,
     outline: f32,
+    line_outline_color: Color32,
+    line_shadow: bool,
     // Shape specifics.
     radius: f32,
     tip: TipShape,
@@ -220,7 +222,9 @@ impl Default for Opts {
             opacity: 1.0,
             line_start: LineEnd::None,
             line_end: LineEnd::Arrow,
-            outline: 0.0,
+            outline: 2.0,
+            line_outline_color: Color32::WHITE,
+            line_shadow: true,
             radius: 8.0,
             tip: TipShape::Round,
             shape: AreaShape::Rect,
@@ -476,7 +480,15 @@ impl DrawSession {
                 continue;
             }
             let extra = match &a.kind {
-                AnnotationKind::Line(o) => o.width + 6.0,
+                AnnotationKind::Line(o) => {
+                    if [o.a, o.ka, o.kb, o.b]
+                        .iter()
+                        .any(|q| p.distance(*q) < 12.0 / scale.max(0.05))
+                    {
+                        return Some(a.id);
+                    }
+                    o.width * 2.0 + o.outline + 8.0
+                }
                 AnnotationKind::Fancy(o) => o.width * 2.0 + 8.0,
                 AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => {
                     o.width / 2.0 + 4.0
@@ -517,7 +529,12 @@ impl DrawSession {
                 // Lines/strokes need a real distance check, not bounds.
                 match &a.kind {
                     AnnotationKind::Line(o) => {
-                        if seg_distance(p, o.a, o.b) <= o.width.max(4.0) + 6.0 {
+                        let tab = render::cubic_table(o.a, o.ka, o.kb, o.b, 32);
+                        let tol = o.width.max(4.0) * 1.5 + o.outline + 6.0;
+                        if tab
+                            .windows(2)
+                            .any(|w| seg_distance(p, w[0].1, w[1].1) <= tol)
+                        {
                             return Some(a.id);
                         }
                     }
@@ -1256,11 +1273,9 @@ impl DrawSession {
                 if let Some(a) = self.doc.annotation_mut(*id) {
                     match &mut a.kind {
                         AnnotationKind::Line(o) => {
-                            if wb {
-                                o.b = p;
-                            } else {
-                                o.a = p;
-                            }
+                            drag_bezier_endpoint(
+                                &mut o.a, &mut o.ka, &mut o.kb, &mut o.b, wb, top, p,
+                            );
                         }
                         AnnotationKind::Fancy(o) => {
                             if wb {
@@ -1270,24 +1285,9 @@ impl DrawSession {
                             }
                         }
                         AnnotationKind::Text(o) => {
-                            // Cubic Bézier (`a`, `ka`, `kb`, `b`): the
-                            // green handles rotate/extend freely around
-                            // their grey endpoint to bend the baseline;
-                            // moving a grey endpoint carries its handle.
-                            match (wb, top) {
-                                (false, false) => o.ka = p,
-                                (true, false) => o.kb = p,
-                                (false, true) => {
-                                    let d = p - o.a;
-                                    o.a = p;
-                                    o.ka += d;
-                                }
-                                (true, true) => {
-                                    let d = p - o.b;
-                                    o.b = p;
-                                    o.kb += d;
-                                }
-                            }
+                            drag_bezier_endpoint(
+                                &mut o.a, &mut o.ka, &mut o.kb, &mut o.b, wb, top, p,
+                            );
                         }
                         _ => {}
                     }
@@ -1445,18 +1445,24 @@ impl DrawSession {
                 opacity: o.opacity,
                 shadow: o.shadow,
             }),
-            Tool::Arrow => AnnotationKind::Line(LineObj {
-                a,
-                b,
-                color: o.color,
-                width: o.width,
-                dash: o.dash,
-                start: o.line_start,
-                end: o.line_end,
-                outline: o.outline,
-                opacity: o.opacity,
-                shadow: o.shadow,
-            }),
+            Tool::Arrow => {
+                let (ka, kb) = bezier_rest_knobs(a, b);
+                AnnotationKind::Line(LineObj {
+                    a,
+                    b,
+                    ka,
+                    kb,
+                    color: o.color,
+                    width: o.width,
+                    dash: o.dash,
+                    start: o.line_start,
+                    end: o.line_end,
+                    outline: o.outline,
+                    outline_color: o.line_outline_color,
+                    opacity: o.opacity,
+                    shadow: if o.line_shadow { 3.0 } else { 0.0 },
+                })
+            }
             Tool::FancyArrow => AnnotationKind::Fancy(FancyObj {
                 a,
                 b,
@@ -1659,15 +1665,7 @@ impl DrawSession {
         let a = self.doc.annotation(id)?;
         let grab = 10.0 / scale.max(0.05);
         match &a.kind {
-            AnnotationKind::Line(o) => {
-                if p.distance(o.b) < grab + o.width {
-                    Some(Handle::Endpoint(true, false))
-                } else if p.distance(o.a) < grab + o.width {
-                    Some(Handle::Endpoint(false, false))
-                } else {
-                    None
-                }
-            }
+            AnnotationKind::Line(o) => bezier_handle_at(o.a, o.ka, o.kb, o.b, p, grab),
             AnnotationKind::Fancy(o) => {
                 if p.distance(o.b) < grab + o.width * 2.0 {
                     Some(Handle::Endpoint(true, false))
@@ -1677,22 +1675,7 @@ impl DrawSession {
                     None
                 }
             }
-            AnnotationKind::Text(o) => {
-                // (grey L, green L, green R, grey R) — greens first since
-                // they sit inside the grey pair's reach.
-                let (gl, ga, gb, gr) = text_anchors(o);
-                if p.distance(ga) < grab {
-                    Some(Handle::Endpoint(false, false))
-                } else if p.distance(gb) < grab {
-                    Some(Handle::Endpoint(true, false))
-                } else if p.distance(gl) < grab {
-                    Some(Handle::Endpoint(false, true))
-                } else if p.distance(gr) < grab {
-                    Some(Handle::Endpoint(true, true))
-                } else {
-                    None
-                }
-            }
+            AnnotationKind::Text(o) => bezier_handle_at(o.a, o.ka, o.kb, o.b, p, grab),
             AnnotationKind::TextBox(o) => {
                 if o.tail.is_some_and(|t| p.distance(t) < grab) {
                     return Some(Handle::Tail);
@@ -1834,8 +1817,8 @@ impl DrawSession {
                 img_rect.min.y + (b.y + b.height as i32) as f32 * scale,
             ),
         );
-        let is_text = matches!(a.kind, AnnotationKind::Text(_));
-        if !is_text {
+        let is_bezier = matches!(a.kind, AnnotationKind::Text(_) | AnnotationKind::Line(_));
+        if !is_bezier {
             painter.rect_stroke(
                 cb,
                 CornerRadius::ZERO,
@@ -1845,8 +1828,7 @@ impl DrawSession {
         }
         // Handles.
         match &a.kind {
-            AnnotationKind::Line(LineObj { a, b, .. })
-            | AnnotationKind::Fancy(FancyObj { a, b, .. }) => {
+            AnnotationKind::Fancy(FancyObj { a, b, .. }) => {
                 for p in [*a, *b] {
                     painter.rect_filled(
                         Rect::from_center_size(to_canvas(p), vec2(8.0, 8.0)),
@@ -1861,7 +1843,12 @@ impl DrawSession {
                     );
                 }
             }
-            AnnotationKind::Text(_) => {}
+            AnnotationKind::Line(o) => {
+                paint_bezier_chrome(painter, &to_canvas, o.a, o.ka, o.kb, o.b, accent, false);
+            }
+            AnnotationKind::Text(o) => {
+                paint_bezier_chrome(painter, &to_canvas, o.a, o.ka, o.kb, o.b, accent, true);
+            }
             _ => {
                 for c in handle_centers(cb) {
                     painter.rect_filled(c, CornerRadius::same(2), Color32::WHITE);
@@ -1877,39 +1864,6 @@ impl DrawSession {
                 {
                     painter.circle_filled(to_canvas(t), 4.0, Color32::from_rgb(60, 170, 80));
                 }
-            }
-        }
-        // Text chrome like the reference: the dashed cubic Bézier
-        // baseline (`a`, `ka`, `kb`, `b`) plus each green tangent
-        // handle's lever to its grey endpoint; all four are draggable.
-        if let AnnotationKind::Text(o) = &a.kind {
-            let (gl, ga, gb, gr) = text_anchors(o);
-            let curve: Vec<Pos2> = (0..=32)
-                .map(|i| to_canvas(render::bezier_eval(o, i as f32 / 32.0).0))
-                .collect();
-            painter.extend(egui::Shape::dashed_line(
-                &curve,
-                Stroke::new(1.0, accent),
-                5.0,
-                4.0,
-            ));
-            for (p0, p1) in [(gl, ga), (gr, gb)] {
-                painter.extend(egui::Shape::dashed_line(
-                    &[to_canvas(p0), to_canvas(p1)],
-                    Stroke::new(1.0, accent),
-                    6.0,
-                    4.0,
-                ));
-            }
-            for (i, q) in [gl, ga, gb, gr].iter().enumerate() {
-                let c = to_canvas(*q);
-                let fill = if i == 1 || i == 2 {
-                    Color32::from_rgb(60, 170, 80)
-                } else {
-                    Color32::from_rgb(200, 200, 200)
-                };
-                painter.circle_filled(c, 5.0, fill);
-                painter.circle_stroke(c, 5.0, Stroke::new(1.0, Color32::WHITE));
             }
         }
     }
@@ -2532,12 +2486,23 @@ impl DrawSession {
                     }
                 }
             }
-            Tool::Arrow | Tool::FancyArrow => {
+            Tool::Arrow => {
+                line_options_row(
+                    ui,
+                    "draw.bar.line",
+                    &mut o.color,
+                    &mut o.width,
+                    &mut o.line_start,
+                    &mut o.line_end,
+                    &mut o.dash,
+                    &mut o.outline,
+                    &mut o.line_outline_color,
+                    &mut o.opacity,
+                    &mut o.line_shadow,
+                );
+            }
+            Tool::FancyArrow => {
                 w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=20.0);
-                if self.tool == Tool::Arrow {
-                    end_combo(ui, "draw.opt.start", &mut o.line_start);
-                    end_combo(ui, "draw.opt.end", &mut o.line_end);
-                }
                 dash_combo(ui, &mut o.dash);
                 color_btn(ui, &mut o.color);
                 slider(ui, t!("draw.opt.outline"), &mut o.outline, 0.0..=6.0);
@@ -2753,10 +2718,23 @@ impl DrawSession {
                     changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
                 }
                 AnnotationKind::Line(o) => {
-                    changed |= w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=20.0).changed();
-                    changed |= color_btn(ui, &mut o.color).changed();
-                    changed |= dash_combo(ui, &mut o.dash);
-                    changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
+                    let mut sh_on = o.shadow > 0.0;
+                    if line_options_row(
+                        ui,
+                        "draw.sel.line",
+                        &mut o.color,
+                        &mut o.width,
+                        &mut o.start,
+                        &mut o.end,
+                        &mut o.dash,
+                        &mut o.outline,
+                        &mut o.outline_color,
+                        &mut o.opacity,
+                        &mut sh_on,
+                    ) {
+                        o.shadow = if sh_on { 3.0 } else { 0.0 };
+                        changed = true;
+                    }
                 }
                 AnnotationKind::Fancy(o) => {
                     changed |= w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0).changed();
@@ -2986,6 +2964,102 @@ fn unit_dir(a: Pos2, b: Pos2) -> Vec2 {
         Vec2::new(1.0, 0.0)
     } else {
         d / len
+    }
+}
+
+/// Default 1/3 and 2/3 cubic-Bézier control points along `a..b`.
+fn bezier_rest_knobs(a: Pos2, b: Pos2) -> (Pos2, Pos2) {
+    (
+        pos2(a.x + (b.x - a.x) / 3.0, a.y + (b.y - a.y) / 3.0),
+        pos2(a.x + (b.x - a.x) * 2.0 / 3.0, a.y + (b.y - a.y) * 2.0 / 3.0),
+    )
+}
+
+/// Hit-tests the four cubic-Bézier anchors (`a`, `ka`, `kb`, `b`) — green
+/// inner knobs first so they stay reachable when close to the endpoints.
+fn bezier_handle_at(a: Pos2, ka: Pos2, kb: Pos2, b: Pos2, p: Pos2, grab: f32) -> Option<Handle> {
+    if p.distance(ka) < grab {
+        Some(Handle::Endpoint(false, false))
+    } else if p.distance(kb) < grab {
+        Some(Handle::Endpoint(true, false))
+    } else if p.distance(a) < grab {
+        Some(Handle::Endpoint(false, true))
+    } else if p.distance(b) < grab {
+        Some(Handle::Endpoint(true, true))
+    } else {
+        None
+    }
+}
+
+/// Updates the dragged cubic-Bézier anchor (`a`, `ka`, `kb`, `b`); moving
+/// a grey endpoint carries its adjacent green tangent handle along.
+fn drag_bezier_endpoint(
+    a: &mut Pos2,
+    ka: &mut Pos2,
+    kb: &mut Pos2,
+    b: &mut Pos2,
+    wb: bool,
+    top: bool,
+    p: Pos2,
+) {
+    match (wb, top) {
+        (false, false) => *ka = p,
+        (true, false) => *kb = p,
+        (false, true) => {
+            let d = p - *a;
+            *a = p;
+            *ka += d;
+        }
+        (true, true) => {
+            let d = p - *b;
+            *b = p;
+            *kb += d;
+        }
+    }
+}
+
+/// Draws the 4-anchor cubic-Bézier selection chrome (dashed levers + two
+/// grey endpoints + two green control knobs, plus the dashed baseline when
+/// `draw_curve_guide` is set).
+#[allow(clippy::too_many_arguments)]
+fn paint_bezier_chrome(
+    painter: &egui::Painter,
+    to_canvas: &dyn Fn(Pos2) -> Pos2,
+    a: Pos2,
+    ka: Pos2,
+    kb: Pos2,
+    b: Pos2,
+    accent: Color32,
+    draw_curve_guide: bool,
+) {
+    if draw_curve_guide {
+        let curve: Vec<Pos2> = (0..=32)
+            .map(|i| to_canvas(render::cubic_eval(a, ka, kb, b, i as f32 / 32.0).0))
+            .collect();
+        painter.extend(egui::Shape::dashed_line(
+            &curve,
+            Stroke::new(1.0, accent),
+            5.0,
+            4.0,
+        ));
+    }
+    for (p0, p1) in [(a, ka), (b, kb)] {
+        painter.extend(egui::Shape::dashed_line(
+            &[to_canvas(p0), to_canvas(p1)],
+            Stroke::new(1.0, accent),
+            6.0,
+            4.0,
+        ));
+    }
+    for (i, q) in [a, ka, kb, b].iter().enumerate() {
+        let c = to_canvas(*q);
+        let fill = if i == 1 || i == 2 {
+            Color32::from_rgb(60, 170, 80)
+        } else {
+            Color32::from_rgb(200, 200, 200)
+        };
+        painter.circle_filled(c, 5.0, fill);
+        painter.circle_stroke(c, 5.0, Stroke::new(1.0, Color32::WHITE));
     }
 }
 
@@ -3235,28 +3309,70 @@ fn dash_combo(ui: &mut Ui, dash: &mut Dash) -> bool {
     *dash != cur
 }
 
-/// Line-end combo (None / Arrow / Dot / Ring).
-fn end_combo(ui: &mut Ui, key: &str, end: &mut LineEnd) {
-    ui.label(t!(key));
-    let cur = *end;
-    egui::ComboBox::from_id_salt(key)
-        .selected_text(match cur {
-            LineEnd::None => t!("draw.end.none").to_string(),
-            LineEnd::Arrow => t!("draw.end.arrow").to_string(),
-            LineEnd::Dot => t!("draw.end.dot").to_string(),
-            LineEnd::Ring => t!("draw.end.ring").to_string(),
-        })
-        .width(90.0)
+/// Line/arrow option strip shared by `Tool::Arrow` and a selected `LineObj`.
+#[allow(clippy::too_many_arguments)]
+fn line_options_row(
+    ui: &mut Ui,
+    salt: &'static str,
+    color: &mut Color32,
+    width: &mut f32,
+    start: &mut LineEnd,
+    end: &mut LineEnd,
+    dash: &mut Dash,
+    outline: &mut f32,
+    outline_color: &mut Color32,
+    opacity: &mut f32,
+    shadow_on: &mut bool,
+) -> bool {
+    const PRESETS: &[((LineEnd, LineEnd), &str)] = &[
+        ((LineEnd::None, LineEnd::None), "———"),
+        ((LineEnd::None, LineEnd::Arrow), "——→"),
+        ((LineEnd::Dot, LineEnd::Arrow), "●—→"),
+        ((LineEnd::Ring, LineEnd::Arrow), "○—→"),
+        ((LineEnd::Dot, LineEnd::Dot), "●—●"),
+        ((LineEnd::Ring, LineEnd::Ring), "○—○"),
+        ((LineEnd::Arrow, LineEnd::None), "←——"),
+        ((LineEnd::Arrow, LineEnd::Dot), "←—●"),
+        ((LineEnd::Arrow, LineEnd::Ring), "←—○"),
+        ((LineEnd::Arrow, LineEnd::Arrow), "←—→"),
+    ];
+    let mut changed = false;
+    ui.label(t!("draw.opt.color"));
+    changed |= color_btn(ui, color).changed();
+    changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=20.0).changed();
+
+    ui.label(t!("draw.opt.start"));
+    let cur = (*start, *end);
+    let mut picked = cur;
+    let cur_label = PRESETS
+        .iter()
+        .find(|(p, _)| *p == cur)
+        .map_or("——→", |(_, l)| *l);
+    egui::ComboBox::from_id_salt((salt, "ends"))
+        .width(68.0)
+        .selected_text(cur_label)
         .show_ui(ui, |ui| {
-            for (v, l) in [
-                (LineEnd::None, t!("draw.end.none")),
-                (LineEnd::Arrow, t!("draw.end.arrow")),
-                (LineEnd::Dot, t!("draw.end.dot")),
-                (LineEnd::Ring, t!("draw.end.ring")),
-            ] {
-                ui.selectable_value(end, v, l.to_string());
+            for &(pair, label) in PRESETS {
+                ui.selectable_value(&mut picked, pair, label);
             }
         });
+    if picked != cur {
+        *start = picked.0;
+        *end = picked.1;
+        changed = true;
+    }
+
+    changed |= dash_combo(ui, dash);
+
+    ui.label(t!("draw.opt.outline"));
+    changed |= outline_combo(ui, salt, outline);
+    changed |= color_btn(ui, outline_color).changed();
+
+    changed |= opacity_pct_slider(ui, opacity);
+    changed |= ui
+        .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
+        .changed();
+    changed
 }
 
 /// Tip-shape combo (round/square nib).
