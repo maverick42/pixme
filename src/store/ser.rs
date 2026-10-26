@@ -8,7 +8,7 @@
 use image::RgbaImage;
 
 /// PNG-encodes an RGBA image — the store's blob format for every bitmap
-/// (base captures, `PicObj` images, `FillObj` masks).
+/// (base captures, `PicObj` images).
 pub fn png_encode(img: &RgbaImage) -> anyhow::Result<Vec<u8>> {
     use image::ImageEncoder;
     let mut buf = Vec::new();

@@ -171,11 +171,6 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/arrow-up-right.svg"),
     ),
     (
-        Icon::ArrowBigUp,
-        "arrow-big-up",
-        include_bytes!("../../assets/icons/arrow-big-up.svg"),
-    ),
-    (
         Icon::Eraser,
         "eraser",
         include_bytes!("../../assets/icons/eraser.svg"),
@@ -206,24 +201,9 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/highlighter.svg"),
     ),
     (
-        Icon::PaintBucket,
-        "paint-bucket",
-        include_bytes!("../../assets/icons/paint-bucket.svg"),
-    ),
-    (
         Icon::Pixelate,
         "pixelate",
         include_bytes!("../../assets/icons/pixelate.svg"),
-    ),
-    (
-        Icon::Smile,
-        "smile",
-        include_bytes!("../../assets/icons/smile.svg"),
-    ),
-    (
-        Icon::MousePointerClick,
-        "mouse-pointer-click",
-        include_bytes!("../../assets/icons/mouse-pointer-click.svg"),
     ),
     (
         Icon::Image,
@@ -239,46 +219,6 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         Icon::Redo2,
         "redo-2",
         include_bytes!("../../assets/icons/redo-2.svg"),
-    ),
-    (
-        Icon::Hand,
-        "hand",
-        include_bytes!("../../assets/icons/hand.svg"),
-    ),
-    (
-        Icon::TextCursor,
-        "text-cursor",
-        include_bytes!("../../assets/icons/text-cursor.svg"),
-    ),
-    (
-        Icon::Ruler,
-        "ruler",
-        include_bytes!("../../assets/icons/ruler.svg"),
-    ),
-    (
-        Icon::LoaderCircle,
-        "loader-circle",
-        include_bytes!("../../assets/icons/loader-circle.svg"),
-    ),
-    (
-        Icon::CircleHelp,
-        "circle-help",
-        include_bytes!("../../assets/icons/circle-help.svg"),
-    ),
-    (
-        Icon::CircleX,
-        "circle-x",
-        include_bytes!("../../assets/icons/circle-x.svg"),
-    ),
-    (
-        Icon::Lightbulb,
-        "lightbulb",
-        include_bytes!("../../assets/icons/lightbulb.svg"),
-    ),
-    (
-        Icon::Mouse,
-        "mouse",
-        include_bytes!("../../assets/icons/mouse.svg"),
     ),
     (
         Icon::AlignLeft,
@@ -341,13 +281,3 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/blur.svg"),
     ),
 ];
-
-/// The raw embedded SVG bytes of `icon` — used by the annotation
-/// renderer to recolour stamps independently of the UI's white-stroke
-/// styling.
-pub(crate) fn raw_svg(icon: Icon) -> &'static [u8] {
-    DATA.iter()
-        .find(|&&(i, _, _)| i == icon)
-        .map(|&(_, _, raw)| raw)
-        .unwrap_or_default()
-}

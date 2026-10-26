@@ -19,17 +19,15 @@ use crate::app::Shared;
 use crate::capture::PhysicalRect;
 use crate::editor::document::{
     Annotation, AnnotationId, AnnotationKind, AreaObj, AreaShape, BlurObj, BlurStyle, BoxObj, Dash,
-    Document, EllipseObj, EraserMode, FancyObj, FillObj, FreeObj, LineEnd, LineObj, PicObj,
-    RectObj, StampId, StampObj, StepMode, StepObj, StepSize, StepStyle, TextAlign, TextObj,
-    TipShape,
+    Document, EllipseObj, EraserMode, FreeObj, LineEnd, LineObj, PicObj, RectObj, StepMode,
+    StepObj, StepSize, StepStyle, TextAlign, TextObj, TipShape,
 };
 use crate::editor::history::{ANNO_HISTORY_CAP, AnnoEdit};
 use crate::editor::render;
-use crate::ui::icons::{self, Icon};
+use crate::ui::icons::Icon;
 use crate::ui::{theme, widgets};
 
-/// One drawable tool of the strip (grid order = the user's reference
-/// screenshots: two columns, fill/stamps/image on the last row).
+/// One drawable tool of the strip (two-column grid).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
     Select,
@@ -40,24 +38,20 @@ enum Tool {
     Text,
     Step,
     Arrow,
-    FancyArrow,
     Pencil,
     Eraser,
     Rect,
     RectFill,
     Ellipse,
     EllipseFill,
-    HighlightLine,
     HighlightArea,
-    Fill,
     Blur,
-    Stamps,
     InsertImage,
 }
 
 impl Tool {
     /// The strip grid in display order (row-major, two columns).
-    const ALL: [Tool; 20] = [
+    const ALL: [Tool; 16] = [
         Self::Select,
         Self::SelectArea,
         Self::TextBoxRect,
@@ -65,18 +59,14 @@ impl Tool {
         Self::Text,
         Self::Step,
         Self::Arrow,
-        Self::FancyArrow,
         Self::Pencil,
         Self::Eraser,
         Self::Rect,
         Self::RectFill,
         Self::Ellipse,
         Self::EllipseFill,
-        Self::HighlightLine,
         Self::HighlightArea,
-        Self::Fill,
         Self::Blur,
-        Self::Stamps,
         Self::InsertImage,
     ];
 
@@ -89,18 +79,14 @@ impl Tool {
             Self::Text => Icon::Type,
             Self::Step => Icon::Info,
             Self::Arrow => Icon::ArrowUpRight,
-            Self::FancyArrow => Icon::ArrowBigUp,
             Self::Pencil => Icon::Pencil,
             Self::Eraser => Icon::Eraser,
             Self::Rect => Icon::Square,
             Self::RectFill => Icon::SquareFill,
             Self::Ellipse => Icon::Circle,
             Self::EllipseFill => Icon::CircleFill,
-            Self::HighlightLine => Icon::Highlighter,
-            Self::HighlightArea => Icon::SquareFill,
-            Self::Fill => Icon::PaintBucket,
+            Self::HighlightArea => Icon::Highlighter,
             Self::Blur => Icon::Pixelate,
-            Self::Stamps => Icon::MousePointerClick,
             Self::InsertImage => Icon::Image,
         }
     }
@@ -114,18 +100,14 @@ impl Tool {
             Self::Text => t!("draw.tool.text"),
             Self::Step => t!("draw.tool.step"),
             Self::Arrow => t!("draw.tool.arrow"),
-            Self::FancyArrow => t!("draw.tool.fancy"),
             Self::Pencil => t!("draw.tool.pencil"),
             Self::Eraser => t!("draw.tool.eraser"),
             Self::Rect => t!("draw.tool.rect"),
             Self::RectFill => t!("draw.tool.rectfill"),
             Self::Ellipse => t!("draw.tool.ellipse"),
             Self::EllipseFill => t!("draw.tool.ellipsefill"),
-            Self::HighlightLine => t!("draw.tool.hline"),
             Self::HighlightArea => t!("draw.tool.harea"),
-            Self::Fill => t!("draw.tool.fill"),
             Self::Blur => t!("draw.tool.blur"),
-            Self::Stamps => t!("draw.tool.stamps"),
             Self::InsertImage => t!("draw.tool.insert"),
         }
     }
@@ -159,9 +141,6 @@ struct Opts {
     eraser_size: f32,
     eraser_mode: EraserMode,
     eraser_pick: bool,
-    // Fill tool.
-    tolerance: u8,
-    transparent_only: bool,
     // Blur tool.
     blur_style: BlurStyle,
     blur_strength: u8,
@@ -189,9 +168,6 @@ struct Opts {
     step_ring_color: Color32,
     step_shadow: bool,
     step_lower: bool,
-    // Stamps.
-    stamp: StampId,
-    stamp_size: f32,
 }
 
 impl Opts {
@@ -239,8 +215,6 @@ impl Default for Opts {
             eraser_size: 12.0,
             eraser_mode: EraserMode::Color,
             eraser_pick: false,
-            tolerance: 32,
-            transparent_only: false,
             blur_style: BlurStyle::Blur,
             blur_strength: 30,
             font: "Arial".to_owned(),
@@ -261,8 +235,6 @@ impl Default for Opts {
             step_ring_color: Color32::WHITE,
             step_shadow: true,
             step_lower: false,
-            stamp: StampId::Smile,
-            stamp_size: 32.0,
         }
     }
 }
@@ -504,12 +476,9 @@ impl DrawSession {
                     }
                     o.width * 2.0 + o.outline + 8.0
                 }
-                AnnotationKind::Fancy(o) => o.width * 2.0 + 8.0,
                 AnnotationKind::Rect(o) => o.stroke_w * 0.5 + o.outline + 6.0,
                 AnnotationKind::Ellipse(o) => o.stroke_w * 0.5 + o.outline + 6.0,
-                AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => {
-                    o.width / 2.0 + 4.0
-                }
+                AnnotationKind::Freehand(o) => o.width / 2.0 + 4.0,
                 AnnotationKind::Text(o) => {
                     // Anchor dots can sit right on the AABB edge — count
                     // them in, the bounds test below covers the body.
@@ -521,19 +490,6 @@ impl DrawSession {
                         return Some(a.id);
                     }
                     4.0
-                }
-                AnnotationKind::Fill(o) => {
-                    // Hit the mask's actual coverage, not a rect.
-                    let (x, y) = (p.x as i64, p.y as i64);
-                    if x >= 0
-                        && y >= 0
-                        && x < o.mask.width() as i64
-                        && y < o.mask.height() as i64
-                        && o.mask.get_pixel(x as u32, y as u32).0[3] > 0
-                    {
-                        return Some(a.id);
-                    }
-                    continue;
                 }
                 _ => 4.0,
             };
@@ -555,13 +511,8 @@ impl DrawSession {
                             return Some(a.id);
                         }
                     }
-                    AnnotationKind::Fancy(o) => {
-                        if seg_distance(p, o.a, o.b) <= o.width * 2.0 + 10.0 {
-                            return Some(a.id);
-                        }
-                    }
                     AnnotationKind::Text(_) => return Some(a.id),
-                    AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => {
+                    AnnotationKind::Freehand(o) => {
                         let hit = o
                             .points
                             .windows(2)
@@ -780,12 +731,8 @@ impl DrawSession {
         });
     }
 
-    /// Handles a tool click — Stamps opens the glyph popup instead.
+    /// Handles a tool click — InsertImage opens its file picker instead.
     fn pick_tool(&mut self, tool: Tool, _ctx: &egui::Context) {
-        if tool == Tool::Stamps {
-            self.tool = tool;
-            return;
-        }
         if tool == Tool::InsertImage {
             self.insert_image();
             return;
@@ -1151,11 +1098,8 @@ impl DrawSession {
         let hit_id = self.hit(img_p, scale);
         // The marquee tool works on regions, not objects — it never
         // picks them (same for the pure pixel tools).
-        let can_pick_existing =
-            !matches!(
-                self.tool,
-                Tool::Eraser | Tool::Blur | Tool::Fill | Tool::SelectArea
-            ) && !matches!(self.drag, Some(Drag::Shape { .. } | Drag::Freehand { .. }));
+        let can_pick_existing = !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::SelectArea)
+            && !matches!(self.drag, Some(Drag::Shape { .. } | Drag::Freehand { .. }));
         let in_sel = self.sel_area.is_some_and(|s| s.rect.contains(img_p));
         let cursor = if on_handle {
             egui::CursorIcon::PointingHand
@@ -1240,10 +1184,8 @@ impl DrawSession {
         // Dragging over an existing object selects and moves it, regardless
         // of which creation tool is armed (except pure pixel tools and the
         // marquee, which frames regions rather than grabbing objects).
-        if !matches!(
-            self.tool,
-            Tool::Eraser | Tool::Blur | Tool::Fill | Tool::SelectArea
-        ) && let Some(id) = self.hit(p, self.canvas_scale)
+        if !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::SelectArea)
+            && let Some(id) = self.hit(p, self.canvas_scale)
             && let Some(before) = self.doc.annotation(id).cloned()
         {
             self.selected = Some(id);
@@ -1273,12 +1215,7 @@ impl DrawSession {
                     self.drag = Some(Drag::Marquee { anchor: p });
                 }
             }
-            Tool::Select
-            | Tool::Text
-            | Tool::Fill
-            | Tool::Step
-            | Tool::Stamps
-            | Tool::InsertImage => {}
+            Tool::Select | Tool::Text | Tool::Step | Tool::InsertImage => {}
             Tool::Eraser => {
                 if self.opts.eraser_pick {
                     self.opts.eraser_color = self.pixel_at(p);
@@ -1288,7 +1225,7 @@ impl DrawSession {
                     self.drag = Some(Drag::Freehand { points: vec![p] });
                 }
             }
-            Tool::Pencil | Tool::HighlightLine => {
+            Tool::Pencil => {
                 self.drag = Some(Drag::Freehand { points: vec![p] });
             }
             _ => self.drag = Some(Drag::Shape { anchor: p }),
@@ -1333,13 +1270,6 @@ impl DrawSession {
                             drag_bezier_endpoint(
                                 &mut o.a, &mut o.ka, &mut o.kb, &mut o.b, wb, top, p,
                             );
-                        }
-                        AnnotationKind::Fancy(o) => {
-                            if wb {
-                                o.b = p;
-                            } else {
-                                o.a = p;
-                            }
                         }
                         AnnotationKind::Text(o) => {
                             drag_bezier_endpoint(
@@ -1439,19 +1369,6 @@ impl DrawSession {
                 soft: false,
                 opacity: 1.0,
             }),
-            Tool::HighlightLine => AnnotationKind::HighlightStroke(FreeObj {
-                points,
-                color: self.opts.color,
-                width: self.opts.width * 4.0,
-                tip: TipShape::Round,
-                dash: Dash::Solid,
-                outline: 0.0,
-                outline_color: Color32::WHITE,
-                shadow: 0.0,
-                eraser_mode: EraserMode::Color,
-                soft: false,
-                opacity: self.opts.hl_opacity,
-            }),
             _ => AnnotationKind::Freehand(FreeObj {
                 points,
                 color: self.opts.color,
@@ -1547,16 +1464,6 @@ impl DrawSession {
                     shadow: if o.line_shadow { 3.0 } else { 0.0 },
                 })
             }
-            Tool::FancyArrow => AnnotationKind::Fancy(FancyObj {
-                a,
-                b,
-                color: o.color,
-                width: o.width,
-                dash: o.dash,
-                outline: o.outline,
-                opacity: o.opacity,
-                shadow: o.shadow,
-            }),
             Tool::HighlightArea => AnnotationKind::HighlightArea(AreaObj {
                 rect: r,
                 color: o.color,
@@ -1623,10 +1530,8 @@ impl DrawSession {
         if had_panel {
             self.close_text_panel();
         }
-        if !matches!(
-            self.tool,
-            Tool::Eraser | Tool::Blur | Tool::Fill | Tool::SelectArea
-        ) && let Some(id) = self.hit(p, self.canvas_scale)
+        if !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::SelectArea)
+            && let Some(id) = self.hit(p, self.canvas_scale)
         {
             self.selected = Some(id);
             self.sync_text_panel();
@@ -1723,29 +1628,6 @@ impl DrawSession {
                 let index = self.doc.annotations.len();
                 self.apply(AnnoEdit::Add { anno, index });
             }
-            Tool::Fill => {
-                let mask = render::compute_fill_mask(
-                    &render::render_to_image(&self.doc),
-                    p,
-                    self.opts.tolerance,
-                );
-                self.add(AnnotationKind::Fill(FillObj {
-                    origin: p,
-                    color: self.opts.fill_color,
-                    tolerance: self.opts.tolerance,
-                    transparent: self.opts.transparent_only,
-                    mask,
-                }));
-            }
-            Tool::Stamps => {
-                self.add(AnnotationKind::Stamp(StampObj {
-                    pos: p,
-                    stamp: self.opts.stamp,
-                    color: self.opts.color,
-                    size: self.opts.stamp_size,
-                    opacity: self.opts.opacity,
-                }));
-            }
             _ => {}
         }
         let _ = ctx;
@@ -1759,15 +1641,6 @@ impl DrawSession {
         let grab = 10.0 / scale.max(0.05);
         match &a.kind {
             AnnotationKind::Line(o) => bezier_handle_at(o.a, o.ka, o.kb, o.b, p, grab),
-            AnnotationKind::Fancy(o) => {
-                if p.distance(o.b) < grab + o.width * 2.0 {
-                    Some(Handle::Endpoint(true, false))
-                } else if p.distance(o.a) < grab + o.width * 2.0 {
-                    Some(Handle::Endpoint(false, false))
-                } else {
-                    None
-                }
-            }
             AnnotationKind::Text(o) => bezier_handle_at(o.a, o.ka, o.kb, o.b, p, grab),
             AnnotationKind::TextBox(o) => {
                 if o.tail.is_some_and(|t| p.distance(t) < grab) {
@@ -1820,11 +1693,6 @@ impl DrawSession {
                     };
                     (preview_col, (o.eraser_size * scale).max(2.0), 0.0)
                 }
-                Tool::HighlightLine => (
-                    o.color.gamma_multiply(o.hl_opacity),
-                    (o.width * 4.0 * scale).max(2.0),
-                    0.0,
-                ),
                 _ => (
                     o.color.gamma_multiply(o.opacity),
                     (o.width * scale).max(1.0),
@@ -1969,7 +1837,7 @@ impl DrawSession {
                         StrokeKind::Inside,
                     );
                 }
-                Tool::Arrow | Tool::FancyArrow => {
+                Tool::Arrow => {
                     painter.line_segment([ca, cb], Stroke::new(o.width.max(1.0), o.color));
                 }
                 _ => {}
@@ -2071,21 +1939,6 @@ impl DrawSession {
         }
         // Handles.
         match &a.kind {
-            AnnotationKind::Fancy(FancyObj { a, b, .. }) => {
-                for p in [*a, *b] {
-                    painter.rect_filled(
-                        Rect::from_center_size(to_canvas(p), vec2(8.0, 8.0)),
-                        CornerRadius::same(2),
-                        Color32::WHITE,
-                    );
-                    painter.rect_stroke(
-                        Rect::from_center_size(to_canvas(p), vec2(8.0, 8.0)),
-                        CornerRadius::same(2),
-                        Stroke::new(1.0, accent),
-                        StrokeKind::Inside,
-                    );
-                }
-            }
             AnnotationKind::Line(o) => {
                 paint_bezier_chrome(painter, &to_canvas, o.a, o.ka, o.kb, o.b, accent, false);
             }
@@ -2609,9 +2462,7 @@ impl DrawSession {
                     }
                 }
                 AnnotationKind::Line(_) => t!("draw.tool.arrow"),
-                AnnotationKind::Fancy(_) => t!("draw.tool.fancy"),
                 AnnotationKind::Freehand(_) => t!("draw.tool.pencil"),
-                AnnotationKind::HighlightStroke(_) => t!("draw.tool.hline"),
                 AnnotationKind::HighlightArea(_) => t!("draw.tool.harea"),
                 AnnotationKind::Rect(o) => {
                     if o.fill.is_some() {
@@ -2628,9 +2479,7 @@ impl DrawSession {
                     }
                 }
                 AnnotationKind::Step(_) => t!("draw.tool.step"),
-                AnnotationKind::Stamp(_) => t!("draw.tool.stamps"),
                 AnnotationKind::Picture(_) => t!("draw.tab.image"),
-                AnnotationKind::Fill(_) => t!("draw.tool.fill"),
                 AnnotationKind::Blur(_) => t!("draw.tool.blur"),
             };
         }
@@ -2851,13 +2700,6 @@ impl DrawSession {
                     &mut o.line_shadow,
                 );
             }
-            Tool::FancyArrow => {
-                w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=20.0);
-                dash_combo(ui, &mut o.dash);
-                color_btn(ui, &mut o.color);
-                slider(ui, t!("draw.opt.outline"), &mut o.outline, 0.0..=6.0);
-                shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
-            }
             Tool::Pencil => {
                 pencil_options_row(
                     ui,
@@ -2937,11 +2779,6 @@ impl DrawSession {
                     o.fill_color = fc;
                 }
             }
-            Tool::HighlightLine => {
-                w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0);
-                color_btn(ui, &mut o.color);
-                opacity_pct_slider(ui, &mut o.hl_opacity);
-            }
             Tool::HighlightArea => {
                 highlight_area_options_row(
                     ui,
@@ -2949,17 +2786,6 @@ impl DrawSession {
                     &mut o.color,
                     &mut o.shape,
                     &mut o.hl_opacity,
-                );
-            }
-            Tool::Fill => {
-                color_btn(ui, &mut o.fill_color);
-                let mut tol = f32::from(o.tolerance);
-                if slider(ui, t!("draw.opt.tolerance"), &mut tol, 0.0..=255.0).changed() {
-                    o.tolerance = tol as u8;
-                }
-                ui.checkbox(
-                    &mut o.transparent_only,
-                    t!("draw.opt.transparent").to_string(),
                 );
             }
             Tool::Blur => {
@@ -3048,24 +2874,6 @@ impl DrawSession {
                     &mut o.step_shadow,
                 );
             }
-            Tool::Stamps => {
-                // The stamp glyph picker.
-                for s in StampId::ALL {
-                    let resp = widgets::icon_button(ui, icons::stamp_icon(s), self.opts.stamp == s)
-                        .on_hover_text(s.label());
-                    if resp.clicked() {
-                        self.opts.stamp = s;
-                    }
-                }
-                ui.separator();
-                color_btn(ui, &mut self.opts.color);
-                slider(
-                    ui,
-                    t!("draw.opt.size"),
-                    &mut self.opts.stamp_size,
-                    8.0..=96.0,
-                );
-            }
             Tool::InsertImage => {
                 ui.label(t!("draw.opt.insert_hint"));
             }
@@ -3144,11 +2952,6 @@ impl DrawSession {
                         changed = true;
                     }
                 }
-                AnnotationKind::Fancy(o) => {
-                    changed |= w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0).changed();
-                    changed |= color_btn(ui, &mut o.color).changed();
-                    changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
-                }
                 AnnotationKind::Freehand(o) => {
                     let mut sh_on = o.shadow > 0.0;
                     if pencil_options_row(
@@ -3166,11 +2969,6 @@ impl DrawSession {
                         o.shadow = if sh_on { 3.0 } else { 0.0 };
                         changed = true;
                     }
-                }
-                AnnotationKind::HighlightStroke(o) => {
-                    changed |= w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0).changed();
-                    changed |= color_btn(ui, &mut o.color).changed();
-                    changed |= opacity_pct_slider(ui, &mut o.opacity);
                 }
                 AnnotationKind::HighlightArea(o) => {
                     if highlight_area_options_row(
@@ -3276,10 +3074,6 @@ impl DrawSession {
                         changed = true;
                     }
                 }
-                AnnotationKind::Stamp(o) => {
-                    changed |= color_btn(ui, &mut o.color).changed();
-                    changed |= slider(ui, t!("draw.opt.size"), &mut o.size, 8.0..=96.0).changed();
-                }
                 AnnotationKind::Picture(o) => {
                     changed |= opacity_pct_slider(ui, &mut o.opacity);
                     let mut sh_on = o.shadow > 0.0;
@@ -3287,9 +3081,6 @@ impl DrawSession {
                         o.shadow = if sh_on { 3.0 } else { 0.0 };
                         changed = true;
                     }
-                }
-                AnnotationKind::Fill(o) => {
-                    changed |= color_btn(ui, &mut o.color).changed();
                 }
                 AnnotationKind::Blur(o) => {
                     let mut s = f32::from(o.strength);
@@ -3716,13 +3507,6 @@ fn opacity_pct_slider(ui: &mut Ui, opacity: &mut f32) -> bool {
     } else {
         false
     }
-}
-
-/// Shadow + opacity sliders — the recurring FS pair.
-fn shadow_opacity(ui: &mut Ui, shadow: &mut f32, opacity: &mut f32) -> bool {
-    let mut changed = slider(ui, t!("draw.opt.shadow"), shadow, 0.0..=8.0).changed();
-    changed |= slider(ui, t!("draw.opt.opacity"), opacity, 0.1..=1.0).changed();
-    changed
 }
 
 /// Dash-style combo (Solid / Dash / Dot / DashDot).

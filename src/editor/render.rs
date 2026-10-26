@@ -5,7 +5,6 @@
 //! local helpers (thick/dashed polylines, fills, text with outline and
 //! faux italics, flood fill, pixelate/blur).
 
-use std::collections::VecDeque;
 use std::sync::OnceLock;
 
 use egui::{Color32, Pos2};
@@ -131,7 +130,6 @@ fn render_one(img: &mut RgbaImage, anno: &Annotation) {
     match &anno.kind {
         // Region effects read + write the base directly.
         AnnotationKind::Blur(o) => apply_blur(img, o),
-        AnnotationKind::Fill(o) => apply_fill(img, o),
         AnnotationKind::Freehand(o) if o.eraser_mode != super::document::EraserMode::Color => {
             apply_freehand_effect(img, o);
         }
@@ -157,15 +155,13 @@ fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
         AnnotationKind::Rect(o) => (0.0, o.opacity),
         AnnotationKind::Ellipse(o) => (0.0, o.opacity),
         AnnotationKind::Line(o) => (0.0, o.opacity),
-        AnnotationKind::Fancy(o) => (o.shadow, o.opacity),
-        AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => (0.0, o.opacity),
+        AnnotationKind::Freehand(o) => (0.0, o.opacity),
         AnnotationKind::HighlightArea(o) => (0.0, o.opacity),
         AnnotationKind::Text(o) => (o.shadow, o.opacity),
         AnnotationKind::TextBox(o) => (o.shadow, o.opacity),
         AnnotationKind::Step(o) => (0.0, o.opacity),
-        AnnotationKind::Stamp(o) => (0.0, o.opacity),
         AnnotationKind::Picture(o) => (o.shadow, o.opacity),
-        AnnotationKind::Fill(_) | AnnotationKind::Blur(_) => (0.0, 1.0),
+        AnnotationKind::Blur(_) => (0.0, 1.0),
     }
 }
 
@@ -201,11 +197,7 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
             o.shadow,
         ),
         AnnotationKind::Line(o) => draw_line_obj(&mut layer, o),
-        AnnotationKind::Fancy(o) => draw_fancy(&mut layer, o),
         AnnotationKind::Freehand(o) => {
-            stroke_freehand(&mut layer, o);
-        }
-        AnnotationKind::HighlightStroke(o) => {
             stroke_freehand(&mut layer, o);
         }
         AnnotationKind::HighlightArea(o) => draw_shape_sdf(
@@ -224,13 +216,12 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
         AnnotationKind::Text(o) => draw_text_obj(&mut layer, o),
         AnnotationKind::TextBox(o) => draw_textbox(&mut layer, o),
         AnnotationKind::Step(o) => draw_step(&mut layer, o),
-        AnnotationKind::Stamp(o) => draw_stamp(&mut layer, o),
         AnnotationKind::Picture(o) => draw_picture(&mut layer, o),
-        AnnotationKind::Fill(_) | AnnotationKind::Blur(_) => {}
+        AnnotationKind::Blur(_) => {}
     }
     // Per-object alpha (freehand strokes carry theirs on the colour).
     let extra = match &anno.kind {
-        AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => o.opacity,
+        AnnotationKind::Freehand(o) => o.opacity,
         _ => 1.0,
     };
     (layer, shadow, opacity * extra)
@@ -941,42 +932,7 @@ fn draw_line_obj(img: &mut RgbaImage, o: &super::document::LineObj) {
     }
 }
 
-/// The tapered fancy arrow: shaft quad + oversized head triangle.
-fn draw_fancy(img: &mut RgbaImage, o: &super::document::FancyObj) {
-    let (dx, dy) = (o.b.x - o.a.x, o.b.y - o.a.y);
-    let len = dx.hypot(dy).max(0.001);
-    let (ux, uy) = (dx / len, dy / len);
-    let (nx, ny) = (-uy, ux);
-    let c = c32(o.color);
-    let head_len = (o.width * 4.0 + 14.0).min(len * 0.6);
-    let head_w = o.width * 1.8 + 7.0;
-    let base = Pos2::new(o.b.x - ux * head_len, o.b.y - uy * head_len);
-    // Shaft: quad from tail to head base.
-    let hw = o.width / 2.0;
-    drw::draw_polygon_mut(
-        img,
-        &points_i32(&[
-            imageproc::point::Point::new(o.a.x + nx * hw, o.a.y + ny * hw),
-            imageproc::point::Point::new(base.x + nx * hw, base.y + ny * hw),
-            imageproc::point::Point::new(base.x - nx * hw, base.y - ny * hw),
-            imageproc::point::Point::new(o.a.x - nx * hw, o.a.y - ny * hw),
-        ]),
-        c,
-    );
-    // Tail cap + head.
-    drw::draw_filled_circle_mut(img, (o.a.x as i32, o.a.y as i32), hw as i32, c);
-    drw::draw_polygon_mut(
-        img,
-        &points_i32(&[
-            imageproc::point::Point::new(o.b.x, o.b.y),
-            imageproc::point::Point::new(base.x + nx * head_w, base.y + ny * head_w),
-            imageproc::point::Point::new(base.x - nx * head_w, base.y - ny * head_w),
-        ]),
-        c,
-    );
-}
-
-/// Pencil/eraser/highlight freehand stroke with SDF anti-aliasing,
+/// Pencil/eraser freehand stroke with SDF anti-aliasing,
 /// dashing, unified outline (0–10), soft edge feathering and drop shadow.
 fn stroke_freehand(img: &mut RgbaImage, o: &super::document::FreeObj) {
     if o.points.is_empty() {
@@ -1955,32 +1911,6 @@ fn step_label(mode: StepMode, count: u32, lower: bool) -> String {
     }
 }
 
-/// A Lucide-glyph stamp, recoloured and rasterized once per draw.
-fn draw_stamp(img: &mut RgbaImage, o: &super::document::StampObj) {
-    let icon = crate::ui::icons::stamp_icon(o.stamp);
-    let svg = String::from_utf8_lossy(crate::ui::icon_data::raw_svg(icon))
-        .replace("currentColor", &hex(o.color));
-    let size = o.size.max(4.0) as u32;
-    let Ok(bmp) = egui_extras::image::load_svg_bytes_with_size(
-        svg.as_bytes(),
-        egui::load::SizeHint::Size {
-            width: size,
-            height: size,
-            maintain_aspect_ratio: true,
-        },
-        &Default::default(),
-    ) else {
-        return;
-    };
-    let rgba = RgbaImage::from_raw(
-        bmp.width() as u32,
-        bmp.height() as u32,
-        bmp.as_raw().to_vec(),
-    )
-    .unwrap_or_default();
-    composite(img, &rgba, o.pos.x as i64, o.pos.y as i64, 1.0);
-}
-
 /// An inserted bitmap, resized into its bounds and composited.
 fn draw_picture(img: &mut RgbaImage, o: &super::document::PicObj) {
     if o.rect.width == 0 || o.rect.height == 0 {
@@ -2074,80 +2004,6 @@ fn mask_shape(patch: &mut RgbaImage, shape: AreaShape) {
     }
 }
 
-/// Fill object: composite `color` through the precomputed mask (or
-/// erase to transparent when `transparent`).
-fn apply_fill(img: &mut RgbaImage, o: &super::document::FillObj) {
-    for y in 0..img.height() {
-        for x in 0..img.width() {
-            let cov = o.mask.get_pixel(x, y).0[3];
-            if cov == 0 {
-                continue;
-            }
-            let t = cov as f32 / 255.0;
-            let dst = img.get_pixel_mut(x, y);
-            if o.transparent {
-                dst.0[3] = (dst.0[3] as f32 * (1.0 - t)) as u8;
-            } else {
-                blend_channel(dst, Rgba([o.color.r(), o.color.g(), o.color.b(), 255]), t);
-            }
-        }
-    }
-}
-
-/// Source-over blends `src` (coverage `t`) into `dst`.
-fn blend_channel(dst: &mut Rgba<u8>, src: Rgba<u8>, t: f32) {
-    for ch in 0..3 {
-        dst.0[ch] = (src.0[ch] as f32 * t + dst.0[ch] as f32 * (1.0 - t)) as u8;
-    }
-    dst.0[3] = dst.0[3].max((src.0[3] as f32 * t) as u8);
-}
-
-/// Computes the fill mask at placement time — BFS flood fill from
-/// `origin` over pixels within `tolerance` of the seed colour.
-pub fn compute_fill_mask(img: &RgbaImage, origin: Pos2, tolerance: u8) -> RgbaImage {
-    let (w, h) = (img.width(), img.height());
-    let mut mask = RgbaImage::new(w, h);
-    let (ox, oy) = (origin.x as i64, origin.y as i64);
-    if ox < 0 || oy < 0 || ox >= w as i64 || oy >= h as i64 {
-        return mask;
-    }
-    let seed = *img.get_pixel(ox as u32, oy as u32);
-    let tol = tolerance as i32 * 3;
-    let within = |p: &Rgba<u8>| {
-        ((p[0] as i32 - seed[0] as i32).abs()
-            + (p[1] as i32 - seed[1] as i32).abs()
-            + (p[2] as i32 - seed[2] as i32).abs()
-            + (p[3] as i32 - seed[3] as i32).abs())
-            <= tol
-    };
-    let mut seen = vec![false; (w * h) as usize];
-    let mut q = VecDeque::from([(ox as u32, oy as u32)]);
-    seen[(oy * w as i64 + ox) as usize] = true;
-    while let Some((x, y)) = q.pop_front() {
-        let p = img.get_pixel(x, y);
-        if !within(p) {
-            continue;
-        }
-        mask.put_pixel(x, y, Rgba([255, 255, 255, 255]));
-        for (nx, ny) in [
-            (x as i64 + 1, y as i64),
-            (x as i64 - 1, y as i64),
-            (x as i64, y as i64 + 1),
-            (x as i64, y as i64 - 1),
-        ] {
-            if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
-                continue;
-            }
-            let idx = (ny * w as i64 + nx) as usize;
-            if !seen[idx] {
-                seen[idx] = true;
-                q.push_back((nx as u32, ny as u32));
-            }
-        }
-    }
-    mask
-}
-
 /// Retints a layer: every pixel becomes `color` at its own alpha.
 fn tint_alpha(src: &RgbaImage, color: Rgba<u8>) -> RgbaImage {
     let mut out = src.clone();
@@ -2208,9 +2064,4 @@ fn c32(c: Color32) -> Rgba<u8> {
 /// `Color32` with a forced alpha.
 fn with_alpha(c: Color32, a: u8) -> Rgba<u8> {
     Rgba([c.r(), c.g(), c.b(), a])
-}
-
-/// `#rrggbb` for SVG recolouring.
-fn hex(c: Color32) -> String {
-    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
 }

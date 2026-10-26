@@ -132,42 +132,6 @@ pub enum BoxVAlign {
     Bottom,
 }
 
-/// One icon stamp offered by the Émoticônes menu — rendered as a
-/// Lucide glyph recoloured with the object's colour.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StampId {
-    /// Arrow pointer.
-    ArrowCursor,
-    /// Open hand.
-    Hand,
-    /// I-beam text caret.
-    TextCursor,
-    /// Plus sign (crosshair).
-    Cross,
-    /// Left mouse button.
-    ClickLeft,
-    /// Right mouse button.
-    ClickRight,
-    /// Waiting spinner.
-    Busy,
-    /// Ruler / dimension arrows.
-    Dimension,
-    /// Information badge.
-    Info,
-    /// Question badge.
-    Question,
-    /// Error cross badge.
-    Error,
-    /// Green check.
-    Ok,
-    /// Red cross.
-    Cancel,
-    /// Note / light bulb.
-    Note,
-    /// Smiley.
-    Smile,
-}
-
 /// Stroked/filled rectangle (the □ and ■ tools — `fill` distinguishes
 /// them).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -249,27 +213,6 @@ pub struct LineObj {
     /// Outline colour.
     #[serde(default = "default_step_ring")]
     pub outline_color: Color32,
-    /// Object opacity 0–1.
-    pub opacity: f32,
-    /// Drop-shadow offset px.
-    pub shadow: f32,
-}
-
-/// The ⬆ fancy arrow: a tapered filled shape from `a` to `b`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FancyObj {
-    /// Tail point.
-    pub a: Pos2,
-    /// Head point.
-    pub b: Pos2,
-    /// Fill colour.
-    pub color: Color32,
-    /// Shaft width px.
-    pub width: f32,
-    /// Dashing of the outline (solid by default).
-    pub dash: Dash,
-    /// Outline stroke around the shape.
-    pub outline: f32,
     /// Object opacity 0–1.
     pub opacity: f32,
     /// Drop-shadow offset px.
@@ -452,62 +395,6 @@ pub struct StepObj {
 fn default_step_ring() -> Color32 {
     Color32::WHITE
 }
-impl StampId {
-    /// Every stamp, in popup order (cursors, badges, note, emoji).
-    pub const ALL: [StampId; 15] = [
-        StampId::ArrowCursor,
-        StampId::Hand,
-        StampId::TextCursor,
-        StampId::Cross,
-        StampId::ClickLeft,
-        StampId::ClickRight,
-        StampId::Busy,
-        StampId::Dimension,
-        StampId::Info,
-        StampId::Question,
-        StampId::Error,
-        StampId::Ok,
-        StampId::Cancel,
-        StampId::Note,
-        StampId::Smile,
-    ];
-
-    /// Translated label for tooltips and the stamp menu.
-    pub fn label(self) -> std::borrow::Cow<'static, str> {
-        match self {
-            Self::ArrowCursor => rust_i18n::t!("stamp.arrow_cursor"),
-            Self::Hand => rust_i18n::t!("stamp.hand"),
-            Self::TextCursor => rust_i18n::t!("stamp.text_cursor"),
-            Self::Cross => rust_i18n::t!("stamp.cross"),
-            Self::ClickLeft => rust_i18n::t!("stamp.click_left"),
-            Self::ClickRight => rust_i18n::t!("stamp.click_right"),
-            Self::Busy => rust_i18n::t!("stamp.busy"),
-            Self::Dimension => rust_i18n::t!("stamp.dimension"),
-            Self::Info => rust_i18n::t!("stamp.info"),
-            Self::Question => rust_i18n::t!("stamp.question"),
-            Self::Error => rust_i18n::t!("stamp.error"),
-            Self::Ok => rust_i18n::t!("stamp.ok"),
-            Self::Cancel => rust_i18n::t!("stamp.cancel"),
-            Self::Note => rust_i18n::t!("stamp.note"),
-            Self::Smile => rust_i18n::t!("stamp.smile"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StampObj {
-    /// Top-left anchor.
-    pub pos: Pos2,
-    /// Which stamp.
-    pub stamp: StampId,
-    /// Stamp colour (recolours the glyph).
-    pub color: Color32,
-    /// Stamp size px.
-    pub size: f32,
-    /// Object opacity 0–1.
-    pub opacity: f32,
-}
-
 /// An inserted bitmap (the 🖼 tool) — pixels stored on the object.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PicObj {
@@ -520,25 +407,6 @@ pub struct PicObj {
     pub opacity: f32,
     /// Drop-shadow offset px.
     pub shadow: f32,
-}
-
-/// A flood fill (the bucket tool) — `mask` is precomputed at creation:
-/// the connected region under `origin` within `tolerance`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FillObj {
-    /// Seed point (physical px).
-    pub origin: Pos2,
-    /// Fill colour.
-    pub color: Color32,
-    /// Colour tolerance 0–100.
-    pub tolerance: u8,
-    /// `true` erases to transparent instead of painting.
-    pub transparent: bool,
-    /// Coverage mask, full-document size (alpha = coverage). Computed
-    /// once when the object is placed, stored for rendering — persisted
-    /// as a PNG blob.
-    #[serde(with = "crate::store::ser::rgba_png")]
-    pub mask: image::RgbaImage,
 }
 
 /// A blur/pixelate region (parametric — rendered live from the base).
@@ -563,12 +431,8 @@ pub enum AnnotationKind {
     Ellipse(EllipseObj),
     /// ↗ straight line with end glyphs.
     Line(LineObj),
-    /// ⬆ tapered arrow.
-    Fancy(FancyObj),
     /// Pencil / eraser freehand stroke.
     Freehand(FreeObj),
-    /// Translucent line highlight.
-    HighlightStroke(FreeObj),
     /// Translucent zone highlight.
     HighlightArea(AreaObj),
     /// "A" plain text.
@@ -577,12 +441,8 @@ pub enum AnnotationKind {
     TextBox(BoxObj),
     /// ① step badge.
     Step(StepObj),
-    /// Icon stamp.
-    Stamp(StampObj),
     /// Inserted bitmap.
     Picture(PicObj),
-    /// Bucket fill region.
-    Fill(FillObj),
     /// Blur/pixelate region.
     Blur(BlurObj),
 }
@@ -621,8 +481,7 @@ impl AnnotationKind {
                     height: ((y2 - y1).max(1.0) as i32 + pad * 2).max(1) as u32,
                 }
             }
-            Self::Fancy(o) => rect_of_points(o.a, o.b),
-            Self::Freehand(o) | Self::HighlightStroke(o) => points_bounds(&o.points),
+            Self::Freehand(o) => points_bounds(&o.points),
             Self::HighlightArea(o) => o.rect,
             Self::Text(o) => {
                 // Ribbon above the cubic Bézier baseline (`a`, `ka`, `kb`, `b`).
@@ -666,19 +525,7 @@ impl AnnotationKind {
                     height: (r * 2) as u32,
                 }
             }
-            Self::Stamp(o) => PhysicalRect {
-                x: o.pos.x as i32,
-                y: o.pos.y as i32,
-                width: o.size as u32,
-                height: o.size as u32,
-            },
             Self::Picture(o) => o.rect,
-            Self::Fill(o) => PhysicalRect {
-                x: 0,
-                y: 0,
-                width: o.mask.width(),
-                height: o.mask.height(),
-            },
             Self::Blur(o) => o.rect,
         }
     }
@@ -702,11 +549,7 @@ impl AnnotationKind {
                 shift(&mut o.ka);
                 shift(&mut o.kb);
             }
-            Self::Fancy(o) => {
-                shift(&mut o.a);
-                shift(&mut o.b);
-            }
-            Self::Freehand(o) | Self::HighlightStroke(o) => {
+            Self::Freehand(o) => {
                 for p in &mut o.points {
                     shift(p);
                 }
@@ -725,9 +568,7 @@ impl AnnotationKind {
                 }
             }
             Self::Step(o) => shift(&mut o.pos),
-            Self::Stamp(o) => shift(&mut o.pos),
             Self::Picture(o) => shift_rect(&mut o.rect),
-            Self::Fill(o) => shift(&mut o.origin),
             Self::Blur(o) => shift_rect(&mut o.rect),
         }
     }
@@ -763,11 +604,7 @@ impl AnnotationKind {
                 scale_pt(&mut o.ka, &b);
                 scale_pt(&mut o.kb, &b);
             }
-            Self::Fancy(o) => {
-                scale_pt(&mut o.a, &b);
-                scale_pt(&mut o.b, &b);
-            }
-            Self::Freehand(o) | Self::HighlightStroke(o) => {
+            Self::Freehand(o) => {
                 for p in &mut o.points {
                     scale_pt(p, &b);
                 }
@@ -784,16 +621,7 @@ impl AnnotationKind {
                 o.pos.x += dx;
                 o.pos.y += dy;
             }
-            Self::Stamp(o) => {
-                o.pos.x += dx;
-                o.pos.y += dy;
-                o.size = (o.size * sx.max(sy)).max(8.0);
-            }
             Self::Picture(o) => o.rect = rect,
-            Self::Fill(o) => {
-                o.origin.x += dx;
-                o.origin.y += dy;
-            }
             Self::Blur(o) => o.rect = rect,
         }
     }
@@ -805,18 +633,6 @@ fn step_radius(size: StepSize) -> f32 {
         StepSize::Small => 12.0,
         StepSize::Medium => 18.0,
         StepSize::Large => 26.0,
-    }
-}
-
-/// `PhysicalRect` spanning two points.
-fn rect_of_points(a: Pos2, b: Pos2) -> PhysicalRect {
-    let (x1, y1) = (a.x.min(b.x), a.y.min(b.y));
-    let (x2, y2) = (a.x.max(b.x), a.y.max(b.y));
-    PhysicalRect {
-        x: x1 as i32,
-        y: y1 as i32,
-        width: (x2 - x1).max(1.0) as u32,
-        height: (y2 - y1).max(1.0) as u32,
     }
 }
 

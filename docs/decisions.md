@@ -803,3 +803,21 @@ Format: date — context — decision — consequences.
 - **Decision**: Share a single option strip (`highlight_area_options_row`) between `Tool::HighlightArea` and a selected `AreaObj` exposing only colour, shape (`Rectangle` / `Circle`) and percentage opacity (`10..=100%`, defaulting to `hl_opacity = 45%`). Render `HighlightArea` via `draw_shape_sdf` (sharp rectangle vs analytical ellipse) and match the live drag preview and selection outline to the chosen shape.
 - **Consequences**: Creating or editing an area highlight shows the exact same controls, respects the selected shape during drag, selection and export, and eliminates the opacity jump on creation.
 
+## 2026-10-26 — Draw tool set trimmed (user decision)
+
+- **Context**: The user asked to remove four draw tools entirely: the line
+  highlighter, the bucket fill, the stamps/cursors picker, and the fancy
+  arrow.
+- **Decision**: Deleted `Tool::HighlightLine`, `Tool::Fill`, `Tool::Stamps`,
+  `Tool::FancyArrow` and their annotation kinds (`HighlightStroke`, `Fill`,
+  `Stamp`, `Fancy`) plus all supporting code (`StampId`, `FillObj`,
+  `StampObj`, `FancyObj`, `draw_fancy`, `draw_stamp`, `apply_fill`,
+  `compute_fill_mask`, `stamp_icon`, `raw_svg`) and the now-unused icons
+  (12 SVG assets removed). The area highlighter keeps its slot and now
+  uses the `Highlighter` pen icon. The marquee's own "fill" button is
+  unaffected — it paints a plain `RectObj`.
+- **Consequences**: `SCHEMA_VERSION` bumped to 11 — annotations using the
+  removed kinds could not be deserialized, so older session stores are
+  wiped on open (accepted: pre-release). The strip now shows 16 tools.
+
+
