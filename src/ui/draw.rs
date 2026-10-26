@@ -2641,7 +2641,8 @@ impl DrawSession {
         if let Some(a) = self.doc.annotation_mut(id) {
             match &mut a.kind {
                 AnnotationKind::Rect(o) => {
-                    w_edit(ui, t!("draw.opt.width"), &mut o.stroke_w, 0.0..=20.0);
+                    changed |=
+                        w_edit(ui, t!("draw.opt.width"), &mut o.stroke_w, 0.0..=20.0).changed();
                     changed |= color_btn(ui, &mut o.stroke).changed();
                     if o.fill.is_some() {
                         ui.label(t!("draw.opt.fill_c"));
@@ -2655,7 +2656,8 @@ impl DrawSession {
                     changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
                 }
                 AnnotationKind::Ellipse(o) => {
-                    w_edit(ui, t!("draw.opt.width"), &mut o.stroke_w, 0.0..=20.0);
+                    changed |=
+                        w_edit(ui, t!("draw.opt.width"), &mut o.stroke_w, 0.0..=20.0).changed();
                     changed |= color_btn(ui, &mut o.stroke).changed();
                     if o.fill.is_some() {
                         ui.label(t!("draw.opt.fill_c"));
@@ -2669,18 +2671,18 @@ impl DrawSession {
                     changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
                 }
                 AnnotationKind::Line(o) => {
-                    w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=20.0);
+                    changed |= w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=20.0).changed();
                     changed |= color_btn(ui, &mut o.color).changed();
                     changed |= dash_combo(ui, &mut o.dash);
                     changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
                 }
                 AnnotationKind::Fancy(o) => {
-                    w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0);
+                    changed |= w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0).changed();
                     changed |= color_btn(ui, &mut o.color).changed();
                     changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
                 }
                 AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => {
-                    w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0);
+                    changed |= w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0).changed();
                     changed |= color_btn(ui, &mut o.color).changed();
                     changed |=
                         slider(ui, t!("draw.opt.opacity"), &mut o.opacity, 0.05..=1.0).changed();

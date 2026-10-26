@@ -139,6 +139,10 @@ pub enum Icon {
     AlignEndVertical,
     /// Password-protected tab.
     Lock,
+    /// Toggle the viewer between the tab strip and the mosaic grid.
+    LayoutGrid,
+    /// Show the tab strip — the mosaic toggle's paired icon.
+    PanelTop,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

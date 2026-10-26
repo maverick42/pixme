@@ -217,6 +217,24 @@ pub mod pin_chrome {
 /// Dim veil drawn over the frozen screen during region selection.
 pub const REGION_SCRIM: Color32 = Color32::from_black_alpha(110);
 
+/// Fixed colours for the mosaic tiles' overlays: the caption band and
+/// the drag anchor stay dark (white text) over arbitrary captures, in
+/// both palettes — like the region scrim, they are not themed.
+pub mod mosaic_chrome {
+    use egui::Color32;
+
+    /// The caption band's dark, semi-transparent fill.
+    pub const BAND: Color32 = Color32::from_black_alpha(165);
+    /// Caption title (and padlock) on the band.
+    pub const BAND_TEXT: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 235);
+    /// Caption date, slightly dimmer than the title.
+    pub const BAND_DIM: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 190);
+    /// The drag anchor's badge fill.
+    pub const ANCHOR_BG: Color32 = Color32::from_black_alpha(100);
+    /// The drag anchor's grip glyph.
+    pub const ANCHOR_ICON: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 230);
+}
+
 // --- Context access ---------------------------------------------------------
 
 const TOKENS_ID: &str = "pixme/theme/tokens";

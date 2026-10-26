@@ -753,3 +753,50 @@ Format: date — context — decision — consequences.
   never in the settings window. `Tab.insertion` keeps the original
   order restorable; re-sort happens on push, rename, duplicate, and
   restore. Numeric-aware compare keeps `Capture 9` before `Capture 10`.
+
+## 2026-10-26 — Mosaic view mode: a runtime-only thumbnail grid
+
+- **Context**: the viewer shows one capture at a time behind a tab
+  strip; the user wants an overview mode — a grid of thumbnails with
+  the tab strip hidden — whose zoom matches the reference's thumbnail
+  strip, without ever uploading every full-resolution capture texture
+  to the GPU at once.
+- **Decision**:
+  - `Viewer.view_mode: ViewMode` (`Tabs` default | `Mosaic`) — pure
+    runtime state, never persisted: PixMe always opens in Tabs mode.
+    The toolbar's new `LayoutGrid` button toggles; in Mosaic the tab
+    strip is hidden and a trailing "new capture" tile (same
+    `Command::ShowBar` as the "+" tab) ends the grid.
+  - `mosaic_scale: f32` (1.0 default, 0.5–2.0): the ± zoom buttons
+    step ×1.25/÷1.25, the percent button resets to 100%, its caret
+    menu lists 50/75/100/125/150/200%. Base tile ≈ 220×160 pt; the
+    column count adapts to the available width inside a vertical
+    `ScrollArea`.
+  - `Tab.thumb: Option<(revision, TextureHandle)>`: a per-tab,
+    lazily-built thumbnail cache — `render_to_image` downscaled to
+    ≤480 px on the longest side (Lanczos3, aspect kept), generated
+    only while the tile is visible (`ui.is_rect_visible`) and only
+    when the document revision changed. The full-resolution
+    `Tab::texture` is never uploaded for the grid; the thumbnail is
+    displayed fit-and-centred ("fit", never distorted).
+  - Protected tabs never generate or display a thumbnail: `set_active`
+    and the protection dialog clear a protected tab's cached thumb; a
+    locked tile shows a centred padlock on `t.card`. Double-clicking a
+    locked tile selects it and returns to Tabs mode, where the usual
+    password card appears. Opening the already-active tile does not
+    re-lock it (not a selection change).
+  - Tile interactions: single left click selects (toolbar actions and
+    ⌘C/⌘Z/⇧⌘Z keep working on the selection), double-click or Enter
+    opens the active tile in Tabs mode, right-click opens the existing
+    tab context menu (its sort zone reorders the grid immediately). A
+    dark caption band (`from_black_alpha(165)`, always visible) shows
+    the unsaved dot, the padlock and the elided title; hovering adds
+    the capture date (same locale format as the status strip) plus a
+    red-hover close cross and a grip-vertical anchor in a dark badge
+    (visual + reserved interaction zone with a translated tooltip —
+    the OS drag-out lands in a later unit).
+- **Consequences**: thumbnail GPU memory is bounded (~0.9 MB per
+  480 px texture) and proportional to visible tiles, not tabs; no new
+  dependencies; thumbnails reuse `render_to_image`, so they are
+  WYSIWYG with annotations by construction. `Viewer::default` is now a
+  manual impl (`mosaic_scale` starts at 1.0, not 0.0).

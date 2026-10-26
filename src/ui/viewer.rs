@@ -35,6 +35,12 @@ pub struct Tab {
     /// `(revision, texture)` cache living with the tab — closing a tab
     /// drops its texture and a later tab can never inherit a stale one.
     texture: Option<(u64, egui::TextureHandle)>,
+    /// `(revision, thumbnail)` cache for the mosaic grid — the
+    /// composited document downscaled to ≤ [`THUMB_MAX_SIDE`] px on its
+    /// longest side, built lazily only while the tile is visible. The
+    /// full-resolution `texture` above is never involved, and a locked
+    /// tab never holds one (the pixels stay hidden).
+    thumb: Option<(u64, egui::TextureHandle)>,
     /// Reversible pixel mutations, oldest → newest (session-only).
     undo: VecDeque<PixelOp>,
     /// Ops undone, reappliable until the next mutation clears them.
@@ -58,6 +64,13 @@ pub struct Tab {
 /// one pre-image each (~20 MB on a Retina capture), so the cap bounds
 /// the worst case.
 const HISTORY_CAP: usize = 10;
+
+/// Longest side of a mosaic thumbnail, px — the lazy per-tab texture
+/// budget for the grid (~0.9 MB each at the cap).
+const THUMB_MAX_SIDE: u32 = 480;
+
+/// Height of a mosaic tile's caption band, pt.
+const BAND_H: f32 = 22.0;
 
 /// One reversible pixel-level mutation of a tab's base image.
 enum PixelOp {
@@ -127,8 +140,17 @@ enum ZoomMode {
     Factor(f32),
 }
 
+/// How the viewer arranges its documents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ViewMode {
+    /// One active document with the tab strip on top.
+    #[default]
+    Tabs,
+    /// A grid of thumbnails; the tab strip is hidden.
+    Mosaic,
+}
+
 /// Session state rendered inside the viewer viewport.
-#[derive(Default)]
 pub struct Viewer {
     /// One tab per captured document.
     pub tabs: Vec<Tab>,
@@ -184,6 +206,45 @@ pub struct Viewer {
     /// The persisted session was already loaded once — restore never
     /// runs twice (a deliberate discard stays discarded).
     restored: bool,
+    /// Tab strip vs thumbnail grid — a runtime-only choice: PixMe
+    /// always opens in Tabs mode.
+    view_mode: ViewMode,
+    /// Mosaic thumbnail scale (0.5–2.0; 1.0 = the base 220×160 tiles).
+    mosaic_scale: f32,
+}
+
+impl Default for Viewer {
+    fn default() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active: 0,
+            dirty: false,
+            confirm_close: false,
+            confirm_then_quit: false,
+            next_title: 0,
+            next_insertion: 0,
+            sort_mode: None,
+            zoom: ZoomMode::default(),
+            eff_scale: 0.0,
+            resize: None,
+            rename: None,
+            protect: None,
+            confirm_delete: None,
+            unlock_draft: String::new(),
+            unlock_error: false,
+            tab_scroll_pos: 0.0,
+            tab_scroll_to: None,
+            scroll_active_into_view: false,
+            tabs_overflow: false,
+            tool_scroll_pos: 0.0,
+            tool_scroll_to: None,
+            tools_overflow: false,
+            closed_ids: Vec::new(),
+            restored: false,
+            view_mode: ViewMode::Tabs,
+            mosaic_scale: 1.0,
+        }
+    }
 }
 
 /// The rename prompt: draft + whether it already failed uniqueness.
@@ -274,6 +335,7 @@ impl Viewer {
             doc,
             saved,
             texture: None,
+            thumb: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
@@ -297,6 +359,8 @@ impl Viewer {
     pub fn push_stub(&mut self, title: &str) {
         use crate::capture::{Capture, MonitorInfo, PhysicalRect};
         let title = self.unique_title(title);
+        let insertion = self.next_insertion;
+        self.next_insertion += 1;
         self.tabs.push(Tab {
             title,
             doc: Document::new(Capture {
@@ -317,11 +381,13 @@ impl Viewer {
             }),
             saved: false,
             texture: None,
+            thumb: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
             anno_redo: VecDeque::new(),
             unlocked: false,
+            insertion,
         });
     }
 
@@ -540,11 +606,15 @@ impl Viewer {
 
     /// Makes `index` the visible tab. Leaving a tab re-locks it: a
     /// protected capture asks for its password on EVERY activation, not
-    /// once per session (the spec's rule).
+    /// once per session (the spec's rule). Re-locking also drops the
+    /// tab's cached thumbnail — a protected tab never keeps pixels.
     fn set_active(&mut self, index: usize) {
         self.active = index;
         for tab in &mut self.tabs {
             tab.unlocked = false;
+            if tab.doc.meta.is_protected() {
+                tab.thumb = None;
+            }
         }
         self.unlock_draft.clear();
         self.unlock_error = false;
@@ -664,6 +734,7 @@ impl Viewer {
                 doc: t.doc,
                 saved: t.saved,
                 texture: None,
+                thumb: None,
                 undo: VecDeque::new(),
                 redo: VecDeque::new(),
                 anno_undo: t.anno_undo,
@@ -721,6 +792,7 @@ impl Viewer {
             doc,
             saved: false,
             texture: None,
+            thumb: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             anno_undo: src.anno_undo.clone(),
@@ -751,6 +823,81 @@ impl Viewer {
         t.saved = false;
         self.recompute_dirty();
         Ok(())
+    }
+
+    /// Toggles between the tab strip and the mosaic grid. Runtime-only:
+    /// PixMe always opens in Tabs mode.
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Tabs => ViewMode::Mosaic,
+            ViewMode::Mosaic => ViewMode::Tabs,
+        };
+    }
+
+    /// Mosaic zoom in: ×1.25, clamped to 200%.
+    fn mosaic_zoom_in(&mut self) {
+        self.mosaic_scale = (self.mosaic_scale * 1.25).min(2.0);
+    }
+
+    /// Mosaic zoom out: ÷1.25, clamped to 50%.
+    fn mosaic_zoom_out(&mut self) {
+        self.mosaic_scale = (self.mosaic_scale / 1.25).max(0.5);
+    }
+
+    /// Mosaic zoom back to 100% (the percent button's main click).
+    fn mosaic_zoom_reset(&mut self) {
+        self.mosaic_scale = 1.0;
+    }
+
+    /// The mosaic's double-click/Enter action: make `index` the active
+    /// tile (re-locking protected tabs when the selection changes, like
+    /// the tab strip) and hand the viewer back to Tabs mode — a locked
+    /// capture then shows its usual password card.
+    fn open_active_tile(&mut self, index: usize) {
+        if index != self.active {
+            self.set_active(index);
+        }
+        self.view_mode = ViewMode::Tabs;
+    }
+
+    /// Lazily builds `index`'s downscaled thumbnail: the composited
+    /// document is resampled so its longest side is ≤
+    /// [`THUMB_MAX_SIDE`] px and cached on the tab keyed by the
+    /// document revision. Locked tabs never get one — their pixels
+    /// stay hidden — and the full-resolution `Tab::texture` is never
+    /// involved.
+    fn ensure_thumb(&mut self, ui: &egui::Ui, index: usize) {
+        // Protected tabs never generate pixel data — locked or not
+        // (the "proven password" only unlocks the canvas, the mosaic
+        // tile stays a padlock).
+        let protected = self
+            .tabs
+            .get(index)
+            .is_some_and(|t| t.doc.meta.is_protected());
+        if self.is_locked(index) || protected {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if tab.thumb.as_ref().map(|(rev, _)| *rev) == Some(tab.doc.revision) {
+            return;
+        }
+        let (w, h) = (tab.doc.base.image.width(), tab.doc.base.image.height());
+        let composited = crate::editor::render::render_to_image(&tab.doc);
+        let scale = (THUMB_MAX_SIDE as f32 / w.max(h).max(1) as f32).min(1.0);
+        let (tw, th) = (
+            ((w as f32 * scale).round() as u32).max(1),
+            ((h as f32 * scale).round() as u32).max(1),
+        );
+        let thumb =
+            image::imageops::resize(&composited, tw, th, image::imageops::FilterType::Lanczos3);
+        let handle = ui.ctx().load_texture(
+            format!("thumb-{index}-{}", tab.doc.revision),
+            egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw()),
+            egui::TextureOptions::LINEAR,
+        );
+        tab.thumb = Some((tab.doc.revision, handle));
     }
 
     /// Draws the viewer for this frame. `shared` routes actions back to the
@@ -833,9 +980,11 @@ impl Viewer {
                 }
                 self.toolbar_strip(ui, shared);
                 widgets::hairline(ui);
-                self.tab_strip(ui, shared);
-                widgets::hairline(ui);
-                self.content(ui);
+                if self.view_mode == ViewMode::Tabs {
+                    self.tab_strip(ui, shared);
+                    widgets::hairline(ui);
+                }
+                self.content(ui, shared);
                 // Modal behaviour for child windows living in other
                 // viewports (save-as, settings): dim the whole panel and
                 // eat every click while one is up.
@@ -961,10 +1110,7 @@ impl Viewer {
             if let Some(index) = self.active_index() {
                 // Capture date in the active language's local format,
                 // then the current sort mode after a bullet separator.
-                let fmt = match &*rust_i18n::locale() {
-                    "fr" | "es" => "%d/%m/%Y %H:%M",
-                    _ => "%b %d, %Y %H:%M",
-                };
+                let fmt = capture_date_fmt();
                 let date = self.tabs[index].doc.meta.captured_at.format(fmt);
                 let mode = match self.sort_mode {
                     Some(TabSort::ByName) => t!("viewer.tab.sort_name"),
@@ -1073,8 +1219,12 @@ impl Viewer {
                             )
                             .clicked()
                             {
-                                self.zoom =
-                                    ZoomMode::Factor((self.scale_for_step() * 1.25).min(8.0));
+                                if self.view_mode == ViewMode::Mosaic {
+                                    self.mosaic_zoom_in();
+                                } else {
+                                    self.zoom =
+                                        ZoomMode::Factor((self.scale_for_step() * 1.25).min(8.0));
+                                }
                             }
                             if widgets::tool_button(
                                 ui,
@@ -1086,8 +1236,12 @@ impl Viewer {
                             )
                             .clicked()
                             {
-                                self.zoom =
-                                    ZoomMode::Factor((self.scale_for_step() / 1.25).max(0.05));
+                                if self.view_mode == ViewMode::Mosaic {
+                                    self.mosaic_zoom_out();
+                                } else {
+                                    self.zoom =
+                                        ZoomMode::Factor((self.scale_for_step() / 1.25).max(0.05));
+                                }
                             }
                             // The zoom button shows the live percent; its caret
                             // opens the mode/preset menu, main click = 100%.
@@ -1102,9 +1256,41 @@ impl Viewer {
                             );
                             let menu_clicked = r.clicked() && widgets::caret_hit(&r, true);
                             if r.clicked() && !menu_clicked {
-                                self.zoom = ZoomMode::Factor(1.0);
+                                if self.view_mode == ViewMode::Mosaic {
+                                    self.mosaic_zoom_reset();
+                                } else {
+                                    self.zoom = ZoomMode::Factor(1.0);
+                                }
                             }
-                            zoom_menu(ui, &r, self, menu_clicked);
+                            if self.view_mode == ViewMode::Mosaic {
+                                mosaic_zoom_menu(ui, &r, self, menu_clicked);
+                            } else {
+                                zoom_menu(ui, &r, self, menu_clicked);
+                            }
+                            widgets::vline(ui, widgets::TOOL_H - 10.0);
+                            // Tabs ⇄ Mosaic — a runtime-only arrangement,
+                            // PixMe always opens in Tabs mode. In Mosaic the
+                            // zoom group above drives the thumbnail scale.
+                            let mosaic = self.view_mode == ViewMode::Mosaic;
+                            let tip = if mosaic {
+                                t!("viewer.mode.tabs.tooltip")
+                            } else {
+                                t!("viewer.mode.mosaic.tooltip")
+                            };
+                            // The toggle wears its destination: a mosaic
+                            // icon while in tabs, a tab-strip icon while
+                            // in mosaic — clicking switches the view.
+                            let (icon, label) = if mosaic {
+                                (Icon::PanelTop, t!("viewer.mode.tabs"))
+                            } else {
+                                (Icon::LayoutGrid, t!("viewer.mode.mosaic"))
+                            };
+                            if widgets::tool_button(ui, icon, &label, false, mosaic, true)
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                self.toggle_view_mode();
+                            }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
                             if widgets::tool_button(
                                 ui,
@@ -1201,8 +1387,12 @@ impl Viewer {
     }
 
     /// The zoom button's caption — the live factor as a percent (first
-    /// frame, before `content()` measures, defaults to 100%).
+    /// frame, before `content()` measures, defaults to 100%). In Mosaic
+    /// mode it is the thumbnail scale instead.
     fn zoom_label(&self) -> String {
+        if self.view_mode == ViewMode::Mosaic {
+            return format!("{}%", (self.mosaic_scale * 100.0).round() as u32);
+        }
         if self.eff_scale <= 0.0 {
             return "100%".to_owned();
         }
@@ -1551,7 +1741,12 @@ impl Viewer {
 
     /// The document canvas: the active capture fit to the window (or at the
     /// explicit zoom, scrollable), plus the marquee-selection interaction.
-    fn content(&mut self, ui: &mut egui::Ui) {
+    /// In Mosaic mode the whole content area becomes the thumbnail grid.
+    fn content(&mut self, ui: &mut egui::Ui, shared: &Shared) {
+        if self.view_mode == ViewMode::Mosaic {
+            self.mosaic_content(ui, shared);
+            return;
+        }
         if self.tabs.is_empty() {
             let t = theme::tokens(ui.ctx());
             ui.centered_and_justified(|ui| {
@@ -1604,10 +1799,301 @@ impl Viewer {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 let canvas = size.max(avail.size());
-                let (canvas_rect, _) = ui.allocate_exact_size(canvas, Sense::hover());
+                let (canvas_rect, resp) = ui.allocate_exact_size(canvas, Sense::click());
                 let img_rect = Rect::from_center_size(canvas_rect.center(), size);
                 ui.painter().image(tex, img_rect, uv, egui::Color32::WHITE);
+                // Double-click on the capture opens the Draw editor on
+                // it — the same action as the toolbar's Pencil.
+                if resp.double_clicked() {
+                    shared.push(Command::OpenDraw);
+                }
             });
+    }
+
+    /// The mosaic grid: one thumbnail tile per capture plus a trailing
+    /// "new capture" tile, in a vertical scroll area whose column count
+    /// adapts to the available width. Enter on the active tile opens it
+    /// in Tabs mode (same as a double-click).
+    fn mosaic_content(&mut self, ui: &mut egui::Ui, shared: &Shared) {
+        let t = theme::tokens(ui.ctx());
+        let avail = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(avail, 0.0, t.canvas);
+        // Keyboard gate mirrors `show`'s: Enter must not fire while a
+        // dialog or a text field is on top.
+        let modal_open = self.confirm_close
+            || self.resize.is_some()
+            || self.rename.is_some()
+            || self.protect.is_some()
+            || self.confirm_delete.is_some()
+            || shared.modal_child_open();
+        // Base tile 220×160 pt at 100%, scaled by the mosaic zoom.
+        let (tile_w, tile_h) = (220.0 * self.mosaic_scale, 160.0 * self.mosaic_scale);
+        let spacing = 10.0;
+        egui::ScrollArea::vertical()
+            .id_salt("pixme-mosaic")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(spacing, spacing);
+                // Grid margin — the selected tile's ring must not kiss
+                // the window edge.
+                ui.add_space(spacing);
+                let cols = (ui.available_width() / (tile_w + spacing)).floor().max(1.0) as usize;
+                let total = self.tabs.len() + 1; // one tile per tab + the "+" tile
+                for row in (0..total).step_by(cols) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = spacing;
+                        ui.add_space(spacing);
+                        for cell in row..(row + cols).min(total) {
+                            if cell < self.tabs.len() {
+                                self.mosaic_tile(ui, cell, shared, tile_w, tile_h);
+                            } else {
+                                self.mosaic_new_tile(ui, shared, tile_w, tile_h);
+                            }
+                        }
+                    });
+                }
+                ui.add_space(spacing);
+            });
+        if !modal_open
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            && let Some(i) = self.active_index()
+        {
+            // The tile is already selected — no re-lock via set_active.
+            self.open_active_tile(i);
+        }
+    }
+
+    /// One mosaic tile: the capture's thumbnail (or a centred padlock
+    /// for locked tabs), a dark caption band with the unsaved dot, the
+    /// padlock and the elided title (plus the capture date on hover),
+    /// and hover-only chrome — the close cross and the drag-out anchor.
+    /// Single click selects, double-click/Enter opens the tile in Tabs
+    /// mode, right-click opens the tab's context menu.
+    fn mosaic_tile(&mut self, ui: &mut egui::Ui, index: usize, shared: &Shared, w: f32, h: f32) {
+        // A previous tile's menu or cross may have closed tabs mid-
+        // frame — the index is only valid while the tab still exists.
+        if index >= self.tabs.len() {
+            return;
+        }
+        let t = theme::tokens(ui.ctx());
+        let selected = index == self.active;
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+        // The close cross and the drag anchor are registered every
+        // frame (stable hover, like the tab chips) but painted only
+        // while the pointer is over the tile.
+        let close_rect = Rect::from_min_size(
+            Pos2::new(rect.max.x - 26.0, rect.min.y + 6.0),
+            Vec2::splat(20.0),
+        );
+        let anchor_rect =
+            Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(24.0, 20.0));
+        let close = ui.interact(
+            close_rect,
+            ui.id().with(("pixme-tile-close", index)),
+            Sense::click(),
+        );
+        let anchor = ui.interact(
+            anchor_rect,
+            ui.id().with(("pixme-tile-drag", index)),
+            Sense::click(),
+        );
+        let tile_hovered = resp.hovered() || close.hovered() || anchor.hovered();
+        // Frame: card at rest, accent-soft when selected — the tab
+        // chips' selected treatment.
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(t.radius_md),
+            if selected { t.accent_soft } else { t.card },
+            Stroke::new(
+                1.0,
+                if selected {
+                    t.accent_border
+                } else {
+                    t.card_border
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        // Pixels stay hidden for protected tabs: no thumbnail is ever
+        // generated or painted, just a centred padlock — a proven
+        // password unlocks the canvas, never the mosaic tile.
+        let image_area = Rect::from_min_max(
+            rect.min + Vec2::new(6.0, 6.0),
+            Pos2::new(rect.max.x - 6.0, rect.max.y - BAND_H - 4.0),
+        );
+        if self.tabs[index].doc.meta.is_protected() {
+            icons::paint(
+                ui,
+                Rect::from_center_size(image_area.center(), Vec2::splat(34.0)),
+                Icon::Lock,
+                34.0,
+                t.text_dim,
+            );
+        } else if ui.is_rect_visible(rect) {
+            self.ensure_thumb(ui, index);
+            if let Some((_, thumb)) = &self.tabs[index].thumb {
+                // Fit, never distorted: the thumbnail keeps its aspect.
+                let img = fit_rect(image_area, thumb.size_vec2());
+                ui.painter().image(
+                    thumb.id(),
+                    img,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+        }
+        self.mosaic_band(ui, index, rect, tile_hovered);
+        // Hover chrome: the drag anchor (top-left) and the close cross
+        // (top-right, red hover like the tabs and the settings window).
+        if tile_hovered {
+            anchor
+                .clone()
+                .on_hover_text(t!("viewer.mosaic.drag_tooltip"));
+            if anchor.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            ui.painter().rect(
+                anchor_rect,
+                CornerRadius::same(t.radius_sm),
+                theme::mosaic_chrome::ANCHOR_BG,
+                Stroke::NONE,
+                StrokeKind::Inside,
+            );
+            icons::paint(
+                ui,
+                anchor_rect,
+                Icon::GripVertical,
+                14.0,
+                theme::mosaic_chrome::ANCHOR_ICON,
+            );
+            paint_tab_close(ui, close_rect, close.hovered());
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // The cross closes only this capture — never a warning, like
+        // the tabs. Guarded by `tile_hovered` so the invisible cross
+        // zone stays inert while the pointer is elsewhere.
+        if close.clicked() && tile_hovered {
+            self.close_tabs(&[index]);
+            return;
+        }
+        // Tile clicks (the cross and the anchor sit above and win).
+        // Double-click opens the tile in Tabs mode — the selection
+        // happened on the first click of the pair.
+        if resp.double_clicked() {
+            self.open_active_tile(index);
+            return;
+        }
+        if resp.clicked() || resp.secondary_clicked() {
+            // Selecting another tile re-locks every protected one.
+            if index != self.active {
+                self.set_active(index);
+            }
+        }
+        egui::Popup::context_menu(&resp).show(|ui| {
+            ui.set_min_width(200.0);
+            self.tab_menu(ui, index, shared);
+        });
+    }
+
+    /// The trailing "new capture" tile — the mosaic's twin of the tab
+    /// strip's "+": clicking it brings the floating bar back.
+    fn mosaic_new_tile(&mut self, ui: &mut egui::Ui, shared: &Shared, w: f32, h: f32) {
+        let t = theme::tokens(ui.ctx());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+        let hovered = resp.hovered();
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(t.radius_md),
+            if hovered { t.hover } else { t.card },
+            Stroke::new(
+                1.0,
+                if hovered {
+                    t.accent_border
+                } else {
+                    t.card_border
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        let plus = Rect::from_center_size(
+            Pos2::new(rect.center().x, rect.center().y - 10.0),
+            Vec2::splat(24.0),
+        );
+        icons::paint(
+            ui,
+            plus,
+            Icon::Plus,
+            24.0,
+            if hovered { t.accent } else { t.icon },
+        );
+        ui.painter().text(
+            Pos2::new(rect.center().x, rect.max.y - 22.0),
+            egui::Align2::CENTER_CENTER,
+            t!("viewer.new_capture.tooltip"),
+            theme::medium(10.5),
+            t.text_dim,
+        );
+        let resp = resp.on_hover_text(t!("viewer.new_capture.tooltip"));
+        if resp.clicked() {
+            shared.push(Command::ShowBar);
+        }
+    }
+
+    /// The tile's caption band: an always-visible dark strip with the
+    /// unsaved dot, the padlock and the elided title; hovering adds the
+    /// capture date in the active language's local format.
+    fn mosaic_band(&self, ui: &mut egui::Ui, index: usize, rect: Rect, hovered: bool) {
+        let t = theme::tokens(ui.ctx());
+        let band = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - BAND_H), rect.max);
+        ui.painter().rect(
+            band,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: t.radius_md,
+                se: t.radius_md,
+            },
+            theme::mosaic_chrome::BAND,
+            Stroke::NONE,
+            StrokeKind::Inside,
+        );
+        let tab = &self.tabs[index];
+        let title = tab.title.clone();
+        let (dirty, protected) = (!tab.saved, tab.doc.meta.is_protected());
+        let date = hovered.then(|| {
+            tab.doc
+                .meta
+                .captured_at
+                .format(capture_date_fmt())
+                .to_string()
+        });
+        let mut band_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(band.shrink2(Vec2::new(8.0, 0.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        band_ui.spacing_mut().item_spacing.x = 4.0;
+        if dirty {
+            let (r, _) = band_ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+            band_ui.painter().circle_filled(r.center(), 3.0, t.danger);
+        }
+        if protected {
+            let (r, _) = band_ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+            icons::image(Icon::Lock, 11.0, theme::mosaic_chrome::BAND_TEXT).paint_at(&band_ui, r);
+        }
+        band_ui.add(
+            egui::Label::new(egui::RichText::new(title).color(theme::mosaic_chrome::BAND_TEXT))
+                .truncate(),
+        );
+        if let Some(date) = date {
+            band_ui.add(
+                egui::Label::new(egui::RichText::new(date).color(theme::mosaic_chrome::BAND_DIM))
+                    .truncate(),
+            );
+        }
     }
 
     /// The locked tab's stand-in: canvas background plus a centred
@@ -1933,9 +2419,13 @@ impl Viewer {
             } else {
                 let tab = &mut self.tabs[state.tab];
                 tab.doc.meta.set_password(state.new.trim());
-                // Proving (or setting) the password unlocks for as long
-                // as the tab stays active.
-                tab.unlocked = true;
+                // Arming (or changing) the password locks the tab
+                // immediately — same instant-padlock rule as the mosaic
+                // tiles. Only DISARMING (an empty new password) leaves
+                // it unlocked. The thumbnail is always dropped: locked
+                // tabs never hold pixels.
+                tab.unlocked = state.new.is_empty();
+                tab.thumb = None;
                 self.protect = None;
                 return;
             }
@@ -2081,6 +2571,22 @@ fn take_digits(s: &str) -> (&str, &str) {
     s.split_at(end)
 }
 
+/// The capture-date format for the active language — shared by the
+/// status strip and the mosaic tiles' hovered bands.
+fn capture_date_fmt() -> &'static str {
+    match &*rust_i18n::locale() {
+        "fr" | "es" => "%d/%m/%Y %H:%M",
+        _ => "%b %d, %Y %H:%M",
+    }
+}
+
+/// The largest centred rect with `inner`'s aspect ratio that fits in
+/// `outer` — the mosaic thumbnail's "fit, never distorted" box.
+fn fit_rect(outer: Rect, inner: Vec2) -> Rect {
+    let scale = (outer.width() / inner.x.max(1.0)).min(outer.height() / inner.y.max(1.0));
+    Rect::from_center_size(outer.center(), inner * scale)
+}
+
 fn paint_tab_close(ui: &mut egui::Ui, rect: Rect, hovered: bool) {
     let t = theme::tokens(ui.ctx());
     if ui.is_rect_visible(rect) {
@@ -2182,6 +2688,24 @@ fn zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) {
     });
 }
 
+/// The mosaic zoom menu: the fixed 50→200% tile-scale presets. The ±
+/// buttons use ×1.25/÷1.25 arithmetic, so an intermediate scale shows
+/// no preset selected.
+fn mosaic_zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) {
+    tool_popup(ui, resp, "mosaic-zoom-menu", open, |ui| {
+        for pct in [50u32, 75, 100, 125, 150, 200] {
+            let scale = pct as f32 / 100.0;
+            if ui
+                .selectable_label((v.mosaic_scale - scale).abs() < 0.001, format!("{pct}%"))
+                .clicked()
+            {
+                v.mosaic_scale = scale;
+                ui.close();
+            }
+        }
+    });
+}
+
 /// One top-level menu label opening a popup (egui menu strip style).
 fn menu_button(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     let resp = ui.button(label);
@@ -2226,12 +2750,15 @@ mod tests {
             }),
             saved: false,
             texture: None,
+            thumb: None,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             anno_undo: VecDeque::new(),
             anno_redo: VecDeque::new(),
             unlocked: false,
+            insertion: v.next_insertion,
         });
+        v.next_insertion += 1;
         v.active = v.tabs.len() - 1;
     }
 
@@ -2371,5 +2898,131 @@ mod tests {
         assert!(!v.tabs[0].saved);
         assert!(v.tabs[0].doc.meta.source_path.is_none());
         assert!(v.dirty);
+    }
+
+    #[test]
+    fn mosaic_mode_defaults_to_tabs_and_toggles() {
+        let mut v = Viewer::default();
+        assert_eq!(v.view_mode, ViewMode::Tabs, "PixMe always opens in tabs");
+        assert_eq!(v.mosaic_scale, 1.0);
+        v.toggle_view_mode();
+        assert_eq!(v.view_mode, ViewMode::Mosaic);
+        v.toggle_view_mode();
+        assert_eq!(v.view_mode, ViewMode::Tabs);
+    }
+
+    #[test]
+    fn mosaic_zoom_steps_and_clamps() {
+        let mut v = Viewer::default();
+        v.mosaic_zoom_in();
+        assert!((v.mosaic_scale - 1.25).abs() < 1e-4);
+        v.mosaic_zoom_in();
+        assert!((v.mosaic_scale - 1.5625).abs() < 1e-4);
+        // 200% is the ceiling: further steps never exceed it.
+        for _ in 0..4 {
+            v.mosaic_zoom_in();
+        }
+        assert_eq!(v.mosaic_scale, 2.0);
+        // 50% is the floor.
+        for _ in 0..20 {
+            v.mosaic_zoom_out();
+        }
+        assert_eq!(v.mosaic_scale, 0.5);
+        v.mosaic_zoom_reset();
+        assert_eq!(v.mosaic_scale, 1.0);
+        // The zoom caption follows the scale in Mosaic mode.
+        v.toggle_view_mode();
+        v.mosaic_zoom_in();
+        assert_eq!(v.zoom_label(), "125%");
+    }
+
+    #[test]
+    fn mosaic_thumbnail_scales_the_longest_side() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut v = Viewer::default();
+            push_doc(&mut v, 2000, 1000);
+            v.ensure_thumb(ui, 0);
+            let (_, tex) = v.tabs[0].thumb.as_ref().expect("thumbnail missing");
+            assert_eq!(
+                tex.size(),
+                [480, 240],
+                "aspect ratio kept, longest side capped"
+            );
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn locked_tabs_never_hold_a_thumbnail() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut v = Viewer::default();
+            v.push_stub("secret");
+            v.tabs[0].doc.meta.set_password("pw");
+            assert!(v.is_locked(0));
+            v.ensure_thumb(ui, 0);
+            assert!(
+                v.tabs[0].thumb.is_none(),
+                "a locked tab must not generate pixel data"
+            );
+            // A proven password unlocks the canvas, but the mosaic tile
+            // stays a padlock — protected tabs never build thumbnails.
+            v.tabs[0].unlocked = true;
+            assert!(!v.is_locked(0));
+            v.ensure_thumb(ui, 0);
+            assert!(
+                v.tabs[0].thumb.is_none(),
+                "a protected tab never shows its pixels in the mosaic"
+            );
+            // …and leaving the tab re-locks it.
+            v.set_active(0);
+            assert!(v.is_locked(0));
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn mosaic_selects_and_closes_like_the_tab_strip() {
+        let mut v = Viewer::default();
+        v.toggle_view_mode();
+        for t in ["a", "b", "c"] {
+            v.push_stub(t);
+        }
+        // Single click selects without leaving the mosaic.
+        v.set_active(1);
+        assert_eq!(v.view_mode, ViewMode::Mosaic);
+        // The tile's close cross closes only that capture.
+        v.close_tabs(&[1]);
+        assert_eq!(v.tabs.len(), 2);
+        assert_eq!(v.active, 1, "active shifts onto the next capture");
+        // Double-click (or Enter) opens the active tile in tabs mode.
+        v.open_active_tile(v.active);
+        assert_eq!(v.view_mode, ViewMode::Tabs);
+        assert_eq!(v.tabs[v.active].title, "c");
+    }
+
+    #[test]
+    fn opening_the_active_tile_does_not_relock() {
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.push_stub("b");
+        v.tabs[0].doc.meta.set_password("pw");
+        v.set_active(0);
+        v.tabs[0].unlocked = true; // the password was proved
+        assert!(!v.is_locked(0));
+        v.open_active_tile(0);
+        assert_eq!(v.view_mode, ViewMode::Tabs);
+        assert!(
+            !v.is_locked(0),
+            "opening the already-active tile is not a selection change"
+        );
+        // Selecting a DIFFERENT tile re-locks it, like the tab strip.
+        v.tabs[1].doc.meta.set_password("pw2");
+        v.view_mode = ViewMode::Mosaic;
+        v.open_active_tile(1);
+        assert_eq!(v.view_mode, ViewMode::Tabs);
+        assert!(v.is_locked(0), "switching selection re-locks the old tab");
+        assert!(v.is_locked(1), "a protected tile opens locked");
     }
 }

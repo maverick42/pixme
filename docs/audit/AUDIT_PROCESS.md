@@ -93,3 +93,25 @@ Windows.
 - MT-22 — Tab sort: context menu second zone toggles by-name/by-date
   (re-click returns to insertion order); ordering persists across
   restarts and re-sorts on capture, rename and duplicate.
+
+## 9. Mosaic view mode
+
+- MT-23 — Toggle: the toolbar's grid button switches to the thumbnail
+  grid and hides the tab strip; the viewer always starts in Tabs mode;
+  the trailing "+ New capture" tile returns to the capture bar.
+- MT-24 — Mosaic zoom: ± buttons step ×1.25 (clamped 50–200 %), the
+  percent button resets to 100 %, its caret menu lists 50/75/100/125/
+  150/200 %; columns reflow with the window width; thumbnails stay
+  sharp and keep their aspect ratio.
+- MT-25 — Tiles: single click selects (toolbar buttons and ⌘C/⌘Z/⇧⌘Z
+  act on the selection), double-click or Enter opens the tile in Tabs
+  mode, right-click opens the tab menu (sort by name/date reorders the
+  grid); the close cross closes only that capture; hovering shows the
+  capture date in the UI language's local format.
+- MT-26 — Protected capture in Mosaic: the tile shows a centred
+  padlock, never a thumbnail; double-click returns to Tabs mode with
+  the password card; switching selection re-locks and drops the
+  thumbnail.
+- MT-27 — Thumbnails: annotations appear in the tiles (same render
+  path as the canvas); thumbnails rebuild after edits; with many tabs
+  only visible tiles are textured (memory stays bounded).
