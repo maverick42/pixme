@@ -74,6 +74,50 @@ pub enum TipShape {
     Round,
 }
 
+/// Bracket / curly-brace shape ("Forme" option row of the bracket tool).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BraceKind {
+    /// Narrow left curly brace `{`.
+    #[default]
+    CurlyLeft,
+    /// Narrow right curly brace `}`.
+    CurlyRight,
+    /// Wide left curly brace `{`.
+    CurlyWideLeft,
+    /// Wide right curly brace `}`.
+    CurlyWideRight,
+    /// Left square bracket `[`.
+    SquareLeft,
+    /// Right square bracket `]`.
+    SquareRight,
+    /// Left round bracket / parenthesis `(`.
+    RoundLeft,
+    /// Right round bracket / parenthesis `)`.
+    RoundRight,
+}
+
+impl BraceKind {
+    /// All eight shapes in option-bar display order.
+    pub const ALL: [BraceKind; 8] = [
+        Self::CurlyLeft,
+        Self::CurlyRight,
+        Self::CurlyWideLeft,
+        Self::CurlyWideRight,
+        Self::SquareLeft,
+        Self::SquareRight,
+        Self::RoundLeft,
+        Self::RoundRight,
+    ];
+
+    /// Whether this bracket bulges toward the left/up normal (`{`, `[`, `(`).
+    pub fn is_left(self) -> bool {
+        matches!(
+            self,
+            Self::CurlyLeft | Self::CurlyWideLeft | Self::SquareLeft | Self::RoundLeft
+        )
+    }
+}
+
 /// Step-marker size presets ("Taille": Petit/Moyen/Grand).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepSize {
@@ -422,6 +466,32 @@ pub struct BlurObj {
     pub strength: u8,
 }
 
+/// A bracket / curly-brace annotation spanning between two endpoints `a` and `b`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BraceObj {
+    /// First endpoint anchor (physical px).
+    pub a: Pos2,
+    /// Second endpoint anchor (physical px).
+    pub b: Pos2,
+    /// Bracket shape.
+    pub kind: BraceKind,
+    /// Stroke colour.
+    pub color: Color32,
+    /// Stroke width px.
+    pub width: f32,
+    /// Stroke dashing.
+    pub dash: Dash,
+    /// Outer contour thickness (0–10).
+    pub outline: f32,
+    /// Outer contour colour.
+    #[serde(default = "default_step_ring")]
+    pub outline_color: Color32,
+    /// Object opacity 0–1.
+    pub opacity: f32,
+    /// Drop-shadow offset px (`0` = no shadow).
+    pub shadow: f32,
+}
+
 /// Geometry/content of one annotation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AnnotationKind {
@@ -445,6 +515,8 @@ pub enum AnnotationKind {
     Picture(PicObj),
     /// Blur/pixelate region.
     Blur(BlurObj),
+    /// `{` / `}` / `[` / `]` / `(` / `)` bracket between two anchors.
+    Brace(BraceObj),
 }
 
 /// One annotation object.
@@ -527,6 +599,15 @@ impl AnnotationKind {
             }
             Self::Picture(o) => o.rect,
             Self::Blur(o) => o.rect,
+            Self::Brace(o) => {
+                let pad = (o.width + o.outline + 8.0).ceil() as i32;
+                let mut r = points_bounds(&crate::editor::render::brace_polyline(o));
+                r.x -= pad;
+                r.y -= pad;
+                r.width = (r.width as i32 + pad * 2).max(1) as u32;
+                r.height = (r.height as i32 + pad * 2).max(1) as u32;
+                r
+            }
         }
     }
 
@@ -570,6 +651,10 @@ impl AnnotationKind {
             Self::Step(o) => shift(&mut o.pos),
             Self::Picture(o) => shift_rect(&mut o.rect),
             Self::Blur(o) => shift_rect(&mut o.rect),
+            Self::Brace(o) => {
+                shift(&mut o.a);
+                shift(&mut o.b);
+            }
         }
     }
 
@@ -623,6 +708,10 @@ impl AnnotationKind {
             }
             Self::Picture(o) => o.rect = rect,
             Self::Blur(o) => o.rect = rect,
+            Self::Brace(o) => {
+                scale_pt(&mut o.a, &b);
+                scale_pt(&mut o.b, &b);
+            }
         }
     }
 }

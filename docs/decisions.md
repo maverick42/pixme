@@ -820,4 +820,32 @@ Format: date — context — decision — consequences.
   removed kinds could not be deserialized, so older session stores are
   wiped on open (accepted: pre-release). The strip now shows 16 tools.
 
+## 2026-10-26 — Bracket / curly-brace tool (`Tool::Brace` / `AnnotationKind::Brace`)
+
+- **Context**: The user asked to add a bracket / curly-brace tool ("Accolade")
+  between Pencil and Eraser in the Draw tool strip, inspired by the functional
+  reference: dragging draws a visible line that sets the bracket's direction and
+  orientation, and releasing displays the bracket with two endpoint anchors to
+  resize or re-orient it.
+- **Decision**:
+  - Added `Tool::Brace` (`Icon::Braces`, upstream Lucide `braces.svg`) between
+    `Tool::Pencil` and `Tool::Eraser` (17 tools in the strip).
+  - Added `BraceKind` (`CurlyLeft`, `CurlyRight`, `CurlyWideLeft`,
+    `CurlyWideRight`, `SquareLeft`, `SquareRight`, `RoundLeft`, `RoundRight`)
+    and `BraceObj` (`a`, `b`, `kind`, `color`, `width`, `dash`, `outline`,
+    `outline_color`, `opacity`, `shadow`) under `AnnotationKind::Brace`.
+  - While dragging (`Drag::Shape`), the canvas previews the straight segment
+    between `a` and `b` (with Ctrl/Shift horizontal/vertical snapping). On
+    release, the bracket is created and selected, exposing two circular
+    endpoint anchors at `a` and `b` (`Handle::Endpoint`) without a bounding-box
+    frame.
+  - `render::brace_polyline` generates `C¹`-smooth quarter-ellipse hooks and
+    central cusp for curly braces (`{` / `}`, narrow and wide), right-angle
+    segments for square brackets (`[` / `]`), and a circular arc for
+    parentheses (`(` / `)`), rendered through the analytical SDF stroke path
+    (`stroke_freehand`).
+  - `brace_options_row` shares one option strip between `Tool::Brace` and a
+    selected `BraceObj` (colour, width, 8 painted `Forme:` buttons, dash,
+    outline width + colour, opacity, shadow).
+- **Consequences**: `SCHEMA_VERSION` bumped to 12 in `src/store/mod.rs`.
 

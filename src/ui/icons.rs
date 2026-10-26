@@ -79,6 +79,8 @@ pub enum Icon {
     Info,
     /// Draw: straight line/arrow.
     ArrowUpRight,
+    /// Draw: curly brace / bracket.
+    Braces,
     /// Draw: eraser.
     Eraser,
     /// Draw: outlined rectangle.

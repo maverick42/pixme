@@ -12,8 +12,8 @@ use image::{Rgba, RgbaImage};
 use imageproc::drawing as drw;
 
 use super::document::{
-    Annotation, AnnotationKind, AreaShape, BlurStyle, Dash, Document, LineEnd, StepMode, StepSize,
-    StepStyle, TextAlign, TipShape,
+    Annotation, AnnotationKind, AreaShape, BlurStyle, BraceKind, BraceObj, Dash, Document,
+    EraserMode, FreeObj, LineEnd, StepMode, StepSize, StepStyle, TextAlign, TipShape,
 };
 use crate::capture::PhysicalRect;
 
@@ -162,6 +162,7 @@ fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
         AnnotationKind::Step(o) => (0.0, o.opacity),
         AnnotationKind::Picture(o) => (o.shadow, o.opacity),
         AnnotationKind::Blur(_) => (0.0, 1.0),
+        AnnotationKind::Brace(o) => (0.0, o.opacity),
     }
 }
 
@@ -218,6 +219,7 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
         AnnotationKind::Step(o) => draw_step(&mut layer, o),
         AnnotationKind::Picture(o) => draw_picture(&mut layer, o),
         AnnotationKind::Blur(_) => {}
+        AnnotationKind::Brace(o) => draw_brace(&mut layer, o),
     }
     // Per-object alpha (freehand strokes carry theirs on the colour).
     let extra = match &anno.kind {
@@ -930,6 +932,103 @@ fn draw_line_obj(img: &mut RgbaImage, o: &super::document::LineObj) {
             img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
         }
     }
+}
+
+/// Polyline vertices of a [`BraceObj`] from endpoint `a` to endpoint `b`.
+pub fn brace_polyline(o: &BraceObj) -> Vec<Pos2> {
+    let d_vec = o.b - o.a;
+    let len = d_vec.length();
+    if len < 1.0 {
+        return vec![o.a, o.b];
+    }
+    // Canonicalize endpoint order so `{`, `[`, `(` always bulge left (or up
+    // when horizontal) and `}`, `]`, `)` always bulge right (or down).
+    let (p0, p1) = if d_vec.y < -1e-3 || (d_vec.y.abs() <= 1e-3 && d_vec.x < 0.0) {
+        (o.b, o.a)
+    } else {
+        (o.a, o.b)
+    };
+    let u = (p1 - p0) / len;
+    let n_left = egui::vec2(-u.y, u.x);
+    let n = if o.kind.is_left() { n_left } else { -n_left };
+    let pt = |s: f32, off: f32| -> Pos2 { p0 + u * s + n * off };
+
+    match o.kind {
+        BraceKind::CurlyLeft
+        | BraceKind::CurlyRight
+        | BraceKind::CurlyWideLeft
+        | BraceKind::CurlyWideRight => {
+            let wide = matches!(o.kind, BraceKind::CurlyWideLeft | BraceKind::CurlyWideRight);
+            let d = if wide {
+                ((len * 0.18).clamp(9.0, 22.0) + o.width * 0.45).min(len * 0.36)
+            } else {
+                ((len * 0.10).clamp(5.0, 11.0) + o.width * 0.35).min(len * 0.25)
+            };
+            let r_end = (d * 0.95).min(len * 0.22);
+            let d_tip = (d * 0.85).min(len * 0.22);
+            let r_mid = d_tip.min((len * 0.5 - r_end).max(0.5));
+            let half = len * 0.5;
+            let frac_pi_2 = std::f32::consts::FRAC_PI_2;
+            let mut pts = Vec::with_capacity(52);
+            for k in 0..=12 {
+                let th = (k as f32 / 12.0) * frac_pi_2;
+                pts.push(pt(r_end * (1.0 - th.cos()), d * th.sin()));
+            }
+            for k in 0..=12 {
+                let th = (k as f32 / 12.0) * frac_pi_2;
+                pts.push(pt(
+                    (half - r_mid) + r_mid * th.sin(),
+                    (d + d_tip) - d_tip * th.cos(),
+                ));
+            }
+            for k in 1..=12 {
+                let th = (k as f32 / 12.0) * frac_pi_2;
+                pts.push(pt(
+                    (half + r_mid) - r_mid * th.cos(),
+                    (d + d_tip) - d_tip * th.sin(),
+                ));
+            }
+            for k in 0..=12 {
+                let th = (k as f32 / 12.0) * frac_pi_2;
+                pts.push(pt((len - r_end) + r_end * th.sin(), d * th.cos()));
+            }
+            pts
+        }
+        BraceKind::SquareLeft | BraceKind::SquareRight => {
+            let d = ((len * 0.16).clamp(5.0, 15.0) + o.width * 0.4).min(len * 0.45);
+            vec![pt(0.0, 0.0), pt(0.0, d), pt(len, d), pt(len, 0.0)]
+        }
+        BraceKind::RoundLeft | BraceKind::RoundRight => {
+            let d = ((len * 0.18).clamp(4.0, 18.0) + o.width * 0.3).min(len * 0.45);
+            let r = (d * d + (len * 0.5).powi(2)) / (2.0 * d.max(0.5));
+            let alpha = (len * 0.5 / r).clamp(-1.0, 1.0).asin();
+            (0..=32)
+                .map(|k| {
+                    let ang = -alpha + (2.0 * alpha) * (k as f32 / 32.0);
+                    pt(len * 0.5 + r * ang.sin(), d - r * (1.0 - ang.cos()))
+                })
+                .collect()
+        }
+    }
+}
+
+/// Renders a bracket / curly brace onto `img` using SDF polyline stroking.
+fn draw_brace(img: &mut RgbaImage, o: &BraceObj) {
+    let points = brace_polyline(o);
+    let free = FreeObj {
+        points,
+        color: o.color,
+        width: o.width,
+        tip: TipShape::Round,
+        dash: o.dash,
+        outline: o.outline,
+        outline_color: o.outline_color,
+        shadow: o.shadow,
+        eraser_mode: EraserMode::Color,
+        soft: false,
+        opacity: 1.0,
+    };
+    stroke_freehand(img, &free);
 }
 
 /// Pencil/eraser freehand stroke with SDF anti-aliasing,

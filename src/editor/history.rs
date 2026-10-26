@@ -190,4 +190,53 @@ mod tests {
         // Pixelated region shows averaged colour (uniform here → same).
         assert_eq!(out.get_pixel(10, 10).0[3], 255);
     }
+
+    /// Every bracket shape generates a non-degenerate polyline between its
+    /// two anchors, bulges consistently regardless of drag direction, and
+    /// renders onto the document bitmap.
+    #[test]
+    fn brace_shapes_render_and_orient_consistently() {
+        use crate::editor::document::{BraceKind, BraceObj, Dash};
+        use crate::editor::render::{brace_polyline, render_to_image};
+        use egui::pos2;
+
+        for kind in BraceKind::ALL {
+            let down = BraceObj {
+                a: pos2(20.0, 6.0),
+                b: pos2(20.0, 34.0),
+                kind,
+                color: Color32::RED,
+                width: 2.0,
+                dash: Dash::Solid,
+                outline: 1.0,
+                outline_color: Color32::WHITE,
+                opacity: 1.0,
+                shadow: 3.0,
+            };
+            let up = BraceObj {
+                a: down.b,
+                b: down.a,
+                ..down.clone()
+            };
+            let pts_down = brace_polyline(&down);
+            let pts_up = brace_polyline(&up);
+            assert!(pts_down.len() >= 4);
+            assert_eq!(pts_down, pts_up);
+            if kind.is_left() {
+                assert!(pts_down.iter().any(|p| p.x < 18.0));
+            } else {
+                assert!(pts_down.iter().any(|p| p.x > 22.0));
+            }
+            let mut d = doc();
+            d.annotations.push(Annotation {
+                id: 1,
+                kind: AnnotationKind::Brace(down),
+            });
+            let out = render_to_image(&d);
+            assert!(
+                out.pixels().any(|px| px.0 != [20, 30, 40, 255]),
+                "{kind:?} did not paint any pixel"
+            );
+        }
+    }
 }

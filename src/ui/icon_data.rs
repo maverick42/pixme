@@ -171,6 +171,11 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/arrow-up-right.svg"),
     ),
     (
+        Icon::Braces,
+        "braces",
+        include_bytes!("../../assets/icons/braces.svg"),
+    ),
+    (
         Icon::Eraser,
         "eraser",
         include_bytes!("../../assets/icons/eraser.svg"),

@@ -18,9 +18,9 @@ use rust_i18n::t;
 use crate::app::Shared;
 use crate::capture::PhysicalRect;
 use crate::editor::document::{
-    Annotation, AnnotationId, AnnotationKind, AreaObj, AreaShape, BlurObj, BlurStyle, BoxObj, Dash,
-    Document, EllipseObj, EraserMode, FreeObj, LineEnd, LineObj, PicObj, RectObj, StepMode,
-    StepObj, StepSize, StepStyle, TextAlign, TextObj, TipShape,
+    Annotation, AnnotationId, AnnotationKind, AreaObj, AreaShape, BlurObj, BlurStyle, BoxObj,
+    BraceKind, BraceObj, Dash, Document, EllipseObj, EraserMode, FreeObj, LineEnd, LineObj, PicObj,
+    RectObj, StepMode, StepObj, StepSize, StepStyle, TextAlign, TextObj, TipShape,
 };
 use crate::editor::history::{ANNO_HISTORY_CAP, AnnoEdit};
 use crate::editor::render;
@@ -39,6 +39,7 @@ enum Tool {
     Step,
     Arrow,
     Pencil,
+    Brace,
     Eraser,
     Rect,
     RectFill,
@@ -51,7 +52,7 @@ enum Tool {
 
 impl Tool {
     /// The strip grid in display order (row-major, two columns).
-    const ALL: [Tool; 16] = [
+    const ALL: [Tool; 17] = [
         Self::Select,
         Self::SelectArea,
         Self::TextBoxRect,
@@ -60,6 +61,7 @@ impl Tool {
         Self::Step,
         Self::Arrow,
         Self::Pencil,
+        Self::Brace,
         Self::Eraser,
         Self::Rect,
         Self::RectFill,
@@ -80,6 +82,7 @@ impl Tool {
             Self::Step => Icon::Info,
             Self::Arrow => Icon::ArrowUpRight,
             Self::Pencil => Icon::Pencil,
+            Self::Brace => Icon::Braces,
             Self::Eraser => Icon::Eraser,
             Self::Rect => Icon::Square,
             Self::RectFill => Icon::SquareFill,
@@ -101,6 +104,7 @@ impl Tool {
             Self::Step => t!("draw.tool.step"),
             Self::Arrow => t!("draw.tool.arrow"),
             Self::Pencil => t!("draw.tool.pencil"),
+            Self::Brace => t!("draw.tool.brace"),
             Self::Eraser => t!("draw.tool.eraser"),
             Self::Rect => t!("draw.tool.rect"),
             Self::RectFill => t!("draw.tool.rectfill"),
@@ -133,6 +137,7 @@ struct Opts {
     // Shape specifics.
     radius: f32,
     tip: TipShape,
+    brace_kind: BraceKind,
     shape: AreaShape,
     /// Line / area highlighter coverage (defaults translucent).
     hl_opacity: f32,
@@ -209,6 +214,7 @@ impl Default for Opts {
             line_shadow: true,
             radius: 8.0,
             tip: TipShape::Round,
+            brace_kind: BraceKind::CurlyLeft,
             shape: AreaShape::Rect,
             hl_opacity: 0.45,
             eraser_color: Color32::WHITE,
@@ -350,6 +356,8 @@ pub struct DrawSession {
     confirm_quit: bool,
     /// Last pointer position in image coords (shape-drag end point).
     last_pointer: Option<Pos2>,
+    /// Whether Ctrl or Shift is held this frame (horizontal/vertical snap).
+    snap_hv: bool,
     /// The canvas rect of the document image (set every frame).
     img_rect: Rect,
     /// Canvas zoom actually used for painting (screen→image px for grabs).
@@ -389,6 +397,7 @@ impl DrawSession {
             outcome: None,
             confirm_quit: false,
             last_pointer: None,
+            snap_hv: false,
             img_rect: Rect::NOTHING,
             canvas_scale: 1.0,
         }
@@ -476,6 +485,15 @@ impl DrawSession {
                     }
                     o.width * 2.0 + o.outline + 8.0
                 }
+                AnnotationKind::Brace(o) => {
+                    if [o.a, o.b]
+                        .iter()
+                        .any(|q| p.distance(*q) < 12.0 / scale.max(0.05))
+                    {
+                        return Some(a.id);
+                    }
+                    o.width * 2.0 + o.outline + 8.0
+                }
                 AnnotationKind::Rect(o) => o.stroke_w * 0.5 + o.outline + 6.0,
                 AnnotationKind::Ellipse(o) => o.stroke_w * 0.5 + o.outline + 6.0,
                 AnnotationKind::Freehand(o) => o.width / 2.0 + 4.0,
@@ -508,6 +526,13 @@ impl DrawSession {
                             .windows(2)
                             .any(|w| seg_distance(p, w[0].1, w[1].1) <= tol)
                         {
+                            return Some(a.id);
+                        }
+                    }
+                    AnnotationKind::Brace(o) => {
+                        let pts = render::brace_polyline(o);
+                        let tol = o.width.max(4.0) * 1.5 + o.outline + 6.0;
+                        if pts.windows(2).any(|w| seg_distance(p, w[0], w[1]) <= tol) {
                             return Some(a.id);
                         }
                     }
@@ -1079,6 +1104,7 @@ impl DrawSession {
         self.canvas_scale = scale;
         let img_p = to_img(hover);
         self.last_pointer = Some(img_p);
+        self.snap_hv = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.shift);
 
         // Cursor feedback: a movable object under the pointer shows the
         // move icon (like the reference editor); crosshair for drawing.
@@ -1264,6 +1290,7 @@ impl DrawSession {
                 id, which_b, top, ..
             }) => {
                 let (wb, top) = (*which_b, *top);
+                let snap = self.snap_hv;
                 if let Some(a) = self.doc.annotation_mut(*id) {
                     match &mut a.kind {
                         AnnotationKind::Line(o) => {
@@ -1275,6 +1302,19 @@ impl DrawSession {
                             drag_bezier_endpoint(
                                 &mut o.a, &mut o.ka, &mut o.kb, &mut o.b, wb, top, p,
                             );
+                        }
+                        AnnotationKind::Brace(o) => {
+                            if wb {
+                                let next = snap_hv_pt(o.a, p, snap);
+                                if (next - o.a).length() >= 8.0 {
+                                    o.b = next;
+                                }
+                            } else {
+                                let next = snap_hv_pt(o.b, p, snap);
+                                if (next - o.b).length() >= 8.0 {
+                                    o.a = next;
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -1464,6 +1504,29 @@ impl DrawSession {
                     shadow: if o.line_shadow { 3.0 } else { 0.0 },
                 })
             }
+            Tool::Brace => {
+                let mut b = snap_hv_pt(a, b, self.snap_hv);
+                if (b - a).length() < 8.0 {
+                    let d = if (b - a).length() < 1e-3 {
+                        vec2(0.0, 1.0)
+                    } else {
+                        unit_dir(a, b)
+                    };
+                    b = a + d * 24.0;
+                }
+                AnnotationKind::Brace(BraceObj {
+                    a,
+                    b,
+                    kind: o.brace_kind,
+                    color: o.color,
+                    width: o.width,
+                    dash: o.dash,
+                    outline: o.outline,
+                    outline_color: o.line_outline_color,
+                    opacity: o.opacity,
+                    shadow: if o.line_shadow { 3.0 } else { 0.0 },
+                })
+            }
             Tool::HighlightArea => AnnotationKind::HighlightArea(AreaObj {
                 rect: r,
                 color: o.color,
@@ -1642,6 +1705,15 @@ impl DrawSession {
         match &a.kind {
             AnnotationKind::Line(o) => bezier_handle_at(o.a, o.ka, o.kb, o.b, p, grab),
             AnnotationKind::Text(o) => bezier_handle_at(o.a, o.ka, o.kb, o.b, p, grab),
+            AnnotationKind::Brace(o) => {
+                if p.distance(o.a) < grab {
+                    Some(Handle::Endpoint(false, true))
+                } else if p.distance(o.b) < grab {
+                    Some(Handle::Endpoint(true, true))
+                } else {
+                    None
+                }
+            }
             AnnotationKind::TextBox(o) => {
                 if o.tail.is_some_and(|t| p.distance(t) < grab) {
                     return Some(Handle::Tail);
@@ -1840,6 +1912,19 @@ impl DrawSession {
                 Tool::Arrow => {
                     painter.line_segment([ca, cb], Stroke::new(o.width.max(1.0), o.color));
                 }
+                Tool::Brace => {
+                    let b_img = snap_hv_pt(*anchor, cur, self.snap_hv);
+                    let cb = to_canvas(b_img, img_rect);
+                    let w_px = (o.width * scale).max(1.5);
+                    painter.line_segment(
+                        [ca, cb],
+                        Stroke::new(w_px, o.color.gamma_multiply(o.opacity)),
+                    );
+                    for end_c in [ca, cb] {
+                        painter.circle_filled(end_c, 4.0, Color32::WHITE);
+                        painter.circle_stroke(end_c, 4.0, Stroke::new(1.0, Color32::from_gray(60)));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1917,7 +2002,10 @@ impl DrawSession {
                 img_rect.min.y + (b.y + b.height as i32) as f32 * scale,
             ),
         );
-        let is_bezier = matches!(a.kind, AnnotationKind::Text(_) | AnnotationKind::Line(_));
+        let is_bezier = matches!(
+            a.kind,
+            AnnotationKind::Text(_) | AnnotationKind::Line(_) | AnnotationKind::Brace(_)
+        );
         if !is_bezier {
             if matches!(
                 &a.kind,
@@ -1944,6 +2032,13 @@ impl DrawSession {
             }
             AnnotationKind::Text(o) => {
                 paint_bezier_chrome(painter, &to_canvas, o.a, o.ka, o.kb, o.b, accent, true);
+            }
+            AnnotationKind::Brace(o) => {
+                for q in [o.a, o.b] {
+                    let c = to_canvas(q);
+                    painter.circle_filled(c, 4.5, Color32::WHITE);
+                    painter.circle_stroke(c, 4.5, Stroke::new(1.2, Color32::from_gray(60)));
+                }
             }
             _ => {
                 for c in handle_centers(cb) {
@@ -2481,7 +2576,11 @@ impl DrawSession {
                 AnnotationKind::Step(_) => t!("draw.tool.step"),
                 AnnotationKind::Picture(_) => t!("draw.tab.image"),
                 AnnotationKind::Blur(_) => t!("draw.tool.blur"),
+                AnnotationKind::Brace(_) => t!("draw.brace.title"),
             };
+        }
+        if self.tool == Tool::Brace {
+            return t!("draw.brace.title");
         }
         self.tool.tip()
     }
@@ -2707,6 +2806,20 @@ impl DrawSession {
                     &mut o.color,
                     &mut o.width,
                     &mut o.tip,
+                    &mut o.dash,
+                    &mut o.outline,
+                    &mut o.line_outline_color,
+                    &mut o.opacity,
+                    &mut o.line_shadow,
+                );
+            }
+            Tool::Brace => {
+                brace_options_row(
+                    ui,
+                    "draw.bar.brace",
+                    &mut o.color,
+                    &mut o.width,
+                    &mut o.brace_kind,
                     &mut o.dash,
                     &mut o.outline,
                     &mut o.line_outline_color,
@@ -3089,6 +3202,25 @@ impl DrawSession {
                         changed = true;
                     }
                 }
+                AnnotationKind::Brace(o) => {
+                    let mut sh_on = o.shadow > 0.0;
+                    if brace_options_row(
+                        ui,
+                        "draw.sel.brace",
+                        &mut o.color,
+                        &mut o.width,
+                        &mut o.kind,
+                        &mut o.dash,
+                        &mut o.outline,
+                        &mut o.outline_color,
+                        &mut o.opacity,
+                        &mut sh_on,
+                    ) {
+                        o.shadow = if sh_on { 3.0 } else { 0.0 };
+                        self.opts.brace_kind = o.kind;
+                        changed = true;
+                    }
+                }
             }
         }
         if let Some((c, f, sz, b, it, out, oc)) = persist {
@@ -3189,6 +3321,18 @@ fn unit_dir(a: Pos2, b: Pos2) -> Vec2 {
         Vec2::new(1.0, 0.0)
     } else {
         d / len
+    }
+}
+
+/// Snaps `p` horizontally or vertically relative to `anchor` when `snap` is true.
+fn snap_hv_pt(anchor: Pos2, p: Pos2, snap: bool) -> Pos2 {
+    if !snap {
+        return p;
+    }
+    if (p.x - anchor.x).abs() >= (p.y - anchor.y).abs() {
+        pos2(p.x, anchor.y)
+    } else {
+        pos2(anchor.x, p.y)
     }
 }
 
@@ -3622,6 +3766,89 @@ fn pencil_options_row(
         .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
         .changed();
     changed
+}
+
+/// Option strip shared by `Tool::Brace` and a selected `BraceObj`.
+#[allow(clippy::too_many_arguments)]
+fn brace_options_row(
+    ui: &mut Ui,
+    salt: &'static str,
+    color: &mut Color32,
+    width: &mut f32,
+    kind: &mut BraceKind,
+    dash: &mut Dash,
+    outline: &mut f32,
+    outline_color: &mut Color32,
+    opacity: &mut f32,
+    shadow_on: &mut bool,
+) -> bool {
+    let mut changed = false;
+    ui.label(t!("draw.opt.color"));
+    changed |= color_btn(ui, color).changed();
+    changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=20.0).changed();
+    ui.label(t!("draw.opt.shape"));
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for candidate in BraceKind::ALL {
+            if brace_kind_button(ui, candidate, *kind == candidate).clicked() && *kind != candidate
+            {
+                *kind = candidate;
+                changed = true;
+            }
+        }
+    });
+    changed |= dash_combo(ui, dash);
+    ui.label(t!("draw.opt.outline"));
+    changed |= outline_combo(ui, salt, outline);
+    changed |= color_btn(ui, outline_color).changed();
+    changed |= opacity_pct_slider(ui, opacity);
+    changed |= ui
+        .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
+        .changed();
+    changed
+}
+
+/// Clickable mini bracket-shape button for the `Forme:` row.
+fn brace_kind_button(ui: &mut Ui, kind: BraceKind, selected: bool) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(vec2(20.0, 22.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let (fill, stroke) = if response.is_pointer_button_down_on() {
+            (t.pressed, Stroke::NONE)
+        } else if selected {
+            (t.accent_soft, Stroke::new(1.0, t.accent_border))
+        } else if response.hovered() {
+            (t.hover, Stroke::NONE)
+        } else {
+            (Color32::TRANSPARENT, Stroke::NONE)
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(t.radius_sm),
+            fill,
+            stroke,
+            StrokeKind::Inside,
+        );
+        let c = rect.center();
+        let half_h = 6.5_f32;
+        let x_shift = if kind.is_left() { 2.0 } else { -2.0 };
+        let sample = BraceObj {
+            a: pos2(c.x + x_shift, c.y - half_h),
+            b: pos2(c.x + x_shift, c.y + half_h),
+            kind,
+            color: t.icon,
+            width: 1.5,
+            dash: Dash::Solid,
+            outline: 0.0,
+            outline_color: Color32::TRANSPARENT,
+            opacity: 1.0,
+            shadow: 0.0,
+        };
+        let pts = render::brace_polyline(&sample);
+        ui.painter()
+            .add(egui::Shape::line(pts, Stroke::new(1.5, t.icon)));
+    }
+    response
 }
 
 /// Option strip shared by `Rect`, `RectFill`, `Ellipse`, `EllipseFill` and
