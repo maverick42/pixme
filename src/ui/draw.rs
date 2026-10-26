@@ -218,7 +218,7 @@ impl Default for Opts {
             eraser_mode: EraserMode::Color,
             eraser_pick: false,
             blur_style: BlurStyle::Blur,
-            blur_strength: 30,
+            blur_strength: 75,
             font: "Arial".to_owned(),
             font_size: 12.0,
             bold: false,
