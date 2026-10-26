@@ -184,6 +184,12 @@ pub struct RectObj {
     pub fill: Option<Color32>,
     /// Corner radius for the rounded look (FS "Contour" corner icon).
     pub radius: f32,
+    /// Outer contour thickness (0–10).
+    #[serde(default)]
+    pub outline: f32,
+    /// Outer contour colour.
+    #[serde(default = "default_step_ring")]
+    pub outline_color: Color32,
     /// Object opacity 0–1.
     pub opacity: f32,
     /// Drop-shadow offset px (`0` = no shadow).
@@ -203,6 +209,12 @@ pub struct EllipseObj {
     pub dash: Dash,
     /// Fill colour, `None` = transparent.
     pub fill: Option<Color32>,
+    /// Outer contour thickness (0–10).
+    #[serde(default)]
+    pub outline: f32,
+    /// Outer contour colour.
+    #[serde(default = "default_step_ring")]
+    pub outline_color: Color32,
     /// Object opacity 0–1.
     pub opacity: f32,
     /// Drop-shadow offset px.

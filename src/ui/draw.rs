@@ -506,6 +506,8 @@ impl DrawSession {
                     o.width * 2.0 + o.outline + 8.0
                 }
                 AnnotationKind::Fancy(o) => o.width * 2.0 + 8.0,
+                AnnotationKind::Rect(o) => o.stroke_w * 0.5 + o.outline + 6.0,
+                AnnotationKind::Ellipse(o) => o.stroke_w * 0.5 + o.outline + 6.0,
                 AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => {
                     o.width / 2.0 + 4.0
                 }
@@ -909,6 +911,8 @@ impl DrawSession {
                     dash: Dash::Solid,
                     fill: Some(color),
                     radius: 0.0,
+                    outline: 0.0,
+                    outline_color: Color32::WHITE,
                     opacity: 1.0,
                     shadow: 0.0,
                 }),
@@ -1483,12 +1487,14 @@ impl DrawSession {
             Tool::Rect => AnnotationKind::Rect(RectObj {
                 rect: r,
                 stroke: o.color,
-                stroke_w: o.width,
+                stroke_w: o.width.max(1.0),
                 dash: o.dash,
                 fill: None,
                 radius: o.radius,
+                outline: o.outline,
+                outline_color: o.line_outline_color,
                 opacity: o.opacity,
-                shadow: o.shadow,
+                shadow: if o.line_shadow { 3.0 } else { 0.0 },
             }),
             Tool::RectFill => AnnotationKind::Rect(RectObj {
                 rect: r,
@@ -1497,17 +1503,21 @@ impl DrawSession {
                 dash: o.dash,
                 fill: Some(o.fill_color),
                 radius: o.radius,
+                outline: 0.0,
+                outline_color: o.line_outline_color,
                 opacity: o.opacity,
-                shadow: o.shadow,
+                shadow: if o.line_shadow { 3.0 } else { 0.0 },
             }),
             Tool::Ellipse => AnnotationKind::Ellipse(EllipseObj {
                 rect: r,
                 stroke: o.color,
-                stroke_w: o.width,
+                stroke_w: o.width.max(1.0),
                 dash: o.dash,
                 fill: None,
+                outline: o.outline,
+                outline_color: o.line_outline_color,
                 opacity: o.opacity,
-                shadow: o.shadow,
+                shadow: if o.line_shadow { 3.0 } else { 0.0 },
             }),
             Tool::EllipseFill => AnnotationKind::Ellipse(EllipseObj {
                 rect: r,
@@ -1515,8 +1525,10 @@ impl DrawSession {
                 stroke_w: o.width,
                 dash: o.dash,
                 fill: Some(o.fill_color),
+                outline: 0.0,
+                outline_color: o.line_outline_color,
                 opacity: o.opacity,
-                shadow: o.shadow,
+                shadow: if o.line_shadow { 3.0 } else { 0.0 },
             }),
             Tool::Arrow => {
                 let (ka, kb) = bezier_rest_knobs(a, b);
@@ -1851,41 +1863,90 @@ impl DrawSession {
             let cb = to_canvas(cur, img_rect);
             let accent = theme::tokens(painter.ctx()).accent;
             match self.tool {
-                Tool::Rect
-                | Tool::RectFill
-                | Tool::Ellipse
-                | Tool::EllipseFill
-                | Tool::HighlightArea
-                | Tool::Blur
-                | Tool::TextBoxRect
-                | Tool::TextBoxOval => {
+                Tool::Rect | Tool::RectFill | Tool::Ellipse | Tool::EllipseFill => {
                     let r = Rect::from_two_pos(ca, cb);
+                    let filled = matches!(self.tool, Tool::RectFill | Tool::EllipseFill);
+                    let w_px = if filled {
+                        (o.width * scale).max(0.0)
+                    } else {
+                        (o.width.max(1.0) * scale).max(1.0)
+                    };
+                    let out_px = if filled {
+                        0.0
+                    } else {
+                        o.outline.max(0.0) * 0.65 * 2.0 * scale
+                    };
+                    let stroke_col = o.color.gamma_multiply(o.opacity);
+                    let out_col = o.line_outline_color.gamma_multiply(o.opacity);
                     match self.tool {
                         Tool::Ellipse | Tool::EllipseFill => {
-                            painter.add(egui::epaint::EllipseShape::stroke(
-                                r.center(),
-                                r.size() / 2.0,
-                                Stroke::new(1.5, accent),
-                            ));
+                            let radii = r.size() / 2.0;
+                            if filled {
+                                painter.add(egui::epaint::EllipseShape::filled(
+                                    r.center(),
+                                    radii,
+                                    o.fill_color.gamma_multiply(o.opacity),
+                                ));
+                            }
+                            if w_px > 0.0 {
+                                if out_px > 0.0 {
+                                    painter.add(egui::epaint::EllipseShape::stroke(
+                                        r.center(),
+                                        radii,
+                                        Stroke::new(w_px + out_px, out_col),
+                                    ));
+                                }
+                                painter.add(egui::epaint::EllipseShape::stroke(
+                                    r.center(),
+                                    radii,
+                                    Stroke::new(w_px, stroke_col),
+                                ));
+                            }
                         }
                         _ => {
-                            painter.rect_stroke(
-                                r,
-                                CornerRadius::same(
-                                    if matches!(
-                                        self.tool,
-                                        Tool::TextBoxRect | Tool::TextBoxOval | Tool::HighlightArea
-                                    ) {
-                                        o.radius as u8
-                                    } else {
-                                        0
-                                    },
-                                ),
-                                Stroke::new(1.5, accent),
-                                StrokeKind::Inside,
+                            let max_r = (r.width().min(r.height()) * 0.5).min(255.0);
+                            let cr = CornerRadius::same(
+                                (o.radius * scale).round().clamp(0.0, max_r) as u8,
                             );
+                            if filled {
+                                painter.rect_filled(r, cr, o.fill_color.gamma_multiply(o.opacity));
+                            }
+                            if w_px > 0.0 {
+                                if out_px > 0.0 {
+                                    painter.rect_stroke(
+                                        r,
+                                        cr,
+                                        Stroke::new(w_px + out_px, out_col),
+                                        StrokeKind::Middle,
+                                    );
+                                }
+                                painter.rect_stroke(
+                                    r,
+                                    cr,
+                                    Stroke::new(w_px, stroke_col),
+                                    StrokeKind::Middle,
+                                );
+                            }
                         }
                     }
+                }
+                Tool::HighlightArea | Tool::Blur | Tool::TextBoxRect | Tool::TextBoxOval => {
+                    let r = Rect::from_two_pos(ca, cb);
+                    painter.rect_stroke(
+                        r,
+                        CornerRadius::same(
+                            if matches!(
+                                self.tool,
+                                Tool::TextBoxRect | Tool::TextBoxOval | Tool::HighlightArea
+                            ) {
+                                o.radius as u8
+                            } else {
+                                0
+                            },
+                        ),
+                        Stroke::new(1.5, accent),
+                        StrokeKind::Inside,
+                    );
                 }
                 Tool::Arrow | Tool::FancyArrow => {
                     painter.line_segment([ca, cb], Stroke::new(o.width.max(1.0), o.color));
@@ -2823,18 +2884,26 @@ impl DrawSession {
                 });
             }
             Tool::Rect | Tool::RectFill | Tool::Ellipse | Tool::EllipseFill => {
-                w_edit(ui, t!("draw.opt.width"), &mut o.width, 0.0..=20.0);
-                ui.label(t!("draw.opt.border"));
-                color_btn(ui, &mut o.color);
-                if matches!(self.tool, Tool::RectFill | Tool::EllipseFill) {
-                    ui.label(t!("draw.opt.fill_c"));
-                    color_btn(ui, &mut o.fill_color);
+                let is_rect = matches!(self.tool, Tool::Rect | Tool::RectFill);
+                let is_filled = matches!(self.tool, Tool::RectFill | Tool::EllipseFill);
+                let mut fill_opt = is_filled.then_some(o.fill_color);
+                let mut radius_opt = is_rect.then_some(&mut o.radius);
+                shape_options_row(
+                    ui,
+                    "draw.bar.shape",
+                    &mut o.color,
+                    &mut o.width,
+                    &mut fill_opt,
+                    &mut radius_opt,
+                    &mut o.dash,
+                    &mut o.outline,
+                    &mut o.line_outline_color,
+                    &mut o.opacity,
+                    &mut o.line_shadow,
+                );
+                if let Some(fc) = fill_opt {
+                    o.fill_color = fc;
                 }
-                if self.tool == Tool::Rect || self.tool == Tool::RectFill {
-                    slider(ui, t!("draw.opt.radius"), &mut o.radius, 0.0..=40.0);
-                }
-                dash_combo(ui, &mut o.dash);
-                shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
             }
             Tool::HighlightLine => {
                 w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0);
@@ -2987,34 +3056,44 @@ impl DrawSession {
         if let Some(a) = self.doc.annotation_mut(id) {
             match &mut a.kind {
                 AnnotationKind::Rect(o) => {
-                    changed |=
-                        w_edit(ui, t!("draw.opt.width"), &mut o.stroke_w, 0.0..=20.0).changed();
-                    changed |= color_btn(ui, &mut o.stroke).changed();
-                    if o.fill.is_some() {
-                        ui.label(t!("draw.opt.fill_c"));
-                        let mut c = o.fill.unwrap_or(Color32::TRANSPARENT);
-                        if color_btn(ui, &mut c).changed() {
-                            o.fill = Some(c);
-                            changed = true;
-                        }
+                    let mut sh_on = o.shadow > 0.0;
+                    let mut radius_opt = Some(&mut o.radius);
+                    if shape_options_row(
+                        ui,
+                        "draw.sel.rect",
+                        &mut o.stroke,
+                        &mut o.stroke_w,
+                        &mut o.fill,
+                        &mut radius_opt,
+                        &mut o.dash,
+                        &mut o.outline,
+                        &mut o.outline_color,
+                        &mut o.opacity,
+                        &mut sh_on,
+                    ) {
+                        o.shadow = if sh_on { 3.0 } else { 0.0 };
+                        changed = true;
                     }
-                    changed |= dash_combo(ui, &mut o.dash);
-                    changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
                 }
                 AnnotationKind::Ellipse(o) => {
-                    changed |=
-                        w_edit(ui, t!("draw.opt.width"), &mut o.stroke_w, 0.0..=20.0).changed();
-                    changed |= color_btn(ui, &mut o.stroke).changed();
-                    if o.fill.is_some() {
-                        ui.label(t!("draw.opt.fill_c"));
-                        let mut c = o.fill.unwrap_or(Color32::TRANSPARENT);
-                        if color_btn(ui, &mut c).changed() {
-                            o.fill = Some(c);
-                            changed = true;
-                        }
+                    let mut sh_on = o.shadow > 0.0;
+                    let mut radius_opt: Option<&mut f32> = None;
+                    if shape_options_row(
+                        ui,
+                        "draw.sel.ellipse",
+                        &mut o.stroke,
+                        &mut o.stroke_w,
+                        &mut o.fill,
+                        &mut radius_opt,
+                        &mut o.dash,
+                        &mut o.outline,
+                        &mut o.outline_color,
+                        &mut o.opacity,
+                        &mut sh_on,
+                    ) {
+                        o.shadow = if sh_on { 3.0 } else { 0.0 };
+                        changed = true;
                     }
-                    changed |= dash_combo(ui, &mut o.dash);
-                    changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
                 }
                 AnnotationKind::Line(o) => {
                     let mut sh_on = o.shadow > 0.0;
@@ -3715,6 +3794,61 @@ fn pencil_options_row(
     ui.label(t!("draw.opt.outline"));
     changed |= outline_combo(ui, salt, outline);
     changed |= color_btn(ui, outline_color).changed();
+    changed |= opacity_pct_slider(ui, opacity);
+    changed |= ui
+        .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
+        .changed();
+    changed
+}
+
+/// Option strip shared by `Rect`, `RectFill`, `Ellipse`, `EllipseFill` and
+/// their selected `RectObj` / `EllipseObj` counterparts.
+#[allow(clippy::too_many_arguments)]
+fn shape_options_row(
+    ui: &mut Ui,
+    salt: &'static str,
+    stroke: &mut Color32,
+    stroke_w: &mut f32,
+    fill: &mut Option<Color32>,
+    radius: &mut Option<&mut f32>,
+    dash: &mut Dash,
+    outline: &mut f32,
+    outline_color: &mut Color32,
+    opacity: &mut f32,
+    shadow_on: &mut bool,
+) -> bool {
+    let mut changed = false;
+    if let Some(fc) = fill {
+        ui.label(t!("draw.opt.fill_c"));
+        changed |= color_btn(ui, fc).changed();
+        ui.label(t!("draw.opt.border"));
+        changed |= color_btn(ui, stroke).changed();
+        changed |= w_edit(ui, t!("draw.opt.width"), stroke_w, 0.0..=20.0).changed();
+    } else {
+        ui.label(t!("draw.opt.color"));
+        changed |= color_btn(ui, stroke).changed();
+        changed |= w_edit(ui, t!("draw.opt.width"), stroke_w, 1.0..=20.0).changed();
+    }
+    if let Some(rad) = radius {
+        ui.label(t!("draw.opt.radius"));
+        changed |= ui
+            .scope(|ui| {
+                ui.spacing_mut().slider_width = 65.0;
+                ui.add(
+                    egui::Slider::new(*rad, 0.0..=60.0)
+                        .trailing_fill(true)
+                        .max_decimals(0),
+                )
+            })
+            .inner
+            .changed();
+    }
+    changed |= dash_combo(ui, dash);
+    if fill.is_none() {
+        ui.label(t!("draw.opt.outline"));
+        changed |= outline_combo(ui, salt, outline);
+        changed |= color_btn(ui, outline_color).changed();
+    }
     changed |= opacity_pct_slider(ui, opacity);
     changed |= ui
         .checkbox(shadow_on, t!("draw.opt.shadow").to_string())

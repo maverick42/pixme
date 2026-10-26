@@ -154,8 +154,8 @@ fn render_one(img: &mut RgbaImage, anno: &Annotation) {
 /// Shadow/opacity accessors shared by the layered objects.
 fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
     match &anno.kind {
-        AnnotationKind::Rect(o) => (o.shadow, o.opacity),
-        AnnotationKind::Ellipse(o) => (o.shadow, o.opacity),
+        AnnotationKind::Rect(o) => (0.0, o.opacity),
+        AnnotationKind::Ellipse(o) => (0.0, o.opacity),
         AnnotationKind::Line(o) => (0.0, o.opacity),
         AnnotationKind::Fancy(o) => (o.shadow, o.opacity),
         AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => (0.0, o.opacity),
@@ -174,27 +174,31 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
     let (shadow, opacity) = shadow_opacity(anno);
     let mut layer = RgbaImage::new(w, h);
     match &anno.kind {
-        AnnotationKind::Rect(o) => draw_shape(
+        AnnotationKind::Rect(o) => draw_shape_sdf(
             &mut layer,
             o.rect,
-            AreaShape::Rect,
+            false,
             o.radius,
             o.fill,
             o.stroke,
             o.stroke_w,
             o.dash,
-            1.0,
+            o.outline,
+            o.outline_color,
+            o.shadow,
         ),
-        AnnotationKind::Ellipse(o) => draw_shape(
+        AnnotationKind::Ellipse(o) => draw_shape_sdf(
             &mut layer,
             o.rect,
-            AreaShape::Ellipse,
+            true,
             0.0,
             o.fill,
             o.stroke,
             o.stroke_w,
             o.dash,
-            1.0,
+            o.outline,
+            o.outline_color,
+            o.shadow,
         ),
         AnnotationKind::Line(o) => draw_line_obj(&mut layer, o),
         AnnotationKind::Fancy(o) => draw_fancy(&mut layer, o),
@@ -232,6 +236,352 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
         _ => 1.0,
     };
     (layer, shadow, opacity * extra)
+}
+
+/// Signed distance to a rounded box of half-extents `(hx, hy)` and corner radius `r`.
+fn rounded_box_sdf(dx: f32, dy: f32, hx: f32, hy: f32, r: f32) -> f32 {
+    let qx = dx.abs() - (hx - r);
+    let qy = dy.abs() - (hy - r);
+    let out = if qx > 0.0 && qy > 0.0 {
+        qx.hypot(qy)
+    } else {
+        qx.max(0.0) + qy.max(0.0)
+    };
+    out + qx.min(0.0).max(qy.min(0.0)) - r
+}
+
+/// Signed distance to an ellipse of semi-axes `(hx, hy)`.
+fn ellipse_sdf(dx: f32, dy: f32, hx: f32, hy: f32) -> f32 {
+    let a = hx.max(0.5);
+    let b = hy.max(0.5);
+    let px = dx.abs();
+    let py = dy.abs();
+    if (a - b).abs() < 1e-2 {
+        return px.hypot(py) - a;
+    }
+    let u = px / a;
+    let v = py / b;
+    let r = u.hypot(v);
+    if r < 1e-5 {
+        return -a.min(b);
+    }
+    let approx = (r - 1.0) * a.min(b);
+    if approx.abs() > a.max(b) * 0.5 + 18.0 {
+        return approx;
+    }
+    let c2 = u.min(1.0);
+    let s2 = (1.0 - c2 * c2).max(0.0).sqrt();
+    let s3 = v.min(1.0);
+    let c3 = (1.0 - s3 * s3).max(0.0).sqrt();
+    let (mut c, mut s) = (u / r, v / r);
+    let mut best_d2 = (px - a * c).powi(2) + (py - b * s).powi(2);
+    for (cand_c, cand_s) in [(c2, s2), (c3, s3)] {
+        let d2 = (px - a * cand_c).powi(2) + (py - b * cand_s).powi(2);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            c = cand_c;
+            s = cand_s;
+        }
+    }
+    for _ in 0..3 {
+        let (ex, ey) = (a * c, b * s);
+        let (rx, ry) = (px - ex, py - ey);
+        let (tx, ty) = (-a * s, b * c);
+        let num = rx * tx + ry * ty;
+        let den = (tx * tx + ty * ty + rx * ex + ry * ey).max(1e-3);
+        let dth = (num / den).clamp(-0.6, 0.6);
+        let nc = (c - s * dth).max(0.0);
+        let ns = (s + c * dth).max(0.0);
+        let inv = 1.0 / nc.hypot(ns).max(1e-6);
+        let (nc, ns) = (nc * inv, ns * inv);
+        let d2 = (px - a * nc).powi(2) + (py - b * ns).powi(2);
+        if d2 <= best_d2 {
+            best_d2 = d2;
+            c = nc;
+            s = ns;
+        }
+    }
+    let dist = best_d2.sqrt();
+    if r >= 1.0 { dist } else { -dist }
+}
+
+/// Renders a rectangle or ellipse (stroked or filled) with analytical SDF
+/// anti-aliasing, rounded corners, dashing, unified outline and soft drop shadow.
+#[allow(clippy::too_many_arguments)]
+fn draw_shape_sdf(
+    img: &mut RgbaImage,
+    rect: PhysicalRect,
+    is_ellipse: bool,
+    radius: f32,
+    fill: Option<Color32>,
+    stroke: Color32,
+    stroke_w: f32,
+    dash: Dash,
+    outline: f32,
+    outline_color: Color32,
+    shadow: f32,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let (w_rect, h_rect) = (rect.width as f32, rect.height as f32);
+    let (cx, cy) = (rect.x as f32 + w_rect * 0.5, rect.y as f32 + h_rect * 0.5);
+    let (hx, hy) = ((w_rect * 0.5).max(0.5), (h_rect * 0.5).max(0.5));
+    let r = if is_ellipse {
+        0.0
+    } else {
+        radius.clamp(0.0, hx.min(hy))
+    };
+    let has_stroke = stroke.a() > 0 && (stroke_w > 0.0 || fill.is_none());
+    let w = if has_stroke {
+        if fill.is_none() {
+            stroke_w.max(1.0)
+        } else {
+            stroke_w.max(0.0)
+        }
+    } else {
+        0.0
+    };
+    let hw = w * 0.5;
+    let out_px = outline.max(0.0) * 0.65;
+
+    let d_bound = |p: Pos2| -> f32 {
+        if is_ellipse {
+            ellipse_sdf(p.x - cx, p.y - cy, hx, hy)
+        } else {
+            rounded_box_sdf(p.x - cx, p.y - cy, hx, hy, r)
+        }
+    };
+
+    // Precompute dashed perimeter segments when `dash != Dash::Solid`.
+    let mut segs: Vec<(Pos2, Pos2, f32, f32, f32, f32)> = Vec::new();
+    if has_stroke && dash != Dash::Solid {
+        let mut poly = shape_path(
+            rect,
+            if is_ellipse {
+                AreaShape::Ellipse
+            } else if r > 0.5 {
+                AreaShape::Round
+            } else {
+                AreaShape::Rect
+            },
+            r,
+        );
+        if let Some(first) = poly.first().copied() {
+            poly.push(first);
+        }
+        let mut arc = Vec::with_capacity(poly.len());
+        let mut total = 0.0_f32;
+        if let Some(&p0) = poly.first() {
+            arc.push((0.0_f32, p0));
+            for pair in poly.windows(2) {
+                let d = (pair[1] - pair[0]).length();
+                if d > 1e-4 {
+                    total += d;
+                    arc.push((total, pair[1]));
+                }
+            }
+        }
+        if total >= 0.5 {
+            let sample_poly = |s: f32| -> Pos2 {
+                let s = s.clamp(0.0, total);
+                let idx = arc
+                    .partition_point(|e| e.0 < s)
+                    .min(arc.len().saturating_sub(1));
+                if idx == 0 {
+                    return arc[0].1;
+                }
+                let (s0, p0) = arc[idx - 1];
+                let (s1, p1) = arc[idx];
+                let t = if (s1 - s0).abs() < 1e-4 {
+                    0.0
+                } else {
+                    (s - s0) / (s1 - s0)
+                };
+                lerp(p0, p1, t)
+            };
+            for (u0, u1) in dash_runs(total, w.max(1.0), dash) {
+                let sa = u0 * total;
+                let sb = u1 * total;
+                let i0 = arc.partition_point(|e| e.0 <= sa);
+                let i1 = arc.partition_point(|e| e.0 < sb);
+                let mut prev = sample_poly(sa);
+                for &(s_mid, p_mid) in &arc[i0..i1] {
+                    if s_mid > sa && s_mid < sb {
+                        segs.push((
+                            prev,
+                            p_mid,
+                            prev.x.min(p_mid.x),
+                            prev.y.min(p_mid.y),
+                            prev.x.max(p_mid.x),
+                            prev.y.max(p_mid.y),
+                        ));
+                        prev = p_mid;
+                    }
+                }
+                let end_p = sample_poly(sb);
+                segs.push((
+                    prev,
+                    end_p,
+                    prev.x.min(end_p.x),
+                    prev.y.min(end_p.y),
+                    prev.x.max(end_p.x),
+                    prev.y.max(end_p.y),
+                ));
+            }
+        }
+    }
+
+    let reach = hw + out_px + 10.0;
+    let stroke_sdf_with_bound = |p: Pos2, db: f32| -> f32 {
+        if !has_stroke {
+            return f32::INFINITY;
+        }
+        if dash == Dash::Solid {
+            db.abs() - hw
+        } else {
+            if db.abs() > reach {
+                return db.abs() - hw;
+            }
+            let mut d = f32::INFINITY;
+            for &(a, b, x0, y0, x1, y1) in &segs {
+                if p.x < x0 - reach || p.x > x1 + reach || p.y < y0 - reach || p.y > y1 + reach {
+                    continue;
+                }
+                d = d.min(pt_seg_dist(p, a, b) - hw);
+            }
+            d
+        }
+    };
+
+    let pad = (hw + out_px + if shadow > 0.0 { 10.0 } else { 3.0 }).ceil() as i32;
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let x0 = (rect.x - pad).max(0);
+    let y0 = (rect.y - pad).max(0);
+    let x1 = (rect.x + rect.width as i32 + pad).min(iw - 1);
+    let y1 = (rect.y + rect.height as i32 + pad).min(ih - 1);
+
+    let rc = outline_color;
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let p = Pos2::new(px as f32 + 0.5, py as f32 + 0.5);
+            let db = d_bound(p);
+
+            if let Some(fill_col) = fill {
+                if db > hw + out_px + 9.0 {
+                    continue;
+                }
+                let d_stroke = stroke_sdf_with_bound(p, db);
+                let d_body = if !has_stroke {
+                    db
+                } else if dash == Dash::Solid {
+                    db - hw
+                } else {
+                    db.min(d_stroke)
+                };
+                let dout = d_body - out_px;
+                let cov_out = (0.5 - dout).clamp(0.0, 1.0);
+
+                let sh_a = if shadow > 0.0 && cov_out < 1.0 {
+                    let ps = Pos2::new(p.x - 2.0, p.y - 2.5);
+                    let dbs = d_bound(ps);
+                    let d_body_s = if !has_stroke {
+                        dbs
+                    } else if dash == Dash::Solid {
+                        dbs - hw
+                    } else {
+                        dbs.min(stroke_sdf_with_bound(ps, dbs))
+                    };
+                    let dsh = d_body_s - out_px;
+                    let t = (1.0 - (dsh + 0.8) / 6.5).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t) * 0.45
+                } else {
+                    0.0
+                };
+
+                let total_a = cov_out + sh_a * (1.0 - cov_out);
+                if total_a <= 1.0 / 255.0 {
+                    continue;
+                }
+
+                let (mut br, mut bg_c, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
+                if cov_out > 0.0 {
+                    br = f32::from(fill_col.r());
+                    bg_c = f32::from(fill_col.g());
+                    bb = f32::from(fill_col.b());
+                    if has_stroke {
+                        let cov_s = if dash == Dash::Solid {
+                            (0.5 - (-hw - db)).clamp(0.0, 1.0)
+                        } else {
+                            (0.5 - d_stroke).clamp(0.0, 1.0)
+                        };
+                        if cov_s > 0.0 {
+                            br = br * (1.0 - cov_s) + f32::from(stroke.r()) * cov_s;
+                            bg_c = bg_c * (1.0 - cov_s) + f32::from(stroke.g()) * cov_s;
+                            bb = bb * (1.0 - cov_s) + f32::from(stroke.b()) * cov_s;
+                        }
+                    }
+                    if out_px > 0.0 {
+                        let cov_in = (0.5 - d_body).clamp(0.0, 1.0);
+                        br = f32::from(rc.r()) * (1.0 - cov_in) + br * cov_in;
+                        bg_c = f32::from(rc.g()) * (1.0 - cov_in) + bg_c * cov_in;
+                        bb = f32::from(rc.b()) * (1.0 - cov_in) + bb * cov_in;
+                    }
+                }
+
+                let w_body = cov_out / total_a;
+                let out_r = (br * w_body).round().clamp(0.0, 255.0) as u8;
+                let out_g = (bg_c * w_body).round().clamp(0.0, 255.0) as u8;
+                let out_b = (bb * w_body).round().clamp(0.0, 255.0) as u8;
+                let out_a = (total_a * 255.0).round().clamp(0.0, 255.0) as u8;
+                img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
+            } else {
+                if db.abs() > hw + out_px + 9.0 {
+                    continue;
+                }
+                let din = stroke_sdf_with_bound(p, db);
+                if din > out_px + 9.0 {
+                    continue;
+                }
+                let dout = din - out_px;
+                let cov_out = (0.5 - dout).clamp(0.0, 1.0);
+
+                let sh_a = if shadow > 0.0 && cov_out < 1.0 {
+                    let ps = Pos2::new(p.x - 2.0, p.y - 2.5);
+                    let dbs = d_bound(ps);
+                    let dsh = stroke_sdf_with_bound(ps, dbs) - out_px;
+                    let t = (1.0 - (dsh + 0.8) / 6.5).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t) * 0.45
+                } else {
+                    0.0
+                };
+
+                let total_a = cov_out + sh_a * (1.0 - cov_out);
+                if total_a <= 1.0 / 255.0 {
+                    continue;
+                }
+
+                let (mut br, mut bg_c, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
+                if cov_out > 0.0 {
+                    let cov_in = if out_px > 0.0 {
+                        (0.5 - din).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    br = f32::from(rc.r()) * (1.0 - cov_in) + f32::from(stroke.r()) * cov_in;
+                    bg_c = f32::from(rc.g()) * (1.0 - cov_in) + f32::from(stroke.g()) * cov_in;
+                    bb = f32::from(rc.b()) * (1.0 - cov_in) + f32::from(stroke.b()) * cov_in;
+                }
+
+                let w_body = cov_out / total_a;
+                let out_r = (br * w_body).round().clamp(0.0, 255.0) as u8;
+                let out_g = (bg_c * w_body).round().clamp(0.0, 255.0) as u8;
+                let out_b = (bb * w_body).round().clamp(0.0, 255.0) as u8;
+                let out_a = (total_a * 255.0).round().clamp(0.0, 255.0) as u8;
+                img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
+            }
+        }
+    }
 }
 
 /// Filled + stroked shape (rect/round/ellipse) onto a layer.

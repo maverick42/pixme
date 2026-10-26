@@ -110,6 +110,8 @@ mod tests {
                 dash: super::super::document::Dash::Solid,
                 fill: None,
                 radius: 0.0,
+                outline: 0.0,
+                outline_color: Color32::WHITE,
                 opacity: 1.0,
                 shadow: 0.0,
             }),
