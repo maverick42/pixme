@@ -19,8 +19,9 @@ use crate::app::Shared;
 use crate::capture::PhysicalRect;
 use crate::editor::document::{
     Annotation, AnnotationId, AnnotationKind, AreaObj, AreaShape, BlurObj, BlurStyle, BoxObj, Dash,
-    Document, EllipseObj, FancyObj, FillObj, FreeObj, LineEnd, LineObj, PicObj, RectObj, StampId,
-    StampObj, StepMode, StepObj, StepSize, StepStyle, TextAlign, TextObj, TipShape,
+    Document, EllipseObj, EraserMode, FancyObj, FillObj, FreeObj, LineEnd, LineObj, PicObj,
+    RectObj, StampId, StampObj, StepMode, StepObj, StepSize, StepStyle, TextAlign, TextObj,
+    TipShape,
 };
 use crate::editor::history::{ANNO_HISTORY_CAP, AnnoEdit};
 use crate::editor::render;
@@ -153,6 +154,11 @@ struct Opts {
     shape: AreaShape,
     soft: bool,
     border_on: bool,
+    // Eraser tool.
+    eraser_color: Color32,
+    eraser_size: f32,
+    eraser_mode: EraserMode,
+    eraser_pick: bool,
     // Fill tool.
     tolerance: u8,
     transparent_only: bool,
@@ -230,6 +236,10 @@ impl Default for Opts {
             shape: AreaShape::Rect,
             soft: false,
             border_on: false,
+            eraser_color: Color32::WHITE,
+            eraser_size: 12.0,
+            eraser_mode: EraserMode::Color,
+            eraser_pick: false,
             tolerance: 32,
             transparent_only: false,
             blur_style: BlurStyle::Blur,
@@ -359,6 +369,9 @@ pub struct DrawSession {
     text_panel: Option<TextPanel>,
     zoom: Option<f32>,
     texture: Option<TextureHandle>,
+    rendered_img: Option<image::RgbaImage>,
+    loupe_tex: Option<TextureHandle>,
+    copied_at: Option<std::time::Instant>,
     rendered_rev: u64,
     outcome: Option<Outcome>,
     /// The unsaved-changes confirmation is up (Échap/Annuler/close with
@@ -398,6 +411,9 @@ impl DrawSession {
             text_panel: None,
             zoom: None,
             texture: None,
+            rendered_img: None,
+            loupe_tex: None,
+            copied_at: None,
             rendered_rev: u64::MAX,
             outcome: None,
             confirm_quit: false,
@@ -650,6 +666,24 @@ impl DrawSession {
         if copy && self.sel_area.is_some() {
             self.sel_copy();
         }
+        // Eyedropper mode: pressing `C` copies the hovered `#RRGGBB` and picks the colour.
+        if self.tool == Tool::Eraser
+            && self.opts.eraser_pick
+            && let Some(p) = self.last_pointer
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, Key::C)
+                    || i.consume_key(egui::Modifiers::COMMAND, Key::C)
+            })
+        {
+            let c = self.pixel_at(p);
+            let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(&hex);
+            }
+            self.opts.eraser_color = c;
+            self.opts.eraser_mode = EraserMode::Color;
+            self.copied_at = Some(std::time::Instant::now());
+        }
         if cut && self.sel_area.is_some() {
             self.sel_cut();
         }
@@ -664,7 +698,9 @@ impl DrawSession {
             }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            if self.text_panel.is_some() {
+            if self.opts.eraser_pick {
+                self.opts.eraser_pick = false;
+            } else if self.text_panel.is_some() {
                 self.close_text_panel();
             } else if self.sel_area.is_some() {
                 self.sel_area = None;
@@ -793,7 +829,14 @@ impl DrawSession {
     /// Colour of the rendered document pixel at `p` — what the marquee
     /// memorises to fill the hole a move/cut/delete leaves behind.
     fn pixel_at(&self, p: Pos2) -> Color32 {
-        let img = render::render_to_image(&self.doc);
+        let fallback;
+        let img = match &self.rendered_img {
+            Some(img) => img,
+            None => {
+                fallback = render::render_to_image(&self.doc);
+                &fallback
+            }
+        };
         let (w, h) = (img.width() as i64, img.height() as i64);
         let x = (p.x as i64).clamp(0, (w - 1).max(0)) as u32;
         let y = (p.y as i64).clamp(0, (h - 1).max(0)) as u32;
@@ -1020,6 +1063,7 @@ impl DrawSession {
                     ));
                 }
             }
+            self.rendered_img = Some(img);
             self.rendered_rev = self.doc.revision;
         }
         let Some(tex_id) = self.texture.as_ref().map(|t| t.id()) else {
@@ -1075,6 +1119,7 @@ impl DrawSession {
                 None
             }
         }) else {
+            self.last_pointer = None;
             // Pointer left the canvas — settle any freehand drag.
             if let Some(Drag::Freehand { points }) = self.drag.take() {
                 self.finish_freehand(points);
@@ -1231,7 +1276,16 @@ impl DrawSession {
             | Tool::Step
             | Tool::Stamps
             | Tool::InsertImage => {}
-            Tool::Pencil | Tool::Eraser | Tool::HighlightLine => {
+            Tool::Eraser => {
+                if self.opts.eraser_pick {
+                    self.opts.eraser_color = self.pixel_at(p);
+                    self.opts.eraser_mode = EraserMode::Color;
+                    self.opts.eraser_pick = false;
+                } else {
+                    self.drag = Some(Drag::Freehand { points: vec![p] });
+                }
+            }
+            Tool::Pencil | Tool::HighlightLine => {
                 self.drag = Some(Drag::Freehand { points: vec![p] });
             }
             _ => self.drag = Some(Drag::Shape { anchor: p }),
@@ -1364,21 +1418,23 @@ impl DrawSession {
     // last_pointer is declared below on the struct… see impl note.
     /// Turns a finished freehand stroke into an object.
     fn finish_freehand(&mut self, points: Vec<Pos2>) {
-        if points.len() < 2 {
+        if points.is_empty() || (self.tool != Tool::Eraser && points.len() < 2) {
             return;
         }
+        let is_eraser = self.tool == Tool::Eraser;
         let kind = match self.tool {
             Tool::Eraser => AnnotationKind::Freehand(FreeObj {
                 points,
-                color: self.opts.fill_color,
-                width: self.opts.width * 2.5,
-                tip: self.opts.tip,
+                color: self.opts.eraser_color,
+                width: self.opts.eraser_size,
+                tip: TipShape::Round,
                 dash: Dash::Solid,
                 outline: 0.0,
                 outline_color: Color32::WHITE,
                 shadow: 0.0,
+                eraser_mode: self.opts.eraser_mode,
                 soft: false,
-                opacity: self.opts.opacity,
+                opacity: 1.0,
             }),
             Tool::HighlightLine => AnnotationKind::HighlightStroke(FreeObj {
                 points,
@@ -1389,6 +1445,7 @@ impl DrawSession {
                 outline: 0.0,
                 outline_color: Color32::WHITE,
                 shadow: 0.0,
+                eraser_mode: EraserMode::Color,
                 soft: self.opts.soft,
                 opacity: 0.45,
             }),
@@ -1401,11 +1458,15 @@ impl DrawSession {
                 outline: self.opts.outline,
                 outline_color: self.opts.line_outline_color,
                 shadow: if self.opts.line_shadow { 3.0 } else { 0.0 },
+                eraser_mode: EraserMode::Color,
                 soft: false,
                 opacity: self.opts.opacity,
             }),
         };
         self.add(kind);
+        if is_eraser && let Some(id) = self.selected {
+            self.sel_patches.push(id);
+        }
         self.selected = None;
     }
 
@@ -1567,6 +1628,15 @@ impl DrawSession {
         match self.tool {
             Tool::Select => {
                 self.sync_text_panel();
+            }
+            Tool::Eraser => {
+                if self.opts.eraser_pick {
+                    self.opts.eraser_color = self.pixel_at(p);
+                    self.opts.eraser_mode = EraserMode::Color;
+                    self.opts.eraser_pick = false;
+                } else {
+                    self.finish_freehand(vec![p]);
+                }
             }
             Tool::SelectArea => {
                 // Inside the frame it stays; a click elsewhere drops it.
@@ -1730,11 +1800,15 @@ impl DrawSession {
             let img_rect = self.img_rect;
             let cpts: Vec<Pos2> = points.iter().map(|&p| to_canvas(p, img_rect)).collect();
             let (col, w_px, out_px) = match self.tool {
-                Tool::Eraser => (
-                    o.fill_color.gamma_multiply(o.opacity),
-                    (o.width * 2.5 * scale).max(1.5),
-                    0.0,
-                ),
+                Tool::Eraser => {
+                    let preview_col = match o.eraser_mode {
+                        EraserMode::Color => o.eraser_color.gamma_multiply(o.opacity),
+                        EraserMode::Blur | EraserMode::Pixelate => {
+                            Color32::from_rgba_unmultiplied(120, 175, 240, 110)
+                        }
+                    };
+                    (preview_col, (o.eraser_size * scale).max(2.0), 0.0)
+                }
                 Tool::HighlightLine => (
                     o.color.gamma_multiply(0.45),
                     (o.width * 4.0 * scale).max(2.0),
@@ -1825,6 +1899,23 @@ impl DrawSession {
     fn draw_overlay(&mut self, painter: &egui::Painter, img_rect: Rect, scale: f32) {
         self.img_rect = img_rect;
         let accent = theme::tokens(painter.ctx()).accent;
+        // Eraser brush circle or eyedropper magnifier under the cursor.
+        if self.tool == Tool::Eraser
+            && let Some(p) = self.last_pointer
+        {
+            let cp = pos2(img_rect.min.x + p.x * scale, img_rect.min.y + p.y * scale);
+            if self.opts.eraser_pick {
+                self.paint_eyedropper_loupe(painter, cp, p);
+            } else {
+                let r = (self.opts.eraser_size * scale * 0.5).max(2.0);
+                painter.circle_stroke(
+                    cp,
+                    r + 1.0,
+                    Stroke::new(1.0, Color32::from_black_alpha(190)),
+                );
+                painter.circle_stroke(cp, r, Stroke::new(1.2, Color32::WHITE));
+            }
+        }
         // The live marquee frames its region above the document — with
         // 8 resize anchors once the initial framing drag is over.
         if let Some(sel) = self.sel_area {
@@ -1924,6 +2015,113 @@ impl DrawSession {
                     painter.circle_filled(to_canvas(t), 4.0, Color32::from_rgb(60, 170, 80));
                 }
             }
+        }
+    }
+
+    /// Magnifier card for the eraser's eyedropper — identical to the
+    /// capture overlay loupe (zoomed 21×21 pixels, crosshair, coords,
+    /// `#RRGGBB` and `C` copy hint).
+    fn paint_eyedropper_loupe(&mut self, painter: &egui::Painter, pos: Pos2, img_p: Pos2) {
+        const LOUPE_SIDE: f32 = 126.0;
+        const LOUPE_SAMPLE: i32 = 21;
+        const LOUPE_GAP: f32 = 18.0;
+        const LOUPE_CROSS: Color32 = Color32::from_rgb(240, 70, 70);
+
+        let clip = painter.clip_rect();
+        let text_h = 78.0_f32;
+        let size = vec2(LOUPE_SIDE, LOUPE_SIDE + text_h);
+        let mut min = pos + Vec2::splat(LOUPE_GAP);
+        if min.x + size.x > clip.max.x - 8.0 {
+            min.x = pos.x - LOUPE_GAP - size.x;
+        }
+        if min.y + size.y > clip.max.y - 8.0 {
+            min.y = pos.y - LOUPE_GAP - size.y;
+        }
+        let card = Rect::from_min_size(min, size);
+        let zoom_rect = Rect::from_min_size(card.min, Vec2::splat(LOUPE_SIDE));
+        let text_rect = Rect::from_min_max(pos2(card.min.x, zoom_rect.max.y), card.max);
+        painter.rect_filled(card, 8.0, Color32::from_black_alpha(235));
+        painter.rect_stroke(
+            card,
+            8.0,
+            Stroke::new(1.0, Color32::from_gray(70)),
+            StrokeKind::Outside,
+        );
+
+        if let Some(img) = &self.rendered_img {
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            let (cx, cy) = (img_p.x as i32, img_p.y as i32);
+            let half = LOUPE_SAMPLE / 2;
+            let mut sample = Vec::with_capacity((LOUPE_SAMPLE * LOUPE_SAMPLE * 4) as usize);
+            for dy in -half..=half {
+                for dx in -half..=half {
+                    let (x, y) = (cx + dx, cy + dy);
+                    let px = if x >= 0 && y >= 0 && x < w && y < h {
+                        img.get_pixel(x as u32, y as u32).0
+                    } else {
+                        [0, 0, 0, 255]
+                    };
+                    sample.extend_from_slice(&px);
+                }
+            }
+            let zoomed = ColorImage::from_rgba_unmultiplied(
+                [LOUPE_SAMPLE as usize, LOUPE_SAMPLE as usize],
+                &sample,
+            );
+            let ctx = painter.ctx().clone();
+            let tex = self.loupe_tex.get_or_insert_with(|| {
+                ctx.load_texture(
+                    "draw.loupe",
+                    ColorImage::filled(
+                        [LOUPE_SAMPLE as usize, LOUPE_SAMPLE as usize],
+                        Color32::BLACK,
+                    ),
+                    TextureOptions::NEAREST,
+                )
+            });
+            tex.set(zoomed, TextureOptions::NEAREST);
+            painter.image(
+                tex.id(),
+                zoom_rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            let centre = zoom_rect.center();
+            painter.hline(zoom_rect.x_range(), centre.y, Stroke::new(1.0, LOUPE_CROSS));
+            painter.vline(centre.x, zoom_rect.y_range(), Stroke::new(1.0, LOUPE_CROSS));
+            painter.hline(
+                card.x_range(),
+                text_rect.min.y,
+                Stroke::new(1.0, Color32::from_gray(70)),
+            );
+        }
+
+        let c = self.pixel_at(img_p);
+        let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+        let font = egui::FontId::monospace(13.0);
+        let centre_x = text_rect.center().x;
+        let mut y = text_rect.min.y + 14.0;
+        let hint = if self
+            .copied_at
+            .is_some_and(|t| t.elapsed().as_secs_f32() < 1.2)
+        {
+            t!("overlay.copied").to_string()
+        } else {
+            t!("overlay.copy_hint").to_string()
+        };
+        for (text, color) in [
+            (format!("{:.0}, {:.0}", img_p.x, img_p.y), Color32::WHITE),
+            (hex, Color32::WHITE),
+            (hint, Color32::from_gray(160)),
+        ] {
+            painter.text(
+                pos2(centre_x, y),
+                egui::Align2::CENTER_TOP,
+                text,
+                font.clone(),
+                color,
+            );
+            y += 20.0;
         }
     }
 
@@ -2582,10 +2780,47 @@ impl DrawSession {
                 );
             }
             Tool::Eraser => {
-                w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0);
-                color_btn(ui, &mut o.fill_color);
-                tip_combo(ui, &mut o.tip);
-                opacity_pct_slider(ui, &mut o.opacity);
+                ui.label(t!("draw.opt.color"));
+                if color_btn(ui, &mut o.eraser_color).changed() {
+                    o.eraser_mode = EraserMode::Color;
+                    o.eraser_pick = false;
+                }
+                if widgets::icon_button(ui, Icon::Pipette, o.eraser_pick)
+                    .on_hover_text(t!("draw.opt.pick").to_string())
+                    .clicked()
+                {
+                    o.eraser_pick = !o.eraser_pick;
+                }
+                w_edit(ui, t!("draw.opt.size"), &mut o.eraser_size, 1.0..=80.0);
+
+                ui.label(t!("draw.opt.blur"));
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let blur_on = o.eraser_mode == EraserMode::Blur;
+                    if widgets::icon_button(ui, Icon::Blur, blur_on)
+                        .on_hover_text(t!("draw.opt.blur").to_string())
+                        .clicked()
+                    {
+                        o.eraser_mode = if blur_on {
+                            EraserMode::Color
+                        } else {
+                            EraserMode::Blur
+                        };
+                        o.eraser_pick = false;
+                    }
+                    let pix_on = o.eraser_mode == EraserMode::Pixelate;
+                    if widgets::icon_button(ui, Icon::Pixelate, pix_on)
+                        .on_hover_text(t!("draw.opt.pixelate").to_string())
+                        .clicked()
+                    {
+                        o.eraser_mode = if pix_on {
+                            EraserMode::Color
+                        } else {
+                            EraserMode::Pixelate
+                        };
+                        o.eraser_pick = false;
+                    }
+                });
             }
             Tool::Rect | Tool::RectFill | Tool::Ellipse | Tool::EllipseFill => {
                 w_edit(ui, t!("draw.opt.width"), &mut o.width, 0.0..=20.0);

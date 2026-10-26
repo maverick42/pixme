@@ -330,6 +330,16 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         "panel-top",
         include_bytes!("../../assets/icons/panel-top.svg"),
     ),
+    (
+        Icon::Pipette,
+        "pipette",
+        include_bytes!("../../assets/icons/pipette.svg"),
+    ),
+    (
+        Icon::Blur,
+        "blur",
+        include_bytes!("../../assets/icons/blur.svg"),
+    ),
 ];
 
 /// The raw embedded SVG bytes of `icon` — used by the annotation

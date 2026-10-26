@@ -264,8 +264,20 @@ pub struct FancyObj {
     pub shadow: f32,
 }
 
-/// A freehand polyline — pencil, eraser (opaque colour) and line
-/// highlight (translucent colour) all share this payload.
+/// Mode of a freehand stroke (ink/colour vs brush blur/pixelate for the eraser).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EraserMode {
+    /// Solid/translucent colour stroke.
+    #[default]
+    Color,
+    /// Gaussian blur along the brush footprint.
+    Blur,
+    /// Mosaic pixelation along the brush footprint.
+    Pixelate,
+}
+
+/// A freehand polyline — pencil, eraser (opaque colour or blur/pixelate)
+/// and line highlight (translucent colour) all share this payload.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FreeObj {
     /// Polyline points in order.
@@ -288,7 +300,10 @@ pub struct FreeObj {
     /// Drop-shadow offset px.
     #[serde(default)]
     pub shadow: f32,
-    /// Soft edge (blurred footprint) vs hard edge.
+    /// Brush mode (`Color`, `Blur`, `Pixelate`).
+    #[serde(default)]
+    pub eraser_mode: EraserMode,
+    /// Soft edge (feathered footprint) vs hard edge.
     pub soft: bool,
     /// Object opacity 0–1 — the highlight tool keeps ~0.5.
     pub opacity: f32,

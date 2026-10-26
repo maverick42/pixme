@@ -143,6 +143,10 @@ pub enum Icon {
     LayoutGrid,
     /// Show the tab strip — the mosaic toggle's paired icon.
     PanelTop,
+    /// Eyedropper / colour picker.
+    Pipette,
+    /// Gaussian blur brush toggle.
+    Blur,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

@@ -132,6 +132,9 @@ fn render_one(img: &mut RgbaImage, anno: &Annotation) {
         // Region effects read + write the base directly.
         AnnotationKind::Blur(o) => apply_blur(img, o),
         AnnotationKind::Fill(o) => apply_fill(img, o),
+        AnnotationKind::Freehand(o) if o.eraser_mode != super::document::EraserMode::Color => {
+            apply_freehand_effect(img, o);
+        }
         _ => {
             // Layered objects: rasterize to a transparent layer, then
             // composite shadow + body — one path for every drawable.
@@ -626,22 +629,16 @@ fn draw_fancy(img: &mut RgbaImage, o: &super::document::FancyObj) {
 }
 
 /// Pencil/eraser/highlight freehand stroke with SDF anti-aliasing,
-/// dashing, unified outline (0–10) and soft drop shadow.
+/// dashing, unified outline (0–10), soft edge feathering and drop shadow.
 fn stroke_freehand(img: &mut RgbaImage, o: &super::document::FreeObj) {
     if o.points.is_empty() {
-        return;
-    }
-    if o.soft {
-        let mut tmp = RgbaImage::new(img.width(), img.height());
-        stroke_polyline(&mut tmp, &o.points, o.width, o.color, o.tip, o.dash);
-        let blurred = imageproc::filter::gaussian_blur_f32(&tmp, (o.width / 6.0).max(0.8));
-        composite(img, &blurred, 0, 0, 1.0);
         return;
     }
 
     let w = o.width.max(1.0);
     let hw = w * 0.5;
     let out_px = o.outline.max(0.0) * 0.65;
+    let feather = if o.soft { (hw * 0.65).max(2.5) } else { 1.0 };
 
     // Build arc-length table along `o.points` and clip to active dash runs.
     let mut arc = Vec::with_capacity(o.points.len());
@@ -757,11 +754,11 @@ fn stroke_freehand(img: &mut RgbaImage, o: &super::document::FreeObj) {
         for px in x0..=x1 {
             let p = Pos2::new(px as f32, py as f32);
             let din = sdf_at(p);
-            if din > out_px + 7.0 {
+            if din > out_px + feather + 6.0 {
                 continue;
             }
             let dout = din - out_px;
-            let cov_out = (0.5 - dout).clamp(0.0, 1.0);
+            let cov_out = ((0.5 * feather - dout) / feather).clamp(0.0, 1.0);
 
             let sh_a = if o.shadow > 0.0 && cov_out < 1.0 {
                 let dsh = sdf_at(Pos2::new(p.x - 1.2, p.y - 2.0)) - out_px;
@@ -779,7 +776,7 @@ fn stroke_freehand(img: &mut RgbaImage, o: &super::document::FreeObj) {
             let (mut br, mut bg_c, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
             if cov_out > 0.0 {
                 let cov_in = if out_px > 0.0 {
-                    (0.5 - din).clamp(0.0, 1.0)
+                    ((0.5 * feather - din) / feather).clamp(0.0, 1.0)
                 } else {
                     1.0
                 };
@@ -794,6 +791,108 @@ fn stroke_freehand(img: &mut RgbaImage, o: &super::document::FreeObj) {
             let out_b = (bb * w_body).round().clamp(0.0, 255.0) as u8;
             let out_a = (total_a * 255.0).round().clamp(0.0, 255.0) as u8;
             img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
+        }
+    }
+}
+
+/// Applies a freehand brush blur or pixelation along `o.points` directly onto `img`.
+fn apply_freehand_effect(img: &mut RgbaImage, o: &super::document::FreeObj) {
+    if o.points.is_empty() {
+        return;
+    }
+    let w = o.width.max(1.0);
+    let hw = w * 0.5;
+    let feather = if o.soft { (hw * 0.65).max(2.5) } else { 1.0 };
+
+    let mut x0f = f32::INFINITY;
+    let mut y0f = f32::INFINITY;
+    let mut x1f = f32::NEG_INFINITY;
+    let mut y1f = f32::NEG_INFINITY;
+    for p in &o.points {
+        x0f = x0f.min(p.x);
+        y0f = y0f.min(p.y);
+        x1f = x1f.max(p.x);
+        y1f = y1f.max(p.y);
+    }
+    let pad = (hw + feather + 4.0).ceil() as i32;
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let x0 = (x0f.floor() as i32 - pad).max(0);
+    let y0 = (y0f.floor() as i32 - pad).max(0);
+    let x1 = (x1f.ceil() as i32 + pad).min(iw - 1);
+    let y1 = (y1f.ceil() as i32 + pad).min(ih - 1);
+    if x1 < x0 || y1 < y0 {
+        return;
+    }
+    let (rw, rh) = ((x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32);
+    let patch = image::imageops::crop_imm(img, x0 as u32, y0 as u32, rw, rh).to_image();
+    let fx = match o.eraser_mode {
+        super::document::EraserMode::Blur => {
+            imageproc::filter::gaussian_blur_f32(&patch, (w * 0.28).clamp(2.2, 10.0))
+        }
+        super::document::EraserMode::Pixelate => {
+            let block = ((w as u32 / 3) + 4).clamp(4, 18);
+            pixelate(&patch, block)
+        }
+        super::document::EraserMode::Color => return,
+    };
+
+    let mut segs: Vec<(Pos2, Pos2, f32, f32, f32, f32)> = Vec::new();
+    if o.points.len() == 1 {
+        let p = o.points[0];
+        segs.push((p, p, p.x, p.y, p.x, p.y));
+    } else {
+        for pair in o.points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            segs.push((a, b, a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)));
+        }
+    }
+    let reach = hw + feather + 2.0;
+
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let p = Pos2::new(px as f32, py as f32);
+            let mut d = f32::INFINITY;
+            for &(a, b, sx0, sy0, sx1, sy1) in &segs {
+                if p.x < sx0 - reach || p.x > sx1 + reach || p.y < sy0 - reach || p.y > sy1 + reach
+                {
+                    continue;
+                }
+                let seg_d = match o.tip {
+                    TipShape::Round => pt_seg_dist(p, a, b) - hw,
+                    TipShape::Square => {
+                        let ab = b - a;
+                        let l2 = ab.length_sq();
+                        let q = if l2 < 1e-6 {
+                            a
+                        } else {
+                            a + ab * ((p - a).dot(ab) / l2).clamp(0.0, 1.0)
+                        };
+                        (p.x - q.x).abs().max((p.y - q.y).abs()) - hw
+                    }
+                };
+                d = d.min(seg_d);
+            }
+            let cov = (((0.5 * feather - d) / feather).clamp(0.0, 1.0) * o.opacity).clamp(0.0, 1.0);
+            if cov <= 1.0 / 255.0 {
+                continue;
+            }
+            let dst = img.get_pixel(px as u32, py as u32).0;
+            let src = fx.get_pixel((px - x0) as u32, (py - y0) as u32).0;
+            let mix = |a: u8, b: u8| -> u8 {
+                (f32::from(a) * (1.0 - cov) + f32::from(b) * cov)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            img.put_pixel(
+                px as u32,
+                py as u32,
+                Rgba([
+                    mix(dst[0], src[0]),
+                    mix(dst[1], src[1]),
+                    mix(dst[2], src[2]),
+                    dst[3],
+                ]),
+            );
         }
     }
 }
