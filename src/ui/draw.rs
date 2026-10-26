@@ -2571,7 +2571,8 @@ impl DrawSession {
                 && matches!(self.tool, Tool::Step));
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            // Tab header chip (two clickable mode tabs for the step marker).
+            // Tab header chip (two clickable mode tabs for the step marker);
+            // OK/Annuler stay pinned to its right edge, always visible.
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
                 if step_bar {
@@ -2649,16 +2650,7 @@ impl DrawSession {
                             );
                         });
                 }
-            });
-            // Tab body: reserve the right-hand buttons first, then fill
-            // the remaining strip with a vertically-centred row so every
-            // label, dropdown, swatch, slider and button shares one axis.
-            let row_h = 26.0;
-            ui.allocate_ui_with_layout(
-                vec2(ui.available_width(), row_h),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    ui.spacing_mut().interact_size.y = 22.0;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
                     if widgets::secondary_button(ui, &t!("draw.cancel")).clicked() {
                         self.request_cancel();
@@ -2666,18 +2658,22 @@ impl DrawSession {
                     if widgets::primary_button(ui, &t!("draw.ok")).clicked() {
                         self.outcome = Some(Outcome::Ok);
                     }
-                    let rest = ui.available_size();
-                    ui.allocate_ui_with_layout(
-                        rest,
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.spacing_mut().interact_size.y = 22.0;
-                            ui.add_space(8.0);
-                            self.bottom_content(ui, shared);
-                        },
-                    );
-                },
-            );
+                });
+            });
+            // Tab body: a single options line that scrolls horizontally
+            // on the mouse wheel when it overflows — no visible scrollbar.
+            ui.style_mut().always_scroll_the_only_direction = true;
+            egui::ScrollArea::horizontal()
+                .id_salt("draw.opts.scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().interact_size.y = 22.0;
+                        ui.add_space(8.0);
+                        self.bottom_content(ui, shared);
+                    });
+                });
         });
     }
 
@@ -2720,9 +2716,15 @@ impl DrawSession {
             self.sel_delete();
         }
         ui.separator();
-        color_btn(ui, &mut self.opts.fill_color);
-        if ui.button(t!("draw.opt.fill_c")).clicked() {
-            self.sel_fill(self.opts.fill_color);
+        let do_fill = ui
+            .horizontal(|ui| {
+                color_btn(ui, &mut self.opts.fill_color);
+                ui.button(t!("draw.opt.fill_c")).clicked()
+            })
+            .inner;
+        if do_fill {
+            let c = self.opts.fill_color;
+            self.sel_fill(c);
         }
     }
 
@@ -2738,17 +2740,19 @@ impl DrawSession {
                 {
                     {
                         let b = a.kind.bounds();
-                        ui.separator();
-                        ui.label(
-                            t!(
-                                "draw.opt.bounds",
-                                x = b.x,
-                                y = b.y,
-                                w = b.width,
-                                h = b.height
-                            )
-                            .to_string(),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.separator();
+                            ui.label(
+                                t!(
+                                    "draw.opt.bounds",
+                                    x = b.x,
+                                    y = b.y,
+                                    w = b.width,
+                                    h = b.height
+                                )
+                                .to_string(),
+                            );
+                        });
                     }
                 }
             }
@@ -2796,46 +2800,50 @@ impl DrawSession {
                 );
             }
             Tool::Eraser => {
-                ui.label(t!("draw.opt.color"));
-                if color_btn(ui, &mut o.eraser_color).changed() {
-                    o.eraser_mode = EraserMode::Color;
-                    o.eraser_pick = false;
-                }
-                if widgets::icon_button(ui, Icon::Pipette, o.eraser_pick)
-                    .on_hover_text(t!("draw.opt.pick").to_string())
-                    .clicked()
-                {
-                    o.eraser_pick = !o.eraser_pick;
-                }
+                ui.horizontal(|ui| {
+                    ui.label(t!("draw.opt.color"));
+                    if color_btn(ui, &mut o.eraser_color).changed() {
+                        o.eraser_mode = EraserMode::Color;
+                        o.eraser_pick = false;
+                    }
+                    if widgets::icon_button(ui, Icon::Pipette, o.eraser_pick)
+                        .on_hover_text(t!("draw.opt.pick").to_string())
+                        .clicked()
+                    {
+                        o.eraser_pick = !o.eraser_pick;
+                    }
+                });
                 w_edit(ui, t!("draw.opt.size"), &mut o.eraser_size, 1.0..=80.0);
 
-                ui.label(t!("draw.opt.blur"));
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    let blur_on = o.eraser_mode == EraserMode::Blur;
-                    if widgets::icon_button(ui, Icon::Blur, blur_on)
-                        .on_hover_text(t!("draw.opt.blur").to_string())
-                        .clicked()
-                    {
-                        o.eraser_mode = if blur_on {
-                            EraserMode::Color
-                        } else {
-                            EraserMode::Blur
-                        };
-                        o.eraser_pick = false;
-                    }
-                    let pix_on = o.eraser_mode == EraserMode::Pixelate;
-                    if widgets::icon_button(ui, Icon::Pixelate, pix_on)
-                        .on_hover_text(t!("draw.opt.pixelate").to_string())
-                        .clicked()
-                    {
-                        o.eraser_mode = if pix_on {
-                            EraserMode::Color
-                        } else {
-                            EraserMode::Pixelate
-                        };
-                        o.eraser_pick = false;
-                    }
+                ui.horizontal(|ui| {
+                    ui.label(t!("draw.opt.blur"));
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let blur_on = o.eraser_mode == EraserMode::Blur;
+                        if widgets::icon_button(ui, Icon::Blur, blur_on)
+                            .on_hover_text(t!("draw.opt.blur").to_string())
+                            .clicked()
+                        {
+                            o.eraser_mode = if blur_on {
+                                EraserMode::Color
+                            } else {
+                                EraserMode::Blur
+                            };
+                            o.eraser_pick = false;
+                        }
+                        let pix_on = o.eraser_mode == EraserMode::Pixelate;
+                        if widgets::icon_button(ui, Icon::Pixelate, pix_on)
+                            .on_hover_text(t!("draw.opt.pixelate").to_string())
+                            .clicked()
+                        {
+                            o.eraser_mode = if pix_on {
+                                EraserMode::Color
+                            } else {
+                                EraserMode::Pixelate
+                            };
+                            o.eraser_pick = false;
+                        }
+                    });
                 });
             }
             Tool::Rect | Tool::RectFill | Tool::Ellipse | Tool::EllipseFill => {
@@ -2888,10 +2896,18 @@ impl DrawSession {
             }
             Tool::Text => {
                 let mut ch = false;
-                ui.label(t!("draw.opt.color"));
-                ch |= color_btn(ui, &mut o.color).changed();
-                ui.label(t!("draw.opt.size"));
-                ch |= font_size_combo(ui, "draw.bar.tsize", &mut o.font_size);
+                ch |= ui
+                    .horizontal(|ui| {
+                        ui.label(t!("draw.opt.color"));
+                        color_btn(ui, &mut o.color).changed()
+                    })
+                    .inner;
+                ch |= ui
+                    .horizontal(|ui| {
+                        ui.label(t!("draw.opt.size"));
+                        font_size_combo(ui, "draw.bar.tsize", &mut o.font_size)
+                    })
+                    .inner;
                 ch |= ui
                     .toggle_value(&mut o.bold, "B")
                     .on_hover_text(t!("draw.opt.bold"))
@@ -2900,9 +2916,13 @@ impl DrawSession {
                     .toggle_value(&mut o.italic, "I")
                     .on_hover_text(t!("draw.opt.italic"))
                     .changed();
-                ui.label(t!("draw.opt.outline"));
-                ch |= outline_combo(ui, "draw.bar.toutline", &mut o.outline_w);
-                ch |= color_btn(ui, &mut o.outline_color).changed();
+                ch |= ui
+                    .horizontal(|ui| {
+                        ui.label(t!("draw.opt.outline"));
+                        outline_combo(ui, "draw.bar.toutline", &mut o.outline_w)
+                            | color_btn(ui, &mut o.outline_color).changed()
+                    })
+                    .inner;
                 ch |= opacity_pct_slider(ui, &mut o.opacity);
                 let mut sh_on = o.shadow > 0.0;
                 if ui.checkbox(&mut sh_on, t!("draw.opt.shadow")).changed() {
@@ -2923,14 +2943,20 @@ impl DrawSession {
             }
             Tool::TextBoxRect | Tool::TextBoxOval => {
                 // Text colour + box interior.
-                ui.label(t!("draw.opt.fg"));
-                color_btn(ui, &mut o.outline_color);
-                ui.label(t!("draw.opt.bg"));
-                color_btn(ui, &mut o.fill_color);
+                ui.horizontal(|ui| {
+                    ui.label(t!("draw.opt.fg"));
+                    color_btn(ui, &mut o.outline_color);
+                });
+                ui.horizontal(|ui| {
+                    ui.label(t!("draw.opt.bg"));
+                    color_btn(ui, &mut o.fill_color);
+                });
                 // Outline: width (1..10) + colour.
-                ui.label(t!("draw.opt.outline"));
-                outline_combo(ui, "draw.bar.boxw", &mut o.width);
-                color_btn(ui, &mut o.color);
+                ui.horizontal(|ui| {
+                    ui.label(t!("draw.opt.outline"));
+                    outline_combo(ui, "draw.bar.boxw", &mut o.width);
+                    color_btn(ui, &mut o.color);
+                });
                 ui.add_space(12.0);
                 opacity_pct_slider(ui, &mut o.opacity);
             }
@@ -3067,16 +3093,22 @@ impl DrawSession {
                     // 5) Contour (0..10) · 6) Couleur contour · 7) Opacité ·
                     // 8) Case Ombre (9=OK, 10=Annuler are on the bar's right).
                     let mut style_ch = false;
-                    ui.label(t!("draw.opt.color"));
-                    if color_btn(ui, &mut o.color).changed() {
-                        changed = true;
-                        style_ch = true;
-                    }
-                    ui.label(t!("draw.opt.size"));
-                    if font_size_combo(ui, "draw.sel.tsize", &mut o.size) {
-                        changed = true;
-                        style_ch = true;
-                    }
+                    let mut sc = ui
+                        .horizontal(|ui| {
+                            ui.label(t!("draw.opt.color"));
+                            color_btn(ui, &mut o.color).changed()
+                        })
+                        .inner;
+                    changed |= sc;
+                    style_ch |= sc;
+                    sc = ui
+                        .horizontal(|ui| {
+                            ui.label(t!("draw.opt.size"));
+                            font_size_combo(ui, "draw.sel.tsize", &mut o.size)
+                        })
+                        .inner;
+                    changed |= sc;
+                    style_ch |= sc;
                     if ui
                         .toggle_value(&mut o.bold, "B")
                         .on_hover_text(t!("draw.opt.bold"))
@@ -3093,15 +3125,15 @@ impl DrawSession {
                         changed = true;
                         style_ch = true;
                     }
-                    ui.label(t!("draw.opt.outline"));
-                    if outline_combo(ui, "draw.sel.toutline", &mut o.outline) {
-                        changed = true;
-                        style_ch = true;
-                    }
-                    if color_btn(ui, &mut o.outline_color).changed() {
-                        changed = true;
-                        style_ch = true;
-                    }
+                    sc = ui
+                        .horizontal(|ui| {
+                            ui.label(t!("draw.opt.outline"));
+                            outline_combo(ui, "draw.sel.toutline", &mut o.outline)
+                                | color_btn(ui, &mut o.outline_color).changed()
+                        })
+                        .inner;
+                    changed |= sc;
+                    style_ch |= sc;
                     changed |= opacity_pct_slider(ui, &mut o.opacity);
                     let mut sh_on = o.shadow > 0.0;
                     if ui.checkbox(&mut sh_on, t!("draw.opt.shadow")).changed() {
@@ -3121,13 +3153,25 @@ impl DrawSession {
                     }
                 }
                 AnnotationKind::TextBox(o) => {
-                    ui.label(t!("draw.opt.fg"));
-                    changed |= color_btn(ui, &mut o.fg).changed();
-                    ui.label(t!("draw.opt.bg"));
-                    changed |= color_btn(ui, &mut o.bg).changed();
-                    ui.label(t!("draw.opt.outline"));
-                    changed |= outline_combo(ui, "draw.sel.boxw", &mut o.border_w);
-                    changed |= color_btn(ui, &mut o.border).changed();
+                    changed |= ui
+                        .horizontal(|ui| {
+                            ui.label(t!("draw.opt.fg"));
+                            color_btn(ui, &mut o.fg).changed()
+                        })
+                        .inner;
+                    changed |= ui
+                        .horizontal(|ui| {
+                            ui.label(t!("draw.opt.bg"));
+                            color_btn(ui, &mut o.bg).changed()
+                        })
+                        .inner;
+                    changed |= ui
+                        .horizontal(|ui| {
+                            ui.label(t!("draw.opt.outline"));
+                            outline_combo(ui, "draw.sel.boxw", &mut o.border_w)
+                                | color_btn(ui, &mut o.border).changed()
+                        })
+                        .inner;
                     ui.add_space(12.0);
                     changed |= opacity_pct_slider(ui, &mut o.opacity);
                 }
@@ -3501,13 +3545,16 @@ fn w_edit(
     v: &mut f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> Response {
-    ui.label(label.into());
-    ui.add(
-        egui::DragValue::new(v)
-            .range(range)
-            .speed(0.2)
-            .max_decimals(1),
-    )
+    ui.horizontal(|ui| {
+        ui.label(label.into());
+        ui.add(
+            egui::DragValue::new(v)
+                .range(range)
+                .speed(0.2)
+                .max_decimals(1),
+        )
+    })
+    .inner
 }
 
 /// Label + slider.
@@ -3517,12 +3564,15 @@ fn slider(
     v: &mut f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> Response {
-    ui.label(label);
-    ui.add(
-        egui::Slider::new(v, range)
-            .show_value(false)
-            .trailing_fill(true),
-    )
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(
+            egui::Slider::new(v, range)
+                .show_value(false)
+                .trailing_fill(true),
+        )
+    })
+    .inner
 }
 
 /// Colour swatch button with an explicit border so light swatches
@@ -3602,20 +3652,23 @@ fn outline_combo(ui: &mut Ui, salt: &'static str, outline: &mut f32) -> bool {
 
 /// Opacity slider displayed as 10..=100% (100% by default).
 fn opacity_pct_slider(ui: &mut Ui, opacity: &mut f32) -> bool {
-    ui.label(t!("draw.opt.opacity"));
-    let mut pct = (*opacity * 100.0).round().clamp(10.0, 100.0);
-    let r = ui.add(
-        egui::Slider::new(&mut pct, 10.0..=100.0)
-            .trailing_fill(true)
-            .suffix("%")
-            .max_decimals(0),
-    );
-    if r.changed() {
-        *opacity = (pct / 100.0).clamp(0.1, 1.0);
-        true
-    } else {
-        false
-    }
+    ui.horizontal(|ui| {
+        ui.label(t!("draw.opt.opacity"));
+        let mut pct = (*opacity * 100.0).round().clamp(10.0, 100.0);
+        let r = ui.add(
+            egui::Slider::new(&mut pct, 10.0..=100.0)
+                .trailing_fill(true)
+                .suffix("%")
+                .max_decimals(0),
+        );
+        if r.changed() {
+            *opacity = (pct / 100.0).clamp(0.1, 1.0);
+            true
+        } else {
+            false
+        }
+    })
+    .inner
 }
 
 /// Dash-style combo (Solid / Dash / Dot / DashDot).
@@ -3664,36 +3717,49 @@ fn line_options_row(
         ((LineEnd::Arrow, LineEnd::Arrow), "←—→"),
     ];
     let mut changed = false;
-    ui.label(t!("draw.opt.color"));
-    changed |= color_btn(ui, color).changed();
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.color"));
+            color_btn(ui, color).changed()
+        })
+        .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=20.0).changed();
 
-    ui.label(t!("draw.opt.start"));
-    let cur = (*start, *end);
-    let mut picked = cur;
-    let cur_label = PRESETS
-        .iter()
-        .find(|(p, _)| *p == cur)
-        .map_or("——→", |(_, l)| *l);
-    egui::ComboBox::from_id_salt((salt, "ends"))
-        .width(68.0)
-        .selected_text(cur_label)
-        .show_ui(ui, |ui| {
-            for &(pair, label) in PRESETS {
-                ui.selectable_value(&mut picked, pair, label);
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.start"));
+            let cur = (*start, *end);
+            let mut picked = cur;
+            let cur_label = PRESETS
+                .iter()
+                .find(|(p, _)| *p == cur)
+                .map_or("——→", |(_, l)| *l);
+            egui::ComboBox::from_id_salt((salt, "ends"))
+                .width(68.0)
+                .selected_text(cur_label)
+                .show_ui(ui, |ui| {
+                    for &(pair, label) in PRESETS {
+                        ui.selectable_value(&mut picked, pair, label);
+                    }
+                });
+            if picked != cur {
+                *start = picked.0;
+                *end = picked.1;
+                true
+            } else {
+                false
             }
-        });
-    if picked != cur {
-        *start = picked.0;
-        *end = picked.1;
-        changed = true;
-    }
+        })
+        .inner;
 
     changed |= dash_combo(ui, dash);
 
-    ui.label(t!("draw.opt.outline"));
-    changed |= outline_combo(ui, salt, outline);
-    changed |= color_btn(ui, outline_color).changed();
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.outline"));
+            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+        })
+        .inner;
 
     changed |= opacity_pct_slider(ui, opacity);
     changed |= ui
@@ -3717,15 +3783,26 @@ fn pencil_options_row(
     shadow_on: &mut bool,
 ) -> bool {
     let mut changed = false;
-    ui.label(t!("draw.opt.color"));
-    changed |= color_btn(ui, color).changed();
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.color"));
+            color_btn(ui, color).changed()
+        })
+        .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=30.0).changed();
-    ui.label(t!("draw.opt.style"));
-    changed |= tip_combo(ui, tip);
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.style"));
+            tip_combo(ui, tip)
+        })
+        .inner;
     changed |= dash_combo(ui, dash);
-    ui.label(t!("draw.opt.outline"));
-    changed |= outline_combo(ui, salt, outline);
-    changed |= color_btn(ui, outline_color).changed();
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.outline"));
+            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+        })
+        .inner;
     changed |= opacity_pct_slider(ui, opacity);
     changed |= ui
         .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
@@ -3748,24 +3825,39 @@ fn brace_options_row(
     shadow_on: &mut bool,
 ) -> bool {
     let mut changed = false;
-    ui.label(t!("draw.opt.color"));
-    changed |= color_btn(ui, color).changed();
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.color"));
+            color_btn(ui, color).changed()
+        })
+        .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=20.0).changed();
-    ui.label(t!("draw.opt.shape"));
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        for candidate in BraceKind::ALL {
-            if brace_kind_button(ui, candidate, *kind == candidate).clicked() && *kind != candidate
-            {
-                *kind = candidate;
-                changed = true;
-            }
-        }
-    });
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.shape"));
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let mut ch = false;
+                for candidate in BraceKind::ALL {
+                    if brace_kind_button(ui, candidate, *kind == candidate).clicked()
+                        && *kind != candidate
+                    {
+                        *kind = candidate;
+                        ch = true;
+                    }
+                }
+                ch
+            })
+            .inner
+        })
+        .inner;
     changed |= dash_combo(ui, dash);
-    ui.label(t!("draw.opt.outline"));
-    changed |= outline_combo(ui, salt, outline);
-    changed |= color_btn(ui, outline_color).changed();
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.outline"));
+            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+        })
+        .inner;
     changed |= opacity_pct_slider(ui, opacity);
     changed |= ui
         .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
@@ -3834,35 +3926,53 @@ fn shape_options_row(
 ) -> bool {
     let mut changed = false;
     if let Some(fc) = fill {
-        ui.label(t!("draw.opt.fill_c"));
-        changed |= color_btn(ui, fc).changed();
-        ui.label(t!("draw.opt.border"));
-        changed |= color_btn(ui, stroke).changed();
+        changed |= ui
+            .horizontal(|ui| {
+                ui.label(t!("draw.opt.fill_c"));
+                color_btn(ui, fc).changed()
+            })
+            .inner;
+        changed |= ui
+            .horizontal(|ui| {
+                ui.label(t!("draw.opt.border"));
+                color_btn(ui, stroke).changed()
+            })
+            .inner;
         changed |= w_edit(ui, t!("draw.opt.width"), stroke_w, 0.0..=20.0).changed();
     } else {
-        ui.label(t!("draw.opt.color"));
-        changed |= color_btn(ui, stroke).changed();
+        changed |= ui
+            .horizontal(|ui| {
+                ui.label(t!("draw.opt.color"));
+                color_btn(ui, stroke).changed()
+            })
+            .inner;
         changed |= w_edit(ui, t!("draw.opt.width"), stroke_w, 1.0..=20.0).changed();
     }
     if let Some(rad) = radius {
-        ui.label(t!("draw.opt.radius"));
         changed |= ui
-            .scope(|ui| {
-                ui.spacing_mut().slider_width = 65.0;
-                ui.add(
-                    egui::Slider::new(*rad, 0.0..=60.0)
-                        .trailing_fill(true)
-                        .max_decimals(0),
-                )
+            .horizontal(|ui| {
+                ui.label(t!("draw.opt.radius"));
+                ui.scope(|ui| {
+                    ui.spacing_mut().slider_width = 65.0;
+                    ui.add(
+                        egui::Slider::new(*rad, 0.0..=60.0)
+                            .trailing_fill(true)
+                            .max_decimals(0),
+                    )
+                })
+                .inner
+                .changed()
             })
-            .inner
-            .changed();
+            .inner;
     }
     changed |= dash_combo(ui, dash);
     if fill.is_none() {
-        ui.label(t!("draw.opt.outline"));
-        changed |= outline_combo(ui, salt, outline);
-        changed |= color_btn(ui, outline_color).changed();
+        changed |= ui
+            .horizontal(|ui| {
+                ui.label(t!("draw.opt.outline"));
+                outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+            })
+            .inner;
     }
     changed |= opacity_pct_slider(ui, opacity);
     changed |= ui
@@ -3896,37 +4006,45 @@ fn highlight_area_options_row(
     opacity: &mut f32,
 ) -> bool {
     let mut changed = false;
-    ui.label(t!("draw.opt.color"));
-    changed |= color_btn(ui, color).changed();
-    ui.label(t!("draw.opt.style"));
-    let cur = if *shape == AreaShape::Rect {
-        AreaShape::Rect
-    } else {
-        AreaShape::Ellipse
-    };
-    let mut picked = cur;
-    egui::ComboBox::from_id_salt((salt, "shape"))
-        .selected_text(match cur {
-            AreaShape::Rect => t!("draw.shape.rect").to_string(),
-            _ => t!("draw.shape.circle").to_string(),
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.color"));
+            color_btn(ui, color).changed()
         })
-        .width(96.0)
-        .show_ui(ui, |ui| {
-            ui.selectable_value(
-                &mut picked,
-                AreaShape::Rect,
-                t!("draw.shape.rect").to_string(),
-            );
-            ui.selectable_value(
-                &mut picked,
-                AreaShape::Ellipse,
-                t!("draw.shape.circle").to_string(),
-            );
-        });
-    if picked != *shape {
-        *shape = picked;
-        changed = true;
-    }
+        .inner;
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.style"));
+            let cur = if *shape == AreaShape::Rect {
+                AreaShape::Rect
+            } else {
+                AreaShape::Ellipse
+            };
+            let mut picked = cur;
+            egui::ComboBox::from_id_salt((salt, "shape"))
+                .selected_text(match cur {
+                    AreaShape::Rect => t!("draw.shape.rect").to_string(),
+                    _ => t!("draw.shape.circle").to_string(),
+                })
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut picked,
+                        AreaShape::Rect,
+                        t!("draw.shape.rect").to_string(),
+                    );
+                    ui.selectable_value(
+                        &mut picked,
+                        AreaShape::Ellipse,
+                        t!("draw.shape.circle").to_string(),
+                    );
+                });
+            if picked != *shape {
+                *shape = picked;
+            }
+            picked != cur
+        })
+        .inner;
     changed |= opacity_pct_slider(ui, opacity);
     changed
 }
@@ -3973,25 +4091,27 @@ fn enum_combo<T: Copy + PartialEq>(
     items: &[(T, std::borrow::Cow<'static, str>)],
     set: impl FnOnce(T),
 ) {
-    ui.label(t!(key));
-    let mut choice = cur;
-    egui::ComboBox::from_id_salt(key)
-        .selected_text(
-            items
-                .iter()
-                .find(|(v, _)| *v == cur)
-                .map(|(_, l)| l.to_string())
-                .unwrap_or_default(),
-        )
-        .width(90.0)
-        .show_ui(ui, |ui| {
-            for (v, l) in items {
-                ui.selectable_value(&mut choice, *v, l.to_string());
-            }
-        });
-    if choice != cur {
-        set(choice);
-    }
+    ui.horizontal(|ui| {
+        ui.label(t!(key));
+        let mut choice = cur;
+        egui::ComboBox::from_id_salt(key)
+            .selected_text(
+                items
+                    .iter()
+                    .find(|(v, _)| *v == cur)
+                    .map(|(_, l)| l.to_string())
+                    .unwrap_or_default(),
+            )
+            .width(90.0)
+            .show_ui(ui, |ui| {
+                for (v, l) in items {
+                    ui.selectable_value(&mut choice, *v, l.to_string());
+                }
+            });
+        if choice != cur {
+            set(choice);
+        }
+    });
 }
 
 /// Single-row option strip shared by `Tool::Step` and a selected `StepObj`.
@@ -4012,83 +4132,102 @@ fn step_options_row(
     shadow_on: &mut bool,
 ) -> bool {
     let mut changed = false;
-    ui.label(if mode == StepMode::Letters {
-        t!("draw.opt.letter")
-    } else {
-        t!("draw.opt.count")
-    });
-    let mut n = (*count).max(1) as i32;
-    let is_lower = *lower;
-    let dv = egui::DragValue::new(&mut n).range(1..=999).speed(0.2);
-    let dv = if mode == StepMode::Letters {
-        dv.custom_formatter(move |v, _| {
-            let base = if is_lower { 'a' } else { 'A' } as u32;
-            char::from_u32(base + (v as u32).saturating_sub(1) % 26)
-                .map(|c| c.to_string())
-                .unwrap_or_default()
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(if mode == StepMode::Letters {
+                t!("draw.opt.letter")
+            } else {
+                t!("draw.opt.count")
+            });
+            let mut n = (*count).max(1) as i32;
+            let is_lower = *lower;
+            let dv = egui::DragValue::new(&mut n).range(1..=999).speed(0.2);
+            let dv = if mode == StepMode::Letters {
+                dv.custom_formatter(move |v, _| {
+                    let base = if is_lower { 'a' } else { 'A' } as u32;
+                    char::from_u32(base + (v as u32).saturating_sub(1) % 26)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                })
+            } else {
+                dv
+            };
+            let mut ch = ui.add(dv).changed();
+            if ch {
+                *count = n.max(1) as u32;
+            }
+            if mode == StepMode::Letters
+                && ui
+                    .checkbox(lower, t!("draw.opt.lower").to_string())
+                    .changed()
+            {
+                ch = true;
+            }
+            ch
         })
-    } else {
-        dv
-    };
-    if ui.add(dv).changed() {
-        *count = n.max(1) as u32;
-        changed = true;
-    }
-    if mode == StepMode::Letters
-        && ui
-            .checkbox(lower, t!("draw.opt.lower").to_string())
-            .changed()
-    {
-        changed = true;
-    }
-
-    ui.label(t!("draw.opt.bg"));
-    changed |= color_btn(ui, bg).changed();
-    ui.label(t!("draw.opt.fg"));
-    changed |= color_btn(ui, fg).changed();
-
-    ui.label(t!("draw.opt.style"));
-    let cur_style = *style;
-    let mut picked_style = cur_style;
-    egui::ComboBox::from_id_salt((salt, "style"))
-        .width(46.0)
-        .selected_text(match cur_style {
-            StepStyle::Circle => "●",
-            StepStyle::Square => "■",
+        .inner;
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.bg"));
+            color_btn(ui, bg).changed()
         })
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut picked_style, StepStyle::Circle, "●");
-            ui.selectable_value(&mut picked_style, StepStyle::Square, "■");
-        });
-    if picked_style != cur_style {
-        *style = picked_style;
-        changed = true;
-    }
-
-    ui.label(t!("draw.opt.size"));
-    let cur_size = *size;
-    let mut picked_size = cur_size;
-    egui::ComboBox::from_id_salt((salt, "size"))
-        .width(46.0)
-        .selected_text(match cur_size {
-            StepSize::Small => "S",
-            StepSize::Medium => "M",
-            StepSize::Large => "L",
+        .inner;
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.fg"));
+            color_btn(ui, fg).changed()
         })
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut picked_size, StepSize::Small, "S");
-            ui.selectable_value(&mut picked_size, StepSize::Medium, "M");
-            ui.selectable_value(&mut picked_size, StepSize::Large, "L");
-        });
-    if picked_size != cur_size {
-        *size = picked_size;
-        changed = true;
-    }
-
-    ui.label(t!("draw.opt.outline"));
-    changed |= outline_combo(ui, salt, ring);
-    changed |= color_btn(ui, ring_color).changed();
-
+        .inner;
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.style"));
+            let cur_style = *style;
+            let mut picked_style = cur_style;
+            egui::ComboBox::from_id_salt((salt, "style"))
+                .width(46.0)
+                .selected_text(match cur_style {
+                    StepStyle::Circle => "●",
+                    StepStyle::Square => "■",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut picked_style, StepStyle::Circle, "●");
+                    ui.selectable_value(&mut picked_style, StepStyle::Square, "■");
+                });
+            if picked_style != cur_style {
+                *style = picked_style;
+            }
+            picked_style != cur_style
+        })
+        .inner;
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.size"));
+            let cur_size = *size;
+            let mut picked_size = cur_size;
+            egui::ComboBox::from_id_salt((salt, "size"))
+                .width(46.0)
+                .selected_text(match cur_size {
+                    StepSize::Small => "S",
+                    StepSize::Medium => "M",
+                    StepSize::Large => "L",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut picked_size, StepSize::Small, "S");
+                    ui.selectable_value(&mut picked_size, StepSize::Medium, "M");
+                    ui.selectable_value(&mut picked_size, StepSize::Large, "L");
+                });
+            if picked_size != cur_size {
+                *size = picked_size;
+            }
+            picked_size != cur_size
+        })
+        .inner;
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.outline"));
+            outline_combo(ui, salt, ring) | color_btn(ui, ring_color).changed()
+        })
+        .inner;
     changed |= opacity_pct_slider(ui, opacity);
     changed |= ui
         .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
