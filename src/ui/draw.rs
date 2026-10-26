@@ -154,6 +154,8 @@ struct Opts {
     shape: AreaShape,
     soft: bool,
     border_on: bool,
+    /// Line highlighter coverage (defaults translucent).
+    hl_opacity: f32,
     // Eraser tool.
     eraser_color: Color32,
     eraser_size: f32,
@@ -236,6 +238,7 @@ impl Default for Opts {
             shape: AreaShape::Rect,
             soft: false,
             border_on: false,
+            hl_opacity: 0.45,
             eraser_color: Color32::WHITE,
             eraser_size: 12.0,
             eraser_mode: EraserMode::Color,
@@ -1450,8 +1453,8 @@ impl DrawSession {
                 outline_color: Color32::WHITE,
                 shadow: 0.0,
                 eraser_mode: EraserMode::Color,
-                soft: self.opts.soft,
-                opacity: 0.45,
+                soft: false,
+                opacity: self.opts.hl_opacity,
             }),
             _ => AnnotationKind::Freehand(FreeObj {
                 points,
@@ -1822,7 +1825,7 @@ impl DrawSession {
                     (preview_col, (o.eraser_size * scale).max(2.0), 0.0)
                 }
                 Tool::HighlightLine => (
-                    o.color.gamma_multiply(0.45),
+                    o.color.gamma_multiply(o.hl_opacity),
                     (o.width * 4.0 * scale).max(2.0),
                     0.0,
                 ),
@@ -2908,7 +2911,7 @@ impl DrawSession {
             Tool::HighlightLine => {
                 w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0);
                 color_btn(ui, &mut o.color);
-                ui.checkbox(&mut o.soft, t!("draw.opt.soft").to_string());
+                opacity_pct_slider(ui, &mut o.hl_opacity);
             }
             Tool::HighlightArea => {
                 color_btn(ui, &mut o.color);
