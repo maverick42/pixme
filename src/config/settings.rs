@@ -44,6 +44,36 @@ impl Appearance {
     }
 }
 
+/// How long captures persist in the session database — the
+/// "Sauvegarde base de données" setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DbRetention {
+    /// The session is never persisted.
+    Never,
+    /// Only today's captures are kept — anything older is pruned at
+    /// launch and when the option is chosen.
+    Today,
+    /// Everything persists until the user clears it.
+    #[default]
+    Always,
+}
+
+impl DbRetention {
+    /// `true` when switching from `self` to `other` may lose stored
+    /// captures — the settings UI warns before applying.
+    pub fn more_restrictive(self, other: Self) -> bool {
+        fn rank(r: DbRetention) -> u8 {
+            match r {
+                DbRetention::Never => 0,
+                DbRetention::Today => 1,
+                DbRetention::Always => 2,
+            }
+        }
+        rank(other) < rank(self)
+    }
+}
+
 /// The complete persisted settings file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -68,6 +98,8 @@ pub struct Settings {
     /// Last folder a file was opened from — seeds File → Open and the
     /// "open last used folder" menu item.
     pub last_open_dir: Option<PathBuf>,
+    /// Session-database retention (never / today / always).
+    pub db_retention: DbRetention,
     /// Text-tool colour `[r, g, b]` persisted across sessions.
     #[serde(default = "default_text_color")]
     pub text_color: [u8; 3],
@@ -115,6 +147,7 @@ impl Default for Settings {
             delay_auto_reset: true,
             last_save_dir: None,
             last_open_dir: None,
+            db_retention: DbRetention::default(),
             text_color: default_text_color(),
             text_font: default_text_font(),
             text_size: default_text_size(),

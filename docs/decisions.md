@@ -624,3 +624,127 @@ Format: date — context — decision — consequences.
   stays lean; the lock offers casual privacy only (documented in
   `editor/meta.rs` docs). Duplicate keeps the password hash but gets a
   fresh id/date. Drag-out payloads of a locked tab remain unrestricted.
+
+## 2026-10-25 — rusqlite for session persistence
+
+- **Context**: the session (viewer tabs: documents + annotations +
+  undo/redo stacks) must survive quitting PixMe, per user decision.
+  A small embedded database is wanted — not a large store, no pixel-op
+  history.
+- **Decision**: `rusqlite = { version = "0.41", features = ["bundled"] }`.
+  Bundled compiles SQLite statically: no system dependency, identical
+  behavior on macOS and Windows, single `session.db` file under
+  `data_dir()`. `cargo audit` after the add: zero vulnerabilities; the
+  7 reported warnings are all pre-existing transitive crates
+  (unmaintained `proc-macro-error`, `unsafe-libyaml`, `ttf-parser`,
+  `zbus*`; unsound `glib` — Linux-only code paths). `bundled` also
+  enables `ffi-sqlite-wasm-rs` (sqlite-wasm-rs/rsqlite-vfs in the
+  lockfile): wasm32-only crates, never compiled on our targets.
+- **Consequences**: ~1-2 MB binary growth. Persistence writes only at
+  app quit (one transaction; crash/kill loses the session — accepted
+  by the user). Restore is silent when the viewer next opens.
+
+## 2026-10-25 — session.db: what is stored, when it is written
+
+- **Context**: FastStone loses every capture + annotation at quit;
+  PixMe's model is already non-destructive (a `Document` = base
+  `Capture` + `Vec<Annotation>`, edits flow through `AnnoEdit`), so a
+  full-fidelity restore is cheap to reach.
+- **Decision** (`src/store/`):
+  - One `documents` row per tab: `doc_id` (`meta.id`), title, saved
+    flag, all `CaptureMeta` columns (captured/saved dates as RFC 3339,
+    source path, password hash), the base image as a PNG blob, scale
+    factor, monitor JSON, `next_id`, plus three postcard blobs —
+    `annotations`, `anno_undo`, `anno_redo`. A `session` row keeps the
+    active tab and the auto-title counter (`Capture N`).
+  - `postcard` (default-features off, `alloc` + `use-std`) serializes
+    the blobs compactly — JSON would inflate every embedded PNG byte
+    ~3-4×; `serde_bytes` was avoided with a 20-line visitor instead.
+    All `*Obj` types derive `Serialize`/`Deserialize` (egui types
+    already serde through eframe `persistence`); only the two
+    `RgbaImage` fields (`PicObj.image`, `FillObj.mask`) go through
+    `#[serde(with)]` PNG helpers.
+  - **PixelOps (Resize) are not persisted** — their payloads are whole
+    pre-op images; the user wants a small database. After a restart,
+    annotation undo survives, pixel undo does not.
+  - **Writes happen at three points only**: app quit (one transaction:
+    delete-all + insert-all, plus committing any open Draw session
+    back into its tab first), tab close (the document row is deleted
+    at once — "a closed capture stays closed"), session discard
+    (store cleared). Crash/kill loses the delta — accepted.
+  - **Restore is lazy and silent** on the first `enter(Viewer)`:
+    launch stays resident/instant; every restored protected tab comes
+    back LOCKED (`unlocked` is runtime-only); an empty restore never
+    touches `dirty`.
+  - Corruption: `meta.schema_version` guards the layout — a garbage
+    file or a foreign version is renamed `session.db.bak` and rebuilt;
+    a per-row decode failure skips just that tab; `conn: None` =
+    degraded mode (persistence off, app keeps running).
+- **Consequences**: enum layout changes in `AnnotationKind`/`AnnoEdit`
+  must bump `SCHEMA_VERSION` (postcard encodes variant indices) — the
+  DB is a convenience cache, wiped rather than migrated. An open Draw
+  session is committed at quit, so mid-edit quits keep the edits.
+
+## 2026-10-25 — session.db hardening
+
+- **Context**: the persisted session holds real captures — possibly
+  sensitive content — and several operational gaps needed policy:
+  deleted-data remanence, `.bak` lifetime, store size, second process.
+- **Decision**:
+  - `PRAGMA secure_delete = ON` at every open: SQLite zeroes freed
+    payload bytes instead of leaving them in free pages.
+  - **VACUUM policy**: immediate `VACUUM` inside `clear()` (Discard is
+    one rare user action on an emptied DB — cheap); per-tab deletions
+    only set `needs_vacuum` and the `Drop` impl vacuums then — a
+    per-close VACUUM would rewrite the whole file on every tab close,
+    and `secure_delete` already zeroes content meanwhile. Plain quits
+    with no deletions skip VACUUM entirely.
+  - **`.bak` policy**: a corrupt/foreign file is parked as
+    `session.db.bak` for manual recovery, then auto-deleted once its
+    mtime is older than 7 days (`BAK_KEEP_DAYS`) — checked at every
+    store open, so captures in it cannot linger forever.
+  - **Limits — REMOVED**: early caps (`MAX_TABS`, `MAX_SESSION_BYTES`,
+    `session.dropped` + status notice) were cut at the user's request —
+    the app never deletes captures for size reasons, so schema v4 drops
+    the `dropped` column and every tab is always persisted.
+  - **Single instance**: `single-instance 0.3` — named mutex on
+    Windows, `flock`ed file on macOS, keyed on
+    `data_dir()/instance.lock` (backslashes→`/` for the Windows mutex
+    name rule). A second process gets a translated `rfd` warning
+    (`app.already_running`) and exits; a guard *failure* logs and lets
+    the app run (a resident capture tool must not be blocked by it).
+  - **Schema v2**: the `dropped` column bumps `SCHEMA_VERSION` to 2 —
+    v1 files are wiped/rebuilt, never migrated.
+  - **Golden test**: `postcard_layout_is_golden` freezes the postcard
+    encoding of a fixed annotation set + undo/redo stacks; any drift
+    fails with a message pointing at `SCHEMA_VERSION`.
+  - **Lock guarantee (restated precisely)**: the protected-tab
+    password is a *screen lock* only — it gates the DISPLAY of the tab
+    (canvas + strip replaced by the unlock card, re-armed on every
+    tab switch). It protects nothing else: pixels stay readable in
+    memory; copy/save/print/draw/drag-out work on a locked tab; the
+    file on disk (`source_path`) is unprotected; `session.db` stores
+    pixels and the password hash plainly. The hash is salted iterated
+    FNV-1a — deliberately non-cryptographic. Casual privacy only; no
+    encryption unless the user asks for it.
+- **Consequences**: `nix`/`widestring`/`winapi` enter the lockfile via
+  `single-instance` (audit clean). `single_instance` has no callback
+  API — a second instance cannot raise the first, it only exits.
+
+## 2026-10-25 — session-database retention setting
+
+- **Context**: persisting every capture forever was too crude; the
+  user wants control over how long the database keeps them.
+- **Decision**: `settings.db_retention` (`never | today | always`,
+  default `always`), a third dropdown row in the settings window.
+  `never` skips the quit-time write entirely; `today` deletes every
+  row whose `captured_epoch` predates local midnight — applied both
+  at store open (launch-time prune) and immediately when the setting
+  is confirmed. Switching to a MORE restrictive option while the
+  store holds captures parks the choice in egui temp state and asks
+  for confirmation ("captures in the database will be lost"); Cancel
+  reverts the shown value untouched. The `captured_epoch` INTEGER
+  column (schema v3) exists because RFC 3339 strings cannot compare
+  across offsets.
+- **Consequences**: `document_count()` and `apply_retention()` on the
+  store; schema v3 wipes v2 files (still a cache, never migrated).

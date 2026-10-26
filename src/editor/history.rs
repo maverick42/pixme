@@ -5,6 +5,8 @@
 //! live on the viewer `Tab` (they survive draw-window re-entry and die
 //! with the tab, or when a pixel op flattens the document).
 
+use serde::{Deserialize, Serialize};
+
 use super::document::{Annotation, AnnotationId, Document};
 
 /// How many annotation edits stay undoable per tab. Annotation payloads
@@ -13,7 +15,7 @@ use super::document::{Annotation, AnnotationId, Document};
 pub const ANNO_HISTORY_CAP: usize = 50;
 
 /// A reversible edit of a [`Document`]'s annotation list.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AnnoEdit {
     /// `anno` was inserted at `index`.
     Add { anno: Annotation, index: usize },

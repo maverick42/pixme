@@ -138,9 +138,6 @@ fn bar_id() -> egui::ViewportId {
 fn viewer_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.viewer")
 }
-fn settings_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("pixme.settings")
-}
 fn overlay_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.capture_overlay")
 }
@@ -196,6 +193,9 @@ pub struct Shared {
     pub save_dialog: Mutex<Option<crate::ui::save_dialog::SaveDialog>>,
     /// The Draw editor session, open while Some — modal to the viewer.
     pub draw: Mutex<Option<crate::ui::draw::DrawSession>>,
+    /// The session database — documents, annotations and undo stacks
+    /// written at quit, read back on the first viewer open.
+    pub store: Mutex<crate::store::Store>,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -307,32 +307,38 @@ impl Shared {
                 if lock(&self.draw).is_some() {
                     return;
                 }
-                let mut viewer = lock(&self.viewer);
-                if viewer.dirty {
-                    viewer.confirm_close = true;
-                } else {
-                    drop(viewer);
-                    self.enter(AppState::Idle, ctx);
-                }
+                // Closing the viewer only returns the resident app to
+                // Idle — the session stays in memory and nothing is
+                // lost, so the dirty warning is Quit-only.
+                self.enter(AppState::Idle, ctx);
             }
             Command::OpenSettings => {
                 self.settings_open.store(true, Ordering::Relaxed);
-                self.request_focus(settings_id());
+                // The settings are a modal of the viewer: make sure the
+                // viewer exists (and is restored) before it shows.
+                self.enter(AppState::Viewer, ctx);
+                // The modal lives in the VIEWER's pass — repainting the
+                // anchor alone would leave an idle viewer asleep and the
+                // modal would wait for the next input event.
+                ctx.request_repaint_of(viewer_id());
             }
             Command::CloseSettings => {
                 self.settings_open.store(false, Ordering::Relaxed);
-                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                ctx.request_repaint_of(viewer_id());
             }
             Command::Quit => {
                 let mut viewer = lock(&self.viewer);
-                if viewer.dirty {
+                if viewer.dirty && !self.session_persists() {
                     viewer.confirm_close = true;
                     viewer.confirm_then_quit = true;
                     drop(viewer);
                     // The confirmation lives in the viewer: surface it.
                     self.enter(AppState::Viewer, ctx);
                 } else {
-                    Self::quit_now(ctx);
+                    // quit_now re-locks the viewer to persist the
+                    // session — this guard must be released first.
+                    drop(viewer);
+                    self.quit_now(ctx);
                 }
             }
             Command::ConfirmSave => {
@@ -578,6 +584,11 @@ impl Shared {
                 self.request_focus(viewer_id());
             }
         }
+        // Restoring runs on EVERY viewer entry (guarded to once): a
+        // same-state re-entry after reset must not skip the load.
+        if next == AppState::Viewer {
+            self.restore_session();
+        }
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
@@ -590,8 +601,11 @@ impl Shared {
             *viewer = Viewer::default();
             then_quit
         };
+        // The session ended deliberately (saved-then-closed or
+        // discarded): nothing of it may come back at the next launch.
+        lock(&self.store).clear();
         if quit {
-            Self::quit_now(ctx);
+            self.quit_now(ctx);
         } else {
             self.enter(AppState::Idle, ctx);
         }
@@ -755,8 +769,49 @@ impl Shared {
         self.enter(return_to, ctx);
     }
 
-    /// Closes the anchor viewport: eframe exits once the root window is gone.
-    fn quit_now(ctx: &egui::Context) {
+    /// First entry into the viewer: pulls the persisted session back
+    /// into memory — silent and best-effort (a corrupt database was
+    /// already parked as `.bak` when the store opened).
+    fn restore_session(&self) {
+        let needed = {
+            let viewer = lock(&self.viewer);
+            !viewer.session_restored() && viewer.tabs.is_empty()
+        };
+        if needed {
+            let session = lock(&self.store).load_session();
+            lock(&self.viewer).restore_session(session);
+        }
+    }
+
+    /// `true` when the session is persisted to `session.db` — the
+    /// dirty-session warning only makes sense when retention is `Never`
+    /// (nothing survives the exit otherwise, so we ask first).
+    fn session_persists(&self) -> bool {
+        lock(&self.settings).db_retention != crate::config::DbRetention::Never
+    }
+
+    /// Mirrors the whole session into the store. An open Draw editor
+    /// still owns its tab's document clone — committing it back first
+    /// keeps a quit mid-edit from losing the work. `Never` retention
+    /// skips persistence entirely.
+    fn save_session(&self) {
+        if lock(&self.settings).db_retention == crate::config::DbRetention::Never {
+            return;
+        }
+        if let Some(draw) = lock(&self.draw).take() {
+            lock(&self.viewer).commit_draw(draw.tab, draw.doc, draw.undo, draw.redo);
+        }
+        let viewer = lock(&self.viewer);
+        let active = viewer.active_index().unwrap_or(0);
+        let next_title = viewer.next_title();
+        lock(&self.store).save_session(&viewer.tabs, active, next_title);
+    }
+
+    /// Persists the session (best-effort — a failure never blocks
+    /// quitting), then closes the anchor viewport: eframe exits once
+    /// the root window is gone.
+    fn quit_now(&self, ctx: &egui::Context) {
+        self.save_session();
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
     }
 }
@@ -807,6 +862,7 @@ impl PixMeApp {
     /// item / tray + menus) and applies language and theme.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
+        let db_retention = settings.db_retention;
         i18n::apply(settings.language);
         ui::install(&cc.egui_ctx);
         ui::theme::apply(
@@ -819,7 +875,7 @@ impl PixMeApp {
         let debug_capture = std::env::var("PIXME_CAPTURE")
             .ok()
             .and_then(|v| debug_mode(&v));
-        Self {
+        let app = Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(AppState::Idle),
                 last_language: Mutex::new(settings.language),
@@ -835,11 +891,25 @@ impl PixMeApp {
                 next_pin_id: Mutex::new(0),
                 save_dialog: Mutex::new(None),
                 draw: Mutex::new(None),
+                store: Mutex::new({
+                    let mut store = crate::store::Store::open();
+                    // Launch-time retention: stale captures are pruned
+                    // before anything can restore them.
+                    store.apply_retention(db_retention);
+                    store
+                }),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
             }),
-        }
-        .tap_debug_capture(&cc.egui_ctx, debug_capture)
+        };
+        // Launch lands on the viewer, not resident-idle: it restores
+        // the persisted session and gives a visible landing point.
+        // Any viewport left open by eframe's persisted state (e.g. the
+        // capture bar showing at a previous quit) is closed explicitly.
+        app.shared.enter(AppState::Viewer, &cc.egui_ctx);
+        cc.egui_ctx
+            .send_viewport_cmd_to(bar_id(), egui::ViewportCommand::Close);
+        app.tap_debug_capture(&cc.egui_ctx, debug_capture)
     }
 
     /// Queues the startup capture requested by `PIXME_CAPTURE`, if any.
@@ -910,6 +980,12 @@ impl eframe::App for PixMeApp {
                     shared.maybe_focus(&ctx, viewer_id());
                     ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
                     lock(&shared.viewer).show(ui, &shared);
+                    // Tabs closed this frame lose their stored rows —
+                    // a closed capture stays closed at the next launch.
+                    let closed = lock(&shared.viewer).take_closed_ids();
+                    if !closed.is_empty() {
+                        lock(&shared.store).delete_documents(&closed);
+                    }
                 });
             }
             AppState::Capturing => {
@@ -1087,24 +1163,6 @@ impl eframe::App for PixMeApp {
                 },
             );
         }
-
-        if self.shared.settings_open.load(Ordering::Relaxed) {
-            let shared = Arc::clone(&self.shared);
-            ctx.show_viewport_deferred(settings_id(), settings_builder(), move |ui, _class| {
-                let ctx = ui.ctx().clone();
-                shared.pump(&ctx);
-                shared.maybe_focus(&ctx, settings_id());
-                ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    shared.settings_open.store(false, Ordering::Relaxed);
-                    // Wake the anchor so the viewport gets deregistered —
-                    // same ghost-window trap as the save dialog.
-                    ctx.request_repaint_of(egui::ViewportId::ROOT);
-                }
-                ui::settings::show(ui, &shared);
-            });
-        }
     }
 }
 
@@ -1203,16 +1261,6 @@ fn draw_builder(title: &str) -> egui::ViewportBuilder {
         .with_active(true)
 }
 
-/// The settings window: small, fixed size, titled, no taskbar entry.
-fn settings_builder() -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default()
-        .with_title(t!("settings.title"))
-        .with_inner_size([340.0, 150.0])
-        .with_resizable(false)
-        .with_taskbar(false)
-        .with_active(true)
-}
-
 /// Runs the app. The root viewport is the permanent 1×1 transparent anchor
 /// window (never in the taskbar); the app first lives in the menu bar /
 /// tray (`Idle`) until the user asks for a capture.
@@ -1261,6 +1309,7 @@ mod tests {
             next_pin_id: Mutex::new(0),
             save_dialog: Mutex::new(None),
             draw: Mutex::new(None),
+            store: Mutex::new(crate::store::Store::open_in_memory()),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
@@ -1309,24 +1358,25 @@ mod tests {
         assert_eq!(lock(&shared.viewer).tabs.len(), 1);
     }
 
+    /// Closing the viewer window just returns the resident app to
+    /// Idle — the session lives in memory, nothing is lost, no dialog.
     #[test]
-    fn dirty_viewer_close_asks_for_confirmation_instead() {
+    fn dirty_viewer_close_idles_without_asking() {
         let (shared, ctx) = harness();
+        lock(&shared.settings).db_retention = crate::config::DbRetention::Never;
         lock(&shared.viewer).dirty = true;
         drive(&shared, &ctx, Command::OpenViewer);
-        assert_eq!(
-            drive(&shared, &ctx, Command::ViewerClosed),
-            AppState::Viewer
-        );
-        assert!(lock(&shared.viewer).confirm_close);
+        assert_eq!(drive(&shared, &ctx, Command::ViewerClosed), AppState::Idle);
+        assert!(!lock(&shared.viewer).confirm_close);
     }
 
     #[test]
     fn confirm_cancel_keeps_the_viewer() {
         let (shared, ctx) = harness();
+        lock(&shared.settings).db_retention = crate::config::DbRetention::Never;
         lock(&shared.viewer).dirty = true;
         drive(&shared, &ctx, Command::OpenViewer);
-        drive(&shared, &ctx, Command::ViewerClosed);
+        drive(&shared, &ctx, Command::Quit);
         assert_eq!(
             drive(&shared, &ctx, Command::ConfirmCancel),
             AppState::Viewer
@@ -1337,17 +1387,94 @@ mod tests {
     #[test]
     fn confirm_discard_idles_and_clears_the_session() {
         let (shared, ctx) = harness();
+        lock(&shared.settings).db_retention = crate::config::DbRetention::Never;
         {
             let mut viewer = lock(&shared.viewer);
             viewer.dirty = true;
             viewer.push_stub("capture 1");
         }
         drive(&shared, &ctx, Command::OpenViewer);
-        drive(&shared, &ctx, Command::ViewerClosed);
+        drive(&shared, &ctx, Command::Quit);
+        // Discard after Quit actually quits (confirm_then_quit) — the
+        // observable part is the session being dropped and wiped.
+        drive(&shared, &ctx, Command::ConfirmDiscard);
+        assert!(lock(&shared.viewer).tabs.is_empty());
+        assert!(!lock(&shared.viewer).dirty);
+    }
+
+    /// A clean quit writes the session; reopening the viewer brings
+    /// every capture back — silent restore, titles and order included.
+    #[test]
+    fn quit_then_reopen_restores_the_session() {
+        let (shared, ctx) = harness();
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.push_stub("capture 1");
+            viewer.push_stub("capture 2");
+            for tab in &mut viewer.tabs {
+                tab.saved = true; // a clean session quits with no dialog
+            }
+            viewer.recompute_dirty();
+        }
+        drive(&shared, &ctx, Command::Quit);
+        // New run: fresh viewer state, same store.
+        *lock(&shared.viewer) = Viewer::default();
+        drive(&shared, &ctx, Command::OpenViewer);
+        let viewer = lock(&shared.viewer);
+        assert_eq!(viewer.tabs.len(), 2);
+        assert_eq!(viewer.tabs[0].title, "capture 1");
+        assert_eq!(viewer.tabs[1].title, "capture 2");
+        assert!(!viewer.dirty, "all tabs came back saved");
+    }
+
+    /// With persistence on, a dirty session quits without asking — the
+    /// captures live on in session.db and come back on the next open.
+    /// The dirty warning only exists when retention is `Never`.
+    #[test]
+    fn dirty_quit_saves_without_asking_when_persisted() {
+        let (shared, ctx) = harness();
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.push_stub("capture 1");
+            viewer.recompute_dirty();
+        }
+        assert!(lock(&shared.viewer).dirty);
+        drive(&shared, &ctx, Command::Quit);
+        assert!(
+            !lock(&shared.viewer).confirm_close,
+            "no dialog when persisting"
+        );
+        *lock(&shared.viewer) = Viewer::default();
+        drive(&shared, &ctx, Command::OpenViewer);
+        assert_eq!(lock(&shared.viewer).tabs.len(), 1);
+    }
+
+    /// A discarded session empties the store — a later viewer open
+    /// never resurrects captures the user threw away.
+    #[test]
+    fn discard_after_quit_keeps_the_store_empty() {
+        let (shared, ctx) = harness();
+        lock(&shared.settings).db_retention = crate::config::DbRetention::Never;
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.push_stub("capture 1");
+            for tab in &mut viewer.tabs {
+                tab.saved = true;
+            }
+            viewer.recompute_dirty();
+        }
+        drive(&shared, &ctx, Command::Quit); // persisted once
+        *lock(&shared.viewer) = Viewer::default();
+        // A new dirty session is quit + discarded: the store is wiped.
+        lock(&shared.viewer).push_stub("capture 2");
+        drive(&shared, &ctx, Command::OpenViewer);
+        drive(&shared, &ctx, Command::Quit);
         assert_eq!(
             drive(&shared, &ctx, Command::ConfirmDiscard),
             AppState::Idle
         );
+        *lock(&shared.viewer) = Viewer::default();
+        drive(&shared, &ctx, Command::OpenViewer);
         assert!(lock(&shared.viewer).tabs.is_empty());
     }
 

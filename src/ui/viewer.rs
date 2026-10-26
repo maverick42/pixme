@@ -169,6 +169,13 @@ pub struct Viewer {
     tool_scroll_to: Option<f32>,
     /// The toolbar was wider than its band last frame — shows ◀ ▶.
     tools_overflow: bool,
+    /// Internal ids of documents whose tabs were closed since the last
+    /// drain — the app forwards them to the session store so their
+    /// rows never come back at the next launch.
+    closed_ids: Vec<String>,
+    /// The persisted session was already loaded once — restore never
+    /// runs twice (a deliberate discard stays discarded).
+    restored: bool,
 }
 
 /// The rename prompt: draft + whether it already failed uniqueness.
@@ -329,7 +336,7 @@ impl Viewer {
     }
 
     /// Index of the active tab, clamped into range (`None` when empty).
-    fn active_index(&self) -> Option<usize> {
+    pub fn active_index(&self) -> Option<usize> {
         if self.tabs.is_empty() {
             None
         } else {
@@ -574,7 +581,10 @@ impl Viewer {
         let active_removed = sorted.contains(&self.active);
         for i in sorted {
             if i < self.tabs.len() {
-                self.tabs.remove(i);
+                // Remember the doc id: its stored row is deleted next
+                // frame so the closed capture stays closed.
+                let removed = self.tabs.remove(i);
+                self.closed_ids.push(removed.doc.meta.id);
             }
         }
         if active_removed {
@@ -591,6 +601,55 @@ impl Viewer {
                 .active
                 .saturating_sub(below_active)
                 .min(self.tabs.len().saturating_sub(1));
+        }
+        self.recompute_dirty();
+    }
+
+    /// Doc ids of tabs closed since the last call — the app forwards
+    /// them to the store so the rows are deleted.
+    pub fn take_closed_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.closed_ids)
+    }
+
+    /// `true` once the persisted session has been loaded — restore is
+    /// a one-shot, never retried within a run.
+    pub fn session_restored(&self) -> bool {
+        self.restored
+    }
+
+    /// The auto-title counter — persisted so `Capture N` keeps counting
+    /// across restarts instead of colliding with restored names.
+    pub fn next_title(&self) -> usize {
+        self.next_title as usize
+    }
+
+    /// Replaces the (empty) session with what the store kept: every tab
+    /// comes back with its document, title, saved flag and annotation
+    /// history; protected tabs restore LOCKED (`unlocked: false`, the
+    /// password is asked on activation like any tab switch).
+    pub fn restore_session(&mut self, session: crate::store::StoredSession) {
+        self.restored = true;
+        // An empty restore changes nothing — most importantly it must
+        // not recompute `dirty` over an untouched session.
+        if session.tabs.is_empty() {
+            return;
+        }
+        self.next_title = self.next_title.max(session.next_title as u32);
+        for t in session.tabs {
+            self.tabs.push(Tab {
+                title: t.title,
+                doc: t.doc,
+                saved: t.saved,
+                texture: None,
+                undo: VecDeque::new(),
+                redo: VecDeque::new(),
+                anno_undo: t.anno_undo,
+                anno_redo: t.anno_redo,
+                unlocked: false,
+            });
+        }
+        if !self.tabs.is_empty() {
+            self.set_active(session.active.min(self.tabs.len() - 1));
         }
         self.recompute_dirty();
     }
@@ -714,6 +773,10 @@ impl Viewer {
                     .fill(t.dock),
             )
             .show(ui, |ui| {
+                // No default vertical gap between strips — every strip
+                // carries its own margins, so the column stays flush
+                // and compact like the reference.
+                ui.spacing_mut().item_spacing.y = 0.0;
                 if !shared.has_native_app_menu() {
                     self.menu_strip(ui, shared);
                     widgets::hairline(ui);
@@ -738,6 +801,92 @@ impl Viewer {
         self.rename_dialog(&ctx);
         self.protect_dialog(&ctx);
         self.delete_file_dialog(&ctx);
+        self.settings_window(&ctx, shared);
+    }
+
+    /// The settings window is modal to the viewer: a centred custom
+    /// panel over the dimmed content (`modal_child_open` eats the
+    /// clicks). Its header reuses the tab's painted cross —
+    /// [`paint_tab_close`] — instead of egui's native title bar.
+    fn settings_window(&self, ctx: &egui::Context, shared: &Shared) {
+        if !shared
+            .settings_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut open = true;
+        egui::Area::new(egui::Id::new("pixme.settings_modal"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let t = theme::tokens(ui.ctx());
+                egui::Frame::default()
+                    .fill(t.dock)
+                    .stroke(Stroke::new(1.0, t.card_border))
+                    .corner_radius(CornerRadius::same(t.radius_lg))
+                    .show(ui, |ui| {
+                        // Fixed width: inside an Area `available_width`
+                        // is the whole window — rows would stretch the
+                        // modal to full size without this bound.
+                        ui.set_width(340.0);
+                        // Flush stack: the band edge separates header
+                        // from body — no stray gaps from item spacing.
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        // Title-bar band: card tint rounded on its top
+                        // corners — reads as a header while keeping our
+                        // painted cross (same look on Windows: nothing
+                        // here is native chrome).
+                        egui::Frame::default()
+                            .inner_margin(Margin::symmetric(10, 6))
+                            .fill(t.card)
+                            .corner_radius(CornerRadius {
+                                nw: t.radius_lg,
+                                ne: t.radius_lg,
+                                sw: 0,
+                                se: 0,
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(340.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(t!("settings.title").to_string())
+                                            .color(t.text)
+                                            .strong(),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                Vec2::splat(20.0),
+                                                Sense::hover(),
+                                            );
+                                            // Painted above like the tab
+                                            // chip: the close cross keeps
+                                            // its own hover and click.
+                                            let resp = ui.interact(
+                                                rect,
+                                                ui.id().with("settings-close"),
+                                                Sense::click(),
+                                            );
+                                            paint_tab_close(ui, rect, resp.hovered());
+                                            if resp.clicked() {
+                                                open = false;
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        egui::Frame::default()
+                            .inner_margin(Margin::symmetric(14, 0))
+                            .show(ui, |ui| crate::ui::settings::show(ui, shared));
+                    });
+            });
+        if !open {
+            shared
+                .settings_open
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// The bottom status strip: capture count, active image dimensions

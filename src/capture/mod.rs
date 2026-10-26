@@ -4,6 +4,8 @@
 //! details (Screen Recording permission on macOS, per-monitor DPI on Windows)
 //! stay behind this module and `crate::platform`.
 
+use serde::{Deserialize, Serialize};
+
 pub mod region;
 pub mod screen;
 pub mod window;
@@ -32,7 +34,7 @@ pub enum CaptureKind {
 }
 
 /// A rectangle in physical pixels.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhysicalRect {
     /// Left edge, px.
     pub x: i32,
@@ -49,7 +51,7 @@ pub struct PhysicalRect {
 pub struct WindowId(pub u64);
 
 /// One connected monitor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonitorInfo {
     /// Stable identifier.
     pub id: u32,

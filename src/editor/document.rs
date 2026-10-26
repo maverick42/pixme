@@ -14,7 +14,7 @@ use crate::capture::{Capture, PhysicalRect};
 pub type AnnotationId = u64;
 
 /// Stroke dashing shared by every outlined object ("Tirets" option).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)] // the variants ARE the dash styles (Dash, Dot, DashDot)
 pub enum Dash {
     /// Unbroken stroke.
@@ -29,7 +29,7 @@ pub enum Dash {
 }
 
 /// Line-end glyph for the straight-line tool (the "Fin" dropdown).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineEnd {
     /// Plain cut end.
     #[default]
@@ -43,7 +43,7 @@ pub enum LineEnd {
 }
 
 /// Outline shape of filled-area objects (the "Forme" icon row).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AreaShape {
     /// Sharp rectangle.
     #[default]
@@ -55,7 +55,7 @@ pub enum AreaShape {
 }
 
 /// The blur tool's two modes ("Style" icons).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlurStyle {
     /// Mosaic / big pixels.
     #[default]
@@ -65,7 +65,7 @@ pub enum BlurStyle {
 }
 
 /// Freehand tip shape (the pencil/eraser "Forme" icons).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TipShape {
     /// Square brush footprint.
     Square,
@@ -75,7 +75,7 @@ pub enum TipShape {
 }
 
 /// Step-marker size presets ("Taille": Petit/Moyen/Grand).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepSize {
     /// Small badge.
     Small,
@@ -87,7 +87,7 @@ pub enum StepSize {
 }
 
 /// Step-marker numbering ("Etape 1.2.3" / "Etape A.B.C" tabs).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepMode {
     /// 1, 2, 3, …
     #[default]
@@ -97,7 +97,7 @@ pub enum StepMode {
 }
 
 /// Step badge style (the "Style" dropdown).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepStyle {
     /// Filled circle.
     #[default]
@@ -107,7 +107,7 @@ pub enum StepStyle {
 }
 
 /// Text alignment inside a text box.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextAlign {
     /// Left.
     #[default]
@@ -134,7 +134,7 @@ pub enum BoxVAlign {
 
 /// One icon stamp offered by the Émoticônes menu — rendered as a
 /// Lucide glyph recoloured with the object's colour.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StampId {
     /// Arrow pointer.
     ArrowCursor,
@@ -170,7 +170,7 @@ pub enum StampId {
 
 /// Stroked/filled rectangle (the □ and ■ tools — `fill` distinguishes
 /// them).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RectObj {
     /// Bounds (physical px).
     pub rect: PhysicalRect,
@@ -191,7 +191,7 @@ pub struct RectObj {
 }
 
 /// Stroked/filled ellipse inside `rect` (○ / ● tools).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EllipseObj {
     /// Bounds (physical px).
     pub rect: PhysicalRect,
@@ -210,7 +210,7 @@ pub struct EllipseObj {
 }
 
 /// Straight segment with styled ends (the ↗ arrow tool).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LineObj {
     /// Start point.
     pub a: Pos2,
@@ -235,7 +235,7 @@ pub struct LineObj {
 }
 
 /// The ⬆ fancy arrow: a tapered filled shape from `a` to `b`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FancyObj {
     /// Tail point.
     pub a: Pos2,
@@ -257,7 +257,7 @@ pub struct FancyObj {
 
 /// A freehand polyline — pencil, eraser (opaque colour) and line
 /// highlight (translucent colour) all share this payload.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FreeObj {
     /// Polyline points in order.
     pub points: Vec<Pos2>,
@@ -274,7 +274,7 @@ pub struct FreeObj {
 }
 
 /// Translucent filled area (the zone-highlighter tool).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AreaObj {
     /// Bounds.
     pub rect: PhysicalRect,
@@ -293,7 +293,7 @@ pub struct AreaObj {
 }
 
 /// Plain text anchored at `pos` (the "A" tool).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextObj {
     /// Baseline start — the left GREY extremity anchor.
     pub a: Pos2,
@@ -330,7 +330,7 @@ pub struct TextObj {
 }
 
 /// A text box (rect or oval callout) with wrapped text inside.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BoxObj {
     /// The box bounds.
     pub rect: PhysicalRect,
@@ -369,7 +369,7 @@ pub struct BoxObj {
 }
 
 /// A numbered/lettered step badge (the "①" tool).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StepObj {
     /// Badge centre.
     pub pos: Pos2,
@@ -434,7 +434,7 @@ impl StampId {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StampObj {
     /// Top-left anchor.
     pub pos: Pos2,
@@ -449,11 +449,12 @@ pub struct StampObj {
 }
 
 /// An inserted bitmap (the 🖼 tool) — pixels stored on the object.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PicObj {
     /// Placement bounds (the image is stretched to fit).
     pub rect: PhysicalRect,
-    /// The inserted pixels.
+    /// The inserted pixels — persisted as a PNG blob.
+    #[serde(with = "crate::store::ser::rgba_png")]
     pub image: image::RgbaImage,
     /// Object opacity 0–1.
     pub opacity: f32,
@@ -463,7 +464,7 @@ pub struct PicObj {
 
 /// A flood fill (the bucket tool) — `mask` is precomputed at creation:
 /// the connected region under `origin` within `tolerance`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FillObj {
     /// Seed point (physical px).
     pub origin: Pos2,
@@ -474,12 +475,14 @@ pub struct FillObj {
     /// `true` erases to transparent instead of painting.
     pub transparent: bool,
     /// Coverage mask, full-document size (alpha = coverage). Computed
-    /// once when the object is placed, stored for rendering.
+    /// once when the object is placed, stored for rendering — persisted
+    /// as a PNG blob.
+    #[serde(with = "crate::store::ser::rgba_png")]
     pub mask: image::RgbaImage,
 }
 
 /// A blur/pixelate region (parametric — rendered live from the base).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlurObj {
     /// Region bounds.
     pub rect: PhysicalRect,
@@ -492,7 +495,7 @@ pub struct BlurObj {
 }
 
 /// Geometry/content of one annotation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AnnotationKind {
     /// □ / ■ rectangle.
     Rect(RectObj),
@@ -525,7 +528,7 @@ pub enum AnnotationKind {
 }
 
 /// One annotation object.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Annotation {
     /// Identity for undo/redo, hit-testing and selection.
     pub id: AnnotationId,
@@ -781,6 +784,17 @@ impl Document {
             revision: 0,
             next_id: 0,
         }
+    }
+
+    /// The next id [`Self::alloc_id`] will hand out — persisted so a
+    /// restored document never re-issues an id its annotations use.
+    pub fn next_id(&self) -> AnnotationId {
+        self.next_id
+    }
+
+    /// Sets the id counter (session restore only).
+    pub fn set_next_id(&mut self, id: AnnotationId) {
+        self.next_id = id;
     }
 
     /// Allocates a fresh annotation id.
