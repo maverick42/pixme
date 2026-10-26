@@ -385,13 +385,25 @@ pub struct StepObj {
     pub bg: Color32,
     /// Counter glyph colour.
     pub fg: Color32,
+    /// Outline thickness, physical px (0 = none).
+    #[serde(default)]
+    pub ring: f32,
+    /// Outline colour.
+    #[serde(default = "default_step_ring")]
+    pub ring_color: Color32,
     /// Object opacity 0–1.
     pub opacity: f32,
     /// Drop-shadow offset px.
     pub shadow: f32,
+    /// Letters mode: render a/b/c instead of A/B/C.
+    #[serde(default)]
+    pub lower: bool,
 }
 
-/// A Lucide icon stamp (the 😊 / cursor tools).
+/// White is the default badge outline colour.
+fn default_step_ring() -> Color32 {
+    Color32::WHITE
+}
 impl StampId {
     /// Every stamp, in popup order (cursors, badges, note, emoji).
     pub const ALL: [StampId; 15] = [
@@ -580,7 +592,7 @@ impl AnnotationKind {
             }
             Self::TextBox(o) => o.rect,
             Self::Step(o) => {
-                let r = step_radius(o.size) as i32;
+                let r = (step_radius(o.size) + o.ring.max(0.0) * 0.65).ceil() as i32;
                 PhysicalRect {
                     x: o.pos.x as i32 - r,
                     y: o.pos.y as i32 - r,

@@ -29,7 +29,7 @@ use crate::ui::viewer::Tab;
 
 /// Current layout — a file carrying another version is wiped clean
 /// rather than migrated (the session is a convenience, not an archive).
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Days a `.bak` recovery copy survives a rebuild — the captures it
 /// contains must not linger forever.
@@ -818,8 +818,11 @@ mod tests {
                     size: super::super::editor::document::StepSize::Large,
                     bg: Color32::from_rgb(10, 20, 30),
                     fg: Color32::WHITE,
+                    ring: 2.0,
+                    ring_color: Color32::WHITE,
                     opacity: 0.75,
                     shadow: 1.5,
+                    lower: false,
                 }),
             },
         ];
@@ -851,7 +854,7 @@ mod tests {
     }
 
     /// See `postcard_layout_is_golden`.
-    const EXPECTED: &str = "02010002040304ff0000ff0000004001010000ffff000080400000003f0000404002090000f04000000841030001020a141effffffffff0000403f0000c03f0200040002040304ff0000ff0000004001010000ffff000080400000003f000040400202050002040304ff0000ff0000004001010000ffff000080400000003f00004040060002040304ff0000ff0000004001010000ffff000080400000003f000040400101070002040304ff0000ff0000004001010000ffff000080400000003f0000404000";
+    const EXPECTED: &str = "02010002040304ff0000ff0000004001010000ffff000080400000003f0000404002090000f04000000841030001020a141effffffffff00000040ffffffff0000403f0000c03f000200040002040304ff0000ff0000004001010000ffff000080400000003f000040400202050002040304ff0000ff0000004001010000ffff000080400000003f00004040060002040304ff0000ff0000004001010000ffff000080400000003f000040400101070002040304ff0000ff0000004001010000ffff000080400000003f0000404000";
     /// `Today` keeps only captures taken this morning or later;
     /// `Never` empties the store and `document_count` reports them.
     #[test]

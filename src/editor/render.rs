@@ -159,7 +159,7 @@ fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
         AnnotationKind::HighlightArea(o) => (0.0, o.opacity),
         AnnotationKind::Text(o) => (o.shadow, o.opacity),
         AnnotationKind::TextBox(o) => (o.shadow, o.opacity),
-        AnnotationKind::Step(o) => (o.shadow, o.opacity),
+        AnnotationKind::Step(o) => (0.0, o.opacity),
         AnnotationKind::Stamp(o) => (0.0, o.opacity),
         AnnotationKind::Picture(o) => (o.shadow, o.opacity),
         AnnotationKind::Fill(_) | AnnotationKind::Blur(_) => (0.0, 1.0),
@@ -1047,47 +1047,153 @@ fn wrap_text(content: &str, size: f32, bold: bool, max_w: f32) -> Vec<String> {
     out
 }
 
-/// A numbered step badge.
+/// A numbered/lettered step badge rendered with analytical signed-distance
+/// anti-aliasing (concentric inner fill + ring + soft drop shadow) and a
+/// 4× supersampled, ink-centred counter glyph.
 fn draw_step(img: &mut RgbaImage, o: &super::document::StepObj) {
-    let r = match o.size {
-        StepSize::Small => 12.0,
-        StepSize::Medium => 18.0,
-        StepSize::Large => 26.0,
+    let r_in = match o.size {
+        StepSize::Small => 11.0_f32,
+        StepSize::Medium => 15.0_f32,
+        StepSize::Large => 21.0_f32,
     };
-    let (cx, cy) = (o.pos.x as i32, o.pos.y as i32);
-    match o.style {
-        StepStyle::Circle => drw::draw_filled_circle_mut(img, (cx, cy), r as i32, c32(o.bg)),
-        StepStyle::Square => drw::draw_polygon_mut(
-            img,
-            &points_i32(&[
-                imageproc::point::Point::new(o.pos.x - r, o.pos.y - r),
-                imageproc::point::Point::new(o.pos.x + r, o.pos.y - r),
-                imageproc::point::Point::new(o.pos.x + r, o.pos.y + r),
-                imageproc::point::Point::new(o.pos.x - r, o.pos.y + r),
-            ]),
-            c32(o.bg),
-        ),
-    }
-    let label = step_label(o.mode, o.count);
-    let fs = r * 1.05;
-    let (tw, th) = drw::text_size(ab_glyph::PxScale::from(fs), font(true), &label);
+    let ring_px = o.ring.max(0.0) * 0.65;
+    let r_out = r_in + ring_px;
+    let cr_in = (r_in * 0.26).max(2.5);
+    let core = (r_in - cr_in).max(0.0);
+    let d_inner = |dx: f32, dy: f32| -> f32 {
+        match o.style {
+            StepStyle::Circle => dx.hypot(dy) - r_in,
+            StepStyle::Square => {
+                let (qx, qy) = (dx.abs() - core, dy.abs() - core);
+                qx.max(0.0).hypot(qy.max(0.0)) + qx.min(0.0).max(qy.min(0.0)) - cr_in
+            }
+        }
+    };
+
+    // Rasterize the counter glyph at 4× and find its true ink bounding box
+    // so digits and letters sit at the exact geometric centre of the badge.
+    const SS: i32 = 4;
+    let label = step_label(o.mode, o.count, o.lower);
+    let fs4 = r_in * 1.18 * SS as f32;
+    let (tw, th) = drw::text_size(ab_glyph::PxScale::from(fs4), font(true), &label);
+    let gw = (tw + 16).max(16);
+    let gh = (th + 16).max(16);
+    let mut gbuf = RgbaImage::new(gw, gh);
     drw::draw_text_mut(
-        img,
-        c32(o.fg),
-        (o.pos.x - tw as f32 / 2.0) as i32,
-        (o.pos.y - th as f32 / 2.0 - fs * 0.08) as i32,
-        ab_glyph::PxScale::from(fs),
+        &mut gbuf,
+        Rgba([255, 255, 255, 255]),
+        8,
+        8,
+        ab_glyph::PxScale::from(fs4),
         font(true),
         &label,
     );
+    let (mut gx0, mut gy0, mut gx1, mut gy1) = (gw as i32, gh as i32, 0i32, 0i32);
+    for (x, y, p) in gbuf.enumerate_pixels() {
+        if p.0[3] > 16 {
+            gx0 = gx0.min(x as i32);
+            gy0 = gy0.min(y as i32);
+            gx1 = gx1.max(x as i32);
+            gy1 = gy1.max(y as i32);
+        }
+    }
+    let (gcx, gcy) = if gx0 <= gx1 && gy0 <= gy1 {
+        ((gx0 + gx1) as f32 * 0.5, (gy0 + gy1) as f32 * 0.5)
+    } else {
+        (gw as f32 * 0.5, gh as f32 * 0.5)
+    };
+
+    let sample_glyph = |dx: f32, dy: f32| -> f32 {
+        let bx = (gcx + dx * SS as f32 - 1.5).round() as i32;
+        let by = (gcy + dy * SS as f32 - 1.5).round() as i32;
+        if bx + SS < 0 || by + SS < 0 || bx >= gw as i32 || by >= gh as i32 {
+            return 0.0;
+        }
+        let mut sum = 0u32;
+        for sy in 0..SS {
+            let py = by + sy;
+            if py < 0 || py >= gh as i32 {
+                continue;
+            }
+            for sx in 0..SS {
+                let px = bx + sx;
+                if px >= 0 && px < gw as i32 {
+                    sum += u32::from(gbuf.get_pixel(px as u32, py as u32).0[3]);
+                }
+            }
+        }
+        sum as f32 / (255.0 * (SS * SS) as f32)
+    };
+
+    let (bg, fg, rc) = (o.bg, o.fg, o.ring_color);
+    let pad = (r_out + if o.shadow > 0.0 { 8.0 } else { 2.0 }).ceil() as i32;
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let x0 = (o.pos.x.floor() as i32 - pad).max(0);
+    let y0 = (o.pos.y.floor() as i32 - pad).max(0);
+    let x1 = (o.pos.x.ceil() as i32 + pad).min(iw - 1);
+    let y1 = (o.pos.y.ceil() as i32 + pad).min(ih - 1);
+
+    for py in y0..=y1 {
+        let dy = py as f32 - o.pos.y;
+        for px in x0..=x1 {
+            let dx = px as f32 - o.pos.x;
+            let din = d_inner(dx, dy);
+            let dout = din - ring_px;
+            let cov_out = (0.5 - dout).clamp(0.0, 1.0);
+
+            let sh_a = if o.shadow > 0.0 && cov_out < 1.0 {
+                let dsh = d_inner(dx - 1.0, dy - 1.8) - ring_px;
+                let t = (1.0 - (dsh + 0.8) / 5.2).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t) * 0.40
+            } else {
+                0.0
+            };
+
+            let total_a = cov_out + sh_a * (1.0 - cov_out);
+            if total_a <= 1.0 / 255.0 {
+                continue;
+            }
+
+            let (mut br, mut bg_c, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
+            if cov_out > 0.0 {
+                let cov_in = if ring_px > 0.0 {
+                    (0.5 - din).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                br = f32::from(rc.r()) * (1.0 - cov_in) + f32::from(bg.r()) * cov_in;
+                bg_c = f32::from(rc.g()) * (1.0 - cov_in) + f32::from(bg.g()) * cov_in;
+                bb = f32::from(rc.b()) * (1.0 - cov_in) + f32::from(bg.b()) * cov_in;
+
+                if cov_in > 0.0 {
+                    let ga = (sample_glyph(dx, dy) * cov_in).clamp(0.0, 1.0);
+                    if ga > 0.0 {
+                        br = br * (1.0 - ga) + f32::from(fg.r()) * ga;
+                        bg_c = bg_c * (1.0 - ga) + f32::from(fg.g()) * ga;
+                        bb = bb * (1.0 - ga) + f32::from(fg.b()) * ga;
+                    }
+                }
+            }
+
+            let w_badge = cov_out / total_a;
+            let out_r = (br * w_badge).round().clamp(0.0, 255.0) as u8;
+            let out_g = (bg_c * w_badge).round().clamp(0.0, 255.0) as u8;
+            let out_b = (bb * w_badge).round().clamp(0.0, 255.0) as u8;
+            let out_a = (total_a * 255.0).round().clamp(0.0, 255.0) as u8;
+            img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
+        }
+    }
 }
 
 /// The counter glyph for a step (`1`/`2`/`3` or `A`/`B`/`C`).
-fn step_label(mode: StepMode, count: u32) -> String {
+fn step_label(mode: StepMode, count: u32, lower: bool) -> String {
     match mode {
         StepMode::Numbers => count.to_string(),
         StepMode::Letters => {
-            String::from(char::from_u32('A' as u32 + count.saturating_sub(1) % 26).unwrap_or('A'))
+            let base = if lower { 'a' } else { 'A' } as u32;
+            String::from(
+                char::from_u32(base + count.saturating_sub(1) % 26).unwrap_or(base as u8 as char),
+            )
         }
     }
 }

@@ -169,8 +169,18 @@ struct Opts {
     step_mode: StepMode,
     step_style: StepStyle,
     step_size: StepSize,
-    step_fixed: Option<u32>,
+    /// Next number counter ("Étape 1.2.3…"); auto-increments on click.
+    step_next_num: u32,
+    /// Next letter counter ("Étape A.B.C…"); auto-increments on click.
+    step_next_let: u32,
     step_bg: Color32,
+    step_fg: Color32,
+    /// Outline thickness 0..=10 (5 by default).
+    step_ring: f32,
+    /// Outline colour.
+    step_ring_color: Color32,
+    step_shadow: bool,
+    step_lower: bool,
     // Stamps.
     stamp: StampId,
     stamp_size: f32,
@@ -230,8 +240,14 @@ impl Default for Opts {
             step_mode: StepMode::Numbers,
             step_style: StepStyle::Circle,
             step_size: StepSize::Medium,
-            step_fixed: None,
+            step_next_num: 1,
+            step_next_let: 1,
             step_bg: Color32::from_rgb(225, 40, 40),
+            step_fg: Color32::WHITE,
+            step_ring: 5.0,
+            step_ring_color: Color32::WHITE,
+            step_shadow: true,
+            step_lower: false,
             stamp: StampId::Smile,
             stamp_size: 32.0,
         }
@@ -1575,25 +1591,38 @@ impl DrawSession {
                 }
             }
             Tool::Step => {
-                let count = self.opts.step_fixed.unwrap_or_else(|| {
-                    self.doc
-                        .annotations
-                        .iter()
-                        .filter(|a| matches!(a.kind, AnnotationKind::Step(_)))
-                        .count() as u32
-                        + 1
-                });
-                self.add(AnnotationKind::Step(StepObj {
-                    pos: p,
-                    count,
-                    mode: self.opts.step_mode,
-                    style: self.opts.step_style,
-                    size: self.opts.step_size,
-                    bg: self.opts.step_bg,
-                    fg: Color32::WHITE,
-                    opacity: self.opts.opacity,
-                    shadow: self.opts.shadow,
-                }));
+                let count = match self.opts.step_mode {
+                    StepMode::Numbers => {
+                        let c = self.opts.step_next_num.max(1);
+                        self.opts.step_next_num = c + 1;
+                        c
+                    }
+                    StepMode::Letters => {
+                        let c = self.opts.step_next_let.max(1);
+                        self.opts.step_next_let = c + 1;
+                        c
+                    }
+                };
+                let id = self.doc.alloc_id();
+                let anno = Annotation {
+                    id,
+                    kind: AnnotationKind::Step(StepObj {
+                        pos: p,
+                        count,
+                        mode: self.opts.step_mode,
+                        style: self.opts.step_style,
+                        size: self.opts.step_size,
+                        bg: self.opts.step_bg,
+                        fg: self.opts.step_fg,
+                        ring: self.opts.step_ring,
+                        ring_color: self.opts.step_ring_color,
+                        opacity: self.opts.opacity,
+                        shadow: if self.opts.step_shadow { 3.0 } else { 0.0 },
+                        lower: self.opts.step_lower,
+                    }),
+                };
+                let index = self.doc.annotations.len();
+                self.apply(AnnoEdit::Add { anno, index });
             }
             Tool::Fill => {
                 let mask = render::compute_fill_mask(
@@ -2309,29 +2338,97 @@ impl DrawSession {
     fn options_bar(&mut self, ui: &mut Ui, shared: &Shared) {
         let tk = theme::tokens(ui.ctx());
         let title = self.bottom_tab_title();
+        let sel_step_mode = self
+            .selected
+            .and_then(|id| self.doc.annotation(id))
+            .and_then(|a| match &a.kind {
+                AnnotationKind::Step(o) => Some(o.mode),
+                _ => None,
+            });
+        let step_bar = sel_step_mode.is_some()
+            || (self.sel_area.is_none()
+                && self.selected.is_none()
+                && matches!(self.tool, Tool::Step));
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            // Tab header chip.
+            // Tab header chip (two clickable mode tabs for the step marker).
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
-                egui::Frame::NONE
-                    .fill(tk.field)
-                    .stroke(Stroke::new(1.0, tk.field_border))
-                    .corner_radius(CornerRadius {
-                        nw: 4,
-                        ne: 4,
-                        sw: 0,
-                        se: 0,
-                    })
-                    .inner_margin(egui::Margin::symmetric(10, 2))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(title.as_ref())
-                                .size(11.5)
-                                .strong()
-                                .color(tk.text),
+                if step_bar {
+                    let cur_mode = sel_step_mode.unwrap_or(self.opts.step_mode);
+                    for (mode, key) in [
+                        (StepMode::Numbers, "draw.step.tab_num"),
+                        (StepMode::Letters, "draw.step.tab_let"),
+                    ] {
+                        let on = cur_mode == mode;
+                        let label = if on {
+                            format!("● {}", t!(key))
+                        } else {
+                            t!(key).to_string()
+                        };
+                        let inner = egui::Frame::NONE
+                            .fill(if on { tk.field } else { tk.dock })
+                            .stroke(Stroke::new(
+                                if on { 1.5 } else { 1.0 },
+                                if on { tk.accent } else { tk.field_border },
+                            ))
+                            .corner_radius(CornerRadius {
+                                nw: 4,
+                                ne: 4,
+                                sw: 0,
+                                se: 0,
+                            })
+                            .inner_margin(egui::Margin::symmetric(10, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(label).size(11.5).strong().color(if on {
+                                        tk.text
+                                    } else {
+                                        tk.text_dim
+                                    }),
+                                );
+                            });
+                        let resp = ui.interact(
+                            inner.response.rect,
+                            ui.id().with(("pixme-step-tab", mode as u8)),
+                            egui::Sense::click(),
                         );
-                    });
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() && !on {
+                            self.opts.step_mode = mode;
+                            if let Some(id) = self.selected
+                                && let Some(before) = self.doc.annotation(id).cloned()
+                                && let Some(a) = self.doc.annotation_mut(id)
+                                && let AnnotationKind::Step(o) = &mut a.kind
+                            {
+                                o.mode = mode;
+                                let after = a.clone();
+                                self.apply(AnnoEdit::Replace { before, after });
+                            }
+                        }
+                    }
+                } else {
+                    egui::Frame::NONE
+                        .fill(tk.field)
+                        .stroke(Stroke::new(1.0, tk.field_border))
+                        .corner_radius(CornerRadius {
+                            nw: 4,
+                            ne: 4,
+                            sw: 0,
+                            se: 0,
+                        })
+                        .inner_margin(egui::Margin::symmetric(10, 2))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(title.as_ref())
+                                    .size(11.5)
+                                    .strong()
+                                    .color(tk.text),
+                            );
+                        });
+                }
             });
             // Tab body: reserve the right-hand buttons first, then fill
             // the remaining strip with a vertically-centred row so every
@@ -2568,40 +2665,25 @@ impl DrawSession {
                 opacity_pct_slider(ui, &mut o.opacity);
             }
             Tool::Step => {
-                enum_combo(
+                let count = match o.step_mode {
+                    StepMode::Numbers => &mut o.step_next_num,
+                    StepMode::Letters => &mut o.step_next_let,
+                };
+                step_options_row(
                     ui,
-                    "draw.opt.mode",
+                    "draw.bar.step",
                     o.step_mode,
-                    &[
-                        (StepMode::Numbers, t!("draw.opt.numbers")),
-                        (StepMode::Letters, t!("draw.opt.letters")),
-                    ],
-                    |v| o.step_mode = v,
+                    count,
+                    &mut o.step_lower,
+                    &mut o.step_bg,
+                    &mut o.step_fg,
+                    &mut o.step_style,
+                    &mut o.step_size,
+                    &mut o.step_ring,
+                    &mut o.step_ring_color,
+                    &mut o.opacity,
+                    &mut o.step_shadow,
                 );
-                enum_combo(
-                    ui,
-                    "draw.opt.style",
-                    o.step_style,
-                    &[
-                        (StepStyle::Circle, "●".into()),
-                        (StepStyle::Square, "■".into()),
-                    ],
-                    |v| o.step_style = v,
-                );
-                enum_combo(
-                    ui,
-                    "draw.opt.size",
-                    o.step_size,
-                    &[
-                        (StepSize::Small, "S".into()),
-                        (StepSize::Medium, "M".into()),
-                        (StepSize::Large, "L".into()),
-                    ],
-                    |v| o.step_size = v,
-                );
-                ui.label(t!("draw.opt.bg"));
-                color_btn(ui, &mut o.step_bg);
-                shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
             }
             Tool::Stamps => {
                 // The stamp glyph picker.
@@ -2762,15 +2844,25 @@ impl DrawSession {
                     changed |= opacity_pct_slider(ui, &mut o.opacity);
                 }
                 AnnotationKind::Step(o) => {
-                    let mut n = o.count as i32;
-                    if ui
-                        .add(egui::DragValue::new(&mut n).range(0..=999))
-                        .changed()
-                    {
-                        o.count = n.max(0) as u32;
+                    let mut sh_on = o.shadow > 0.0;
+                    if step_options_row(
+                        ui,
+                        "draw.sel.step",
+                        o.mode,
+                        &mut o.count,
+                        &mut o.lower,
+                        &mut o.bg,
+                        &mut o.fg,
+                        &mut o.style,
+                        &mut o.size,
+                        &mut o.ring,
+                        &mut o.ring_color,
+                        &mut o.opacity,
+                        &mut sh_on,
+                    ) {
+                        o.shadow = if sh_on { 3.0 } else { 0.0 };
                         changed = true;
                     }
-                    changed |= color_btn(ui, &mut o.bg).changed();
                 }
                 AnnotationKind::Stamp(o) => {
                     changed |= color_btn(ui, &mut o.color).changed();
@@ -3029,7 +3121,24 @@ fn slider(
 /// (e.g. white outline) remain visible on the light theme.
 fn color_btn(ui: &mut Ui, c: &mut Color32) -> Response {
     let border = theme::tokens(ui.ctx()).field_border;
-    let r = ui.color_edit_button_srgba(c);
+    let id = ui.next_auto_id();
+    let mut hsva: egui::epaint::Hsva = ui
+        .ctx()
+        .data_mut(|d| d.get_temp(id))
+        .filter(|cached: &egui::epaint::Hsva| Color32::from(*cached) == *c)
+        .unwrap_or_else(|| egui::epaint::Hsva::from(*c));
+    let old_h = hsva.h;
+    let r = egui::widgets::color_picker::color_edit_button_hsva(
+        ui,
+        &mut hsva,
+        egui::widgets::color_picker::Alpha::Opaque,
+    );
+    if (hsva.h - old_h).abs() > 1e-4 && (hsva.s < 0.02 || hsva.v < 0.02) {
+        hsva.s = 1.0;
+        hsva.v = 1.0;
+    }
+    *c = Color32::from(hsva);
+    ui.ctx().data_mut(|d| d.insert_temp(id, hsva));
     ui.painter().rect_stroke(
         r.rect,
         CornerRadius::same(3),
@@ -3226,4 +3335,106 @@ fn enum_combo<T: Copy + PartialEq>(
     if choice != cur {
         set(choice);
     }
+}
+
+/// Single-row option strip shared by `Tool::Step` and a selected `StepObj`.
+#[allow(clippy::too_many_arguments)]
+fn step_options_row(
+    ui: &mut Ui,
+    salt: &'static str,
+    mode: StepMode,
+    count: &mut u32,
+    lower: &mut bool,
+    bg: &mut Color32,
+    fg: &mut Color32,
+    style: &mut StepStyle,
+    size: &mut StepSize,
+    ring: &mut f32,
+    ring_color: &mut Color32,
+    opacity: &mut f32,
+    shadow_on: &mut bool,
+) -> bool {
+    let mut changed = false;
+    ui.label(if mode == StepMode::Letters {
+        t!("draw.opt.letter")
+    } else {
+        t!("draw.opt.count")
+    });
+    let mut n = (*count).max(1) as i32;
+    let is_lower = *lower;
+    let dv = egui::DragValue::new(&mut n).range(1..=999).speed(0.2);
+    let dv = if mode == StepMode::Letters {
+        dv.custom_formatter(move |v, _| {
+            let base = if is_lower { 'a' } else { 'A' } as u32;
+            char::from_u32(base + (v as u32).saturating_sub(1) % 26)
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+        })
+    } else {
+        dv
+    };
+    if ui.add(dv).changed() {
+        *count = n.max(1) as u32;
+        changed = true;
+    }
+    if mode == StepMode::Letters
+        && ui
+            .checkbox(lower, t!("draw.opt.lower").to_string())
+            .changed()
+    {
+        changed = true;
+    }
+
+    ui.label(t!("draw.opt.bg"));
+    changed |= color_btn(ui, bg).changed();
+    ui.label(t!("draw.opt.fg"));
+    changed |= color_btn(ui, fg).changed();
+
+    ui.label(t!("draw.opt.style"));
+    let cur_style = *style;
+    let mut picked_style = cur_style;
+    egui::ComboBox::from_id_salt((salt, "style"))
+        .width(46.0)
+        .selected_text(match cur_style {
+            StepStyle::Circle => "●",
+            StepStyle::Square => "■",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut picked_style, StepStyle::Circle, "●");
+            ui.selectable_value(&mut picked_style, StepStyle::Square, "■");
+        });
+    if picked_style != cur_style {
+        *style = picked_style;
+        changed = true;
+    }
+
+    ui.label(t!("draw.opt.size"));
+    let cur_size = *size;
+    let mut picked_size = cur_size;
+    egui::ComboBox::from_id_salt((salt, "size"))
+        .width(46.0)
+        .selected_text(match cur_size {
+            StepSize::Small => "S",
+            StepSize::Medium => "M",
+            StepSize::Large => "L",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut picked_size, StepSize::Small, "S");
+            ui.selectable_value(&mut picked_size, StepSize::Medium, "M");
+            ui.selectable_value(&mut picked_size, StepSize::Large, "L");
+        });
+    if picked_size != cur_size {
+        *size = picked_size;
+        changed = true;
+    }
+
+    ui.label(t!("draw.opt.outline"));
+    changed |= outline_combo(ui, salt, ring);
+    changed |= color_btn(ui, ring_color).changed();
+
+    changed |= opacity_pct_slider(ui, opacity);
+    changed |= ui
+        .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
+        .changed();
+    changed
 }
