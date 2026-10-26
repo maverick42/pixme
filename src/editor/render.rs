@@ -208,20 +208,18 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
         AnnotationKind::HighlightStroke(o) => {
             stroke_freehand(&mut layer, o);
         }
-        AnnotationKind::HighlightArea(o) => draw_shape(
+        AnnotationKind::HighlightArea(o) => draw_shape_sdf(
             &mut layer,
             o.rect,
-            o.shape,
-            if o.shape == AreaShape::Round {
-                12.0
-            } else {
-                0.0
-            },
+            o.shape != AreaShape::Rect,
+            0.0,
             Some(o.color),
-            o.border.unwrap_or(Color32::TRANSPARENT),
-            if o.border.is_some() { 1.5 } else { 0.0 },
-            o.dash,
-            if o.soft { 0.5 } else { 1.0 },
+            Color32::TRANSPARENT,
+            0.0,
+            Dash::Solid,
+            0.0,
+            Color32::TRANSPARENT,
+            0.0,
         ),
         AnnotationKind::Text(o) => draw_text_obj(&mut layer, o),
         AnnotationKind::TextBox(o) => draw_textbox(&mut layer, o),

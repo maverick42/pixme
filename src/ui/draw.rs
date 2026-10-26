@@ -152,9 +152,7 @@ struct Opts {
     radius: f32,
     tip: TipShape,
     shape: AreaShape,
-    soft: bool,
-    border_on: bool,
-    /// Line highlighter coverage (defaults translucent).
+    /// Line / area highlighter coverage (defaults translucent).
     hl_opacity: f32,
     // Eraser tool.
     eraser_color: Color32,
@@ -236,8 +234,6 @@ impl Default for Opts {
             radius: 8.0,
             tip: TipShape::Round,
             shape: AreaShape::Rect,
-            soft: false,
-            border_on: false,
             hl_opacity: 0.45,
             eraser_color: Color32::WHITE,
             eraser_size: 12.0,
@@ -1565,10 +1561,10 @@ impl DrawSession {
                 rect: r,
                 color: o.color,
                 shape: o.shape,
-                border: o.border_on.then_some(o.fill_color),
-                dash: o.dash,
-                soft: o.soft,
-                opacity: o.opacity * 0.5,
+                border: None,
+                dash: Dash::Solid,
+                soft: false,
+                opacity: o.hl_opacity,
             }),
             Tool::Blur => AnnotationKind::Blur(BlurObj {
                 rect: r,
@@ -1933,15 +1929,37 @@ impl DrawSession {
                         }
                     }
                 }
-                Tool::HighlightArea | Tool::Blur | Tool::TextBoxRect | Tool::TextBoxOval => {
+                Tool::HighlightArea => {
+                    let r = Rect::from_two_pos(ca, cb);
+                    let fill_col = o.color.gamma_multiply(o.hl_opacity);
+                    if o.shape == AreaShape::Rect {
+                        painter.rect_filled(r, CornerRadius::ZERO, fill_col);
+                        painter.rect_stroke(
+                            r,
+                            CornerRadius::ZERO,
+                            Stroke::new(1.5, accent),
+                            StrokeKind::Inside,
+                        );
+                    } else {
+                        let radii = r.size() / 2.0;
+                        painter.add(egui::epaint::EllipseShape::filled(
+                            r.center(),
+                            radii,
+                            fill_col,
+                        ));
+                        painter.add(egui::epaint::EllipseShape::stroke(
+                            r.center(),
+                            radii,
+                            Stroke::new(1.5, accent),
+                        ));
+                    }
+                }
+                Tool::Blur | Tool::TextBoxRect | Tool::TextBoxOval => {
                     let r = Rect::from_two_pos(ca, cb);
                     painter.rect_stroke(
                         r,
                         CornerRadius::same(
-                            if matches!(
-                                self.tool,
-                                Tool::TextBoxRect | Tool::TextBoxOval | Tool::HighlightArea
-                            ) {
+                            if matches!(self.tool, Tool::TextBoxRect | Tool::TextBoxOval) {
                                 o.radius as u8
                             } else {
                                 0
@@ -2033,12 +2051,23 @@ impl DrawSession {
         );
         let is_bezier = matches!(a.kind, AnnotationKind::Text(_) | AnnotationKind::Line(_));
         if !is_bezier {
-            painter.rect_stroke(
-                cb,
-                CornerRadius::ZERO,
-                Stroke::new(1.0, accent),
-                StrokeKind::Outside,
-            );
+            if matches!(
+                &a.kind,
+                AnnotationKind::HighlightArea(o) if o.shape != AreaShape::Rect
+            ) {
+                painter.add(egui::epaint::EllipseShape::stroke(
+                    cb.center(),
+                    cb.size() / 2.0,
+                    Stroke::new(1.0, accent),
+                ));
+            } else {
+                painter.rect_stroke(
+                    cb,
+                    CornerRadius::ZERO,
+                    Stroke::new(1.0, accent),
+                    StrokeKind::Outside,
+                );
+            }
         }
         // Handles.
         match &a.kind {
@@ -2914,15 +2943,13 @@ impl DrawSession {
                 opacity_pct_slider(ui, &mut o.hl_opacity);
             }
             Tool::HighlightArea => {
-                color_btn(ui, &mut o.color);
-                shape_combo(ui, &mut o.shape);
-                ui.checkbox(&mut o.border_on, t!("draw.opt.border").to_string());
-                if o.border_on {
-                    color_btn(ui, &mut o.fill_color);
-                    dash_combo(ui, &mut o.dash);
-                }
-                ui.checkbox(&mut o.soft, t!("draw.opt.soft").to_string());
-                slider(ui, t!("draw.opt.opacity"), &mut o.opacity, 0.1..=1.0);
+                highlight_area_options_row(
+                    ui,
+                    "draw.bar.harea",
+                    &mut o.color,
+                    &mut o.shape,
+                    &mut o.hl_opacity,
+                );
             }
             Tool::Fill => {
                 color_btn(ui, &mut o.fill_color);
@@ -3146,9 +3173,18 @@ impl DrawSession {
                     changed |= opacity_pct_slider(ui, &mut o.opacity);
                 }
                 AnnotationKind::HighlightArea(o) => {
-                    changed |= color_btn(ui, &mut o.color).changed();
-                    changed |=
-                        slider(ui, t!("draw.opt.opacity"), &mut o.opacity, 0.1..=1.0).changed();
+                    if highlight_area_options_row(
+                        ui,
+                        "draw.sel.harea",
+                        &mut o.color,
+                        &mut o.shape,
+                        &mut o.opacity,
+                    ) {
+                        self.opts.color = o.color;
+                        self.opts.shape = o.shape;
+                        self.opts.hl_opacity = o.opacity;
+                        changed = true;
+                    }
                 }
                 AnnotationKind::Text(o) => {
                     // 1) Couleurs · 2) Taille (8..72) · 3) Bold · 4) Italic ·
@@ -3873,6 +3909,50 @@ fn tip_combo(ui: &mut Ui, tip: &mut TipShape) -> bool {
             ui.selectable_value(tip, TipShape::Square, "■");
         });
     *tip != cur
+}
+
+/// Option strip shared by `Tool::HighlightArea` and a selected `AreaObj`.
+fn highlight_area_options_row(
+    ui: &mut Ui,
+    salt: &'static str,
+    color: &mut Color32,
+    shape: &mut AreaShape,
+    opacity: &mut f32,
+) -> bool {
+    let mut changed = false;
+    ui.label(t!("draw.opt.color"));
+    changed |= color_btn(ui, color).changed();
+    ui.label(t!("draw.opt.style"));
+    let cur = if *shape == AreaShape::Rect {
+        AreaShape::Rect
+    } else {
+        AreaShape::Ellipse
+    };
+    let mut picked = cur;
+    egui::ComboBox::from_id_salt((salt, "shape"))
+        .selected_text(match cur {
+            AreaShape::Rect => t!("draw.shape.rect").to_string(),
+            _ => t!("draw.shape.circle").to_string(),
+        })
+        .width(96.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut picked,
+                AreaShape::Rect,
+                t!("draw.shape.rect").to_string(),
+            );
+            ui.selectable_value(
+                &mut picked,
+                AreaShape::Ellipse,
+                t!("draw.shape.circle").to_string(),
+            );
+        });
+    if picked != *shape {
+        *shape = picked;
+        changed = true;
+    }
+    changed |= opacity_pct_slider(ui, opacity);
+    changed
 }
 
 /// Area-shape combo.

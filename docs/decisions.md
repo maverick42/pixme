@@ -373,7 +373,6 @@ Format: date — context — decision — consequences.
 - **Rule of thumb**: never lock a `Mutex` in a `match`/`if let`
   scrutinee when an arm may re-lock it — bind the value first.
 
-
 ## 2026-10-24 — Fixed-region capture remembers its rect (session memory)
 
 - **User requirement**: the first `FixedRegion` call shows the placement
@@ -391,7 +390,6 @@ Format: date — context — decision — consequences.
 - **Scope**: session memory only (survives bar/viewer cycles, cleared on
   quit). Persisting to `settings.toml` like FastStone is a possible
   follow-up.
-
 
 ## 2026-10-24 — Pin capture: autonomous floating windows, image-level export
 
@@ -420,7 +418,6 @@ Format: date — context — decision — consequences.
   monitor correctness comes for free (all space math is monitor-logical);
   zoom changes the viewport's `InnerSize` rather than the texture, so
   scaling stays pixel-accurate.
-
 
 ## 2026-10-24 — Pin resize, white chrome, and a real save-as window
 
@@ -458,7 +455,6 @@ Format: date — context — decision — consequences.
   Esc, window X, successful save) wakes the ROOT anchor — forgetting to
   left the viewport registered and produced a ghost window (the same
   latent trap existed on the settings window, fixed too).
-
 
 ## 2026-10-24 — Viewer toolbar: file/edit actions, zoom, marquee, resize
 
@@ -597,7 +593,7 @@ Format: date — context — decision — consequences.
     `captured_at`).
   - **No new dependency** (user's call): `editor::meta::new_id()` mints
     a UUIDv4-shaped string from `RandomState` entropy + nanos + counter
-    + pid; `hash_password` is a salted iterated FNV-1a stored as
+    plus pid; `hash_password` is a salted iterated FNV-1a stored as
     `v1:salt:hash`. The lock is a *screen lock*, not encryption — pixels
     stay in memory and saved files are unprotected.
   - Tab strip: red dot on the left marks unsaved-or-modified tabs
@@ -608,7 +604,7 @@ Format: date — context — decision — consequences.
   - **Closing a tab never warns** (user decision): the red dot is the
     warning. The session-level Save/Discard/Cancel confirmation still
     guards closing the whole viewer / quitting.
-  - Unique names everywhere: `unique_title` appends ` (n)` on clashes
+  - Unique names everywhere: `unique_title` appends `(n)` on clashes
     (push, duplicate), Rename validates case-insensitively against the
     other tabs.
   - **Protection**: menu-only entry ("Protection…"), per the feature's
@@ -800,3 +796,10 @@ Format: date — context — decision — consequences.
   dependencies; thumbnails reuse `render_to_image`, so they are
   WYSIWYG with annotations by construction. `Viewer::default` is now a
   manual impl (`mosaic_scale` starts at 1.0, not 0.0).
+
+## 2026-10-26 — Area highlighter options and SDF rendering
+
+- **Context**: The area highlighter (`Tool::HighlightArea` / `AnnotationKind::HighlightArea`) exposed unused border and soft-edge checkboxes in tool mode, hid its shape selector once an object was selected, drew a rounded-rectangle preview regardless of the active shape during drag, and rasterized through integer polygons instead of the analytical SDF path.
+- **Decision**: Share a single option strip (`highlight_area_options_row`) between `Tool::HighlightArea` and a selected `AreaObj` exposing only colour, shape (`Rectangle` / `Circle`) and percentage opacity (`10..=100%`, defaulting to `hl_opacity = 45%`). Render `HighlightArea` via `draw_shape_sdf` (sharp rectangle vs analytical ellipse) and match the live drag preview and selection outline to the chosen shape.
+- **Consequences**: Creating or editing an area highlight shows the exact same controls, respects the selected shape during drag, selection and export, and eliminates the opacity jump on creation.
+
