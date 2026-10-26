@@ -155,7 +155,7 @@ fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
         AnnotationKind::Ellipse(o) => (o.shadow, o.opacity),
         AnnotationKind::Line(o) => (0.0, o.opacity),
         AnnotationKind::Fancy(o) => (o.shadow, o.opacity),
-        AnnotationKind::Freehand(_) | AnnotationKind::HighlightStroke(_) => (0.0, 1.0),
+        AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => (0.0, o.opacity),
         AnnotationKind::HighlightArea(o) => (0.0, o.opacity),
         AnnotationKind::Text(o) => (o.shadow, o.opacity),
         AnnotationKind::TextBox(o) => (o.shadow, o.opacity),
@@ -625,16 +625,176 @@ fn draw_fancy(img: &mut RgbaImage, o: &super::document::FancyObj) {
     );
 }
 
-/// Pencil/eraser/highlight freehand stroke.
+/// Pencil/eraser/highlight freehand stroke with SDF anti-aliasing,
+/// dashing, unified outline (0–10) and soft drop shadow.
 fn stroke_freehand(img: &mut RgbaImage, o: &super::document::FreeObj) {
+    if o.points.is_empty() {
+        return;
+    }
     if o.soft {
-        // Soft edge: draw to a scratch layer, blur it, composite.
         let mut tmp = RgbaImage::new(img.width(), img.height());
-        stroke_polyline(&mut tmp, &o.points, o.width, o.color, o.tip, Dash::Solid);
+        stroke_polyline(&mut tmp, &o.points, o.width, o.color, o.tip, o.dash);
         let blurred = imageproc::filter::gaussian_blur_f32(&tmp, (o.width / 6.0).max(0.8));
         composite(img, &blurred, 0, 0, 1.0);
+        return;
+    }
+
+    let w = o.width.max(1.0);
+    let hw = w * 0.5;
+    let out_px = o.outline.max(0.0) * 0.65;
+
+    // Build arc-length table along `o.points` and clip to active dash runs.
+    let mut arc = Vec::with_capacity(o.points.len());
+    let mut total = 0.0_f32;
+    arc.push((0.0_f32, o.points[0]));
+    for pair in o.points.windows(2) {
+        let d = (pair[1] - pair[0]).length();
+        if d > 1e-4 {
+            total += d;
+            arc.push((total, pair[1]));
+        }
+    }
+
+    let sample_poly = |s: f32| -> Pos2 {
+        let s = s.clamp(0.0, total);
+        let idx = arc
+            .partition_point(|e| e.0 < s)
+            .min(arc.len().saturating_sub(1));
+        if idx == 0 {
+            return arc[0].1;
+        }
+        let (s0, p0) = arc[idx - 1];
+        let (s1, p1) = arc[idx];
+        let t = if (s1 - s0).abs() < 1e-4 {
+            0.0
+        } else {
+            (s - s0) / (s1 - s0)
+        };
+        lerp(p0, p1, t)
+    };
+
+    // Active sub-segments `(a, b, min_x, min_y, max_x, max_y)` for fast AABB culling.
+    let mut segs: Vec<(Pos2, Pos2, f32, f32, f32, f32)> = Vec::new();
+    if total < 0.5 {
+        let p = o.points[0];
+        segs.push((p, p, p.x, p.y, p.x, p.y));
     } else {
-        stroke_polyline(img, &o.points, o.width, o.color, o.tip, Dash::Solid);
+        for (u0, u1) in dash_runs(total, w, o.dash) {
+            let sa = u0 * total;
+            let sb = u1 * total;
+            let i0 = arc.partition_point(|e| e.0 <= sa);
+            let i1 = arc.partition_point(|e| e.0 < sb);
+            let mut prev = sample_poly(sa);
+            for &(s_mid, p_mid) in &arc[i0..i1] {
+                if s_mid > sa && s_mid < sb {
+                    segs.push((
+                        prev,
+                        p_mid,
+                        prev.x.min(p_mid.x),
+                        prev.y.min(p_mid.y),
+                        prev.x.max(p_mid.x),
+                        prev.y.max(p_mid.y),
+                    ));
+                    prev = p_mid;
+                }
+            }
+            let end_p = sample_poly(sb);
+            segs.push((
+                prev,
+                end_p,
+                prev.x.min(end_p.x),
+                prev.y.min(end_p.y),
+                prev.x.max(end_p.x),
+                prev.y.max(end_p.y),
+            ));
+        }
+    }
+
+    let reach = hw + out_px + 8.0;
+    let sdf_at = |p: Pos2| -> f32 {
+        let mut d = f32::INFINITY;
+        for &(a, b, x0, y0, x1, y1) in &segs {
+            if p.x < x0 - reach || p.x > x1 + reach || p.y < y0 - reach || p.y > y1 + reach {
+                continue;
+            }
+            let seg_d = match o.tip {
+                TipShape::Round => pt_seg_dist(p, a, b) - hw,
+                TipShape::Square => {
+                    let ab = b - a;
+                    let l2 = ab.length_sq();
+                    let q = if l2 < 1e-6 {
+                        a
+                    } else {
+                        a + ab * ((p - a).dot(ab) / l2).clamp(0.0, 1.0)
+                    };
+                    (p.x - q.x).abs().max((p.y - q.y).abs()) - hw
+                }
+            };
+            d = d.min(seg_d);
+        }
+        d
+    };
+
+    let mut x0f = f32::INFINITY;
+    let mut y0f = f32::INFINITY;
+    let mut x1f = f32::NEG_INFINITY;
+    let mut y1f = f32::NEG_INFINITY;
+    for p in &o.points {
+        x0f = x0f.min(p.x);
+        y0f = y0f.min(p.y);
+        x1f = x1f.max(p.x);
+        y1f = y1f.max(p.y);
+    }
+    let pad = (hw + out_px + if o.shadow > 0.0 { 8.0 } else { 3.0 }).ceil() as i32;
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let x0 = (x0f.floor() as i32 - pad).max(0);
+    let y0 = (y0f.floor() as i32 - pad).max(0);
+    let x1 = (x1f.ceil() as i32 + pad).min(iw - 1);
+    let y1 = (y1f.ceil() as i32 + pad).min(ih - 1);
+
+    let (fc, rc) = (o.color, o.outline_color);
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let p = Pos2::new(px as f32, py as f32);
+            let din = sdf_at(p);
+            if din > out_px + 7.0 {
+                continue;
+            }
+            let dout = din - out_px;
+            let cov_out = (0.5 - dout).clamp(0.0, 1.0);
+
+            let sh_a = if o.shadow > 0.0 && cov_out < 1.0 {
+                let dsh = sdf_at(Pos2::new(p.x - 1.2, p.y - 2.0)) - out_px;
+                let t = (1.0 - (dsh + 0.8) / 5.2).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t) * 0.42
+            } else {
+                0.0
+            };
+
+            let total_a = cov_out + sh_a * (1.0 - cov_out);
+            if total_a <= 1.0 / 255.0 {
+                continue;
+            }
+
+            let (mut br, mut bg_c, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
+            if cov_out > 0.0 {
+                let cov_in = if out_px > 0.0 {
+                    (0.5 - din).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                br = f32::from(rc.r()) * (1.0 - cov_in) + f32::from(fc.r()) * cov_in;
+                bg_c = f32::from(rc.g()) * (1.0 - cov_in) + f32::from(fc.g()) * cov_in;
+                bb = f32::from(rc.b()) * (1.0 - cov_in) + f32::from(fc.b()) * cov_in;
+            }
+
+            let w_body = cov_out / total_a;
+            let out_r = (br * w_body).round().clamp(0.0, 255.0) as u8;
+            let out_g = (bg_c * w_body).round().clamp(0.0, 255.0) as u8;
+            let out_b = (bb * w_body).round().clamp(0.0, 255.0) as u8;
+            let out_a = (total_a * 255.0).round().clamp(0.0, 255.0) as u8;
+            img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
+        }
     }
 }
 

@@ -1373,6 +1373,10 @@ impl DrawSession {
                 color: self.opts.fill_color,
                 width: self.opts.width * 2.5,
                 tip: self.opts.tip,
+                dash: Dash::Solid,
+                outline: 0.0,
+                outline_color: Color32::WHITE,
+                shadow: 0.0,
                 soft: false,
                 opacity: self.opts.opacity,
             }),
@@ -1381,6 +1385,10 @@ impl DrawSession {
                 color: self.opts.color,
                 width: self.opts.width * 4.0,
                 tip: TipShape::Round,
+                dash: Dash::Solid,
+                outline: 0.0,
+                outline_color: Color32::WHITE,
+                shadow: 0.0,
                 soft: self.opts.soft,
                 opacity: 0.45,
             }),
@@ -1389,6 +1397,10 @@ impl DrawSession {
                 color: self.opts.color,
                 width: self.opts.width,
                 tip: self.opts.tip,
+                dash: self.opts.dash,
+                outline: self.opts.outline,
+                outline_color: self.opts.line_outline_color,
+                shadow: if self.opts.line_shadow { 3.0 } else { 0.0 },
                 soft: false,
                 opacity: self.opts.opacity,
             }),
@@ -1708,6 +1720,53 @@ impl DrawSession {
                 to_canvas(cur, self.img_rect),
             );
             sel_chrome(painter, r, theme::tokens(painter.ctx()).accent);
+            return;
+        }
+        // Live freehand stroke preview while dragging pencil / eraser / highlighter.
+        if let Drag::Freehand { points } = drag
+            && !points.is_empty()
+        {
+            let o = &self.opts;
+            let img_rect = self.img_rect;
+            let cpts: Vec<Pos2> = points.iter().map(|&p| to_canvas(p, img_rect)).collect();
+            let (col, w_px, out_px) = match self.tool {
+                Tool::Eraser => (
+                    o.fill_color.gamma_multiply(o.opacity),
+                    (o.width * 2.5 * scale).max(1.5),
+                    0.0,
+                ),
+                Tool::HighlightLine => (
+                    o.color.gamma_multiply(0.45),
+                    (o.width * 4.0 * scale).max(2.0),
+                    0.0,
+                ),
+                _ => (
+                    o.color.gamma_multiply(o.opacity),
+                    (o.width * scale).max(1.0),
+                    o.outline.max(0.0) * 0.65 * 2.0 * scale,
+                ),
+            };
+            if cpts.len() == 1 {
+                if out_px > 0.0 {
+                    painter.circle_filled(
+                        cpts[0],
+                        (w_px + out_px) * 0.5,
+                        o.line_outline_color.gamma_multiply(o.opacity),
+                    );
+                }
+                painter.circle_filled(cpts[0], w_px * 0.5, col);
+            } else {
+                if out_px > 0.0 {
+                    painter.add(egui::Shape::line(
+                        cpts.clone(),
+                        Stroke::new(
+                            w_px + out_px,
+                            o.line_outline_color.gamma_multiply(o.opacity),
+                        ),
+                    ));
+                }
+                painter.add(egui::Shape::line(cpts, Stroke::new(w_px, col)));
+            }
             return;
         }
         // Shapes preview from anchor → current point.
@@ -2508,20 +2567,25 @@ impl DrawSession {
                 slider(ui, t!("draw.opt.outline"), &mut o.outline, 0.0..=6.0);
                 shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
             }
-            Tool::Pencil | Tool::Eraser => {
-                w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0);
-                // Pencil paints the ink colour; the eraser paints the
-                // (opaque) background colour — both optionable.
-                color_btn(
+            Tool::Pencil => {
+                pencil_options_row(
                     ui,
-                    if self.tool == Tool::Eraser {
-                        &mut o.fill_color
-                    } else {
-                        &mut o.color
-                    },
+                    "draw.bar.pencil",
+                    &mut o.color,
+                    &mut o.width,
+                    &mut o.tip,
+                    &mut o.dash,
+                    &mut o.outline,
+                    &mut o.line_outline_color,
+                    &mut o.opacity,
+                    &mut o.line_shadow,
                 );
+            }
+            Tool::Eraser => {
+                w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0);
+                color_btn(ui, &mut o.fill_color);
                 tip_combo(ui, &mut o.tip);
-                slider(ui, t!("draw.opt.opacity"), &mut o.opacity, 0.05..=1.0);
+                opacity_pct_slider(ui, &mut o.opacity);
             }
             Tool::Rect | Tool::RectFill | Tool::Ellipse | Tool::EllipseFill => {
                 w_edit(ui, t!("draw.opt.width"), &mut o.width, 0.0..=20.0);
@@ -2741,11 +2805,28 @@ impl DrawSession {
                     changed |= color_btn(ui, &mut o.color).changed();
                     changed |= shadow_opacity(ui, &mut o.shadow, &mut o.opacity);
                 }
-                AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => {
+                AnnotationKind::Freehand(o) => {
+                    let mut sh_on = o.shadow > 0.0;
+                    if pencil_options_row(
+                        ui,
+                        "draw.sel.pencil",
+                        &mut o.color,
+                        &mut o.width,
+                        &mut o.tip,
+                        &mut o.dash,
+                        &mut o.outline,
+                        &mut o.outline_color,
+                        &mut o.opacity,
+                        &mut sh_on,
+                    ) {
+                        o.shadow = if sh_on { 3.0 } else { 0.0 };
+                        changed = true;
+                    }
+                }
+                AnnotationKind::HighlightStroke(o) => {
                     changed |= w_edit(ui, t!("draw.opt.width"), &mut o.width, 1.0..=30.0).changed();
                     changed |= color_btn(ui, &mut o.color).changed();
-                    changed |=
-                        slider(ui, t!("draw.opt.opacity"), &mut o.opacity, 0.05..=1.0).changed();
+                    changed |= opacity_pct_slider(ui, &mut o.opacity);
                 }
                 AnnotationKind::HighlightArea(o) => {
                     changed |= color_btn(ui, &mut o.color).changed();
@@ -3375,19 +3456,51 @@ fn line_options_row(
     changed
 }
 
+/// Freehand pencil option strip shared by `Tool::Pencil` and a selected `FreeObj`.
+#[allow(clippy::too_many_arguments)]
+fn pencil_options_row(
+    ui: &mut Ui,
+    salt: &'static str,
+    color: &mut Color32,
+    width: &mut f32,
+    tip: &mut TipShape,
+    dash: &mut Dash,
+    outline: &mut f32,
+    outline_color: &mut Color32,
+    opacity: &mut f32,
+    shadow_on: &mut bool,
+) -> bool {
+    let mut changed = false;
+    ui.label(t!("draw.opt.color"));
+    changed |= color_btn(ui, color).changed();
+    changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=30.0).changed();
+    ui.label(t!("draw.opt.style"));
+    changed |= tip_combo(ui, tip);
+    changed |= dash_combo(ui, dash);
+    ui.label(t!("draw.opt.outline"));
+    changed |= outline_combo(ui, salt, outline);
+    changed |= color_btn(ui, outline_color).changed();
+    changed |= opacity_pct_slider(ui, opacity);
+    changed |= ui
+        .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
+        .changed();
+    changed
+}
+
 /// Tip-shape combo (round/square nib).
-fn tip_combo(ui: &mut Ui, tip: &mut TipShape) {
+fn tip_combo(ui: &mut Ui, tip: &mut TipShape) -> bool {
     let cur = *tip;
     egui::ComboBox::from_id_salt("draw.tip")
         .selected_text(match cur {
             TipShape::Round => "●",
             TipShape::Square => "■",
         })
-        .width(60.0)
+        .width(46.0)
         .show_ui(ui, |ui| {
             ui.selectable_value(tip, TipShape::Round, "●");
             ui.selectable_value(tip, TipShape::Square, "■");
         });
+    *tip != cur
 }
 
 /// Area-shape combo.

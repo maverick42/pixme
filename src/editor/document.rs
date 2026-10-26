@@ -276,6 +276,18 @@ pub struct FreeObj {
     pub width: f32,
     /// Brush tip shape.
     pub tip: TipShape,
+    /// Dashing pattern along the polyline.
+    #[serde(default)]
+    pub dash: Dash,
+    /// Outline width (0–10).
+    #[serde(default)]
+    pub outline: f32,
+    /// Outline colour.
+    #[serde(default = "default_step_ring")]
+    pub outline_color: Color32,
+    /// Drop-shadow offset px.
+    #[serde(default)]
+    pub shadow: f32,
     /// Soft edge (blurred footprint) vs hard edge.
     pub soft: bool,
     /// Object opacity 0–1 — the highlight tool keeps ~0.5.
