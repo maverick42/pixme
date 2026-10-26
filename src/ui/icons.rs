@@ -95,8 +95,6 @@ pub enum Icon {
     Highlighter,
     /// Draw: blur/pixelate.
     Pixelate,
-    /// Draw: insert an image object.
-    Image,
     /// Draw: undo.
     Undo2,
     /// Draw: redo.

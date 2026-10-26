@@ -211,11 +211,6 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/pixelate.svg"),
     ),
     (
-        Icon::Image,
-        "image",
-        include_bytes!("../../assets/icons/image.svg"),
-    ),
-    (
         Icon::Undo2,
         "undo-2",
         include_bytes!("../../assets/icons/undo-2.svg"),

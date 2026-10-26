@@ -47,12 +47,11 @@ enum Tool {
     EllipseFill,
     HighlightArea,
     Blur,
-    InsertImage,
 }
 
 impl Tool {
     /// The strip grid in display order (row-major, two columns).
-    const ALL: [Tool; 17] = [
+    const ALL: [Tool; 16] = [
         Self::Select,
         Self::SelectArea,
         Self::TextBoxRect,
@@ -69,7 +68,6 @@ impl Tool {
         Self::EllipseFill,
         Self::HighlightArea,
         Self::Blur,
-        Self::InsertImage,
     ];
 
     fn icon(self) -> Icon {
@@ -90,7 +88,6 @@ impl Tool {
             Self::EllipseFill => Icon::CircleFill,
             Self::HighlightArea => Icon::Highlighter,
             Self::Blur => Icon::Pixelate,
-            Self::InsertImage => Icon::Image,
         }
     }
 
@@ -112,7 +109,6 @@ impl Tool {
             Self::EllipseFill => t!("draw.tool.ellipsefill"),
             Self::HighlightArea => t!("draw.tool.harea"),
             Self::Blur => t!("draw.tool.blur"),
-            Self::InsertImage => t!("draw.tool.insert"),
         }
     }
 }
@@ -708,7 +704,7 @@ impl DrawSession {
                 });
             ui.add_space(4.0);
             ui.separator();
-            // Utility block: delete, undo, redo, zooms, print.
+            // Utility block: delete + actual-size, undo/redo, zooms, print.
             egui::Grid::new("draw.util")
                 .num_columns(2)
                 .spacing(vec2(2.0, 2.0))
@@ -718,10 +714,10 @@ impl DrawSession {
                     if del.clicked() {
                         self.delete_selected();
                     }
-                    let undo = widgets::icon_button(ui, Icon::Undo2, false)
-                        .on_hover_text(t!("menu.edit.undo").to_string());
-                    if undo.clicked() {
-                        self.undo_once();
+                    let one = widgets::icon_button(ui, Icon::Scaling, false)
+                        .on_hover_text(t!("zoom.actual").to_string());
+                    if one.clicked() {
+                        self.zoom = Some(1.0);
                     }
                     ui.end_row();
                     let redo = widgets::icon_button(ui, Icon::Redo2, false)
@@ -729,25 +725,25 @@ impl DrawSession {
                     if redo.clicked() {
                         self.redo_once();
                     }
+                    let undo = widgets::icon_button(ui, Icon::Undo2, false)
+                        .on_hover_text(t!("menu.edit.undo").to_string());
+                    if undo.clicked() {
+                        self.undo_once();
+                    }
+                    ui.end_row();
+                    let zout = widgets::icon_button(ui, Icon::ZoomOut, false)
+                        .on_hover_text(t!("vbar.zoom_out.tooltip").to_string());
+                    if zout.clicked() {
+                        self.bump_zoom(1.0 / 1.25);
+                    }
                     let zin = widgets::icon_button(ui, Icon::ZoomIn, false)
-                        .on_hover_text(t!("vbar.zoom_in.tip").to_string());
+                        .on_hover_text(t!("vbar.zoom_in.tooltip").to_string());
                     if zin.clicked() {
                         self.bump_zoom(1.25);
                     }
                     ui.end_row();
-                    let zout = widgets::icon_button(ui, Icon::ZoomOut, false)
-                        .on_hover_text(t!("vbar.zoom_out.tip").to_string());
-                    if zout.clicked() {
-                        self.bump_zoom(1.0 / 1.25);
-                    }
-                    let one = widgets::icon_button(ui, Icon::Scaling, false)
-                        .on_hover_text(t!("zoom.actual").to_string());
-                    if one.clicked() {
-                        self.zoom = Some(1.0);
-                    }
-                    ui.end_row();
                     let print = widgets::icon_button(ui, Icon::Printer, false)
-                        .on_hover_text(t!("vbar.print.tip").to_string());
+                        .on_hover_text(t!("vbar.print.tooltip").to_string());
                     if print.clicked() {
                         let _ =
                             crate::export::file::print_image(&render::render_to_image(&self.doc));
@@ -756,12 +752,8 @@ impl DrawSession {
         });
     }
 
-    /// Handles a tool click — InsertImage opens its file picker instead.
+    /// Handles a tool click.
     fn pick_tool(&mut self, tool: Tool, _ctx: &egui::Context) {
-        if tool == Tool::InsertImage {
-            self.insert_image();
-            return;
-        }
         self.tool = tool;
         self.sel_area = None;
         self.close_text_panel();
@@ -771,30 +763,6 @@ impl DrawSession {
     fn bump_zoom(&mut self, factor: f32) {
         let cur = self.zoom.unwrap_or(1.0);
         self.zoom = Some((cur * factor).clamp(0.1, 8.0));
-    }
-
-    /// File picker for the Insert-image tool.
-    fn insert_image(&mut self) {
-        let file = rfd::FileDialog::new()
-            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
-            .pick_file();
-        if let Some(path) = file
-            && let Ok(img) = image::open(&path)
-        {
-            let rgba = img.to_rgba8();
-            let (w, h) = (rgba.width(), rgba.height());
-            self.add(AnnotationKind::Picture(PicObj {
-                rect: PhysicalRect {
-                    x: 20,
-                    y: 20,
-                    width: w,
-                    height: h,
-                },
-                image: rgba,
-                opacity: 1.0,
-                shadow: 0.0,
-            }));
-        }
     }
 
     // ── Marquee selection (SelectArea) ─────────────────────────────
@@ -1241,7 +1209,7 @@ impl DrawSession {
                     self.drag = Some(Drag::Marquee { anchor: p });
                 }
             }
-            Tool::Select | Tool::Text | Tool::Step | Tool::InsertImage => {}
+            Tool::Select | Tool::Text | Tool::Step => {}
             Tool::Eraser => {
                 if self.opts.eraser_pick {
                     self.opts.eraser_color = self.pixel_at(p);
@@ -2986,9 +2954,6 @@ impl DrawSession {
                     &mut o.opacity,
                     &mut o.step_shadow,
                 );
-            }
-            Tool::InsertImage => {
-                ui.label(t!("draw.opt.insert_hint"));
             }
             Tool::SelectArea => {
                 ui.label(t!("draw.sel.hint"));
