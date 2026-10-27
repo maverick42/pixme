@@ -257,6 +257,13 @@ struct RenameState {
     draft: String,
     /// Last Apply hit a duplicate/empty name — inline error shown.
     taken: bool,
+    /// How many of the next tabs (current order) also get renamed —
+    /// when > 0 the sequence covers the current tab too (`{draft} - 1`
+    /// on it). Clamped to the following-tab count on use.
+    follow: usize,
+    /// The name field grabs focus once — re-requesting every frame
+    /// would steal it back from the follow field.
+    focused: bool,
 }
 
 /// Which field of the protection dialog failed validation.
@@ -523,6 +530,8 @@ impl Viewer {
             self.rename = Some(RenameState {
                 draft: title,
                 taken: false,
+                follow: 0,
+                focused: false,
             });
         }
     }
@@ -547,10 +556,34 @@ impl Viewer {
     /// Renames the active tab (the File → Rename command). A rename is
     /// a sort key under `ByName` — re-sort right away.
     pub fn set_active_title(&mut self, title: String) {
-        if let Some(i) = self.active_index() {
-            self.tabs[i].title = title;
-            self.sort_tabs();
+        self.apply_rename(title, 0);
+    }
+
+    /// Rename-dialog apply: the active tab takes `name`; the `follow`
+    /// tabs that come after it in the current order get `{name} - k`,
+    /// snapshotted by document id BEFORE the sort renames can trigger.
+    fn apply_rename(&mut self, name: String, follow: usize) {
+        let Some(ai) = self.active_index() else {
+            return;
+        };
+        let ids: Vec<_> = self.tabs[ai + 1..]
+            .iter()
+            .take(follow)
+            .map(|t| t.doc.meta.id.clone())
+            .collect();
+        // follow > 0 starts the numbered series on the current tab:
+        // `{name} - 1` on it, ` - 2`, ` - 3`… on the next ones.
+        self.tabs[ai].title = if follow > 0 {
+            format!("{name} - 1")
+        } else {
+            name.clone()
+        };
+        for (k, id) in ids.iter().enumerate() {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.doc.meta.id == *id) {
+                tab.title = format!("{name} - {}", k + 2);
+            }
         }
+        self.sort_tabs();
     }
 
     /// ⌘Z — reverts the newest pixel mutation of the active tab.
@@ -2337,12 +2370,25 @@ impl Viewer {
         let t = theme::tokens(ctx);
         let mut apply = false;
         let mut cancel = false;
+        // Tabs after the active one in the current order — the follow
+        // count can never exceed them.
+        let max_follow = self
+            .active_index()
+            .map(|i| self.tabs.len().saturating_sub(i + 1))
+            .unwrap_or(0);
         let resp = egui::Modal::new(egui::Id::new("pixme-rename")).show(ctx, |ui| {
             ui.set_width(300.0);
-            ui.label(
-                egui::RichText::new(t!("dialog.rename.title").to_string())
-                    .font(theme::semibold(14.0)),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(t!("dialog.rename.title").to_string())
+                        .font(theme::semibold(14.0)),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if dialog_close(ui) {
+                        cancel = true;
+                    }
+                });
+            });
             widgets::hairline(ui);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -2352,28 +2398,63 @@ impl Viewer {
                         .desired_width(200.0)
                         .font(theme::medium(12.0)),
                 );
-                // The only input in this dialog — keep it focused from
-                // the moment the prompt opens so typing starts at once.
-                field.request_focus();
+                // Focus once on open — every frame would steal it back
+                // from the follow field.
+                if !state.focused {
+                    field.request_focus();
+                    state.focused = true;
+                }
                 // Enter applies, like the Rename button.
                 if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     apply = true;
                 }
             });
+            // Optional batch rename: the current tab plus the next
+            // `follow` tabs become `{name} - 1`, ` - 2`… in the current
+            // order. Digits-only field, clamped on use; disabled when
+            // the active tab is already last.
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(t!("dialog.rename.follow").to_string());
+                ui.add_enabled(
+                    max_follow > 0,
+                    egui::DragValue::new(&mut state.follow)
+                        .range(0..=max_follow)
+                        .speed(1.0),
+                );
+            });
+            let follow = state.follow.min(max_follow);
+            if follow > 0 {
+                let base = state.draft.trim();
+                let mut names: Vec<String> = (1..=(follow + 1).min(4))
+                    .map(|k| format!("{base} - {k}"))
+                    .collect();
+                if follow + 1 > 4 {
+                    names.push("…".to_owned());
+                }
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {}",
+                        t!("dialog.rename.preview"),
+                        names.join(", ")
+                    ))
+                    .color(t.text_dim)
+                    .font(theme::medium(10.5)),
+                );
+            }
             if state.taken {
                 ui.add_space(4.0);
                 ui.colored_label(t.danger, t!("dialog.rename.empty").to_string());
             }
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
                     cancel = true;
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::primary_button(ui, &t!("dialog.rename.ok")).clicked() {
-                        apply = true;
-                    }
-                });
+                if widgets::primary_button(ui, &t!("dialog.rename.ok")).clicked() {
+                    apply = true;
+                }
             });
         });
         if resp.should_close() {
@@ -2387,7 +2468,7 @@ impl Viewer {
             if taken {
                 state.taken = true;
             } else {
-                self.set_active_title(name.to_owned());
+                self.apply_rename(name.to_owned(), state.follow.min(max_follow));
             }
             if !taken {
                 return;
@@ -2691,6 +2772,37 @@ fn paint_tab_close(ui: &mut egui::Ui, rect: Rect, hovered: bool) {
             if hovered { t.danger } else { t.icon },
         );
     }
+}
+
+/// A dialog's top-right close cross — the tab-close style (red soft
+/// fill + red X on hover). Returns `clicked`.
+fn dialog_close(ui: &mut egui::Ui) -> bool {
+    let t = theme::tokens(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hovered = resp.hovered();
+        if hovered {
+            let fill =
+                Color32::from_rgba_unmultiplied(t.danger.r(), t.danger.g(), t.danger.b(), 34);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(t.radius_sm), fill);
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(t.radius_sm),
+                Stroke::new(1.0, t.danger),
+                StrokeKind::Inside,
+            );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        icons::paint(
+            ui,
+            rect,
+            Icon::X,
+            if hovered { 14.0 } else { 12.0 },
+            if hovered { t.danger } else { t.icon },
+        );
+    }
+    resp.clicked()
 }
 
 /// One dropdown popup anchored to a tool button. Must be called EVERY
