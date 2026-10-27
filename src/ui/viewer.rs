@@ -58,6 +58,14 @@ pub struct Tab {
     /// re-locks it (`false` again), so a protected capture asks for its
     /// password on every activation.
     pub unlocked: bool,
+    /// `doc.revision` as the store last saw it (`Some` on restored
+    /// tabs, `None` on new ones) — unchanged tabs skip `png_encode` +
+    /// postcard at quit.
+    pub persisted_rev: Option<u64>,
+    /// True when `doc.base.image` is not yet in the store (new tab, or
+    /// mutated by flatten/resize/undo). Annotation-only edits leave it
+    /// `false` so quit updates the row without touching `base_png`.
+    pub base_dirty: bool,
 }
 
 /// How many pixel mutations stay undoable per tab. Full-image ops keep
@@ -71,6 +79,19 @@ const THUMB_MAX_SIDE: u32 = 480;
 
 /// Height of a mosaic tile's caption band, pt.
 const BAND_H: f32 = 22.0;
+
+/// What the save-as dialog needs to write a viewer document.
+pub struct SaveTarget {
+    /// Tab index (marked clean by `mark_saved` on success).
+    pub index: usize,
+    /// Tab title — seeds the file name for never-saved documents.
+    pub title: String,
+    /// The composited document as a standalone capture.
+    pub capture: crate::capture::Capture,
+    /// File the document was loaded/saved from — overwriting it is
+    /// allowed (re-saving IS the point for that file).
+    pub source: Option<std::path::PathBuf>,
+}
 
 /// One reversible pixel-level mutation of a tab's base image.
 enum PixelOp {
@@ -209,6 +230,13 @@ pub struct Viewer {
     /// The persisted session was already loaded once — restore never
     /// runs twice (a deliberate discard stays discarded).
     restored: bool,
+    /// Some(start) while the session loads on its worker thread — the
+    /// spinner only shows past ~80 ms so small sessions never flash.
+    loading_since: Option<std::time::Instant>,
+    /// `(content_sig, meta_sig)` of the session as the store last saw
+    /// it (set at restore and after each write). Quit compares to skip
+    /// a pointless full rewrite — or downgrade it to a meta update.
+    pub persisted_sigs: Option<(u64, u64)>,
     /// Tab strip vs thumbnail grid — a runtime-only choice: PixMe
     /// always opens in Tabs mode.
     view_mode: ViewMode,
@@ -245,6 +273,8 @@ impl Default for Viewer {
             tools_overflow: false,
             closed_ids: Vec::new(),
             restored: false,
+            loading_since: None,
+            persisted_sigs: None,
             view_mode: ViewMode::Tabs,
             mosaic_scale: 1.0,
         }
@@ -308,6 +338,7 @@ impl Tab {
             return;
         }
         self.doc.base.image = crate::editor::render::render_to_image(&self.doc);
+        self.base_dirty = true;
         self.doc.annotations.clear();
         self.anno_undo.clear();
         self.anno_redo.clear();
@@ -353,6 +384,8 @@ impl Viewer {
             anno_redo: VecDeque::new(),
             unlocked: false,
             insertion,
+            persisted_rev: None,
+            base_dirty: true,
         });
         // A new document gets a fresh view — a stale zoom would
         // leak onto unrelated pixels — and the tab we leave re-locks.
@@ -382,6 +415,8 @@ impl Viewer {
             anno_redo: VecDeque::new(),
             unlocked: false,
             insertion,
+            persisted_rev: None,
+            base_dirty: true,
         });
         let new = self.tabs.len() - 1;
         self.set_active(new);
@@ -424,6 +459,8 @@ impl Viewer {
             anno_redo: VecDeque::new(),
             unlocked: false,
             insertion,
+            persisted_rev: None,
+            base_dirty: true,
         });
     }
 
@@ -435,18 +472,23 @@ impl Viewer {
     /// Marks `index` saved at `path` and refreshes the session flag —
     /// called after a save-as dialog completes for a viewer document.
     /// The meta records the location and the timestamp ("was saved at
-    /// least once, and when") for the future database restore.
+    /// least once, and when") for the future database restore. The tab
+    /// takes the written file's stem: a save-as under another name
+    /// renames the document with it (like File → Open does).
     pub fn mark_saved(&mut self, index: usize, path: std::path::PathBuf) {
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.saved = true;
+            if let Some(stem) = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+            {
+                tab.title = stem;
+            }
             tab.doc.meta.source_path = Some(path);
             tab.doc.meta.saved_at = Some(chrono::Local::now());
-            // Saving a drawn-on document bakes pixels the op history
-            // knows nothing about — the chronology ends there.
-            if !tab.doc.annotations.is_empty() {
-                tab.undo.clear();
-                tab.redo.clear();
-            }
+            // A title change is a sort key under ByName — re-sort.
+            self.sort_tabs();
             self.recompute_dirty();
         }
     }
@@ -490,7 +532,8 @@ impl Viewer {
     }
 
     /// Draw's OK: the session's document and annotation stacks replace
-    /// the tab's — objects stay re-editable on the next entry.
+    /// the tab's — objects stay re-editable on the next entry. A no-op
+    /// commit (nothing changed since Draw opened) leaves the tab clean.
     pub fn commit_draw(
         &mut self,
         tab: usize,
@@ -501,27 +544,47 @@ impl Viewer {
         let Some(t) = self.tabs.get_mut(tab) else {
             return;
         };
-        t.doc = doc;
-        t.doc.revision += 1;
+        let doc_changed = postcard::to_allocvec(&t.doc.annotations).ok()
+            != postcard::to_allocvec(&doc.annotations).ok();
+        let hist_changed = postcard::to_allocvec(&t.anno_undo).ok()
+            != postcard::to_allocvec(&undo).ok()
+            || postcard::to_allocvec(&t.anno_redo).ok() != postcard::to_allocvec(&redo).ok();
+        if !doc_changed && !hist_changed {
+            return;
+        }
+        t.doc.set_next_id(doc.next_id());
         t.anno_undo = undo;
         t.anno_redo = redo;
-        t.saved = false;
-        self.dirty = true;
+        if doc_changed {
+            t.doc = doc;
+            t.doc.revision += 1;
+            // New annotations sit on top of the current base image —
+            // reverting an older PixelOp (Resize) under them would
+            // desynchronise coordinates, so the pixel history ends here.
+            t.undo.clear();
+            t.redo.clear();
+            t.saved = false;
+            self.dirty = true;
+        }
     }
 
-    /// `(index, title, base capture)` of the active tab — everything the
-    /// save-as dialog needs to own (the capture is cloned).
-    pub fn save_target(&self) -> Option<(usize, String, crate::capture::Capture)> {
+    /// Everything the save-as dialog needs for the active tab.
+    pub fn save_target(&self) -> Option<SaveTarget> {
         self.save_target_at(self.active_index()?)
     }
 
     /// Same as [`Self::save_target`] for an explicit tab — the
     /// close-request confirmation saves a tab that is not the active one.
-    pub fn save_target_at(&self, index: usize) -> Option<(usize, String, crate::capture::Capture)> {
+    pub fn save_target_at(&self, index: usize) -> Option<SaveTarget> {
         let tab = self.tabs.get(index)?;
         let mut capture = tab.doc.base.clone();
         capture.image = crate::editor::render::render_to_image(&tab.doc);
-        Some((index, tab.title.clone(), capture))
+        Some(SaveTarget {
+            index,
+            title: tab.title.clone(),
+            capture,
+            source: tab.doc.meta.source_path.clone(),
+        })
     }
 
     /// Opens the rename prompt on the active tab (File → Rename).
@@ -562,6 +625,9 @@ impl Viewer {
     /// Rename-dialog apply: the active tab takes `name`; the `follow`
     /// tabs that come after it in the current order get `{name} - k`,
     /// snapshotted by document id BEFORE the sort renames can trigger.
+    /// A renamed tab becomes unsaved: its title no longer matches the
+    /// file on disk (`source_path` is kept so Enregistrer still
+    /// proposes that folder).
     fn apply_rename(&mut self, name: String, follow: usize) {
         let Some(ai) = self.active_index() else {
             return;
@@ -573,16 +639,25 @@ impl Viewer {
             .collect();
         // follow > 0 starts the numbered series on the current tab:
         // `{name} - 1` on it, ` - 2`, ` - 3`… on the next ones.
-        self.tabs[ai].title = if follow > 0 {
+        let first = if follow > 0 {
             format!("{name} - 1")
         } else {
             name.clone()
         };
+        if self.tabs[ai].title != first {
+            self.tabs[ai].title = first;
+            self.tabs[ai].saved = false;
+        }
         for (k, id) in ids.iter().enumerate() {
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.doc.meta.id == *id) {
-                tab.title = format!("{name} - {}", k + 2);
+                let next = format!("{name} - {}", k + 2);
+                if tab.title != next {
+                    tab.title = next;
+                    tab.saved = false;
+                }
             }
         }
+        self.recompute_dirty();
         self.sort_tabs();
     }
 
@@ -596,6 +671,7 @@ impl Viewer {
         };
         let tab = &mut self.tabs[i];
         op.undo(&mut tab.doc);
+        tab.base_dirty = true;
         tab.doc.revision += 1;
         tab.saved = false;
         tab.redo.push_back(op);
@@ -613,6 +689,7 @@ impl Viewer {
         };
         let tab = &mut self.tabs[i];
         op.redo(&mut tab.doc);
+        tab.base_dirty = true;
         tab.doc.revision += 1;
         tab.saved = false;
         tab.undo.push_back(op);
@@ -647,6 +724,7 @@ impl Viewer {
             size: (w, h),
             antialias,
         });
+        tab.base_dirty = true;
         tab.doc.revision += 1;
         tab.saved = false;
         self.dirty = true;
@@ -765,6 +843,13 @@ impl Viewer {
         self.restored
     }
 
+    /// Claims the one-shot restore: a loader thread was spawned, the
+    /// session lands via `restore_session` when it finishes.
+    pub fn start_restore(&mut self) {
+        self.restored = true;
+        self.loading_since = Some(std::time::Instant::now());
+    }
+
     /// The auto-title counter — persisted so `Capture N` keeps counting
     /// across restarts instead of colliding with restored names.
     pub fn next_title(&self) -> usize {
@@ -781,17 +866,27 @@ impl Viewer {
         sort_mode: Option<TabSort>,
     ) {
         self.restored = true;
+        self.loading_since = None;
         self.sort_mode = sort_mode;
-        // An empty restore changes nothing — most importantly it must
-        // not recompute `dirty` over an untouched session.
+        let had_live_tabs = !self.tabs.is_empty();
+        // Baseline for the quit-time change check: what the store
+        // holds is exactly this session only when no new tab arrived
+        // while the loader thread was running.
         if session.tabs.is_empty() {
+            self.persisted_sigs = (!had_live_tabs).then(|| self.sigs());
             return;
         }
         self.next_title = self.next_title.max(session.next_title as u32);
-        for t in session.tabs {
-            let insertion = self.next_insertion;
-            self.next_insertion += 1;
-            self.tabs.push(Tab {
+        let restored_count = session.tabs.len();
+        if had_live_tabs {
+            for t in &mut self.tabs {
+                t.insertion += restored_count;
+            }
+        }
+        let mut restored_tabs = Vec::with_capacity(restored_count + self.tabs.len());
+        for (i, t) in session.tabs.into_iter().enumerate() {
+            let persisted_rev = Some(t.doc.revision);
+            restored_tabs.push(Tab {
                 title: t.title,
                 doc: t.doc,
                 saved: t.saved,
@@ -802,14 +897,49 @@ impl Viewer {
                 anno_undo: t.anno_undo,
                 anno_redo: t.anno_redo,
                 unlocked: false,
-                insertion,
+                insertion: i,
+                persisted_rev,
+                base_dirty: false,
             });
         }
-        if !self.tabs.is_empty() {
+        self.next_insertion += restored_count;
+        restored_tabs.append(&mut self.tabs);
+        self.tabs = restored_tabs;
+        if had_live_tabs {
+            self.active = (self.active + restored_count).min(self.tabs.len() - 1);
+        } else if !self.tabs.is_empty() {
             self.set_active(session.active.min(self.tabs.len() - 1));
         }
         self.sort_tabs();
         self.recompute_dirty();
+        self.persisted_sigs = (!had_live_tabs).then(|| self.sigs());
+    }
+
+    /// Cheap fingerprints of what `save_session` persists, hashed in
+    /// tab order (position = the stored `ord`): `content` covers every
+    /// per-tab field — mutations bump `doc.revision`, the rest is
+    /// hashed directly — `meta` adds the session row (active tab,
+    /// title counter). Equal content ⇒ the rows are already written.
+    pub fn sigs(&self) -> (u64, u64) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut content = DefaultHasher::new();
+        for tab in &self.tabs {
+            let d = &tab.doc;
+            d.meta.id.hash(&mut content);
+            tab.title.hash(&mut content);
+            tab.saved.hash(&mut content);
+            d.revision.hash(&mut content);
+            d.next_id().hash(&mut content);
+            d.meta.captured_at.timestamp().hash(&mut content);
+            d.meta.saved_at.map(|s| s.timestamp()).hash(&mut content);
+            d.meta.source_path.hash(&mut content);
+            d.meta.password_hash.hash(&mut content);
+        }
+        let mut meta = content.clone();
+        self.active.hash(&mut meta);
+        self.next_title.hash(&mut meta);
+        (content.finish(), meta.finish())
     }
 
     /// Reorders tabs per `sort_mode` (`None` = insertion order). The
@@ -861,6 +991,8 @@ impl Viewer {
             anno_redo: src.anno_redo.clone(),
             unlocked: false,
             insertion: self.next_insertion,
+            persisted_rev: None,
+            base_dirty: true,
         });
         self.next_insertion += 1;
         let new = self.tabs.len() - 1;
@@ -1048,6 +1180,15 @@ impl Viewer {
                     widgets::hairline(ui);
                 }
                 self.content(ui, shared);
+                // Session restore in flight: the window is already up,
+                // the spinner waits ~80 ms so a small session never
+                // flashes.
+                if let Some(since) = self.loading_since
+                    && since.elapsed() > std::time::Duration::from_millis(80)
+                {
+                    paint_loading(ui);
+                    ui.ctx().request_repaint();
+                }
                 // Modal behaviour for child windows living in other
                 // viewports (save-as, settings): dim the whole panel and
                 // eat every click while one is up.
@@ -1056,6 +1197,23 @@ impl Viewer {
                     ui.painter()
                         .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(70));
                     ui.allocate_rect(rect, Sense::click_and_drag());
+                }
+                // Quit-time save on its worker thread: an opaque veil
+                // (the tabs moved out), the spinner and a message
+                // cover everything until pump() closes the app.
+                if shared.saving() {
+                    let rect = ui.max_rect();
+                    ui.painter().rect_filled(rect, 0.0, t.dock);
+                    paint_loading(ui);
+                    ui.painter().text(
+                        rect.center() + Vec2::new(0.0, 36.0),
+                        egui::Align2::CENTER_CENTER,
+                        t!("quit.saving").as_ref(),
+                        theme::medium(12.0),
+                        t.text,
+                    );
+                    ui.allocate_rect(rect, Sense::click_and_drag());
+                    ctx.request_repaint();
                 }
             });
         self.confirm_dialog(&ctx, shared);
@@ -1840,8 +1998,15 @@ impl Viewer {
         }
         if self.tabs.is_empty() {
             let t = theme::tokens(ui.ctx());
+            // Restore in flight reads as "loading", not "empty" — the
+            // tabs may arrive with it.
+            let key = if self.loading_since.is_some() {
+                "viewer.loading"
+            } else {
+                "viewer.empty"
+            };
             ui.centered_and_justified(|ui| {
-                ui.colored_label(t.text_dim, t!("viewer.empty").to_string());
+                ui.colored_label(t.text_dim, t!(key).to_string());
             });
             return;
         }
@@ -2747,6 +2912,26 @@ fn fit_rect(outer: Rect, inner: Vec2) -> Rect {
     Rect::from_center_size(outer.center(), inner * scale)
 }
 
+/// The session-restore spinner: a faint track ring plus a rotating
+/// accent arc, centred on the content area.
+fn paint_loading(ui: &mut egui::Ui) {
+    let t = theme::tokens(ui.ctx());
+    let center = ui.max_rect().center();
+    let r = 22.0;
+    ui.painter()
+        .circle_stroke(center, r, Stroke::new(2.5, t.field_border));
+    let head = ui.ctx().input(|i| i.time) * 3.0;
+    let sweep = std::f64::consts::TAU * 0.72;
+    let pts: Vec<egui::Pos2> = (0..=48)
+        .map(|i| {
+            let a = (head + i as f64 / 48.0 * sweep) as f32;
+            center + Vec2::new(a.cos(), a.sin()) * r
+        })
+        .collect();
+    ui.painter()
+        .add(egui::Shape::line(pts, Stroke::new(2.5, t.accent)));
+}
+
 fn paint_tab_close(ui: &mut egui::Ui, rect: Rect, hovered: bool) {
     let t = theme::tokens(ui.ctx());
     if ui.is_rect_visible(rect) {
@@ -2950,6 +3135,8 @@ mod tests {
             anno_redo: VecDeque::new(),
             unlocked: false,
             insertion: v.next_insertion,
+            persisted_rev: None,
+            base_dirty: true,
         });
         v.next_insertion += 1;
         v.active = v.tabs.len() - 1;
@@ -3076,6 +3263,44 @@ mod tests {
         v.set_active(1);
         assert!(v.is_locked(0));
         assert!(!v.is_locked(1));
+    }
+
+    #[test]
+    fn renaming_a_saved_tab_marks_it_unsaved() {
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.mark_saved(0, std::path::PathBuf::from("/tmp/a.png"));
+        v.recompute_dirty();
+        assert!(!v.dirty);
+
+        v.set_active_title("b".to_owned());
+        assert!(!v.tabs[0].saved, "renamed saved tab is unsaved again");
+        assert!(v.dirty);
+        assert_eq!(
+            v.tabs[0].doc.meta.source_path.as_deref(),
+            Some(std::path::Path::new("/tmp/a.png")),
+            "source kept: Enregistrer still proposes that folder"
+        );
+
+        // Re-applying the SAME name changes nothing — it stays saved.
+        v.mark_saved(0, std::path::PathBuf::from("/tmp/b.png"));
+        v.recompute_dirty();
+        v.set_active_title("b".to_owned());
+        assert!(v.tabs[0].saved);
+        assert!(!v.dirty);
+    }
+
+    #[test]
+    fn mark_saved_renames_the_tab_to_the_written_stem() {
+        let mut v = Viewer::default();
+        v.push_stub("capture 1");
+        v.mark_saved(0, std::path::PathBuf::from("/tmp/my new name.png"));
+        assert_eq!(v.tabs[0].title, "my new name");
+        assert!(v.tabs[0].saved);
+        assert_eq!(
+            v.tabs[0].doc.meta.source_path.as_deref(),
+            Some(std::path::Path::new("/tmp/my new name.png"))
+        );
     }
 
     #[test]
@@ -3217,5 +3442,95 @@ mod tests {
         assert_eq!(v.view_mode, ViewMode::Tabs);
         assert!(v.is_locked(0), "switching selection re-locks the old tab");
         assert!(v.is_locked(1), "a protected tile opens locked");
+    }
+
+    #[test]
+    fn commit_draw_noop_keeps_saved_and_real_edit_clears_pixel_undo() {
+        let mut v = Viewer::default();
+        push_doc(&mut v, 20, 20);
+        v.resize_active(10, 10, false);
+        v.tabs[0].saved = true;
+        v.recompute_dirty();
+        assert_eq!(v.tabs[0].undo.len(), 1);
+
+        // No-op Draw commit: saved stays true, pixel undo stays intact.
+        let (tab, _, doc, undo, redo) = v.draw_parts().unwrap();
+        v.commit_draw(tab, doc, undo, redo);
+        assert!(v.tabs[0].saved);
+        assert!(!v.dirty);
+        assert_eq!(v.tabs[0].undo.len(), 1);
+
+        // Real annotation edit in Draw: marks unsaved and clears pixel undo
+        // immediately (without waiting for mark_saved).
+        let (tab, title, doc, undo, redo) = v.draw_parts().unwrap();
+        let mut session = crate::ui::draw::DrawSession::open(
+            doc,
+            tab,
+            title,
+            undo,
+            redo,
+            &crate::config::Settings::default(),
+        );
+        let id = session.doc.alloc_id();
+        let anno = crate::editor::document::Annotation {
+            id,
+            kind: crate::editor::document::AnnotationKind::Step(crate::editor::document::StepObj {
+                pos: egui::pos2(2.0, 2.0),
+                count: 1,
+                mode: crate::editor::document::StepMode::Numbers,
+                style: crate::editor::document::StepStyle::Circle,
+                size: crate::editor::document::StepSize::Medium,
+                bg: Color32::RED,
+                fg: Color32::WHITE,
+                ring: 0.0,
+                ring_color: Color32::WHITE,
+                opacity: 1.0,
+                shadow: 0.0,
+                lower: false,
+            }),
+        };
+        session.doc.annotations.push(anno.clone());
+        session.undo.push_back(AnnoEdit::Add { anno, index: 0 });
+        session.doc.revision += 1;
+        assert!(session.has_uncommitted_edits());
+
+        // Undoing back to the open state lets request_cancel exit silently.
+        session.undo_once();
+        assert!(!session.has_uncommitted_edits());
+        session.request_cancel();
+        assert!(session.outcome() == Some(crate::ui::draw::Outcome::Cancel));
+
+        // Re-apply and commit to the viewer.
+        session.redo_once();
+        v.commit_draw(session.tab, session.doc, session.undo, session.redo);
+        assert!(!v.tabs[0].saved);
+        assert!(v.dirty);
+        assert!(
+            v.tabs[0].undo.is_empty(),
+            "pixel op history cleared on annotation commit"
+        );
+    }
+
+    #[test]
+    fn restore_with_preexisting_live_tab_keeps_persisted_sigs_unset() {
+        let mut store = crate::store::Store::open_in_memory();
+        let mut old = Viewer::default();
+        old.push_stub("from_db");
+        old.tabs[0].saved = true;
+        old.recompute_dirty();
+        store.save_session(&old.tabs, 0, old.next_title());
+
+        // A new session where a tab arrived before restore_session landed.
+        let mut v = Viewer::default();
+        v.push_stub("live_capture");
+        v.restore_session(store.load_session(), None);
+        assert_eq!(v.tabs.len(), 2);
+        assert_eq!(v.tabs[0].title, "from_db");
+        assert_eq!(v.tabs[1].title, "live_capture");
+        assert_eq!(v.active, 1, "live tab stays active");
+        assert!(
+            v.persisted_sigs.is_none(),
+            "unpersisted live tab must force a save on quit"
+        );
     }
 }

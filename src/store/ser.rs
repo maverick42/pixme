@@ -8,16 +8,20 @@
 use image::RgbaImage;
 
 /// PNG-encodes an RGBA image — the store's blob format for every bitmap
-/// (base captures, `PicObj` images).
+/// (base captures, `PicObj` images). `Fast` compression: PNG is
+/// lossless, the level only trades encode time for blob size — session
+/// blobs live on disk, never on screen, so the trade is free.
 pub fn png_encode(img: &RgbaImage) -> anyhow::Result<Vec<u8>> {
     use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
     let mut buf = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut buf).write_image(
-        img.as_raw(),
-        img.width(),
-        img.height(),
-        image::ExtendedColorType::Rgba8,
-    )?;
+    PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Adaptive)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )?;
     Ok(buf)
 }
 

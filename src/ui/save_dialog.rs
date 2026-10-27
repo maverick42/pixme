@@ -45,6 +45,9 @@ pub struct SaveDialog {
     /// When the dialog serves a viewer document (Save Active), the saved
     /// tab index — the app marks it clean on success. `None` for pins.
     pub viewer_tab: Option<usize>,
+    /// File this document was loaded/saved from: it may be overwritten
+    /// without tripping the "file exists" block (re-saving IS the point).
+    pub existing_ok: Option<PathBuf>,
 }
 
 impl SaveDialog {
@@ -58,6 +61,7 @@ impl SaveDialog {
             reveal: false,
             error: None,
             viewer_tab: None,
+            existing_ok: None,
         }
     }
 
@@ -67,6 +71,21 @@ impl SaveDialog {
         let stem = sanitize(&self.filename);
         let stem = if stem.is_empty() { "capture" } else { &stem };
         PathBuf::from(self.folder.trim()).join(format!("{stem}.{}", self.format.extension()))
+    }
+
+    /// True when the candidate path collides with a file on disk that is
+    /// not the document's own source — overwriting a foreign file stays
+    /// blocked, overwriting its own is what saving means.
+    pub fn blocked_by_existing(&self) -> bool {
+        let candidate = self.candidate_path();
+        if !candidate.exists() {
+            return false;
+        }
+        std::fs::canonicalize(&candidate).ok()
+            != self
+                .existing_ok
+                .as_ref()
+                .and_then(|p| std::fs::canonicalize(p).ok())
     }
 
     /// Writes the file at [`candidate_path`], updates the last-used
@@ -151,9 +170,9 @@ pub fn show(ui: &mut Ui, state: &mut SaveDialog) -> Outcome {
                     ui.end_row();
                 });
 
-            // Live existence check: saving over an existing file is
-            // blocked — the button greys out and a warning shows.
-            let taken = state.candidate_path().exists();
+            // Live existence check: saving over a FOREIGN file is blocked
+            // (the document's own source is exempt — re-save overwrites it).
+            let taken = state.blocked_by_existing();
             if let Some(err) = &state.error {
                 ui.add_space(6.0);
                 ui.colored_label(t.danger, err);
@@ -207,4 +226,57 @@ fn sanitize(name: &str) -> String {
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{MonitorInfo, PhysicalRect};
+
+    fn dialog_in(dir: &Path) -> SaveDialog {
+        let capture = Capture {
+            image: image::RgbaImage::new(1, 1),
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        };
+        SaveDialog::new(Arc::new(capture), dir.to_path_buf())
+    }
+
+    /// The exists-block ignores the document's own source path but keeps
+    /// protecting every other file on disk.
+    #[test]
+    fn own_file_is_exempt_from_the_exists_block() {
+        let dir = std::env::temp_dir().join(format!("pixme-dlg-{}", crate::editor::meta::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("shot.png");
+        std::fs::write(&file, b"png").unwrap();
+        let other = dir.join("other.png");
+        std::fs::write(&other, b"png").unwrap();
+
+        let mut d = dialog_in(&dir);
+        d.filename = "shot".to_owned();
+        assert!(d.blocked_by_existing(), "a foreign existing file blocks");
+        d.existing_ok = Some(file);
+        assert!(
+            !d.blocked_by_existing(),
+            "the document's own file may be overwritten"
+        );
+        d.filename = "other".to_owned();
+        assert!(
+            d.blocked_by_existing(),
+            "another existing file still blocks"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

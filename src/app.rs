@@ -144,6 +144,9 @@ pub enum ModalState {
     SaveDialog,
     /// The Draw (Dessiner) editor window.
     Draw,
+    /// The quit-time session save is writing on a worker — the UI is
+    /// frozen behind the saving veil until the app actually closes.
+    Saving,
 }
 
 /// The single source of truth for command availability vs modal state:
@@ -161,6 +164,11 @@ pub enum ModalState {
 pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
     if modal == ModalState::None {
         return true;
+    }
+    // A quit already committed is final: nothing may run while the
+    // store writes — not even a second Quit.
+    if modal == ModalState::Saving {
+        return false;
     }
     match command {
         // Always live: quit, modal-owned answers, overlay capture flow
@@ -272,6 +280,15 @@ pub struct Shared {
     /// The session database — documents, annotations and undo stacks
     /// written at quit, read back on the first viewer open.
     pub store: Mutex<crate::store::Store>,
+    /// The in-flight session restore: a worker thread owns the Store
+    /// while loading (image decode off the UI thread) and hands it
+    /// back with the session.
+    pub restore_rx: Mutex<
+        Option<std::sync::mpsc::Receiver<(crate::store::StoredSession, crate::store::Store)>>,
+    >,
+    /// The in-flight quit-time save: the worker owns the Store + the
+    /// tabs while writing; its return closes the app.
+    pub quit_rx: Mutex<Option<std::sync::mpsc::Receiver<crate::store::Store>>>,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -312,7 +329,9 @@ impl Shared {
 
     /// The modal surface currently owning input, if any.
     pub fn modal_state(&self) -> ModalState {
-        if lock(&self.draw).is_some() {
+        if self.saving() {
+            ModalState::Saving
+        } else if lock(&self.draw).is_some() {
             ModalState::Draw
         } else if lock(&self.save_dialog).is_some() {
             ModalState::SaveDialog
@@ -327,6 +346,13 @@ impl Shared {
     /// reads this to grey out buttons and menu entries.
     pub fn command_enabled(&self, command: &Command) -> bool {
         is_command_enabled(command, self.modal_state())
+    }
+
+    /// True while the quit-time save runs on its worker — the viewer
+    /// paints the saving veil and every command is gated off until the
+    /// store comes back and the app closes.
+    pub fn saving(&self) -> bool {
+        lock(&self.quit_rx).is_some()
     }
 
     /// The concrete theme for the current appearance setting and OS theme.
@@ -370,6 +396,24 @@ impl Shared {
             ctx.request_repaint_of(egui::ViewportId::ROOT);
             ctx.request_repaint_of(viewer_id());
             ctx.request_repaint_of(bar_id());
+        }
+        // A background session restore lands here — swap the empty
+        // session for the loaded tabs and drop the spinner.
+        let done = lock(&self.restore_rx)
+            .as_ref()
+            .and_then(|r| r.try_recv().ok());
+        if let Some((session, store)) = done {
+            *lock(&self.restore_rx) = None;
+            self.finish_restore(session, store);
+            ctx.request_repaint_of(viewer_id());
+        }
+        // The quit-time save finished on its thread: the store comes
+        // back and the app closes for real.
+        let store_back = lock(&self.quit_rx).as_ref().and_then(|r| r.try_recv().ok());
+        if let Some(store) = store_back {
+            *lock(&self.quit_rx) = None;
+            *lock(&self.store) = store;
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
         }
     }
 
@@ -489,9 +533,15 @@ impl Shared {
                 }
             }
             Command::ConfirmSave => {
-                // "Save" in the unsaved-session dialog = save-all, then close.
-                self.save_all(ctx);
-                self.finish_confirmation(ctx);
+                // "Save" in the unsaved-session dialog = save-all, then close
+                // only when every unsaved tab actually reached disk.
+                if self.save_all(ctx) {
+                    self.finish_confirmation(ctx);
+                } else {
+                    let mut viewer = lock(&self.viewer);
+                    viewer.confirm_close = false;
+                    viewer.confirm_then_quit = false;
+                }
             }
             Command::ConfirmDiscard => self.finish_confirmation(ctx),
             Command::ConfirmCancel => {
@@ -566,22 +616,40 @@ impl Shared {
                 // Reuses the pin save-as window — `viewer_tab` lets the app
                 // mark the tab clean when the write lands.
                 let target = lock(&self.viewer).save_target();
-                let folder = lock(&self.settings).last_save_dir.clone().or_else(|| {
+                let fallback = lock(&self.settings).last_save_dir.clone().or_else(|| {
                     directories::UserDirs::new()
                         .and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
                 });
-                if let (Some((index, title, capture)), Some(folder)) = (target, folder) {
-                    let mut dialog =
-                        crate::ui::save_dialog::SaveDialog::new(Arc::new(capture), folder);
-                    // The tab title seeds the file name (sanitized later).
-                    dialog.filename = title;
-                    dialog.viewer_tab = Some(index);
-                    *lock(&self.save_dialog) = Some(dialog);
-                    self.request_focus(save_dialog_id());
-                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                if let Some(t) = target {
+                    let folder = t
+                        .source
+                        .as_ref()
+                        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                        .or(fallback);
+                    if let Some(folder) = folder {
+                        let mut dialog =
+                            crate::ui::save_dialog::SaveDialog::new(Arc::new(t.capture), folder);
+                        // The title seeds the file name (sanitized later)
+                        // — an unchanged title lands on the source file
+                        // and overwrites it; a renamed tab saves under
+                        // its new name.
+                        dialog.filename = t.title;
+                        if let Some(path) = t.source {
+                            if let Some(fmt) = ext_format(&path) {
+                                dialog.format = fmt;
+                            }
+                            dialog.existing_ok = Some(path);
+                        }
+                        dialog.viewer_tab = Some(t.index);
+                        *lock(&self.save_dialog) = Some(dialog);
+                        self.request_focus(save_dialog_id());
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
                 }
             }
-            Command::SaveAll => self.save_all(ctx),
+            Command::SaveAll => {
+                self.save_all(ctx);
+            }
             Command::RenameActive => lock(&self.viewer).open_rename(),
             Command::CopyActive => {
                 if let Some(img) = lock(&self.viewer).copy_image()
@@ -699,12 +767,15 @@ impl Shared {
         title
     }
 
-    fn save_all(&self, ctx: &egui::Context) {
+    /// Writes every unsaved tab to the last-used folder (or ~/Pictures) as
+    /// PNGs with annotations composited. Returns `true` when the whole
+    /// session is clean afterwards.
+    fn save_all(&self, ctx: &egui::Context) -> bool {
         let Some(folder) = lock(&self.settings).last_save_dir.clone().or_else(|| {
             directories::UserDirs::new().and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
         }) else {
             tracing::warn!("save-all: no writable folder known");
-            return;
+            return false;
         };
         let mut viewer = lock(&self.viewer);
         // Duplicate titles are legal everywhere but HERE: two files can
@@ -719,7 +790,7 @@ impl Shared {
         if clash {
             viewer.dup_names = true;
             ctx.request_repaint_of(viewer_id());
-            return;
+            return false;
         }
         for tab in viewer.tabs.iter_mut() {
             if tab.saved {
@@ -727,8 +798,10 @@ impl Shared {
             }
             let stem = crate::config::filename::sanitize_filename(tab.title.trim());
             let path = unique_png(&folder, &stem);
+            let mut capture = tab.doc.base.clone();
+            capture.image = crate::editor::render::render_to_image(&tab.doc);
             match crate::export::file::save_capture_to(
-                &tab.doc.base,
+                &capture,
                 &path,
                 crate::export::ImageFormat::Png,
             ) {
@@ -742,6 +815,7 @@ impl Shared {
             }
         }
         viewer.recompute_dirty();
+        !viewer.dirty
     }
 
     /// Moves the machine to `next` and wakes the anchor so the child
@@ -767,7 +841,7 @@ impl Shared {
         // Restoring runs on EVERY viewer entry (guarded to once): a
         // same-state re-entry after reset must not skip the load.
         if next == AppState::Viewer {
-            self.restore_session();
+            self.restore_session(ctx);
         }
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
@@ -951,19 +1025,49 @@ impl Shared {
         self.enter(return_to, ctx);
     }
 
-    /// First entry into the viewer: pulls the persisted session back
-    /// into memory — silent and best-effort (a corrupt database was
+    /// First entry into the viewer: the persisted session loads on a
+    /// worker thread so the window paints instantly — image decode is
+    /// what takes time, not the queries. The result lands in
+    /// `restore_rx`, drained by `pump()`; the viewer paints a spinner
+    /// meanwhile. Silent and best-effort (a corrupt database was
     /// already parked as `.bak` when the store opened).
-    fn restore_session(&self) {
+    fn restore_session(&self, ctx: &egui::Context) {
         let needed = {
             let viewer = lock(&self.viewer);
             !viewer.session_restored() && viewer.tabs.is_empty()
         };
-        if needed {
-            let session = lock(&self.store).load_session();
-            let sort = lock(&self.settings).tab_sort;
-            lock(&self.viewer).restore_session(session, sort);
+        if !needed {
+            return;
         }
+        // Claim the restore first — a second viewer entry while the
+        // thread runs must not spawn a duplicate loader.
+        lock(&self.viewer).start_restore();
+        // Retention `Never` writes nothing: skip the thread entirely.
+        if !self.session_persists() {
+            let sort = lock(&self.settings).tab_sort;
+            lock(&self.viewer).restore_session(crate::store::StoredSession::default(), sort);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        *lock(&self.restore_rx) = Some(rx);
+        // The Store itself rides the thread — one connection, no dual
+        // access, and tests keep their in-memory database. A disabled
+        // placeholder sits in `shared.store` meanwhile.
+        let mut store = std::mem::replace(&mut *lock(&self.store), crate::store::Store::disabled());
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let session = store.load_session();
+            let _ = tx.send((session, store));
+            wake.request_repaint();
+        });
+    }
+
+    /// Installs the result of the loader thread: the store comes back,
+    /// the loaded session swaps into the viewer.
+    fn finish_restore(&self, session: crate::store::StoredSession, store: crate::store::Store) {
+        *lock(&self.store) = store;
+        let sort = lock(&self.settings).tab_sort;
+        lock(&self.viewer).restore_session(session, sort);
     }
 
     /// `true` when the session is persisted to `session.db` — the
@@ -973,29 +1077,64 @@ impl Shared {
         lock(&self.settings).db_retention != crate::config::DbRetention::Never
     }
 
-    /// Mirrors the whole session into the store. An open Draw editor
-    /// still owns its tab's document clone — committing it back first
-    /// keeps a quit mid-edit from losing the work. `Never` retention
-    /// skips persistence entirely.
-    fn save_session(&self) {
-        if lock(&self.settings).db_retention == crate::config::DbRetention::Never {
-            return;
-        }
-        if let Some(draw) = lock(&self.draw).take() {
-            lock(&self.viewer).commit_draw(draw.tab, draw.doc, draw.undo, draw.redo);
-        }
-        let viewer = lock(&self.viewer);
-        let active = viewer.active_index().unwrap_or(0);
-        let next_title = viewer.next_title();
-        lock(&self.store).save_session(&viewer.tabs, active, next_title);
-    }
-
     /// Persists the session (best-effort — a failure never blocks
     /// quitting), then closes the anchor viewport: eframe exits once
     /// the root window is gone.
+    ///
+    /// The content signature decides the cost: an unchanged session
+    /// writes nothing; a meta-only drift (active tab, titles, order)
+    /// costs one row of UPDATEs; a real change rides a worker thread
+    /// while the viewer shows the saving veil — `pump()` closes the
+    /// app when the store comes back.
     fn quit_now(&self, ctx: &egui::Context) {
-        self.save_session();
-        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+        if !self.session_persists() {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            return;
+        }
+        // An open Draw editor still owns its tab's document clone —
+        // finalize any open text panel and commit it back so a quit
+        // mid-edit loses nothing.
+        if let Some(mut draw) = lock(&self.draw).take() {
+            draw.finalize_pending();
+            lock(&self.viewer).commit_draw(draw.tab, draw.doc, draw.undo, draw.redo);
+        }
+        let mut viewer = lock(&self.viewer);
+        let sigs = viewer.sigs();
+        if viewer.persisted_sigs == Some(sigs) {
+            drop(viewer);
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            return;
+        }
+        let active = viewer.active_index().unwrap_or(0);
+        let next_title = viewer.next_title();
+        if viewer.persisted_sigs.is_some_and(|(c, _)| c == sigs.0) {
+            // Content identical — only meta drifted: cheap UPDATEs,
+            // no image work, quit stays instant.
+            let rows: Vec<_> = viewer
+                .tabs
+                .iter()
+                .map(|t| (t.doc.meta.id.clone(), t.title.clone(), t.saved))
+                .collect();
+            drop(viewer);
+            lock(&self.store).save_meta(&rows, active, next_title);
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            return;
+        }
+        // Real changes — tabs and store both ride the worker; the
+        // viewer's saving veil covers the wait and pump() closes the
+        // app when the store returns.
+        let tabs = std::mem::take(&mut viewer.tabs);
+        drop(viewer);
+        let mut store = std::mem::replace(&mut *lock(&self.store), crate::store::Store::disabled());
+        let (tx, rx) = std::sync::mpsc::channel();
+        *lock(&self.quit_rx) = Some(rx);
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            store.save_session(&tabs, active, next_title);
+            let _ = tx.send(store);
+            wake.request_repaint();
+        });
+        ctx.request_repaint_of(viewer_id());
     }
 }
 
@@ -1013,6 +1152,16 @@ fn unique_png(folder: &std::path::Path, stem: &str) -> std::path::PathBuf {
         }
     }
     unreachable!()
+}
+
+/// File extension → save dialog format (`None` keeps the default PNG).
+fn ext_format(path: &std::path::Path) -> Option<crate::export::ImageFormat> {
+    match path.extension()?.to_str()?.to_lowercase().as_str() {
+        "png" => Some(crate::export::ImageFormat::Png),
+        "jpg" | "jpeg" => Some(crate::export::ImageFormat::Jpeg),
+        "webp" => Some(crate::export::ImageFormat::Webp),
+        _ => None,
+    }
 }
 
 /// Wraps a file/clipboard image in a `Capture` for a viewer document:
@@ -1099,6 +1248,8 @@ impl PixMeApp {
                     store.apply_retention(db_retention);
                     store
                 }),
+                restore_rx: Mutex::new(None),
+                quit_rx: Mutex::new(None),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
             }),
@@ -1302,11 +1453,12 @@ impl eframe::App for PixMeApp {
                     guard.as_ref().and_then(|s| s.outcome())
                 };
                 if let Some(outcome) = outcome
-                    && let Some(session) = lock(&shared.draw).take()
+                    && let Some(mut session) = lock(&shared.draw).take()
                 {
                     // The modal closed: the viewer gets focus back.
                     ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Focus);
                     if outcome == crate::ui::draw::Outcome::Ok {
+                        session.finalize_pending();
                         lock(&shared.viewer).commit_draw(
                             session.tab,
                             session.doc,
@@ -1522,6 +1674,8 @@ mod tests {
             save_dialog: Mutex::new(None),
             draw: Mutex::new(None),
             store: Mutex::new(crate::store::Store::open_in_memory()),
+            restore_rx: Mutex::new(None),
+            quit_rx: Mutex::new(None),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
@@ -1534,6 +1688,28 @@ mod tests {
         shared.push(command);
         shared.pump(ctx);
         *lock(&shared.state)
+    }
+
+    /// Blocks on the loader thread and installs its result — the
+    /// synchronous twin of the drain `pump()` does each frame.
+    fn drain_restore(shared: &Shared) {
+        let rx = lock(&shared.restore_rx).take();
+        if let Some(rx) = rx
+            && let Ok((session, store)) = rx.recv()
+        {
+            shared.finish_restore(session, store);
+        }
+    }
+
+    /// Blocks on the quit-time save thread and puts the store back —
+    /// the synchronous twin of the drain `pump()` does each frame.
+    fn drain_quit(shared: &Shared) {
+        let rx = lock(&shared.quit_rx).take();
+        if let Some(rx) = rx
+            && let Ok(store) = rx.recv()
+        {
+            *lock(&shared.store) = store;
+        }
     }
 
     #[test]
@@ -1630,9 +1806,11 @@ mod tests {
             viewer.recompute_dirty();
         }
         drive(&shared, &ctx, Command::Quit);
+        drain_quit(&shared);
         // New run: fresh viewer state, same store.
         *lock(&shared.viewer) = Viewer::default();
         drive(&shared, &ctx, Command::OpenViewer);
+        drain_restore(&shared);
         let viewer = lock(&shared.viewer);
         assert_eq!(viewer.tabs.len(), 2);
         assert_eq!(viewer.tabs[0].title, "capture 1");
@@ -1653,12 +1831,49 @@ mod tests {
         }
         assert!(lock(&shared.viewer).dirty);
         drive(&shared, &ctx, Command::Quit);
+        drain_quit(&shared);
         assert!(
             !lock(&shared.viewer).confirm_close,
             "no dialog when persisting"
         );
         *lock(&shared.viewer) = Viewer::default();
         drive(&shared, &ctx, Command::OpenViewer);
+        drain_restore(&shared);
+        assert_eq!(lock(&shared.viewer).tabs.len(), 1);
+    }
+
+    /// A quit that changed nothing writes nothing — the signature check
+    /// short-circuits before any store work.
+    #[test]
+    fn unchanged_quit_writes_nothing() {
+        let (shared, ctx) = harness();
+        // Restore runs first so the persisted baseline exists.
+        drive(&shared, &ctx, Command::OpenViewer);
+        drain_restore(&shared);
+        drive(&shared, &ctx, Command::Quit);
+        assert!(
+            lock(&shared.quit_rx).is_none(),
+            "unchanged quit must not write"
+        );
+    }
+
+    /// A real change still takes the worker path — the store goes away
+    /// and comes back through the quit channel.
+    #[test]
+    fn changed_quit_saves_on_a_thread() {
+        let (shared, ctx) = harness();
+        drive(&shared, &ctx, Command::OpenViewer);
+        drain_restore(&shared);
+        lock(&shared.viewer).push_stub("capture 1");
+        drive(&shared, &ctx, Command::Quit);
+        assert!(
+            lock(&shared.quit_rx).is_some(),
+            "changed quit must spawn the save thread"
+        );
+        drain_quit(&shared);
+        *lock(&shared.viewer) = Viewer::default();
+        drive(&shared, &ctx, Command::OpenViewer);
+        drain_restore(&shared);
         assert_eq!(lock(&shared.viewer).tabs.len(), 1);
     }
 
@@ -1803,6 +2018,13 @@ mod tests {
                 "Draw: {command:?}"
             );
         }
+        // A committed quit freezes everything — even Quit itself.
+        for command in all_commands() {
+            assert!(
+                !is_command_enabled(&command, ModalState::Saving),
+                "Saving: {command:?}"
+            );
+        }
     }
 
     /// A blocked command is dropped by dispatch, not executed: SaveAll
@@ -1835,5 +2057,96 @@ mod tests {
         drive(&shared, &ctx, Command::Quit);
         assert!(!shared.settings_open.load(Ordering::Relaxed));
         assert!(lock(&shared.viewer).confirm_close);
+    }
+
+    /// Save-all composites annotations onto the exported PNG, and a
+    /// duplicate-name clash during ConfirmSave aborts the quit instead of
+    /// wiping the unsaved session.
+    #[test]
+    fn save_all_renders_annotations_and_confirm_save_respects_clash() {
+        let (shared, ctx) = harness();
+        let dir =
+            std::env::temp_dir().join(format!("pixme-save-all-{}", crate::editor::meta::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        lock(&shared.settings).last_save_dir = Some(dir.clone());
+        lock(&shared.settings).db_retention = crate::config::DbRetention::Never;
+
+        // Two unsaved tabs sharing a title block ConfirmSave without
+        // dropping the session.
+        {
+            let mut viewer = lock(&shared.viewer);
+            let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 0, 255]));
+            let mut doc = Document::new(synthetic_capture(img));
+            let id = doc.alloc_id();
+            doc.annotations.push(crate::editor::document::Annotation {
+                id,
+                kind: crate::editor::document::AnnotationKind::Rect(
+                    crate::editor::document::RectObj {
+                        rect: crate::capture::PhysicalRect {
+                            x: 0,
+                            y: 0,
+                            width: 8,
+                            height: 8,
+                        },
+                        stroke: egui::Color32::RED,
+                        stroke_w: 0.0,
+                        dash: crate::editor::document::Dash::Solid,
+                        fill: Some(egui::Color32::from_rgb(255, 0, 0)),
+                        radius: 0.0,
+                        outline: 0.0,
+                        outline_color: egui::Color32::WHITE,
+                        opacity: 1.0,
+                        shadow: 0.0,
+                    },
+                ),
+            });
+            viewer.push_capture_document(doc, "dup".to_owned());
+            viewer.push_capture_document(
+                Document::new(synthetic_capture(image::RgbaImage::new(4, 4))),
+                "dup".to_owned(),
+            );
+        }
+        drive(&shared, &ctx, Command::OpenViewer);
+        drive(&shared, &ctx, Command::Quit);
+        assert!(lock(&shared.viewer).confirm_close);
+        drive(&shared, &ctx, Command::ConfirmSave);
+        {
+            let viewer = lock(&shared.viewer);
+            assert_eq!(viewer.tabs.len(), 2, "session kept on clash");
+            assert!(viewer.dup_names, "clash modal raised");
+            assert!(!viewer.confirm_close, "confirm modal dismissed");
+        }
+
+        // Rename the second tab and run SaveAll: the first tab's red
+        // annotation must be baked into the written PNG.
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.dup_names = false;
+            viewer.tabs[1].title = "unique".to_owned();
+        }
+        drive(&shared, &ctx, Command::SaveAll);
+        let saved_img = crate::export::file::load_image(&dir.join("dup.png")).unwrap();
+        assert_eq!(saved_img.get_pixel(4, 4).0, [255, 0, 0, 255]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SaveActive on a saved + renamed tab proposes the NEW title (not
+    /// the old file stem) while still exempting the source path from
+    /// the exists-block.
+    #[test]
+    fn save_active_proposes_the_renamed_title() {
+        let (shared, ctx) = harness();
+        let path = std::env::temp_dir().join("old_name.png");
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.push_stub("old_name");
+            viewer.mark_saved(0, path.clone());
+            viewer.set_active_title("new_name".to_owned());
+        }
+        drive(&shared, &ctx, Command::SaveActive);
+        let guard = lock(&shared.save_dialog);
+        let dialog = guard.as_ref().expect("save dialog open");
+        assert_eq!(dialog.filename, "new_name");
+        assert_eq!(dialog.existing_ok, Some(path));
     }
 }

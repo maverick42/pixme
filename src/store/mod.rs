@@ -29,7 +29,7 @@ use crate::ui::viewer::Tab;
 
 /// Current layout — a file carrying another version is wiped clean
 /// rather than migrated (the session is a convenience, not an archive).
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Days a `.bak` recovery copy survives a rebuild — the captures it
 /// contains must not linger forever.
@@ -49,8 +49,8 @@ const DDL_TABLES: &str = "
         next_title INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS documents (
-        ord           INTEGER PRIMARY KEY,
-        doc_id        TEXT    NOT NULL,
+        doc_id        TEXT    PRIMARY KEY,
+        ord           INTEGER NOT NULL,
         title         TEXT    NOT NULL,
         saved         INTEGER NOT NULL,
         captured_at   TEXT    NOT NULL,
@@ -117,6 +117,16 @@ impl Store {
         migrate(&conn).expect("migrate memory db");
         Self {
             conn: Some(conn),
+            needs_vacuum: false,
+        }
+    }
+
+    /// A placeholder with persistence off — `Shared` swaps it in while
+    /// the real store loads the session on a worker thread, then takes
+    /// the real one back through the restore channel.
+    pub fn disabled() -> Self {
+        Self {
+            conn: None,
             needs_vacuum: false,
         }
     }
@@ -267,6 +277,32 @@ impl Store {
         }
     }
 
+    /// Meta-only persist — the quit-time content signature proved the
+    /// rows identical, so only `ord`/`title`/`saved` and the session
+    /// row (active tab, title counter) are refreshed. No image work.
+    pub fn save_meta(&mut self, rows: &[(String, String, bool)], active: usize, next_title: usize) {
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let Ok(tx) = conn.transaction() else {
+            return;
+        };
+        let _ = tx.execute(
+            "UPDATE session SET active=?1, next_title=?2 WHERE id=0",
+            params![active as i64, next_title as i64],
+        );
+        if let Ok(mut stmt) =
+            tx.prepare("UPDATE documents SET ord=?2, title=?3, saved=?4 WHERE doc_id=?1")
+        {
+            for (ord, (id, title, saved)) in rows.iter().enumerate() {
+                let _ = stmt.execute(params![id, ord as i64, title, saved]);
+            }
+        }
+        if let Err(err) = tx.commit() {
+            tracing::warn!("session meta save failed: {err:#}");
+        }
+    }
+
     /// Empties the store — the session was deliberately discarded, so
     /// nothing of it may come back at the next launch. Discard is a
     /// single rare action: the VACUUM runs right here.
@@ -380,10 +416,11 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The transaction body of [`Store::save_session`]. Every tab is
-/// persisted — the app never drops captures for size reasons (user
-/// decision: the database stays modest in real use, and deleting
-/// captures unilaterally is unacceptable).
+/// The transaction body of [`Store::save_session`]. Incremental per
+/// tab: unchanged tabs (`persisted_rev == Some(doc.revision)`) touch
+/// only their `ord`/meta columns; annotation-only edits update
+/// `annotations` + history without re-encoding `base_png`; only a new
+/// or pixel-mutated tab (`base_dirty`) runs `png_encode`.
 fn save_inner(
     conn: &mut Connection,
     tabs: &[Tab],
@@ -391,15 +428,41 @@ fn save_inner(
     next_title: usize,
 ) -> anyhow::Result<()> {
     let tx = conn.transaction()?;
-    tx.execute_batch("DELETE FROM documents; DELETE FROM session;")?;
     tx.execute(
-        "INSERT INTO session (id, active, next_title) VALUES (0, ?1, ?2)",
+        "INSERT OR REPLACE INTO session (id, active, next_title) VALUES (0, ?1, ?2)",
         params![active as i64, next_title as i64],
     )?;
+    // Prune any row whose tab is not in the live list anymore (covers
+    // tabs closed on a path that skipped `delete_documents`).
+    let live: std::collections::HashSet<&str> =
+        tabs.iter().map(|t| t.doc.meta.id.as_str()).collect();
+    let stored: Vec<String> = {
+        let mut s = tx.prepare("SELECT doc_id FROM documents")?;
+        let rows = s.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in stored {
+        if !live.contains(id.as_str()) {
+            tx.execute("DELETE FROM documents WHERE doc_id = ?1", params![id])?;
+        }
+    }
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO documents (
-                ord, doc_id, title, saved,
+        let mut meta_only = tx.prepare(
+            "UPDATE documents SET
+                ord=?2, title=?3, saved=?4, saved_at=?5,
+                source_path=?6, password_hash=?7
+             WHERE doc_id=?1",
+        )?;
+        let mut anno_only = tx.prepare(
+            "UPDATE documents SET
+                ord=?2, title=?3, saved=?4, saved_at=?5,
+                source_path=?6, password_hash=?7,
+                next_id=?8, annotations=?9, anno_undo=?10, anno_redo=?11
+             WHERE doc_id=?1",
+        )?;
+        let mut full = tx.prepare(
+            "INSERT OR REPLACE INTO documents (
+                doc_id, ord, title, saved,
                 captured_at, captured_epoch, saved_at, source_path, password_hash,
                 base_png, scale_factor, monitor_json,
                 next_id, annotations, anno_undo, anno_redo
@@ -407,18 +470,52 @@ fn save_inner(
         )?;
         for (ord, tab) in tabs.iter().enumerate() {
             let doc = &tab.doc;
-            stmt.execute(params![
-                ord as i64,
+            let saved_at = doc.meta.saved_at.as_ref().map(|d| d.to_rfc3339());
+            let source_path = doc
+                .meta
+                .source_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+            if !tab.base_dirty && tab.persisted_rev == Some(doc.revision) {
+                let n = meta_only.execute(params![
+                    doc.meta.id,
+                    ord as i64,
+                    tab.title,
+                    tab.saved,
+                    saved_at,
+                    source_path,
+                    doc.meta.password_hash,
+                ])?;
+                if n > 0 {
+                    continue;
+                }
+            } else if !tab.base_dirty && tab.persisted_rev.is_some() {
+                let n = anno_only.execute(params![
+                    doc.meta.id,
+                    ord as i64,
+                    tab.title,
+                    tab.saved,
+                    saved_at,
+                    source_path,
+                    doc.meta.password_hash,
+                    doc.next_id() as i64,
+                    postcard::to_allocvec(&doc.annotations)?,
+                    postcard::to_allocvec(&tab.anno_undo)?,
+                    postcard::to_allocvec(&tab.anno_redo)?,
+                ])?;
+                if n > 0 {
+                    continue;
+                }
+            }
+            full.execute(params![
                 doc.meta.id,
+                ord as i64,
                 tab.title,
                 tab.saved,
                 doc.meta.captured_at.to_rfc3339(),
                 doc.meta.captured_at.timestamp(),
-                doc.meta.saved_at.as_ref().map(|d| d.to_rfc3339()),
-                doc.meta
-                    .source_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned()),
+                saved_at,
+                source_path,
                 doc.meta.password_hash,
                 ser::png_encode(&doc.base.image)?,
                 doc.base.scale_factor,
@@ -874,5 +971,47 @@ mod tests {
         assert_eq!(session.tabs[0].title, "new");
         store.apply_retention(crate::config::DbRetention::Never);
         assert_eq!(store.document_count(), 0);
+    }
+
+    /// A restored tab whose base image was not mutated (`base_dirty ==
+    /// false`) must not have its `base_png` re-written — even when an
+    /// annotation edit bumps `doc.revision`.
+    #[test]
+    fn incremental_save_skips_unchanged_base_png() {
+        let mut store = Store::open_in_memory();
+        let mut viewer = Viewer::default();
+        push_tab(&mut viewer, "one", 4, [10, 20, 30, 255]);
+        push_tab(&mut viewer, "two", 4, [40, 50, 60, 255]);
+        save(&mut store, &viewer);
+
+        // Restore: both tabs get `base_dirty = false` and a persisted_rev.
+        let mut viewer = Viewer::default();
+        viewer.restore_session(store.load_session(), None);
+        // Poison the in-memory pixels — if `save_session` re-encoded
+        // them, the next load would come back red instead of the stored
+        // blue/green.
+        for t in &mut viewer.tabs {
+            t.doc
+                .base
+                .image
+                .put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        }
+        // Tab 0 stays untouched; tab 1 gets an annotation edit (revision
+        // moves, `base_dirty` stays false) + a rename.
+        viewer.tabs[1].title = "two-renamed".to_owned();
+        viewer.tabs[1].doc.revision += 1;
+        save(&mut store, &viewer);
+
+        let back = store.load_session();
+        assert_eq!(back.tabs.len(), 2);
+        assert_eq!(
+            back.tabs[0].doc.base.image.get_pixel(0, 0).0,
+            [10, 20, 30, 255]
+        );
+        assert_eq!(
+            back.tabs[1].doc.base.image.get_pixel(0, 0).0,
+            [40, 50, 60, 255]
+        );
+        assert_eq!(back.tabs[1].title, "two-renamed");
     }
 }

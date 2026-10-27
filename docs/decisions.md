@@ -936,3 +936,30 @@ Format: date — context — decision — consequences.
     proposes the tab title.
 - **Consequences**: all changes live in `prefs.json`; tests cover the
   template expansion (dates, padding, `@` charset, `%VAR%`, literals).
+
+## 2026-10-27 — Quit-time persistence is signature-gated and threaded
+
+- **Context**: every quit ran `save_session` synchronously — a full
+  `DELETE` + re-INSERT transaction that PNG-encoded every tab's image
+  on the UI thread, even when nothing had changed. Many captures made
+  the exit hang for seconds.
+- **Decision**:
+  - `viewer.sigs()` hashes two fingerprints: `content` (per-tab doc id,
+    `doc.revision`, next_id, meta — order-insensitive sum) and `meta`
+    (ordered id/title/saved + active + next_title). The baseline is
+    recorded in `persisted_sigs` at restore. Invariant: every persisted
+    mutation must bump `doc.revision`.
+  - `quit_now` picks the cheapest correct path: identical signatures →
+    close with no write at all; identical content → `Store::save_meta`
+    (UPDATEs only: `ord`/title/saved per row + session row); real
+    change → the tabs and the Store ride a worker thread, the viewer
+    paints an opaque saving veil (`paint_loading` spinner +
+    `quit.saving`) and `pump()` closes the app when the store returns.
+  - `ModalState::Saving` disables every command during the write —
+    even a second Quit.
+  - Session PNG blobs encode with `CompressionType::Fast` — PNG is
+    lossless, only size/encode time change.
+- **Consequences**: an unchanged quit is instant; a meta-only drift is
+  sub-millisecond; a content rewrite keeps the window up with a
+  spinner instead of freezing silently. Tests cover the unchanged-skip
+  and the threaded path (`drain_quit`/`drain_restore` helpers).

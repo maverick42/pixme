@@ -354,9 +354,10 @@ pub struct DrawSession {
     /// The unsaved-changes confirmation is up (Échap/Annuler/close with
     /// edits pending).
     confirm_quit: bool,
-    /// `doc.revision` at open — the session is dirty only once it moved,
-    /// so a restored history stack alone never arms the warning.
-    open_revision: u64,
+    /// Postcard snapshot of `doc.annotations` at open — the session is
+    /// dirty only when the current annotations differ from this baseline
+    /// (so an edit followed by Undo returns to clean).
+    open_snapshot: Vec<u8>,
     /// Last pointer position in image coords (shape-drag end point).
     last_pointer: Option<Pos2>,
     /// Whether Ctrl or Shift is held this frame (horizontal/vertical snap).
@@ -377,7 +378,7 @@ impl DrawSession {
         redo: VecDeque<AnnoEdit>,
         prefs: &crate::config::Settings,
     ) -> Self {
-        let open_revision = doc.revision;
+        let open_snapshot = postcard::to_allocvec(&doc.annotations).unwrap_or_default();
         Self {
             doc,
             tab,
@@ -401,7 +402,7 @@ impl DrawSession {
             rendered_rev: u64::MAX,
             outcome: None,
             confirm_quit: false,
-            open_revision,
+            open_snapshot,
             last_pointer: None,
             snap_hv: false,
             img_rect: Rect::NOTHING,
@@ -414,11 +415,23 @@ impl DrawSession {
         self.outcome
     }
 
+    /// Commits any in-flight text panel edit into `self.doc` and `self.undo`
+    /// before the session is inspected or committed.
+    pub fn finalize_pending(&mut self) {
+        self.close_text_panel();
+    }
+
+    /// Whether the annotations currently differ from the state at `open`.
+    pub fn has_uncommitted_edits(&self) -> bool {
+        postcard::to_allocvec(&self.doc.annotations).unwrap_or_default() != self.open_snapshot
+    }
+
     /// Cancels the session — discarding edits is only silent when there
     /// are none; otherwise the user confirms through a warning box.
     /// Called by Annuler, Escape and the window's close control.
     pub fn request_cancel(&mut self) {
-        if self.doc.revision == self.open_revision {
+        self.close_text_panel();
+        if !self.has_uncommitted_edits() {
             self.outcome = Some(Outcome::Cancel);
         } else {
             self.confirm_quit = true;
@@ -2707,6 +2720,7 @@ impl DrawSession {
                         self.request_cancel();
                     }
                     if widgets::primary_button(ui, &t!("draw.ok")).clicked() {
+                        self.close_text_panel();
                         self.outcome = Some(Outcome::Ok);
                     }
                 });
