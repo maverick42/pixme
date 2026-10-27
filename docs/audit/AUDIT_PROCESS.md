@@ -115,3 +115,13 @@ Windows.
 - MT-27 — Thumbnails: annotations appear in the tiles (same render
   path as the canvas); thumbnails rebuild after edits; with many tabs
   only visible tiles are textured (memory stays bounded).
+
+## 10. Modal gating
+
+- MT-28 — With Settings open, the menu bar greys out « Tout
+  enregistrer », « Imprimer », all captures and the status-item
+  entries; their shortcuts are inert. ⌘Q still works, including from
+  the icon menu. Same check with the Draw editor and the save-as
+  dialog; under Draw, undo/redo/copy act on the editor only. On
+  Windows the same holds for global shortcuts and the tray menu, and
+  the egui menu strip / bar buttons show disabled.

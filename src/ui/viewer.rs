@@ -1416,42 +1416,62 @@ impl Viewer {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
             menu_button(ui, t!("menu.file").as_ref(), |ui| {
-                menu_item(ui, t!("menu.file.open").as_ref(), || {
-                    shared.push(Command::OpenFile)
-                });
-                menu_item(ui, t!("menu.app.import_clipboard").as_ref(), || {
-                    shared.push(Command::ImportClipboard)
-                });
+                menu_item(ui, shared, Command::OpenFile, t!("menu.file.open").as_ref());
+                menu_item(
+                    ui,
+                    shared,
+                    Command::ImportClipboard,
+                    t!("menu.app.import_clipboard").as_ref(),
+                );
                 ui.separator();
-                menu_item(ui, t!("menu.file.save").as_ref(), || {
-                    shared.push(Command::SaveActive)
-                });
-                menu_item(ui, t!("menu.file.save_all").as_ref(), || {
-                    shared.push(Command::SaveAll)
-                });
-                menu_item(ui, t!("menu.file.rename").as_ref(), || {
-                    shared.push(Command::RenameActive)
-                });
+                menu_item(
+                    ui,
+                    shared,
+                    Command::SaveActive,
+                    t!("menu.file.save").as_ref(),
+                );
+                menu_item(
+                    ui,
+                    shared,
+                    Command::SaveAll,
+                    t!("menu.file.save_all").as_ref(),
+                );
+                menu_item(
+                    ui,
+                    shared,
+                    Command::RenameActive,
+                    t!("menu.file.rename").as_ref(),
+                );
                 ui.separator();
-                menu_item(ui, t!("menu.file.print").as_ref(), || {
-                    shared.push(Command::PrintActive)
-                });
+                menu_item(
+                    ui,
+                    shared,
+                    Command::PrintActive,
+                    t!("menu.file.print").as_ref(),
+                );
                 ui.separator();
-                menu_item(ui, t!("menu.app.quit").as_ref(), || {
-                    shared.push(Command::Quit)
-                });
+                menu_item(ui, shared, Command::Quit, t!("menu.app.quit").as_ref());
             });
             menu_button(ui, t!("menu.edit").as_ref(), |ui| {
-                menu_item(ui, t!("menu.edit.undo").as_ref(), || {
-                    shared.push(Command::UndoActive)
-                });
-                menu_item(ui, t!("menu.edit.redo").as_ref(), || {
-                    shared.push(Command::RedoActive)
-                });
+                menu_item(
+                    ui,
+                    shared,
+                    Command::UndoActive,
+                    t!("menu.edit.undo").as_ref(),
+                );
+                menu_item(
+                    ui,
+                    shared,
+                    Command::RedoActive,
+                    t!("menu.edit.redo").as_ref(),
+                );
                 ui.separator();
-                menu_item(ui, t!("menu.edit.copy").as_ref(), || {
-                    shared.push(Command::CopyActive)
-                });
+                menu_item(
+                    ui,
+                    shared,
+                    Command::CopyActive,
+                    t!("menu.edit.copy").as_ref(),
+                );
             });
             menu_button(ui, t!("menu.capture").as_ref(), |ui| {
                 for (tip, mode) in [
@@ -1461,13 +1481,16 @@ impl Viewer {
                     ("toolbar.fixed_region.tooltip", CaptureMode::FixedRegion),
                     ("toolbar.pin.tooltip", CaptureMode::Pin),
                 ] {
-                    menu_item(ui, t!(tip).as_ref(), || shared.push(Command::Capture(mode)));
+                    menu_item(ui, shared, Command::Capture(mode), t!(tip).as_ref());
                 }
             });
             menu_button(ui, t!("settings.title").as_ref(), |ui| {
-                menu_item(ui, t!("menu.app.preferences").as_ref(), || {
-                    shared.push(Command::OpenSettings)
-                });
+                menu_item(
+                    ui,
+                    shared,
+                    Command::OpenSettings,
+                    t!("menu.app.preferences").as_ref(),
+                );
             });
         });
     }
@@ -2715,10 +2738,12 @@ fn menu_button(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) 
     });
 }
 
-/// One menu entry dispatching a [`Command`] when clicked.
-fn menu_item(ui: &mut egui::Ui, label: &str, action: impl FnOnce()) {
-    if ui.button(label).clicked() {
-        action();
+/// One menu entry dispatching a [`Command`] when clicked, greyed out
+/// when the command is forbidden by the current modal state.
+fn menu_item(ui: &mut egui::Ui, shared: &Shared, command: Command, label: &str) {
+    let enabled = shared.command_enabled(&command);
+    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+        shared.push(command);
         ui.close();
     }
 }

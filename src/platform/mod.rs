@@ -141,6 +141,16 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
     })
 }
 
+/// Greys out menu items whose [`Command`]'s
+/// [`crate::app::is_command_enabled`] ruling forbids them under `modal`.
+/// Called from [`crate::app::Shared::pump`], i.e. always on the main
+/// thread, where the thread_local muda handles live.
+#[cfg(target_os = "macos")]
+pub use macos::sync_menu_enabled;
+/// Greys out menu items (see above).
+#[cfg(target_os = "windows")]
+pub use windows::sync_menu_enabled;
+
 /// Reveals a file selected in the OS file manager after saving.
 #[cfg(target_os = "macos")]
 pub use macos::reveal_in_file_manager;

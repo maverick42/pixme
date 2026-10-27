@@ -53,14 +53,14 @@ const STATUS_ICON_PX: u32 = 44;
 /// to relabel them when the language changes.
 #[derive(Default)]
 struct Labels {
-    items: Vec<(MenuItem, &'static str)>,
+    items: Vec<(MenuItem, &'static str, String)>,
     predef: Vec<(PredefinedMenuItem, &'static str)>,
     subs: Vec<(Submenu, &'static str)>,
 }
 
 impl Labels {
     fn relabel(&self) {
-        for (item, key) in &self.items {
+        for (item, key, _id) in &self.items {
             item.set_text(t!(*key).as_ref());
         }
         for (item, key) in &self.predef {
@@ -120,7 +120,7 @@ fn item(
 ) {
     let item = MenuItem::with_id(id, t!(key).as_ref(), true, accelerator);
     append(menu, &item);
-    labels.items.push((item, key));
+    labels.items.push((item, key, id.to_owned()));
 }
 
 /// Installs the status item, the application menus and the menu-event
@@ -301,6 +301,22 @@ pub fn relabel_menus() {
     INSTALLED.with(|cell| {
         if let Some(installed) = &*cell.borrow() {
             installed.labels.relabel();
+        }
+    });
+}
+
+/// Greys out menu items whose command [`crate::app::is_command_enabled`]
+/// forbids under `modal` — app menu bar and status-item menu share the
+/// one table. Called from `Shared::pump`, always on the main thread where
+/// these thread_local handles live.
+pub fn sync_menu_enabled(modal: crate::app::ModalState) {
+    INSTALLED.with(|cell| {
+        if let Some(installed) = &*cell.borrow() {
+            for (item, _key, id) in &installed.labels.items {
+                if let Some(command) = super::command_from_menu_id(id) {
+                    item.set_enabled(crate::app::is_command_enabled(&command, modal));
+                }
+            }
         }
     });
 }

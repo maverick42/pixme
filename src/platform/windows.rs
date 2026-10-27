@@ -50,7 +50,7 @@ const TRAY_ICON_PX: u32 = 32;
 struct Installed {
     _tray: Option<TrayIcon>,
     _menu: Menu,
-    items: Vec<(MenuItem, &'static str)>,
+    items: Vec<(MenuItem, &'static str, &'static str)>,
 }
 
 thread_local! {
@@ -78,7 +78,7 @@ pub fn install_ui(ctx: &egui::Context) {
         if let Err(err) = menu.append(&item) {
             tracing::warn!("cannot append tray menu item: {err}");
         }
-        items.push((item, key));
+        items.push((item, key, id));
     }
 
     let mut builder = TrayIcon::builder()
@@ -145,8 +145,23 @@ pub fn window_list() -> Vec<super::WindowRecord> {
 pub fn relabel_menus() {
     INSTALLED.with(|cell| {
         if let Some(installed) = &*cell.borrow() {
-            for (item, key) in &installed.items {
+            for (item, key, _id) in &installed.items {
                 item.set_text(t!(*key).as_ref());
+            }
+        }
+    });
+}
+
+/// Greys out tray menu items whose command is forbidden under `modal`
+/// (same [`crate::app::is_command_enabled`] table as the macOS menus).
+/// Called from `Shared::pump`, always on the main thread.
+pub fn sync_menu_enabled(modal: crate::app::ModalState) {
+    INSTALLED.with(|cell| {
+        if let Some(installed) = &*cell.borrow() {
+            for (item, _key, id) in &installed.items {
+                if let Some(command) = super::command_from_menu_id(id) {
+                    item.set_enabled(crate::app::is_command_enabled(&command, modal));
+                }
             }
         }
     });

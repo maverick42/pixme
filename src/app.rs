@@ -130,6 +130,79 @@ pub enum Command {
     SavePin(u32),
 }
 
+/// Which modal surface owns input right now, if any. Only one modal can
+/// exist at a time (opening any command that would create a second one is
+/// disabled while a modal is up).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModalState {
+    /// No modal is open.
+    #[default]
+    None,
+    /// The settings panel (drawn inside the viewer viewport).
+    Settings,
+    /// The save-as dialog window.
+    SaveDialog,
+    /// The Draw (Dessiner) editor window.
+    Draw,
+}
+
+/// The single source of truth for command availability vs modal state:
+/// menu items (native + tray + egui strip), the dispatch safety net and
+/// every button read this table. The match is exhaustive — adding a
+/// `Command` variant without a ruling here fails compilation.
+///
+/// Rulings: `Quit` is always allowed (it closes the modal first, then
+/// runs the normal confirmation flow). While Draw is open its own
+/// undo/redo apply to its session, and `edit.copy`/paste live inside
+/// egui text fields — `CopyActive` stays reachable. `OpenSettings`
+/// re-focuses the existing settings window rather than stacking.
+/// Confirmation answers and overlay outcomes stay enabled (they are
+/// pushed by the modal/dialog itself, not by user menus).
+pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
+    if modal == ModalState::None {
+        return true;
+    }
+    match command {
+        // Always live: quit, modal-owned answers, overlay capture flow
+        // and pin self-management.
+        Command::Quit
+        | Command::CloseSettings
+        | Command::ConfirmSave
+        | Command::ConfirmDiscard
+        | Command::ConfirmCancel
+        | Command::ConfirmCapture
+        | Command::CancelCapture
+        | Command::ClosePin(_)
+        | Command::CopyPin(_)
+        | Command::ViewerClosed
+        | Command::CloseBar => true,
+        // Draw owns its document: its undo/redo/copy apply there; the
+        // viewer's copies must not act behind the modal.
+        Command::UndoActive | Command::RedoActive | Command::CopyActive => {
+            modal == ModalState::Draw
+        }
+        // Re-invoking the open modal's entry re-focuses it instead of
+        // re-opening. When the SETTINGS modal is up the same menu click
+        // brings it forward.
+        Command::OpenSettings => modal == ModalState::Settings,
+        Command::OpenViewer => modal == ModalState::Settings,
+        // Everything else is blocked while a modal owns the UI.
+        Command::Capture(_)
+        | Command::CaptureNow(_)
+        | Command::ShowBar
+        | Command::ImportClipboard
+        | Command::OpenFile
+        | Command::OpenLastDir
+        | Command::NewDocument
+        | Command::SaveActive
+        | Command::SaveAll
+        | Command::RenameActive
+        | Command::OpenDraw
+        | Command::PrintActive
+        | Command::SavePin(_) => false,
+    }
+}
+
 /// `egui::ViewportId` of the child windows (`from_hash_of` is not a const fn
 /// in egui 0.36, hence the functions).
 fn bar_id() -> egui::ViewportId {
@@ -206,6 +279,9 @@ pub struct Shared {
     /// Language applied at last check — detects changes made in the
     /// settings window so menus and `t!` can be refreshed.
     last_language: Mutex<Language>,
+    /// Last modal state pushed to the OS menus — diffs drive the
+    /// enable/disable sync so menu greying tracks every transition.
+    last_modal: Mutex<ModalState>,
 }
 
 impl Shared {
@@ -228,9 +304,26 @@ impl Shared {
     /// A modal child viewport is up (save-as, settings) — other windows
     /// dim themselves and refuse input while one is open.
     pub fn modal_child_open(&self) -> bool {
-        lock(&self.save_dialog).is_some()
-            || self.settings_open.load(Ordering::Relaxed)
-            || lock(&self.draw).is_some()
+        self.modal_state() != ModalState::None
+    }
+
+    /// The modal surface currently owning input, if any.
+    pub fn modal_state(&self) -> ModalState {
+        if lock(&self.draw).is_some() {
+            ModalState::Draw
+        } else if lock(&self.save_dialog).is_some() {
+            ModalState::SaveDialog
+        } else if self.settings_open.load(Ordering::Relaxed) {
+            ModalState::Settings
+        } else {
+            ModalState::None
+        }
+    }
+
+    /// Whether `command` may run in the current modal state — the UI
+    /// reads this to grey out buttons and menu entries.
+    pub fn command_enabled(&self, command: &Command) -> bool {
+        is_command_enabled(command, self.modal_state())
     }
 
     /// The concrete theme for the current appearance setting and OS theme.
@@ -261,10 +354,32 @@ impl Shared {
             i18n::apply(language);
             platform::relabel_menus();
         }
+        // Menu enable state follows every modal transition — opened via
+        // commands, closed via window chrome, Escape or programmatic
+        // clears all funnel into `modal_state()` read here. `pump` only
+        // runs on viewport passes, i.e. the main thread, which is where
+        // the thread_local muda handles live.
+        let modal = self.modal_state();
+        let mut last_modal = lock(&self.last_modal);
+        if *last_modal != modal {
+            *last_modal = modal;
+            platform::sync_menu_enabled(modal);
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            ctx.request_repaint_of(viewer_id());
+            ctx.request_repaint_of(bar_id());
+        }
     }
 
     /// The one dispatch path for every entry point.
     fn dispatch(&self, command: Command, ctx: &egui::Context) {
+        // Safety net under the greyed menus: an out-of-date item, a global
+        // hotkey or a queued click can still deliver a stale command —
+        // `is_command_enabled` is the single table deciding for all of them.
+        let modal = self.modal_state();
+        if !is_command_enabled(&command, modal) {
+            tracing::debug!(?command, ?modal, "command blocked while modal is open");
+            return;
+        }
         match command {
             Command::Capture(mode) => {
                 let (delay, auto_reset) = {
@@ -313,6 +428,13 @@ impl Shared {
                 self.enter(AppState::Idle, ctx);
             }
             Command::OpenSettings => {
+                if self.settings_open.load(Ordering::Relaxed) {
+                    // Already open: re-invocation brings the existing
+                    // modal to the front rather than re-opening it.
+                    self.request_focus(viewer_id());
+                    ctx.request_repaint_of(viewer_id());
+                    return;
+                }
                 self.settings_open.store(true, Ordering::Relaxed);
                 // The settings are a modal of the viewer: make sure the
                 // viewer exists (and is restored) before it shows.
@@ -327,6 +449,14 @@ impl Shared {
                 ctx.request_repaint_of(viewer_id());
             }
             Command::Quit => {
+                // Quit is always live: close the non-Draw modals first so
+                // the confirmation (or the exit) never sits behind them.
+                // An open Draw editor is committed as usual by
+                // `save_session` on the actual quit.
+                self.settings_open.store(false, Ordering::Relaxed);
+                if lock(&self.save_dialog).is_some() {
+                    *lock(&self.save_dialog) = None;
+                }
                 let mut viewer = lock(&self.viewer);
                 if viewer.dirty && !self.session_persists() {
                     viewer.confirm_close = true;
@@ -880,6 +1010,7 @@ impl PixMeApp {
             shared: Arc::new(Shared {
                 state: Mutex::new(AppState::Idle),
                 last_language: Mutex::new(settings.language),
+                last_modal: Mutex::new(ModalState::None),
                 settings: Mutex::new(settings),
                 viewer: Mutex::new(Viewer::default()),
                 toolbar: Mutex::new(Toolbar::default()),
@@ -1314,6 +1445,7 @@ mod tests {
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
+            last_modal: Mutex::new(ModalState::None),
         };
         (shared, egui::Context::default())
     }
@@ -1487,5 +1619,141 @@ mod tests {
         drive(&shared, &ctx, Command::OpenViewer);
         assert_eq!(drive(&shared, &ctx, Command::ShowBar), AppState::Bar);
         assert_eq!(drive(&shared, &ctx, Command::OpenViewer), AppState::Viewer);
+    }
+
+    /// Every `Command` variant, one instance each. `is_command_enabled`
+    /// matches exhaustively (no wildcard arm), so a new variant added here
+    /// without a ruling in the table fails to compile — and forgetting to
+    /// add the variant to this list fails this test's intent: update BOTH.
+    fn all_commands() -> Vec<Command> {
+        vec![
+            Command::Capture(CaptureMode::Region),
+            Command::CaptureNow(CaptureMode::Region),
+            Command::ConfirmCapture,
+            Command::CancelCapture,
+            Command::ShowBar,
+            Command::OpenViewer,
+            Command::CloseBar,
+            Command::ViewerClosed,
+            Command::OpenSettings,
+            Command::CloseSettings,
+            Command::Quit,
+            Command::ImportClipboard,
+            Command::OpenFile,
+            Command::OpenLastDir,
+            Command::NewDocument,
+            Command::SaveActive,
+            Command::SaveAll,
+            Command::RenameActive,
+            Command::CopyActive,
+            Command::OpenDraw,
+            Command::UndoActive,
+            Command::RedoActive,
+            Command::PrintActive,
+            Command::ConfirmSave,
+            Command::ConfirmDiscard,
+            Command::ConfirmCancel,
+            Command::ClosePin(0),
+            Command::CopyPin(0),
+            Command::SavePin(0),
+        ]
+    }
+
+    /// Nothing is blocked when no modal is open.
+    #[test]
+    fn all_commands_enabled_without_modal() {
+        for command in all_commands() {
+            assert!(
+                is_command_enabled(&command, ModalState::None),
+                "{command:?} must run with no modal"
+            );
+        }
+    }
+
+    /// The modal × command table. `(command, Settings, SaveDialog, Draw)`
+    /// — one row per variant of `all_commands()`.
+    #[test]
+    fn modal_command_table() {
+        // (Command, Settings?, SaveDialog?, Draw?)
+        let table: &[(Command, bool, bool, bool)] = &[
+            (Command::Capture(CaptureMode::Region), false, false, false),
+            (Command::CaptureNow(CaptureMode::Pin), false, false, false),
+            (Command::ConfirmCapture, true, true, true),
+            (Command::CancelCapture, true, true, true),
+            (Command::ShowBar, false, false, false),
+            (Command::OpenViewer, true, false, false),
+            (Command::CloseBar, true, true, true),
+            (Command::ViewerClosed, true, true, true),
+            (Command::OpenSettings, true, false, false),
+            (Command::CloseSettings, true, true, true),
+            (Command::Quit, true, true, true),
+            (Command::ImportClipboard, false, false, false),
+            (Command::OpenFile, false, false, false),
+            (Command::OpenLastDir, false, false, false),
+            (Command::NewDocument, false, false, false),
+            (Command::SaveActive, false, false, false),
+            (Command::SaveAll, false, false, false),
+            (Command::RenameActive, false, false, false),
+            (Command::CopyActive, false, false, true),
+            (Command::OpenDraw, false, false, false),
+            (Command::UndoActive, false, false, true),
+            (Command::RedoActive, false, false, true),
+            (Command::PrintActive, false, false, false),
+            (Command::ConfirmSave, true, true, true),
+            (Command::ConfirmDiscard, true, true, true),
+            (Command::ConfirmCancel, true, true, true),
+            (Command::ClosePin(1), true, true, true),
+            (Command::CopyPin(1), true, true, true),
+            (Command::SavePin(1), false, false, false),
+        ];
+        for (command, settings, save_dialog, draw) in table {
+            assert_eq!(
+                is_command_enabled(command, ModalState::Settings),
+                *settings,
+                "Settings: {command:?}"
+            );
+            assert_eq!(
+                is_command_enabled(command, ModalState::SaveDialog),
+                *save_dialog,
+                "SaveDialog: {command:?}"
+            );
+            assert_eq!(
+                is_command_enabled(command, ModalState::Draw),
+                *draw,
+                "Draw: {command:?}"
+            );
+        }
+    }
+
+    /// A blocked command is dropped by dispatch, not executed: SaveAll
+    /// during the Settings modal must not write anything.
+    #[test]
+    fn modal_blocks_save_all_dispatch() {
+        let (shared, ctx) = harness();
+        lock(&shared.viewer).push_stub("capture 1");
+        drive(&shared, &ctx, Command::OpenViewer);
+        drive(&shared, &ctx, Command::OpenSettings);
+        assert_eq!(shared.modal_state(), ModalState::Settings);
+        drive(&shared, &ctx, Command::SaveAll);
+        // The tab is still unsaved: SaveAll never ran.
+        assert!(lock(&shared.viewer).tabs.iter().all(|t| !t.saved));
+    }
+
+    /// Quit stays live under a modal: it closes the settings flag before
+    /// running the normal dirty-session confirmation.
+    #[test]
+    fn quit_under_settings_closes_modal_first() {
+        let (shared, ctx) = harness();
+        lock(&shared.settings).db_retention = crate::config::DbRetention::Never;
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.push_stub("capture 1");
+            viewer.dirty = true;
+        }
+        drive(&shared, &ctx, Command::OpenViewer);
+        drive(&shared, &ctx, Command::OpenSettings);
+        drive(&shared, &ctx, Command::Quit);
+        assert!(!shared.settings_open.load(Ordering::Relaxed));
+        assert!(lock(&shared.viewer).confirm_close);
     }
 }

@@ -63,40 +63,45 @@ impl Toolbar {
                     ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
                 }
                 grip_resp.on_hover_cursor(egui::CursorIcon::Grab);
-                for (icon, tip, mode) in [
-                    (
-                        Icon::SquareDashedMousePointer,
-                        "toolbar.window.tooltip",
-                        CaptureMode::WindowOrObject,
-                    ),
-                    (
-                        Icon::SquareDashed,
-                        "toolbar.region.tooltip",
-                        CaptureMode::Region,
-                    ),
-                    (
-                        Icon::Monitor,
-                        "toolbar.fullscreen.tooltip",
-                        CaptureMode::FullScreen,
-                    ),
-                    (
-                        Icon::Crop,
-                        "toolbar.fixed_region.tooltip",
-                        CaptureMode::FixedRegion,
-                    ),
-                    (Icon::Pin, "toolbar.pin.tooltip", CaptureMode::Pin),
-                ] {
-                    if cap_button(ui, icon, tip, false).clicked() {
-                        shared.push(Command::Capture(mode));
+                // A modal window (save-as opened from a pin, etc.) can be
+                // up while the bar is visible: grey out every command it
+                // forbids, keep the close X live (`CloseBar` always runs).
+                ui.add_enabled_ui(!shared.modal_child_open(), |ui| {
+                    for (icon, tip, mode) in [
+                        (
+                            Icon::SquareDashedMousePointer,
+                            "toolbar.window.tooltip",
+                            CaptureMode::WindowOrObject,
+                        ),
+                        (
+                            Icon::SquareDashed,
+                            "toolbar.region.tooltip",
+                            CaptureMode::Region,
+                        ),
+                        (
+                            Icon::Monitor,
+                            "toolbar.fullscreen.tooltip",
+                            CaptureMode::FullScreen,
+                        ),
+                        (
+                            Icon::Crop,
+                            "toolbar.fixed_region.tooltip",
+                            CaptureMode::FixedRegion,
+                        ),
+                        (Icon::Pin, "toolbar.pin.tooltip", CaptureMode::Pin),
+                    ] {
+                        if cap_button(ui, icon, tip, false).clicked() {
+                            shared.push(Command::Capture(mode));
+                        }
                     }
-                }
-                widgets::vline(ui, 18.0);
-                let delay_btn = cap_button(ui, Icon::Clock, "toolbar.delay.tooltip", false);
-                Self::delay_menu(&delay_btn, settings);
-                widgets::vline(ui, 18.0);
-                let opts_btn = cap_button(ui, Icon::Settings, "toolbar.options.tooltip", false);
-                Self::options_menu(&opts_btn, settings);
-                widgets::vline(ui, 18.0);
+                    widgets::vline(ui, 18.0);
+                    let delay_btn = cap_button(ui, Icon::Clock, "toolbar.delay.tooltip", false);
+                    Self::delay_menu(&delay_btn, settings);
+                    widgets::vline(ui, 18.0);
+                    let opts_btn = cap_button(ui, Icon::Settings, "toolbar.options.tooltip", false);
+                    Self::options_menu(&opts_btn, settings);
+                    widgets::vline(ui, 18.0);
+                });
                 if cap_button(ui, Icon::X, "toolbar.close.tooltip", false).clicked() {
                     shared.push(Command::CloseBar);
                 }

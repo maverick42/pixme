@@ -849,3 +849,53 @@ Format: date — context — decision — consequences.
     outline width + colour, opacity, shadow).
 - **Consequences**: `SCHEMA_VERSION` bumped to 12 in `src/store/mod.rs`.
 
+
+## 2026-10-27 — Modal windows gate commands via one eligibility table
+
+- **Context**: on macOS the global menu bar stays fully active while a
+  modal window (Settings, save-as dialog, Draw editor) is open — « Tout
+  enregistrer », printing or captures could fire mid-settings. Windows
+  has no global menu bar but the tray menu and (later) global hotkeys
+  reach the same commands.
+- **Decision**: one pure table — `app::is_command_enabled(command,
+  modal_state)` in `src/app.rs` — is the single source of truth. It is
+  an exhaustive `match` (no wildcard), so a new `Command` variant
+  without a ruling fails to compile. `ModalState` (`None`, `Settings`,
+  `SaveDialog`, `Draw`) is computed by `Shared::modal_state()`. Three
+  consumers read it:
+  - **Menu greying**: `platform::sync_menu_enabled` maps each item id
+    through `command_from_menu_id` and calls `set_enabled` — covers the
+    macOS app menu bar, the macOS status-item menu and the Windows tray
+    menu. `Shared::pump` diffs `modal_state()` every pass and re-syncs
+    on ANY transition (window X, Esc, programmatic close), then requests
+    repaints on root, viewer and bar so egui surfaces reflect it too.
+    All `set_enabled` calls run on the main thread: `pump` only runs
+    inside viewport passes and the muda handles live in a thread_local.
+  - **Dispatch safety net**: `dispatch()` drops any forbidden command
+    before matching, so a stale menu event, a queued click or a global
+    hotkey can never bypass the table.
+  - **Widgets**: the Windows egui menu strip and the floating bar's
+    buttons are drawn disabled through the same `command_enabled`.
+  - Rulings: `Quit` is always live — it closes Settings/save-as modals
+    first (an open Draw editor is committed by `save_session`, as
+    before) then runs the existing Save/Discard/Cancel flow.
+    `OpenSettings` while Settings is already open re-focuses the modal
+    instead of re-opening. Under Draw, `UndoActive`/`RedoActive`/
+    `CopyActive` route to the Draw session (existing dispatch arms) —
+    under Settings or save-as they are blocked so they can never act on
+    the background document; modal text fields keep native egui editing
+    since those keys never become `Command`s. Confirmation answers and
+    capture-overlay outcomes stay enabled (the modal itself pushes
+    them); pin close/copy stay enabled (pins are autonomous); `SavePin`
+    is blocked while a modal is up (no stacked modals).
+  - **Windows findings** (requested verification): (a) there is NO
+    OS-level modality — egui child viewports are ordinary top-level
+    windows and no `EnableWindow`/owner-disabling exists; the parent is
+    blocked only by the egui dim overlay and now by the dispatch guard.
+    (b) The Windows notification-area icon exists by spec (rules 00 /
+    decision 2026-10-24: "Windows tray + taskbar button", accent-coloured
+    icon) and its menu carries exactly two entries: "Take a capture" and
+    "Open PixMe" — both now grey out under a modal.
+- **Consequences**: menu-enable state can never diverge from dispatch
+  behaviour; every future `Command` must rule itself in the table.
+  Manual coverage: MT-28 in `docs/audit/AUDIT_PROCESS.md`.
