@@ -408,7 +408,16 @@ impl Shared {
             Command::ConfirmCapture => self.confirm_capture(ctx),
             Command::CancelCapture => self.cancel_capture(ctx),
             Command::ShowBar => self.enter(AppState::Bar, ctx),
-            Command::OpenViewer => self.enter(AppState::Viewer, ctx),
+            Command::OpenViewer => {
+                self.enter(AppState::Viewer, ctx);
+                // Re-invoking while the window is already open (behind
+                // other apps, or minimized in the Dock) must still bring
+                // it forward: `enter` only requests focus on a state
+                // CHANGE, so de-minimize and focus explicitly here.
+                ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Minimized(false));
+                self.request_focus(viewer_id());
+                ctx.request_repaint_of(viewer_id());
+            }
             Command::CloseBar => {
                 // Back where the user came from: the viewer when the session
                 // has captures, the resident icon otherwise.
@@ -431,6 +440,7 @@ impl Shared {
                 if self.settings_open.load(Ordering::Relaxed) {
                     // Already open: re-invocation brings the existing
                     // modal to the front rather than re-opening it.
+                    ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Minimized(false));
                     self.request_focus(viewer_id());
                     ctx.request_repaint_of(viewer_id());
                     return;
@@ -1115,9 +1125,7 @@ impl eframe::App for PixMeApp {
                     // modality. Clicking the modal's parent (the dim veil
                     // eats it) brings the editor back in front — one
                     // command per click, no per-frame focus fight.
-                    if lock(&shared.draw).is_some()
-                        && ctx.input(|i| i.pointer.any_pressed())
-                    {
+                    if lock(&shared.draw).is_some() && ctx.input(|i| i.pointer.any_pressed()) {
                         ctx.send_viewport_cmd_to(draw_id(), egui::ViewportCommand::Focus);
                     }
                     ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
