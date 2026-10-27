@@ -350,6 +350,9 @@ pub struct DrawSession {
     /// The unsaved-changes confirmation is up (Échap/Annuler/close with
     /// edits pending).
     confirm_quit: bool,
+    /// `doc.revision` at open — the session is dirty only once it moved,
+    /// so a restored history stack alone never arms the warning.
+    open_revision: u64,
     /// Last pointer position in image coords (shape-drag end point).
     last_pointer: Option<Pos2>,
     /// Whether Ctrl or Shift is held this frame (horizontal/vertical snap).
@@ -370,6 +373,7 @@ impl DrawSession {
         redo: VecDeque<AnnoEdit>,
         prefs: &crate::config::Settings,
     ) -> Self {
+        let open_revision = doc.revision;
         Self {
             doc,
             tab,
@@ -392,6 +396,7 @@ impl DrawSession {
             rendered_rev: u64::MAX,
             outcome: None,
             confirm_quit: false,
+            open_revision,
             last_pointer: None,
             snap_hv: false,
             img_rect: Rect::NOTHING,
@@ -408,7 +413,7 @@ impl DrawSession {
     /// are none; otherwise the user confirms through a warning box.
     /// Called by Annuler, Escape and the window's close control.
     pub fn request_cancel(&mut self) {
-        if self.undo.is_empty() {
+        if self.doc.revision == self.open_revision {
             self.outcome = Some(Outcome::Cancel);
         } else {
             self.confirm_quit = true;
@@ -572,26 +577,26 @@ impl DrawSession {
         if !self.confirm_quit {
             return;
         }
-        let mut open = true;
-        egui::Window::new(t!("draw.quit.title").to_string())
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(t!("draw.quit.body").to_string());
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(t!("draw.quit.stay").to_string()).clicked() {
-                        self.confirm_quit = false;
-                    }
-                    if ui.button(t!("draw.quit.discard").to_string()).clicked() {
-                        self.confirm_quit = false;
-                        self.outcome = Some(Outcome::Cancel);
-                    }
-                });
+        let resp = egui::Modal::new(egui::Id::new("pixme-draw-quit")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(
+                egui::RichText::new(t!("draw.quit.title").to_string()).font(theme::semibold(14.0)),
+            );
+            widgets::hairline(ui);
+            ui.add_space(4.0);
+            ui.label(t!("draw.quit.body").to_string());
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &t!("draw.quit.stay")).clicked() {
+                    self.confirm_quit = false;
+                }
+                if widgets::secondary_button(ui, &t!("draw.quit.discard")).clicked() {
+                    self.confirm_quit = false;
+                    self.outcome = Some(Outcome::Cancel);
+                }
             });
-        if !open {
+        });
+        if resp.should_close() {
             self.confirm_quit = false;
         }
     }
