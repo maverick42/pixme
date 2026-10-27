@@ -329,6 +329,10 @@ pub struct DrawSession {
     tool: Tool,
     opts: Opts,
     selected: Option<AnnotationId>,
+    /// Object the z-order context menu was opened on (right-click) —
+    /// remembered because `hit` reports nothing while the pointer sits
+    /// over the popup itself.
+    ctx_menu_id: Option<AnnotationId>,
     drag: Option<Drag>,
     /// The live marquee (SelectArea) — cleared on tool switch, Escape,
     /// click-outside, or when the region is lifted into an object.
@@ -383,6 +387,7 @@ impl DrawSession {
             tool: Tool::Select,
             opts: Opts::from_settings(prefs),
             selected: None,
+            ctx_menu_id: None,
             drag: None,
             sel_area: None,
             sel_patches: Vec::new(),
@@ -457,6 +462,22 @@ impl DrawSession {
             let anno = self.doc.annotations[idx].clone();
             self.apply(AnnoEdit::Remove { anno, index: idx });
             self.selected = None;
+        }
+    }
+
+    /// Moves `id` to the very top (`front`) or bottom (`back`) of the
+    /// z-order — undoable like every annotation edit.
+    fn reorder(&mut self, id: AnnotationId, front: bool) {
+        let Some(from) = self.doc.index_of(id) else {
+            return;
+        };
+        let to = if front {
+            self.doc.annotations.len().saturating_sub(1)
+        } else {
+            0
+        };
+        if from != to {
+            self.apply(AnnoEdit::Reorder { id, from, to });
         }
     }
 
@@ -1046,6 +1067,21 @@ impl DrawSession {
                 };
                 self.pointer(ui, &resp, &painter, to_img, scale);
                 self.draw_overlay(&painter, img_rect, scale);
+                let menu_id = self.ctx_menu_id;
+                egui::Popup::context_menu(&resp).show(|ui| {
+                    let Some(id) = menu_id else {
+                        ui.close();
+                        return;
+                    };
+                    if ui.button(t!("draw.ctx.front").to_string()).clicked() {
+                        self.reorder(id, true);
+                        ui.close();
+                    }
+                    if ui.button(t!("draw.ctx.back").to_string()).clicked() {
+                        self.reorder(id, false);
+                        ui.close();
+                    }
+                });
             });
     }
 
@@ -1113,6 +1149,16 @@ impl DrawSession {
             egui::CursorIcon::Crosshair
         };
         ui.ctx().set_cursor_icon(cursor);
+
+        // Right-click an object: it becomes the selection and arms the
+        // z-order menu drawn in `canvas` (it must run even while the
+        // pointer is off-canvas over the popup, or it would close).
+        if resp.secondary_clicked() {
+            self.ctx_menu_id = hit_id.filter(|_| can_pick_existing);
+            if self.ctx_menu_id.is_some() {
+                self.selected = self.ctx_menu_id;
+            }
+        }
 
         // Commit a pending move/resize on release.
         if !resp.dragged()

@@ -26,6 +26,13 @@ pub enum AnnoEdit {
         before: Annotation,
         after: Annotation,
     },
+    /// The annotation `id` moved from index `from` to `to` in the
+    /// z-order (later entries draw on top).
+    Reorder {
+        id: AnnotationId,
+        from: usize,
+        to: usize,
+    },
 }
 
 impl AnnoEdit {
@@ -42,6 +49,7 @@ impl AnnoEdit {
                     *slot = after.clone();
                 }
             }
+            Self::Reorder { id, to, .. } => move_to(doc, *id, *to),
         }
     }
 
@@ -58,7 +66,16 @@ impl AnnoEdit {
                     *slot = before.clone();
                 }
             }
+            Self::Reorder { id, from, .. } => move_to(doc, *id, *from),
         }
+    }
+}
+
+/// Re-inserts the annotation `id` at index `to` (clamped).
+fn move_to(doc: &mut Document, id: AnnotationId, to: usize) {
+    if let Some(cur) = doc.annotations.iter().position(|a| a.id == id) {
+        let a = doc.annotations.remove(cur);
+        doc.annotations.insert(to.min(doc.annotations.len()), a);
     }
 }
 
@@ -165,6 +182,39 @@ mod tests {
         if let AnnotationKind::Rect(o) = &d.annotation(7).unwrap().kind {
             assert_eq!(o.stroke, Color32::RED);
         }
+    }
+
+    /// Bring-to-front / send-to-back round-trips through apply/revert.
+    #[test]
+    fn reorder_round_trip() {
+        let mut d = doc();
+        for id in [1, 2, 3] {
+            AnnoEdit::Add {
+                anno: rect_anno(id),
+                index: d.annotations.len(),
+            }
+            .apply(&mut d);
+        }
+        let ids = |d: &Document| d.annotations.iter().map(|a| a.id).collect::<Vec<_>>();
+        assert_eq!(ids(&d), vec![1, 2, 3]);
+        let front = AnnoEdit::Reorder {
+            id: 1,
+            from: 0,
+            to: 2,
+        };
+        front.apply(&mut d);
+        assert_eq!(ids(&d), vec![2, 3, 1]);
+        front.revert(&mut d);
+        assert_eq!(ids(&d), vec![1, 2, 3]);
+        let back = AnnoEdit::Reorder {
+            id: 3,
+            from: 2,
+            to: 0,
+        };
+        back.apply(&mut d);
+        assert_eq!(ids(&d), vec![3, 1, 2]);
+        back.revert(&mut d);
+        assert_eq!(ids(&d), vec![1, 2, 3]);
     }
 
     /// A blur annotation actually changes the pixels it covers.
