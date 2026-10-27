@@ -46,6 +46,7 @@ settings.filename.notes: |-
 toolbar.close.tooltip: "Cerrar la barra de captura"
 viewer.empty: "Aún no hay capturas"
 viewer.loading: "Cargando la sesión…"
+viewer.saving_all: "Guardando las capturas… %{done}/%{total}"
 viewer.new_capture.tooltip: "Nueva captura"
 viewer.mode.mosaic: "Mosaico"
 viewer.mode.tabs: "Pestañas"

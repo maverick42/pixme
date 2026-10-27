@@ -1214,6 +1214,31 @@ impl Viewer {
                     );
                     ui.allocate_rect(rect, Sense::click_and_drag());
                     ctx.request_repaint();
+                } else if let Some((done, total)) = shared.save_all_progress() {
+                    // "Tout enregistrer" in flight: same opaque veil,
+                    // plus the written/total counter and a progress bar.
+                    let rect = ui.max_rect();
+                    ui.painter().rect_filled(rect, 0.0, t.dock);
+                    paint_loading(ui);
+                    ui.painter().text(
+                        rect.center() + Vec2::new(0.0, 36.0),
+                        egui::Align2::CENTER_CENTER,
+                        t!("viewer.saving_all", done = done, total = total).as_ref(),
+                        theme::medium(12.0),
+                        t.text,
+                    );
+                    let bar = Rect::from_center_size(
+                        rect.center() + Vec2::new(0.0, 60.0),
+                        Vec2::new(240.0, 6.0),
+                    );
+                    ui.put(
+                        bar,
+                        egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                            .desired_height(6.0)
+                            .corner_radius(3.0),
+                    );
+                    ui.allocate_rect(rect, Sense::click_and_drag());
+                    ctx.request_repaint();
                 }
             });
         self.confirm_dialog(&ctx, shared);

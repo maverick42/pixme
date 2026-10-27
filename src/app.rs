@@ -289,6 +289,9 @@ pub struct Shared {
     /// The in-flight quit-time save: the worker owns the Store + the
     /// tabs while writing; its return closes the app.
     pub quit_rx: Mutex<Option<std::sync::mpsc::Receiver<crate::store::Store>>>,
+    /// The in-flight "Tout enregistrer" batch: the worker owns the tabs
+    /// while writing; `pump` reattaches them when it lands.
+    save_all: Mutex<Option<SaveAllJob>>,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -302,6 +305,16 @@ pub struct Shared {
     /// Last modal state pushed to the OS menus — diffs drive the
     /// enable/disable sync so menu greying tracks every transition.
     last_modal: Mutex<ModalState>,
+}
+
+/// A running background save-all: the moved tabs come back over `rx`,
+/// `done` ticks once per processed tab for the progress veil, and
+/// `then_confirm` closes the saved session on completion (ConfirmSave).
+struct SaveAllJob {
+    rx: std::sync::mpsc::Receiver<Vec<crate::ui::viewer::Tab>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    total: usize,
+    then_confirm: bool,
 }
 
 impl Shared {
@@ -329,7 +342,7 @@ impl Shared {
 
     /// The modal surface currently owning input, if any.
     pub fn modal_state(&self) -> ModalState {
-        if self.saving() {
+        if self.saving() || lock(&self.save_all).is_some() {
             ModalState::Saving
         } else if lock(&self.draw).is_some() {
             ModalState::Draw
@@ -353,6 +366,14 @@ impl Shared {
     /// store comes back and the app closes.
     pub fn saving(&self) -> bool {
         lock(&self.quit_rx).is_some()
+    }
+
+    /// `(done, total)` while a background save-all batch runs — the
+    /// viewer paints the progress veil.
+    pub fn save_all_progress(&self) -> Option<(usize, usize)> {
+        lock(&self.save_all)
+            .as_ref()
+            .map(|j| (j.done.load(Ordering::Relaxed), j.total))
     }
 
     /// The concrete theme for the current appearance setting and OS theme.
@@ -414,6 +435,28 @@ impl Shared {
             *lock(&self.quit_rx) = None;
             *lock(&self.store) = store;
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+        }
+        // A background save-all finished: the tabs come back into the
+        // viewer; a ConfirmSave batch then closes the (now clean)
+        // session, or keeps it open when some tab is still unsaved.
+        let save_done = lock(&self.save_all)
+            .as_ref()
+            .and_then(|j| j.rx.try_recv().ok());
+        if let Some(tabs) = save_done {
+            let job = lock(&self.save_all).take().expect("save-all job");
+            {
+                let mut viewer = lock(&self.viewer);
+                viewer.tabs = tabs;
+                viewer.recompute_dirty();
+            }
+            if job.then_confirm {
+                if lock(&self.viewer).dirty {
+                    lock(&self.viewer).confirm_then_quit = false;
+                } else {
+                    self.finish_confirmation(ctx);
+                }
+            }
+            ctx.request_repaint_of(viewer_id());
         }
     }
 
@@ -533,11 +576,13 @@ impl Shared {
                 }
             }
             Command::ConfirmSave => {
-                // "Save" in the unsaved-session dialog = save-all, then close
-                // only when every unsaved tab actually reached disk.
-                if self.save_all(ctx) {
+                // "Save" in the unsaved-session dialog = save-all, then
+                // close only when every unsaved tab reached disk. When
+                // the batch runs in background, its completion decides.
+                if self.save_all(ctx, true) {
                     self.finish_confirmation(ctx);
-                } else {
+                } else if lock(&self.save_all).is_none() {
+                    // Couldn't even start (name clash / no folder).
                     let mut viewer = lock(&self.viewer);
                     viewer.confirm_close = false;
                     viewer.confirm_then_quit = false;
@@ -648,7 +693,7 @@ impl Shared {
                 }
             }
             Command::SaveAll => {
-                self.save_all(ctx);
+                self.save_all(ctx, false);
             }
             Command::RenameActive => lock(&self.viewer).open_rename(),
             Command::CopyActive => {
@@ -768,9 +813,12 @@ impl Shared {
     }
 
     /// Writes every unsaved tab to the last-used folder (or ~/Pictures) as
-    /// PNGs with annotations composited. Returns `true` when the whole
-    /// session is clean afterwards.
-    fn save_all(&self, ctx: &egui::Context) -> bool {
+    /// PNGs with annotations composited — the same sequential write loop as
+    /// before, just riding a worker thread so the viewer paints a progress
+    /// veil (`pump` reattaches the tabs when the job lands). Returns `true`
+    /// only when the session is clean right away; `then_confirm` marks a
+    /// ConfirmSave batch so its completion runs the saved-session close.
+    fn save_all(&self, ctx: &egui::Context, then_confirm: bool) -> bool {
         let Some(folder) = lock(&self.settings).last_save_dir.clone().or_else(|| {
             directories::UserDirs::new().and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
         }) else {
@@ -792,30 +840,52 @@ impl Shared {
             ctx.request_repaint_of(viewer_id());
             return false;
         }
-        for tab in viewer.tabs.iter_mut() {
-            if tab.saved {
-                continue;
-            }
-            let stem = crate::config::filename::sanitize_filename(tab.title.trim());
-            let path = unique_png(&folder, &stem);
-            let mut capture = tab.doc.base.clone();
-            capture.image = crate::editor::render::render_to_image(&tab.doc);
-            match crate::export::file::save_capture_to(
-                &capture,
-                &path,
-                crate::export::ImageFormat::Png,
-            ) {
-                Ok(()) => {
-                    tab.saved = true;
-                    tab.doc.meta.source_path = Some(path.clone());
-                    tab.doc.meta.saved_at = Some(chrono::Local::now());
-                    tracing::info!(?path, "tab saved");
-                }
-                Err(e) => tracing::warn!(?path, "save-all failed: {e}"),
-            }
+        if viewer.tabs.iter().all(|t| t.saved) {
+            return true;
         }
-        viewer.recompute_dirty();
-        !viewer.dirty
+        let total = viewer.tabs.iter().filter(|t| !t.saved).count();
+        // The confirm modal must not linger above the progress veil;
+        // `confirm_then_quit` survives for the completion step.
+        viewer.confirm_close = false;
+        let tabs = std::mem::take(&mut viewer.tabs);
+        drop(viewer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *lock(&self.save_all) = Some(SaveAllJob {
+            rx,
+            done: std::sync::Arc::clone(&done),
+            total,
+            then_confirm,
+        });
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let mut tabs = tabs;
+            for tab in tabs.iter_mut().filter(|t| !t.saved) {
+                let stem = crate::config::filename::sanitize_filename(tab.title.trim());
+                let path = unique_png(&folder, &stem);
+                let mut capture = tab.doc.base.clone();
+                capture.image = crate::editor::render::render_to_image(&tab.doc);
+                match crate::export::file::save_capture_to(
+                    &capture,
+                    &path,
+                    crate::export::ImageFormat::Png,
+                ) {
+                    Ok(()) => {
+                        tab.saved = true;
+                        tab.doc.meta.source_path = Some(path.clone());
+                        tab.doc.meta.saved_at = Some(chrono::Local::now());
+                        tracing::info!(?path, "tab saved");
+                    }
+                    Err(e) => tracing::warn!(?path, "save-all failed: {e}"),
+                }
+                done.fetch_add(1, Ordering::Relaxed);
+                wake.request_repaint();
+            }
+            let _ = tx.send(tabs);
+            wake.request_repaint();
+        });
+        ctx.request_repaint_of(viewer_id());
+        false
     }
 
     /// Moves the machine to `next` and wakes the anchor so the child
@@ -1250,6 +1320,7 @@ impl PixMeApp {
                 }),
                 restore_rx: Mutex::new(None),
                 quit_rx: Mutex::new(None),
+                save_all: Mutex::new(None),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
             }),
@@ -1676,6 +1747,7 @@ mod tests {
             store: Mutex::new(crate::store::Store::open_in_memory()),
             restore_rx: Mutex::new(None),
             quit_rx: Mutex::new(None),
+            save_all: Mutex::new(None),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
@@ -1709,6 +1781,19 @@ mod tests {
             && let Ok(store) = rx.recv()
         {
             *lock(&shared.store) = store;
+        }
+    }
+
+    /// Blocks on the save-all worker and reattaches the tabs — the
+    /// synchronous twin of the `save_all` drain `pump()` does per frame.
+    fn drain_save_all(shared: &Shared) {
+        let Some(job) = lock(&shared.save_all).take() else {
+            return;
+        };
+        if let Ok(tabs) = job.rx.recv() {
+            let mut viewer = lock(&shared.viewer);
+            viewer.tabs = tabs;
+            viewer.recompute_dirty();
         }
     }
 
@@ -2125,6 +2210,7 @@ mod tests {
             viewer.tabs[1].title = "unique".to_owned();
         }
         drive(&shared, &ctx, Command::SaveAll);
+        drain_save_all(&shared);
         let saved_img = crate::export::file::load_image(&dir.join("dup.png")).unwrap();
         assert_eq!(saved_img.get_pixel(4, 4).0, [255, 0, 0, 255]);
         let _ = std::fs::remove_dir_all(&dir);
