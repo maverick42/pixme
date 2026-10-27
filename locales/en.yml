@@ -29,6 +29,20 @@ settings.db.warn.title: "Session database"
 settings.db.warn.body: "Captures stored in the database will be lost."
 settings.db.warn.confirm: "Confirm"
 settings.db.warn.cancel: "Cancel"
+settings.page.general: "General"
+settings.page.filename: "File name"
+settings.filename.label: "Template:"
+settings.filename.add: "Add the current template to the list"
+settings.filename.remove: "Remove this template from the list"
+settings.filename.example: "Example: %{name}.png"
+settings.filename.empty: "The template cannot be empty"
+settings.filename.notes: |-
+  Notes:  #  - Sequential number
+          @  - Random character (0-9, a-z, A-Z)
+          $Y - Year,   $M - Month,  $D - Day
+          $H - Hour,   $N - Minute, $S - Second
+          %COMPUTERNAME% - Computer name
+          %USERNAME%     - User name
 toolbar.close.tooltip: "Close the capture bar"
 viewer.empty: "No captures yet"
 viewer.new_capture.tooltip: "New capture"
@@ -119,6 +133,9 @@ dialog.rename.title: "Rename"
 dialog.rename.label: "New name:"
 dialog.rename.ok: "Rename"
 dialog.rename.taken: "This name is already used by another capture"
+dialog.rename.empty: "The name cannot be empty"
+dialog.dup_names.title: "Save all"
+dialog.dup_names.body: "Two captures share the same name. Rename them before saving all."
 viewer.tab.save: "Save"
 viewer.tab.rename: "Rename…"
 viewer.tab.delete_file: "Delete file"

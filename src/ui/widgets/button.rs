@@ -5,23 +5,29 @@ use egui::{Color32, CornerRadius, Response, Sense, Stroke, StrokeKind, Ui, Vec2}
 
 use crate::ui::theme;
 
+/// The three button fills: resting, hovered, pressed.
+struct Fills {
+    rest: Color32,
+    hover: Color32,
+    pressed: Color32,
+}
+
 fn paint_button(
     ui: &Ui,
     response: &Response,
     rect: egui::Rect,
     text: &str,
-    fill: Color32,
+    fills: &Fills,
     fg: Color32,
     border: Stroke,
 ) {
     let t = theme::tokens(ui.ctx());
     let fill = if response.is_pointer_button_down_on() {
-        t.pressed
+        fills.pressed
     } else if response.hovered() {
-        // One step brighter/darker than the resting fill.
-        t.hover
+        fills.hover
     } else {
-        fill
+        fills.rest
     };
     ui.painter().rect(
         rect,
@@ -39,7 +45,7 @@ fn paint_button(
     );
 }
 
-fn button(ui: &mut Ui, text: &str, fill: Color32, fg: Color32, border: Stroke) -> Response {
+fn button(ui: &mut Ui, text: &str, fills: &Fills, fg: Color32, border: Stroke) -> Response {
     let padding = ui.spacing().button_padding;
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
@@ -52,21 +58,43 @@ fn button(ui: &mut Ui, text: &str, fill: Color32, fg: Color32, border: Stroke) -
         Sense::click(),
     );
     if ui.is_rect_visible(rect) {
-        paint_button(ui, &response, rect, text, fill, fg, border);
+        paint_button(ui, &response, rect, text, fills, fg, border);
     }
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text));
     response
 }
 
-/// Filled call-to-action button (`primary_bg` / `primary_text`).
+/// Filled call-to-action button (`primary_bg` / `primary_text`): hover
+/// and pressed keep the accent hue — just lighter/darker, not the
+/// neutral grey that read as a washed-out button.
 pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
     let t = theme::tokens(ui.ctx());
-    button(ui, text, t.primary_bg, t.primary_text, Stroke::NONE)
+    button(
+        ui,
+        text,
+        &Fills {
+            rest: t.primary_bg,
+            hover: t.primary_bg.blend(Color32::from_white_alpha(40)),
+            pressed: t.primary_bg.blend(Color32::from_black_alpha(45)),
+        },
+        t.primary_text,
+        Stroke::NONE,
+    )
 }
 
 /// Quiet button on `field` with `field_border` outline.
 pub fn secondary_button(ui: &mut Ui, text: &str) -> Response {
     let t = theme::tokens(ui.ctx());
-    button(ui, text, t.field, t.text, Stroke::new(1.0, t.field_border))
+    button(
+        ui,
+        text,
+        &Fills {
+            rest: t.field,
+            hover: t.hover,
+            pressed: t.pressed,
+        },
+        t.text,
+        Stroke::new(1.0, t.field_border),
+    )
 }

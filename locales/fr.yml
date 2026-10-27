@@ -29,6 +29,20 @@ settings.db.warn.title: "Sauvegarde de la base"
 settings.db.warn.body: "Les captures en base de données vont être perdues."
 settings.db.warn.confirm: "Confirmer"
 settings.db.warn.cancel: "Annuler"
+settings.page.general: "Général"
+settings.page.filename: "Nom de fichier"
+settings.filename.label: "Modèle :"
+settings.filename.add: "Ajouter le modèle courant à la liste"
+settings.filename.remove: "Supprimer ce modèle de la liste"
+settings.filename.example: "Exemple : %{name}.png"
+settings.filename.empty: "Le modèle ne peut pas être vide"
+settings.filename.notes: |-
+  Notes : #  - Numéro séquentiel
+          @  - Caractère aléatoire (0-9, a-z, A-Z)
+          $Y - Année,  $M - Mois,   $D - Jour
+          $H - Heure,  $N - Minute, $S - Seconde
+          %COMPUTERNAME% - Nom de l'ordinateur
+          %USERNAME%     - Nom de l'utilisateur
 toolbar.close.tooltip: "Fermer la barre de capture"
 viewer.empty: "Aucune capture pour l'instant"
 viewer.new_capture.tooltip: "Nouvelle capture"
@@ -119,6 +133,9 @@ dialog.rename.title: "Renommer"
 dialog.rename.label: "Nouveau nom :"
 dialog.rename.ok: "Renommer"
 dialog.rename.taken: "Ce nom est déjà utilisé par une autre capture"
+dialog.rename.empty: "Le nom ne peut pas être vide"
+dialog.dup_names.title: "Tout enregistrer"
+dialog.dup_names.body: "Deux captures portent le même nom. Renommez-les avant d’enregistrer."
 viewer.tab.save: "Enregistrer"
 viewer.tab.rename: "Renommer…"
 viewer.tab.delete_file: "Supprimer le fichier"

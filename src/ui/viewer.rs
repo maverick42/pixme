@@ -180,6 +180,9 @@ pub struct Viewer {
     protect: Option<ProtectDialog>,
     /// The "delete the file on disk" confirmation, open while Some.
     confirm_delete: Option<DeleteFileDialog>,
+    /// Save-all found two unsaved captures sharing a name — show the
+    /// blocking notice until dismissed.
+    pub dup_names: bool,
     /// Draft of the locked tab's password prompt.
     unlock_draft: String,
     /// The last unlock attempt failed — show the inline error.
@@ -227,6 +230,7 @@ impl Default for Viewer {
             zoom: ZoomMode::default(),
             eff_scale: 0.0,
             resize: None,
+            dup_names: false,
             rename: None,
             protect: None,
             confirm_delete: None,
@@ -349,6 +353,31 @@ impl Viewer {
         self.set_active(new);
         // Sorting may move the new tab; set_active ran first so
         // sort_tabs remaps `active` by document id.
+        self.sort_tabs();
+        self.recompute_dirty();
+    }
+
+    /// Adds `doc` as a fresh tab with `title` VERBATIM — the capture
+    /// naming template may legitimately repeat (duplicates are caught at
+    /// save-all, where a rename is the fix).
+    pub fn push_capture_document(&mut self, doc: Document, title: String) {
+        let insertion = self.next_insertion;
+        self.next_insertion += 1;
+        self.tabs.push(Tab {
+            title,
+            doc,
+            saved: false,
+            texture: None,
+            thumb: None,
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            anno_undo: VecDeque::new(),
+            anno_redo: VecDeque::new(),
+            unlocked: false,
+            insertion,
+        });
+        let new = self.tabs.len() - 1;
+        self.set_active(new);
         self.sort_tabs();
         self.recompute_dirty();
     }
@@ -915,6 +944,7 @@ impl Viewer {
             || self.rename.is_some()
             || self.protect.is_some()
             || self.confirm_delete.is_some()
+            || self.dup_names
             || shared.modal_child_open();
         // Canvas keyboard: ⌘/Ctrl+C copies the document. The copy
         // convention works everywhere in the window — text edits keep
@@ -1000,6 +1030,7 @@ impl Viewer {
         self.rename_dialog(&ctx);
         self.protect_dialog(&ctx);
         self.delete_file_dialog(&ctx);
+        self.dup_names_dialog(&ctx);
         self.settings_window(&ctx, shared);
     }
 
@@ -1027,8 +1058,10 @@ impl Viewer {
                     .show(ui, |ui| {
                         // Fixed width: inside an Area `available_width`
                         // is the whole window — rows would stretch the
-                        // modal to full size without this bound.
-                        ui.set_width(340.0);
+                        // modal to full size without this bound. Wider
+                        // than the old single-column sheet: sidebar +
+                        // page + footer.
+                        ui.set_width(560.0);
                         // Flush stack: the band edge separates header
                         // from body — no stray gaps from item spacing.
                         ui.spacing_mut().item_spacing.y = 0.0;
@@ -1046,7 +1079,7 @@ impl Viewer {
                                 se: 0,
                             })
                             .show(ui, |ui| {
-                                ui.set_width(340.0);
+                                ui.set_width(560.0);
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(t!("settings.title").to_string())
@@ -1085,6 +1118,8 @@ impl Viewer {
             shared
                 .settings_open
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            // Closing via the cross discards the draft like Annuler.
+            *crate::app::lock(&shared.settings_draft) = None;
         }
     }
 
@@ -2327,7 +2362,7 @@ impl Viewer {
             });
             if state.taken {
                 ui.add_space(4.0);
-                ui.colored_label(t.danger, t!("dialog.rename.taken").to_string());
+                ui.colored_label(t.danger, t!("dialog.rename.empty").to_string());
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -2346,7 +2381,9 @@ impl Viewer {
         }
         if apply {
             let name = state.draft.trim();
-            let taken = name.is_empty() || self.title_taken(name, self.active_index());
+            // Empty only: duplicate titles are allowed — save-all is
+            // where a clash is reported and fixed by renaming.
+            let taken = name.is_empty();
             if taken {
                 state.taken = true;
             } else {
@@ -2359,6 +2396,25 @@ impl Viewer {
         if !(cancel || (apply && !state.taken)) {
             self.rename = Some(state);
         }
+    }
+
+    /// Save-all blocked by duplicate titles: two unsaved captures share
+    /// a name; the only way forward is renaming, so one OK dismisses it.
+    fn dup_names_dialog(&mut self, ctx: &egui::Context) {
+        if !self.dup_names {
+            return;
+        }
+        egui::Window::new(t!("dialog.dup_names.title").to_string())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(t!("dialog.dup_names.body").to_string());
+                ui.add_space(8.0);
+                if ui.button(t!("draw.ok").to_string()).clicked() {
+                    self.dup_names = false;
+                }
+            });
     }
 
     /// The Protection… dialog — the context menu's only entry to the

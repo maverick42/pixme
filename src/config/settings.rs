@@ -131,6 +131,15 @@ pub struct Settings {
     /// Text-tool outline colour `[r, g, b]`.
     #[serde(default = "default_outline_color")]
     pub text_outline_color: [u8; 3],
+    /// Filename template for batch/auto saves ("$Y-$M-$D_$H$N$S").
+    #[serde(default = "default_filename_template")]
+    pub filename_template: String,
+    /// Editable filename-template presets shown in the settings dropdown.
+    #[serde(default = "default_filename_templates")]
+    pub filename_templates: Vec<String>,
+    /// Sequential counter consumed by `#` placeholders in the template.
+    #[serde(default = "default_filename_counter")]
+    pub filename_counter: u64,
 }
 
 fn default_true() -> bool {
@@ -147,6 +156,27 @@ fn default_text_size() -> u8 {
 }
 fn default_outline_color() -> [u8; 3] {
     [255, 255, 255]
+}
+fn default_filename_template() -> String {
+    "$Y-$M-$D_$H$N$S".to_owned()
+}
+/// The preset list matches the functional reference's defaults.
+fn default_filename_templates() -> Vec<String> {
+    [
+        "$Y-$M-$D_$H$N$S",
+        "Screenshot#####",
+        "$Y-$M-$D_#####",
+        "%USERNAME%_$Y-$M-$D_$H$N$S",
+        "%COMPUTERNAME%_$Y-$M-$D_$H$N$S",
+        "@@@@@@@@@@@",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+/// First `#` expansion yields `…001`, not `…000`.
+fn default_filename_counter() -> u64 {
+    1
 }
 
 impl Default for Settings {
@@ -169,6 +199,9 @@ impl Default for Settings {
             text_italic: false,
             text_outline: 0,
             text_outline_color: default_outline_color(),
+            filename_template: default_filename_template(),
+            filename_templates: default_filename_templates(),
+            filename_counter: default_filename_counter(),
         }
     }
 }

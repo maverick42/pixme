@@ -905,3 +905,34 @@ Format: date — context — decision — consequences.
 - **Consequences**: menu-enable state can never diverge from dispatch
   behaviour; every future `Command` must rule itself in the table.
   Manual coverage: MT-28 in `docs/audit/AUDIT_PROCESS.md`.
+
+## 2026-10-27 — Settings window: sidebar pages, draft + OK/Cancel, filename templates
+
+- **Context**: the settings sheet was a single column applied live; the
+  functional reference has several settings categories and an editable
+  filename-template system (batch-save names) the user wants.
+- **Decision**:
+  - The modal now has a left **sidebar** (`General`, `File name` —
+    `SettingsPage`, extensible), the page's rows on the right and an
+    **OK / Annuler** footer. Editing works on a cloned draft
+    (`Shared.settings_draft`); `OK` writes it back + persists, while
+    Annuler / the cross / Escape discard — including preset edits.
+    The restrictive-retention warning moved from pick-time to OK-time
+    and parks the whole draft (Cancel reverts only the retention field).
+  - `Settings` gains `filename_template` (default
+    `$Y-$M-$D_$H$N$$`), `filename_templates` (6 presets matching the
+    reference, editable inline via +/− — no third window) and
+    `filename_counter` (sequential `#`, first write yields `…001`).
+  - `config::expand_template` handles `$Y/$M/$D/$H/$N/$S` (chrono),
+    `#` runs as a zero-padded sequential, `@` runs as random
+    alphanumerics (tiny xorshift — no new dependency) and `%VAR%` with
+    cross-OS aliases (`%USERNAME%`→`USER|USERNAME`,
+    `%COMPUTERNAME%`→`COMPUTERNAME|HOSTNAME`); unknown codes and unset
+    vars expand to nothing/literal.
+  - `save_all` now names files through the template (`unique_path`
+    appends `_2`, `_3`… on collisions, e.g. templates without `#`);
+    the counter persists only when files are actually written and the
+    settings-page example never consumes it. The save-as dialog still
+    proposes the tab title.
+- **Consequences**: all changes live in `prefs.json`; tests cover the
+  template expansion (dates, padding, `@` charset, `%VAR%`, literals).

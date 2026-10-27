@@ -248,6 +248,9 @@ pub struct Shared {
     pub bar_pos: Mutex<Option<egui::Pos2>>,
     /// Whether the settings window is open.
     pub settings_open: AtomicBool,
+    /// The editable copy shown by the settings window — written back to
+    /// `settings` only on OK; Annuler/close drops it untouched.
+    pub settings_draft: Mutex<Option<Settings>>,
     /// The live capture session while in `Capturing` (`None` otherwise).
     pub capture: Mutex<Option<OverlaySession>>,
     /// The last confirmed fixed-region rect, in monitor-logical space:
@@ -446,6 +449,8 @@ impl Shared {
                     return;
                 }
                 self.settings_open.store(true, Ordering::Relaxed);
+                // The window edits a draft: changes apply on OK only.
+                *lock(&self.settings_draft) = Some(lock(&self.settings).clone());
                 // The settings are a modal of the viewer: make sure the
                 // viewer exists (and is restored) before it shows.
                 self.enter(AppState::Viewer, ctx);
@@ -456,6 +461,7 @@ impl Shared {
             }
             Command::CloseSettings => {
                 self.settings_open.store(false, Ordering::Relaxed);
+                *lock(&self.settings_draft) = None;
                 ctx.request_repaint_of(viewer_id());
             }
             Command::Quit => {
@@ -464,6 +470,7 @@ impl Shared {
                 // An open Draw editor is committed as usual by
                 // `save_session` on the actual quit.
                 self.settings_open.store(false, Ordering::Relaxed);
+                *lock(&self.settings_draft) = None;
                 if lock(&self.save_dialog).is_some() {
                     *lock(&self.save_dialog) = None;
                 }
@@ -483,7 +490,7 @@ impl Shared {
             }
             Command::ConfirmSave => {
                 // "Save" in the unsaved-session dialog = save-all, then close.
-                self.save_all();
+                self.save_all(ctx);
                 self.finish_confirmation(ctx);
             }
             Command::ConfirmDiscard => self.finish_confirmation(ctx),
@@ -531,7 +538,9 @@ impl Shared {
                 // Import opens a NEW tab — it never replaces the current
                 // document (the functional reference's rule).
                 Ok(Some(image)) => {
-                    lock(&self.viewer).push_document(Document::new(synthetic_capture(image)));
+                    let title = self.capture_title();
+                    lock(&self.viewer)
+                        .push_capture_document(Document::new(synthetic_capture(image)), title);
                     self.enter(AppState::Viewer, ctx);
                 }
                 Ok(None) => tracing::info!("clipboard holds no image"),
@@ -572,7 +581,7 @@ impl Shared {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             }
-            Command::SaveAll => self.save_all(),
+            Command::SaveAll => self.save_all(ctx),
             Command::RenameActive => lock(&self.viewer).open_rename(),
             Command::CopyActive => {
                 if let Some(img) = lock(&self.viewer).copy_image()
@@ -673,20 +682,51 @@ impl Shared {
         }
     }
 
-    fn save_all(&self) {
+    /// The next capture tab title, expanded from the filename template —
+    /// `Screenshot#####`-style names. The `#` counter is persisted when
+    /// consumed; templates without it don't burn sequence numbers.
+    fn capture_title(&self) -> String {
+        let mut s = lock(&self.settings);
+        let title = crate::config::expand_template(
+            &s.filename_template,
+            s.filename_counter,
+            &chrono::Local::now(),
+        );
+        if s.filename_template.contains('#') {
+            s.filename_counter += 1;
+            s.save();
+        }
+        title
+    }
+
+    fn save_all(&self, ctx: &egui::Context) {
         let Some(folder) = lock(&self.settings).last_save_dir.clone().or_else(|| {
             directories::UserDirs::new().and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
         }) else {
             tracing::warn!("save-all: no writable folder known");
             return;
         };
-        let stamp = chrono::Local::now().format("%y%m%d_%H%M%S");
         let mut viewer = lock(&self.viewer);
-        for (i, tab) in viewer.tabs.iter_mut().enumerate() {
+        // Duplicate titles are legal everywhere but HERE: two files can
+        // never share a name, so the batch is refused until the user
+        // renames — the viewer surfaces the blocking notice.
+        let mut seen = std::collections::HashSet::new();
+        let clash = viewer
+            .tabs
+            .iter()
+            .filter(|t| !t.saved)
+            .any(|t| !seen.insert(crate::config::filename::sanitize_filename(t.title.trim())));
+        if clash {
+            viewer.dup_names = true;
+            ctx.request_repaint_of(viewer_id());
+            return;
+        }
+        for tab in viewer.tabs.iter_mut() {
             if tab.saved {
                 continue;
             }
-            let path = folder.join(format!("capture_{stamp}_{}.png", i + 1));
+            let stem = crate::config::filename::sanitize_filename(tab.title.trim());
+            let path = unique_png(&folder, &stem);
             match crate::export::file::save_capture_to(
                 &tab.doc.base,
                 &path,
@@ -870,7 +910,9 @@ impl Shared {
         }
         let title = {
             let mut viewer = lock(&self.viewer);
-            viewer.push_document(Document::new(frame))
+            let title = self.capture_title();
+            viewer.push_capture_document(Document::new(frame), title.clone());
+            title
         };
         tracing::info!(%title, "capture stored");
         self.enter(AppState::Viewer, ctx);
@@ -957,6 +999,22 @@ impl Shared {
     }
 }
 
+/// Returns the first `folder/stem.png` that does not exist, suffixing
+/// `_2`, `_3`… on collisions (same-name file already on disk).
+fn unique_png(folder: &std::path::Path, stem: &str) -> std::path::PathBuf {
+    let candidate = folder.join(format!("{stem}.png"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    for n in 2u32.. {
+        let path = folder.join(format!("{stem}_{n}.png"));
+        if !path.exists() {
+            return path;
+        }
+    }
+    unreachable!()
+}
+
 /// Wraps a file/clipboard image in a `Capture` for a viewer document:
 /// 1:1 physical-to-logical pixels and a synthetic monitor record (only
 /// the image and scale factor reach the canvas).
@@ -1026,6 +1084,7 @@ impl PixMeApp {
                 toolbar: Mutex::new(Toolbar::default()),
                 bar_pos: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
+                settings_draft: Mutex::new(None),
                 capture: Mutex::new(None),
                 last_fixed_region: Mutex::new(None),
                 last_capture_rect: Mutex::new(None),
@@ -1454,6 +1513,7 @@ mod tests {
             toolbar: Mutex::new(Toolbar::default()),
             bar_pos: Mutex::new(None),
             settings_open: AtomicBool::new(false),
+            settings_draft: Mutex::new(None),
             capture: Mutex::new(None),
             last_fixed_region: Mutex::new(None),
             last_capture_rect: Mutex::new(None),

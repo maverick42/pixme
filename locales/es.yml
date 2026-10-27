@@ -29,6 +29,20 @@ settings.db.warn.title: "Respaldo de la base"
 settings.db.warn.body: "Las capturas de la base de datos se perderán."
 settings.db.warn.confirm: "Confirmar"
 settings.db.warn.cancel: "Cancelar"
+settings.page.general: "General"
+settings.page.filename: "Nombre de archivo"
+settings.filename.label: "Plantilla:"
+settings.filename.add: "Añadir la plantilla actual a la lista"
+settings.filename.remove: "Quitar esta plantilla de la lista"
+settings.filename.example: "Ejemplo: %{name}.png"
+settings.filename.empty: "La plantilla no puede estar vacía"
+settings.filename.notes: |-
+  Notas:  #  - Número secuencial
+          @  - Carácter aleatorio (0-9, a-z, A-Z)
+          $Y - Año,    $M - Mes,    $D - Día
+          $H - Hora,   $N - Minuto, $S - Segundo
+          %COMPUTERNAME% - Nombre del ordenador
+          %USERNAME%     - Nombre del usuario
 toolbar.close.tooltip: "Cerrar la barra de captura"
 viewer.empty: "Aún no hay capturas"
 viewer.new_capture.tooltip: "Nueva captura"
@@ -119,6 +133,9 @@ dialog.rename.title: "Renombrar"
 dialog.rename.label: "Nuevo nombre:"
 dialog.rename.ok: "Renombrar"
 dialog.rename.taken: "Ese nombre ya lo usa otra captura"
+dialog.rename.empty: "El nombre no puede estar vacío"
+dialog.dup_names.title: "Guardar todo"
+dialog.dup_names.body: "Dos capturas tienen el mismo nombre. Renómbralas antes de guardar."
 viewer.tab.save: "Guardar"
 viewer.tab.rename: "Renombrar…"
 viewer.tab.delete_file: "Eliminar el archivo"
