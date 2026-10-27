@@ -1110,6 +1110,16 @@ impl eframe::App for PixMeApp {
                     let ctx = ui.ctx().clone();
                     shared.pump(&ctx);
                     shared.maybe_focus(&ctx, viewer_id());
+                    // Draw is modal to the viewer: deferred viewports are
+                    // plain top-level windows with no OS child-window
+                    // modality. Clicking the modal's parent (the dim veil
+                    // eats it) brings the editor back in front — one
+                    // command per click, no per-frame focus fight.
+                    if lock(&shared.draw).is_some()
+                        && ctx.input(|i| i.pointer.any_pressed())
+                    {
+                        ctx.send_viewport_cmd_to(draw_id(), egui::ViewportCommand::Focus);
+                    }
                     ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
                     lock(&shared.viewer).show(ui, &shared);
                     // Tabs closed this frame lose their stored rows —
@@ -1227,6 +1237,8 @@ impl eframe::App for PixMeApp {
                 if let Some(outcome) = outcome
                     && let Some(session) = lock(&shared.draw).take()
                 {
+                    // The modal closed: the viewer gets focus back.
+                    ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Focus);
                     if outcome == crate::ui::draw::Outcome::Ok {
                         lock(&shared.viewer).commit_draw(
                             session.tab,

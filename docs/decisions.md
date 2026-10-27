@@ -888,10 +888,16 @@ Format: date — context — decision — consequences.
     capture-overlay outcomes stay enabled (the modal itself pushes
     them); pin close/copy stay enabled (pins are autonomous); `SavePin`
     is blocked while a modal is up (no stacked modals).
+  - **Draw is a real modal**: deferred viewports are plain top-level
+    windows (no OS child-window modality on either OS), so the viewer
+    pass steals focus for `draw_id` the moment it gains any — clicking
+    or raising the viewer puts the editor back on top a frame later;
+    closing Draw hands focus back to the viewer.
   - **Windows findings** (requested verification): (a) there is NO
     OS-level modality — egui child viewports are ordinary top-level
     windows and no `EnableWindow`/owner-disabling exists; the parent is
-    blocked only by the egui dim overlay and now by the dispatch guard.
+    blocked only by the egui dim overlay, the focus-steal and the
+    dispatch guard.
     (b) The Windows notification-area icon exists by spec (rules 00 /
     decision 2026-10-24: "Windows tray + taskbar button", accent-coloured
     icon) and its menu carries exactly two entries: "Take a capture" and
