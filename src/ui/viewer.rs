@@ -1839,6 +1839,9 @@ impl Viewer {
         let (title, dirty, protected) =
             (tab.title.clone(), !tab.saved, tab.doc.meta.is_protected());
         let selected = index == self.active;
+        // A title shared with another tab can't save two files under
+        // one name — it takes the danger tint as an inline warning.
+        let dup = self.title_taken(&title, Some(index));
         // The cross is reserved inside the chip but registered and
         // painted AFTER the chip interact, so it sits above it and
         // keeps its own hover/click (egui: the topmost widget wins).
@@ -1873,7 +1876,9 @@ impl Viewer {
                         .paint_at(ui, lock_rect);
                     }
                     ui.add(
-                        egui::Label::new(egui::RichText::new(title).color(if selected {
+                        egui::Label::new(egui::RichText::new(title).color(if dup {
+                            t.danger
+                        } else if selected {
                             t.text
                         } else {
                             t.text_dim
