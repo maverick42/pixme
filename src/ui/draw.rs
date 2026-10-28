@@ -2934,12 +2934,6 @@ impl DrawSession {
                         o.eraser_mode = EraserMode::Color;
                         o.eraser_pick = false;
                     }
-                    if widgets::icon_button(ui, Icon::Pipette, o.eraser_pick)
-                        .on_hover_text(t!("draw.opt.pick").to_string())
-                        .clicked()
-                    {
-                        o.eraser_pick = !o.eraser_pick;
-                    }
                 });
                 w_edit(ui, t!("draw.opt.size"), &mut o.eraser_size, 1.0..=80.0);
 
