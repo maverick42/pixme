@@ -47,11 +47,14 @@ enum Tool {
     EllipseFill,
     HighlightArea,
     Blur,
+    /// Colour eyedropper: the loupe follows the cursor, a click picks
+    /// the pixel's colour, `C` copies its `#RRGGBB`.
+    Pipette,
 }
 
 impl Tool {
     /// The strip grid in display order (row-major, two columns).
-    const ALL: [Tool; 16] = [
+    const ALL: [Tool; 17] = [
         Self::Select,
         Self::SelectArea,
         Self::TextBoxRect,
@@ -68,6 +71,7 @@ impl Tool {
         Self::EllipseFill,
         Self::HighlightArea,
         Self::Blur,
+        Self::Pipette,
     ];
 
     fn icon(self) -> Icon {
@@ -88,6 +92,7 @@ impl Tool {
             Self::EllipseFill => Icon::CircleFill,
             Self::HighlightArea => Icon::Highlighter,
             Self::Blur => Icon::Pixelate,
+            Self::Pipette => Icon::Pipette,
         }
     }
 
@@ -109,6 +114,7 @@ impl Tool {
             Self::EllipseFill => t!("draw.tool.ellipsefill"),
             Self::HighlightArea => t!("draw.tool.harea"),
             Self::Blur => t!("draw.tool.blur"),
+            Self::Pipette => t!("draw.tool.pipette"),
         }
     }
 }
@@ -678,9 +684,11 @@ impl DrawSession {
         if copy && self.sel_area.is_some() {
             self.sel_copy();
         }
-        // Eyedropper mode: pressing `C` copies the hovered `#RRGGBB` and picks the colour.
-        if self.tool == Tool::Eraser
-            && self.opts.eraser_pick
+        // Eyedropper mode: pressing `C` copies the hovered `#RRGGBB` and
+        // picks the colour (dedicated Pipette tool, or the eraser's pick).
+        let pipetting =
+            self.tool == Tool::Pipette || (self.tool == Tool::Eraser && self.opts.eraser_pick);
+        if pipetting
             && let Some(p) = self.last_pointer
             && ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, Key::C)
@@ -692,8 +700,13 @@ impl DrawSession {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 let _ = cb.set_text(&hex);
             }
-            self.opts.eraser_color = c;
-            self.opts.eraser_mode = EraserMode::Color;
+            match self.tool {
+                Tool::Eraser => {
+                    self.opts.eraser_color = c;
+                    self.opts.eraser_mode = EraserMode::Color;
+                }
+                _ => self.opts.color = c,
+            }
             self.copied_at = Some(std::time::Instant::now());
         }
         if cut && self.sel_area.is_some() {
@@ -1242,8 +1255,10 @@ impl DrawSession {
         // Dragging over an existing object selects and moves it, regardless
         // of which creation tool is armed (except pure pixel tools and the
         // marquee, which frames regions rather than grabbing objects).
-        if !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::SelectArea)
-            && let Some(id) = self.hit(p, self.canvas_scale)
+        if !matches!(
+            self.tool,
+            Tool::Eraser | Tool::Blur | Tool::SelectArea | Tool::Pipette
+        ) && let Some(id) = self.hit(p, self.canvas_scale)
             && let Some(before) = self.doc.annotation(id).cloned()
         {
             self.selected = Some(id);
@@ -1274,6 +1289,11 @@ impl DrawSession {
                 }
             }
             Tool::Select | Tool::Text | Tool::Step => {}
+            Tool::Pipette => {
+                // A press picks the pixel's colour into the shared
+                // stroke colour — `C` copies its `#RRGGBB`.
+                self.opts.color = self.pixel_at(p);
+            }
             Tool::Eraser => {
                 if self.opts.eraser_pick {
                     self.opts.eraser_color = self.pixel_at(p);
@@ -1625,8 +1645,10 @@ impl DrawSession {
         if had_panel {
             self.close_text_panel();
         }
-        if !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::SelectArea)
-            && let Some(id) = self.hit(p, self.canvas_scale)
+        if !matches!(
+            self.tool,
+            Tool::Eraser | Tool::Blur | Tool::SelectArea | Tool::Pipette
+        ) && let Some(id) = self.hit(p, self.canvas_scale)
         {
             self.selected = Some(id);
             self.sync_text_panel();
@@ -1648,6 +1670,9 @@ impl DrawSession {
                 } else {
                     self.finish_freehand(vec![p]);
                 }
+            }
+            Tool::Pipette => {
+                self.opts.color = self.pixel_at(p);
             }
             Tool::SelectArea => {
                 // Inside the frame it stays; a click elsewhere drops it.
@@ -1982,6 +2007,14 @@ impl DrawSession {
                 );
                 painter.circle_stroke(cp, r, Stroke::new(1.2, Color32::WHITE));
             }
+        }
+        // The dedicated Pipette tool gets the same loupe as the capture
+        // overlay: zoomed pixels, crosshair, coords, `#RRGGBB`, `C` hint.
+        if self.tool == Tool::Pipette
+            && let Some(p) = self.last_pointer
+        {
+            let cp = pos2(img_rect.min.x + p.x * scale, img_rect.min.y + p.y * scale);
+            self.paint_eyedropper_loupe(painter, cp, p);
         }
         // The live marquee frames its region above the document — with
         // 8 resize anchors once the initial framing drag is over.
@@ -2958,6 +2991,9 @@ impl DrawSession {
                     o.blur_strength = bs as u8;
                 }
                 shape_combo(ui, &mut o.shape);
+            }
+            Tool::Pipette => {
+                ui.label(t!("draw.opt.pipette_hint"));
             }
             Tool::Text => {
                 let mut ch = false;
