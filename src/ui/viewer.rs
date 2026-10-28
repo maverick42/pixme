@@ -136,11 +136,22 @@ impl PixelOp {
 
 /// The Redimensionner dialog's draft — explicit pixels only (the percent
 /// mode comes back later through the button's menu).
+/// What the resize dialog's width/height fields express.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeUnit {
+    /// Target size in physical pixels.
+    Pixels,
+    /// Target size as a percentage of the original.
+    Percent,
+}
+
 struct ResizeDialog {
-    /// Draft width, px.
+    /// Draft width (px or % of the original, per `unit`).
     width: String,
-    /// Draft height, px.
+    /// Draft height (px or % of the original, per `unit`).
     height: String,
+    /// The fields' unit.
+    unit: ResizeUnit,
     /// Keep the aspect ratio while editing width/height.
     keep_ratio: bool,
     /// Anti-aliased resample (Lanczos3) vs nearest-neighbour.
@@ -1573,6 +1584,7 @@ impl Viewer {
                                 self.resize = Some(ResizeDialog {
                                     width: w.to_string(),
                                     height: h.to_string(),
+                                    unit: ResizeUnit::Pixels,
                                     keep_ratio: true,
                                     anti_alias: true,
                                     invalid: false,
@@ -2462,101 +2474,224 @@ impl Viewer {
             .unwrap_or((1, 1));
         let mut apply = false;
         let mut dismiss = false;
-        let resp = egui::Modal::new(egui::Id::new("pixme-resize")).show(ctx, |ui| {
-            let t = theme::tokens(ui.ctx());
-            ui.set_width(320.0);
-            ui.label(
-                egui::RichText::new(t!("resize.title").to_string()).font(theme::semibold(14.0)),
-            );
-            widgets::hairline(ui);
-            ui.add_space(4.0);
-            // Original / new dimensions with MP count, like the
-            // functional reference's dialog — the new side follows
-            // the fields.
-            let dims = |w: f64, h: f64| format!("{w:.0}x{h:.0}  {:.2}MP", w * h / 1e6);
-            let new_dims = match (
-                state.width.trim().parse::<f64>(),
-                state.height.trim().parse::<f64>(),
-            ) {
-                (Ok(w), Ok(h)) if w > 0.0 && h > 0.0 => dims(w, h),
-                _ => "—".to_owned(),
-            };
-            for (key, value) in [
-                ("resize.original", dims(orig_w as f64, orig_h as f64)),
-                ("resize.new_dim", new_dims),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(t!(key).to_string());
-                    ui.label(egui::RichText::new(value).color(t.text_dim));
-                });
-            }
-            ui.add_space(6.0);
-            let ratio = orig_h as f64 / orig_w.max(1) as f64;
-            let w_changed = ui
-                .horizontal(|ui| {
-                    ui.label(t!("resize.width").to_string());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.width)
-                            .desired_width(80.0)
-                            .font(theme::medium(12.0)),
-                    )
-                })
-                .inner
-                .changed();
-            let h_changed = ui
-                .horizontal(|ui| {
-                    ui.label(t!("resize.height").to_string());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.height)
-                            .desired_width(80.0)
-                            .font(theme::medium(12.0)),
-                    )
-                })
-                .inner
-                .changed();
-            // Editing one field rewrites the other while locked.
-            if state.keep_ratio {
-                if w_changed && let Ok(w) = state.width.trim().parse::<f64>() {
-                    state.height = ((w * ratio).round() as u64).to_string();
-                } else if h_changed && let Ok(h) = state.height.trim().parse::<f64>() {
-                    state.width = ((h / ratio).round() as u64).to_string();
-                }
-            }
-            ui.checkbox(&mut state.keep_ratio, t!("resize.keep_ratio"));
-            ui.checkbox(&mut state.anti_alias, t!("resize.antialias"));
-            if state.invalid {
-                ui.add_space(4.0);
-                ui.colored_label(t.danger, t!("resize.invalid"));
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
-                    dismiss = true;
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::primary_button(ui, &t!("resize.apply")).clicked() {
-                        apply = true;
-                    }
-                });
+        let t = theme::tokens(ctx);
+        let resp = egui::Modal::new(egui::Id::new("pixme-resize"))
+            .frame(
+                egui::Frame::default()
+                    .fill(t.dock)
+                    .stroke(Stroke::new(1.0, t.card_border))
+                    .corner_radius(CornerRadius::same(t.radius_lg)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // Title-bar band like the other modals: card tint rounded on
+                // the top corners, with the painted close cross (red on
+                // hover) instead of native chrome.
+                egui::Frame::default()
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .fill(t.card)
+                    .corner_radius(CornerRadius {
+                        nw: t.radius_lg,
+                        ne: t.radius_lg,
+                        sw: 0,
+                        se: 0,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(340.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(t!("resize.title").to_string())
+                                    .color(t.text)
+                                    .strong(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                                    let resp = ui.interact(
+                                        rect,
+                                        ui.id().with("resize-close"),
+                                        Sense::click(),
+                                    );
+                                    paint_tab_close(ui, rect, resp.hovered());
+                                    if resp.clicked() {
+                                        dismiss = true;
+                                    }
+                                },
+                            );
+                        });
+                    });
+                egui::Frame::default()
+                    .inner_margin(Margin::symmetric(14, 14))
+                    .show(ui, |ui| {
+                        ui.set_width(320.0);
+                        ui.spacing_mut().item_spacing.y = 7.0;
+                        // Unit toggle: pixels or percentage of the original. Switching
+                        // converts the draft so the target size never jumps.
+                        let mut px_on = state.unit == ResizeUnit::Pixels;
+                        let mut pct_on = state.unit == ResizeUnit::Percent;
+                        ui.horizontal(|ui| {
+                            ui.label(t!("resize.unit").to_string());
+                            if ui
+                                .toggle_value(&mut px_on, t!("resize.unit_px").to_string())
+                                .clicked()
+                            {
+                                // Fields hold percentages — resolve them to pixels.
+                                if let (Ok(w), Ok(h)) = (
+                                    state.width.trim().parse::<f64>(),
+                                    state.height.trim().parse::<f64>(),
+                                ) {
+                                    state.width = (orig_w as f64 * w / 100.0).round().to_string();
+                                    state.height = (orig_h as f64 * h / 100.0).round().to_string();
+                                }
+                                state.unit = ResizeUnit::Pixels;
+                            } else if ui
+                                .toggle_value(&mut pct_on, t!("resize.unit_pct").to_string())
+                                .clicked()
+                            {
+                                if let (Ok(w), Ok(h)) = (
+                                    state.width.trim().parse::<f64>(),
+                                    state.height.trim().parse::<f64>(),
+                                ) {
+                                    state.width =
+                                        (w / orig_w.max(1) as f64 * 100.0).round().to_string();
+                                    state.height =
+                                        (h / orig_h.max(1) as f64 * 100.0).round().to_string();
+                                }
+                                state.unit = ResizeUnit::Percent;
+                            }
+                        });
+                        // Original / new dimensions with MP count, like the
+                        // functional reference's dialog — the new side follows
+                        // the fields (percentages resolve against the original).
+                        let dims = |w: f64, h: f64| format!("{w:.0}x{h:.0}  {:.2}MP", w * h / 1e6);
+                        let new_dims = match state.unit {
+                            ResizeUnit::Pixels => match (
+                                state.width.trim().parse::<f64>(),
+                                state.height.trim().parse::<f64>(),
+                            ) {
+                                (Ok(w), Ok(h)) if w > 0.0 && h > 0.0 => dims(w, h),
+                                _ => "—".to_owned(),
+                            },
+                            ResizeUnit::Percent => match (
+                                state.width.trim().parse::<f64>(),
+                                state.height.trim().parse::<f64>(),
+                            ) {
+                                (Ok(wp), Ok(hp)) if wp > 0.0 && hp > 0.0 => {
+                                    dims(orig_w as f64 * wp / 100.0, orig_h as f64 * hp / 100.0)
+                                }
+                                _ => "—".to_owned(),
+                            },
+                        };
+                        for (key, value) in [
+                            ("resize.original", dims(orig_w as f64, orig_h as f64)),
+                            ("resize.new_dim", new_dims),
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.label(t!(key).to_string());
+                                ui.label(egui::RichText::new(value).color(t.text_dim));
+                            });
+                        }
+                        ui.add_space(6.0);
+                        let ratio = orig_h as f64 / orig_w.max(1) as f64;
+                        let w_changed = ui
+                            .horizontal(|ui| {
+                                ui.label(t!("resize.width").to_string());
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut state.width)
+                                        .desired_width(80.0)
+                                        .font(theme::medium(12.0)),
+                                )
+                            })
+                            .inner
+                            .changed();
+                        let h_changed = ui
+                            .horizontal(|ui| {
+                                ui.label(t!("resize.height").to_string());
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut state.height)
+                                        .desired_width(80.0)
+                                        .font(theme::medium(12.0)),
+                                )
+                            })
+                            .inner
+                            .changed();
+                        // Editing one field rewrites the other while locked. In
+                        // percent mode the same percentage applies to both sides,
+                        // so the fields simply mirror each other.
+                        if state.keep_ratio {
+                            if state.unit == ResizeUnit::Percent {
+                                if w_changed && let Ok(w) = state.width.trim().parse::<f64>() {
+                                    state.height = w.round().to_string();
+                                } else if h_changed
+                                    && let Ok(h) = state.height.trim().parse::<f64>()
+                                {
+                                    state.width = h.round().to_string();
+                                }
+                            } else if w_changed && let Ok(w) = state.width.trim().parse::<f64>() {
+                                state.height = ((w * ratio).round() as u64).to_string();
+                            } else if h_changed && let Ok(h) = state.height.trim().parse::<f64>() {
+                                state.width = ((h / ratio).round() as u64).to_string();
+                            }
+                        }
+                        ui.checkbox(&mut state.keep_ratio, t!("resize.keep_ratio"));
+                        ui.checkbox(&mut state.anti_alias, t!("resize.antialias"));
+                        if state.invalid {
+                            ui.add_space(4.0);
+                            ui.colored_label(t.danger, t!("resize.invalid"));
+                        }
+                        ui.add_space(10.0);
+                        // Right-aligned pair: Cancel rightmost, Apply to its left.
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                                    dismiss = true;
+                                }
+                                if widgets::primary_button(ui, &t!("resize.apply")).clicked() {
+                                    apply = true;
+                                }
+                            });
+                        });
+                    });
             });
-        });
         // Backdrop click or Escape = Cancel.
         if resp.should_close() {
             dismiss = true;
         }
         let mut applied = false;
         if apply {
-            // Parse the draft into target pixels; invalid input only flags
-            // the dialog — it never reaches the resampler.
-            match (
-                state.width.trim().parse::<u32>(),
-                state.height.trim().parse::<u32>(),
-            ) {
-                (Ok(w), Ok(h)) if w > 0 && h > 0 => {
+            // Resolve the draft into target pixels (percent mode scales
+            // the original); invalid input only flags the dialog — it
+            // never reaches the resampler.
+            let resolved: Option<(u32, u32)> = match state.unit {
+                ResizeUnit::Pixels => match (
+                    state.width.trim().parse::<f64>(),
+                    state.height.trim().parse::<f64>(),
+                ) {
+                    (Ok(w), Ok(h)) if w > 0.0 && h > 0.0 => {
+                        Some((w.round() as u32, h.round() as u32))
+                    }
+                    _ => None,
+                },
+                ResizeUnit::Percent => match (
+                    state.width.trim().parse::<f64>(),
+                    state.height.trim().parse::<f64>(),
+                ) {
+                    (Ok(wp), Ok(hp)) if wp > 0.0 && hp > 0.0 => Some((
+                        (orig_w as f64 * wp / 100.0).round().max(1.0) as u32,
+                        (orig_h as f64 * hp / 100.0).round().max(1.0) as u32,
+                    )),
+                    _ => None,
+                },
+            };
+            match resolved {
+                Some((w, h)) => {
                     self.resize_active(w, h, state.anti_alias);
                     applied = true;
                 }
-                _ => state.invalid = true,
+                None => state.invalid = true,
             }
         }
         if !(dismiss || applied) {
