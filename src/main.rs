@@ -13,6 +13,7 @@ extern crate rust_i18n;
 mod app;
 mod capture;
 mod config;
+#[cfg(feature = "dev-tools")]
 mod devseed;
 mod editor;
 mod export;
@@ -31,9 +32,11 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
-    // Dev tool: `pixme --seed-session [N]` writes N large synthetic
-    // captures into session.db and exits — performance test data. It
-    // owns the store like the app, so a running instance blocks it.
+    // Dev tool (dev-tools feature only): `pixme --seed-session [N]`
+    // writes N large synthetic captures into session.db and exits —
+    // performance test data. Use PIXME_DATA_DIR to keep it away from
+    // a real session.
+    #[cfg(feature = "dev-tools")]
     if let Some(count) = devseed::requested() {
         let instance = instance_guard();
         if instance.as_ref().is_some_and(|i| !i.is_single()) {
@@ -66,9 +69,7 @@ fn main() -> eframe::Result<()> {
 /// file on macOS. `None` = the guard itself failed — a resident app
 /// must not be blocked by that, so the failure only logs.
 fn instance_guard() -> Option<single_instance::SingleInstance> {
-    let path = directories::ProjectDirs::from("", "", "pixme")
-        .map(|d| d.data_dir().join("instance.lock"))
-        .unwrap_or_else(|| std::path::PathBuf::from("pixme-instance.lock"));
+    let path = store::data_dir().join("instance.lock");
     // The data dir may not exist on a first-ever run — without it the
     // lockfile cannot be created and the guard silently disables.
     if let Some(dir) = path.parent() {

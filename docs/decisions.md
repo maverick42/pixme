@@ -1034,3 +1034,40 @@ Format: date — context — decision — consequences.
   compatible `thumbs` table (no `SCHEMA_VERSION` bump, lazy load,
   same secure-delete purge as the session); `image` release
   `opt-level = 3` measured — no gain, rejected.
+
+## 2026-10-28 — Thumbnails on a background worker; dev-tools Cargo feature
+
+- **Context**: after A+B+E+C, single-build frames during thumbnail
+  prefill still reached ~315 ms on the UI thread (one
+  `render_to_image` cannot be sliced below itself). Edit-path
+  suspicion confirmed as worth solving: any revision bump re-queued a
+  ~180–310 ms UI-thread build next frame.
+- **Decision**: one worker thread (`std::thread`, no new dependency)
+  rasterizes thumbnails; the UI only dispatches jobs and stores
+  results. `Capture.image` became `Arc<RgbaImage>` so a `Document`
+  clone for a job shares the base image — only annotations copy.
+  Jobs are `(tab id, revision)`; one job in flight; results whose
+  revision no longer matches, or whose tab closed, are dropped.
+  Worker panics are caught, logged, and the loop continues; a dead
+  channel respawns the worker once. `request_repaint` is UI-side
+  while work remains — `Context::request_repaint` from the worker
+  thread did NOT wake the event loop in this eframe integration
+  (verified empirically: the pipeline stalled after one job).
+  Thumbnail textures get `mipmap_mode` (egui 0.36 supports it via
+  `TextureOptions::mipmap_mode`) so far-zoomed tiles stay clean.
+- **Measured (release, dev-tools)**: 20 thumbnails build in ~3 s of
+  background work, UI never blocks; visible tiles ready at 1.28 s;
+  annotation commit op 0.03 ms, undo/redo ~0 ms, resize op 877 ms
+  (intrinsic Lanczos3 5K→4K cost — NOT thumbnail-attributable);
+  CPU 0.0 % at rest. Frames >100 ms attributable to thumbnails: none.
+- **dev-tools feature** replaces `cfg(debug_assertions)` gating:
+  `--seed-session`, `PIXME_DEBUG_MOSAIC`, `PIXME_DEBUG_EDIT`, and the
+  `PIXME_DATA_DIR` data-dir override exist only in
+  `cargo build --features dev-tools` builds; `PIXME_DATA_DIR` makes
+  seeding unable to touch a real session.
+- **Consequences**: memory bound = 1 in-flight `Document` clone
+  (Arc-shared base) + 1 result `ColorImage`; no unbounded queue of
+  pixel data. The in-flight job may compute a stale result (dropped).
+- **Future tracks (not implemented)**: persisted thumbnails in a
+  compatible `thumbs` table (no `SCHEMA_VERSION` bump), lazy base
+  decoding for decoded-image memory.

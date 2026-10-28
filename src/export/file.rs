@@ -15,7 +15,7 @@ pub fn save_capture_to(
 ) -> Result<(), ExportError> {
     let res = match format {
         // The JPEG encoder takes no alpha channel: flatten to RGB first.
-        ImageFormat::Jpeg => image::DynamicImage::ImageRgba8(capture.image.clone())
+        ImageFormat::Jpeg => image::DynamicImage::ImageRgba8(capture.image.as_ref().clone())
             .into_rgb8()
             .save_with_format(path, format.into()),
         _ => capture.image.save_with_format(path, format.into()),

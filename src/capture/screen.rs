@@ -72,7 +72,7 @@ pub fn capture_monitor(id: u32) -> Result<Capture, CaptureError> {
         .capture_image()
         .map_err(|e| CaptureError::Failed(e.to_string()))?;
     Ok(Capture {
-        image,
+        image: std::sync::Arc::new(image),
         scale_factor: info.scale_factor,
         monitor: info,
     })
@@ -86,7 +86,7 @@ pub fn crop_region(capture: &Capture, rect: PhysicalRect) -> Capture {
     let x = rect.x.clamp(0, w.saturating_sub(1) as i32) as u32;
     let y = rect.y.clamp(0, h.saturating_sub(1) as i32) as u32;
     let image = image::imageops::crop_imm(
-        &capture.image,
+        &*capture.image,
         x,
         y,
         rect.width.min(w - x).max(1),
@@ -94,7 +94,7 @@ pub fn crop_region(capture: &Capture, rect: PhysicalRect) -> Capture {
     )
     .to_image();
     Capture {
-        image,
+        image: std::sync::Arc::new(image),
         scale_factor: capture.scale_factor,
         monitor: capture.monitor.clone(),
     }

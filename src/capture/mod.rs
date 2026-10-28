@@ -13,8 +13,10 @@ pub mod window;
 /// A captured frame, in **physical** pixels, with the monitor it came from.
 #[derive(Clone, Debug)]
 pub struct Capture {
-    /// RGBA pixels, `width × height` physical pixels.
-    pub image: image::RgbaImage,
+    /// RGBA pixels, `width × height` physical pixels. Shared behind an
+    /// `Arc` so thumbnail workers (and document clones) borrow the same
+    /// buffer instead of duplicating tens of megabytes per job.
+    pub image: std::sync::Arc<image::RgbaImage>,
     /// Device pixels per logical point on the source monitor
     /// (2.0 on Retina, per-monitor DPI on Windows).
     pub scale_factor: f32,

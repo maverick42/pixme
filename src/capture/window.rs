@@ -70,7 +70,7 @@ pub fn capture_window(id: u32) -> Result<Capture, CaptureError> {
         .capture_image()
         .map_err(|e| CaptureError::Failed(e.to_string()))?;
     Ok(Capture {
-        image,
+        image: std::sync::Arc::new(image),
         scale_factor: monitor.scale_factor().unwrap_or(1.0),
         monitor: super::screen::monitor_info(&monitor)?,
     })

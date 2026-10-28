@@ -874,7 +874,8 @@ impl Shared {
                 let stem = crate::config::filename::sanitize_filename(tab.title.trim());
                 let path = unique_png(&folder, &stem);
                 let mut capture = tab.doc.base.clone();
-                capture.image = crate::editor::render::render_to_image(&tab.doc);
+                capture.image =
+                    std::sync::Arc::new(crate::editor::render::render_to_image(&tab.doc));
                 match crate::export::file::save_capture_to(
                     &capture,
                     &path,
@@ -1271,7 +1272,7 @@ fn synthetic_capture(image: image::RgbaImage) -> crate::capture::Capture {
             scale_factor: 1.0,
             is_primary: true,
         },
-        image,
+        image: std::sync::Arc::new(image),
     }
 }
 

@@ -95,7 +95,11 @@ mod tests {
 
     fn doc() -> Document {
         Document::new(Capture {
-            image: image::RgbaImage::from_pixel(40, 40, image::Rgba([20, 30, 40, 255])),
+            image: std::sync::Arc::new(image::RgbaImage::from_pixel(
+                40,
+                40,
+                image::Rgba([20, 30, 40, 255]),
+            )),
             scale_factor: 1.0,
             monitor: MonitorInfo {
                 id: 0,

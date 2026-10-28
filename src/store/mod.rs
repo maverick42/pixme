@@ -347,13 +347,23 @@ fn local_midnight() -> i64 {
         .unwrap_or(0)
 }
 
+/// Per-user application data directory. `PIXME_DATA_DIR` overrides it
+/// in dev-tools builds ONLY, so `--seed-session` and benchmarks can
+/// never touch a real session — distributed binaries ignore the
+/// variable entirely.
+pub(crate) fn data_dir() -> PathBuf {
+    #[cfg(feature = "dev-tools")]
+    if let Some(dir) = std::env::var_os("PIXME_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    directories::ProjectDirs::from("", "", "pixme")
+        .map_or_else(|| PathBuf::from("."), |dirs| dirs.data_dir().to_path_buf())
+}
+
 /// `data_dir()/session.db` (per-user application data); the bare
 /// fallback never silently fails to persist.
 pub(crate) fn db_path() -> PathBuf {
-    directories::ProjectDirs::from("", "", "pixme").map_or_else(
-        || PathBuf::from("session.db"),
-        |dirs| dirs.data_dir().join("session.db"),
-    )
+    data_dir().join("session.db")
 }
 
 /// `<db>.bak` — where a corrupt or foreign-version file is parked.
@@ -573,7 +583,7 @@ impl RawDoc {
             })
             .transpose()?;
         let mut doc = Document::new(crate::capture::Capture {
-            image,
+            image: std::sync::Arc::new(image),
             scale_factor: self.scale_factor,
             monitor: serde_json::from_str(&self.monitor_json)?,
         });
@@ -675,7 +685,7 @@ mod tests {
     /// the tab index for post-push tweaking.
     fn push_tab(viewer: &mut Viewer, title: &str, w: u32, color: [u8; 4]) -> usize {
         let doc = Document::new(Capture {
-            image: image::RgbaImage::from_pixel(w, w, image::Rgba(color)),
+            image: std::sync::Arc::new(image::RgbaImage::from_pixel(w, w, image::Rgba(color))),
             scale_factor: 2.0,
             monitor: MonitorInfo {
                 id: 7,
@@ -1009,10 +1019,11 @@ mod tests {
         // them, the next load would come back red instead of the stored
         // blue/green.
         for t in &mut viewer.tabs {
-            t.doc
-                .base
-                .image
-                .put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+            std::sync::Arc::make_mut(&mut t.doc.base.image).put_pixel(
+                0,
+                0,
+                image::Rgba([255, 0, 0, 255]),
+            );
         }
         // Tab 0 stays untouched; tab 1 gets an annotation edit (revision
         // moves, `base_dirty` stays false) + a rename.

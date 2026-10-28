@@ -32,28 +32,35 @@ cargo test -- --ignored
 
 Currently none exist; capture/permission tests land with the capture feature.
 
-### Performance test data
+### Performance test data and benchmarks
 
-`pixme --seed-session [N]` (default 20) writes N synthetic 5120×2880
-captures — half carrying annotations — into the real `session.db` and
-exits, so thumbnail and session-restore costs are measurable on a
-realistic session. Seeding **replaces** the current session; the
-existing database is copied aside to `session.db.preseed` first.
+All measurement tooling is behind the `dev-tools` Cargo feature — **off
+by default, never compiled into a distributed binary**. Enable it for
+profiling builds only: `cargo build --release --features dev-tools`.
 
-In dev builds, `PIXME_DEBUG_MOSAIC=1` opens the restored session
-straight into the mosaic grid (release builds always open in Tabs —
-the hook is compiled out). Combined with `RUST_LOG=pixme=debug`, the
-per-stage timings (`session capture decoded`, `mosaic thumbnail
-built`, `mosaic frame`) give the full first-paint breakdown.
+It provides:
 
-To reproduce the mosaic benchmark on Windows (PowerShell):
+- `pixme --seed-session [N]` — writes N synthetic 5120×2880 captures
+  (half annotated) into `session.db` and exits, for realistic thumbnail
+  and session-restore benchmarks.
+- `PIXME_DATA_DIR` — overrides the per-user data directory **in
+  dev-tools builds only**. Point `--seed-session` and benchmark runs at
+  a scratch directory and your real session is untouchable:
+  `PIXME_DATA_DIR=/tmp/pixme-bench ./target/release/pixme --seed-session`.
+- `PIXME_DEBUG_MOSAIC=1` — opens the restored session straight into
+  the mosaic grid (first-paint cost measurable without driving the UI).
+- `PIXME_DEBUG_EDIT=1` — replays annotation-commit → resize → undo →
+  redo on the first annotated tab, one op per frame, timing each
+  (`debug edit op` log lines) for edit-path jank measurement.
+- `RUST_LOG=pixme=debug` — per-stage timings: `session capture decoded`,
+  `mosaic thumbnail built`, `pixel undo`/`pixel redo`/`annotation commit`.
+
+Windows procedure (PowerShell):
 
 ```powershell
-cargo build                                   # dev build keeps the hook
-.\target\debug\pixme.exe --seed-session    # 20 synthetic 5K captures
+cargo build --release --features dev-tools
+$env:PIXME_DATA_DIR="$env:TEMP\pixme-bench"
+.\target\release\pixme.exe --seed-session
 $env:PIXME_DEBUG_MOSAIC="1"; $env:RUST_LOG="pixme=debug"
-.\target\debug\pixme.exe                   # log shows the timings
+.\target\release\pixme.exe
 ```
-
-Dev-profile dependencies already build at `opt-level = 2`, so the
-numbers are representative (though not identical to release).

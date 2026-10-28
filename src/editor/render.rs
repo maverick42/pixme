@@ -113,7 +113,7 @@ pub fn text_extent(o: &super::document::TextObj) -> (f32, f32) {
 
 /// Composites `doc` (base + annotations) to a flat RGBA bitmap.
 pub fn render_to_image(doc: &Document) -> RgbaImage {
-    let mut img = doc.base.image.clone();
+    let mut img = doc.base.image.as_ref().clone();
     // One scratch layer for every layered object: the full-frame
     // alloc happens once per document instead of once per
     // annotation, and each object is rasterized at absolute
@@ -2343,7 +2343,7 @@ mod tests {
             ]);
         }
         Capture {
-            image: img,
+            image: std::sync::Arc::new(img),
             scale_factor: 1.0,
             monitor: MonitorInfo {
                 id: 0,
@@ -2432,7 +2432,7 @@ mod tests {
 
     /// Reference [`render_to_image`], oracle for the parity tests.
     pub(super) fn render_to_image_ref(doc: &Document) -> RgbaImage {
-        let mut img = doc.base.image.clone();
+        let mut img = doc.base.image.as_ref().clone();
         for anno in &doc.annotations {
             render_one_ref(&mut img, anno);
         }

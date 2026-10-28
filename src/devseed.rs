@@ -61,7 +61,7 @@ pub fn run(count: usize) -> i32 {
     let mut viewer = Viewer::default();
     for i in 0..count {
         let mut doc = Document::new(Capture {
-            image: synth_image(i as u64),
+            image: std::sync::Arc::new(synth_image(i as u64)),
             scale_factor: 2.0,
             monitor: MonitorInfo {
                 id: 1,

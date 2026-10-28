@@ -233,7 +233,7 @@ mod tests {
 
     fn dialog_in(dir: &Path) -> SaveDialog {
         let capture = Capture {
-            image: image::RgbaImage::new(1, 1),
+            image: std::sync::Arc::new(image::RgbaImage::new(1, 1)),
             scale_factor: 1.0,
             monitor: MonitorInfo {
                 id: 0,

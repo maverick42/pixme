@@ -3,6 +3,12 @@ name = "pixme"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Benchmark/debug tooling compiled out of every distributed binary:
+# `pixme --seed-session N`, PIXME_DATA_DIR override, PIXME_DEBUG_*
+# hooks. Enable for profiling: `cargo build --release --features dev-tools`.
+dev-tools = []
+
 [dependencies]
 ab_glyph = "0.2.23"
 anyhow = "1.0.104"

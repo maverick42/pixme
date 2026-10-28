@@ -79,10 +79,122 @@ const HISTORY_CAP: usize = 10;
 /// cache.
 const THUMB_MAX_SIDE: u32 = 880;
 
-/// Per-frame budget for thumbnail builds — at least one thumbnail
-/// always builds, then the frame stops feeding the queue. ~8 ms keeps
-/// the grid responsive while big captures still stream in.
-const THUMB_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+/// A thumbnail build sent to the background worker — `Document` clones
+/// are cheap: the base image is an `Arc`, only annotations copy.
+struct ThumbJob {
+    /// Tab document id (stable across reorder/close).
+    id: String,
+    /// Document revision the job must produce.
+    rev: u64,
+    doc: crate::editor::document::Document,
+}
+
+/// A finished thumbnail handed back to the UI thread.
+struct ThumbDone {
+    id: String,
+    rev: u64,
+    img: egui::ColorImage,
+}
+
+/// Ends of the worker channel pair — `job_rx`/`done_tx` move into the
+/// thread at spawn; tests can take `job_rx` to inspect dispatch without
+/// a live worker.
+struct ThumbPipe {
+    job_tx: std::sync::mpsc::Sender<ThumbJob>,
+    job_rx: Option<std::sync::mpsc::Receiver<ThumbJob>>,
+    done_tx: Option<std::sync::mpsc::Sender<ThumbDone>>,
+    done_rx: std::sync::mpsc::Receiver<ThumbDone>,
+}
+
+impl ThumbPipe {
+    fn new() -> Self {
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        Self {
+            job_tx,
+            job_rx: Some(job_rx),
+            done_tx: Some(done_tx),
+            done_rx,
+        }
+    }
+}
+
+/// Spawns the thumbnail worker: rasterizes `Document`s off the UI
+/// thread, catches panics (logged, job dropped, loop keeps working —
+/// the tab re-queues on the next sync), and asks for one repaint per
+/// finished job so results land on the next frame only — zero repaint
+/// activity while idle.
+fn spawn_thumb_worker(
+    ctx: &egui::Context,
+    job_rx: std::sync::mpsc::Receiver<ThumbJob>,
+    done_tx: std::sync::mpsc::Sender<ThumbDone>,
+) {
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("pixme-thumbs".to_owned())
+        .spawn(move || {
+            while let Ok(job) = job_rx.recv() {
+                let t0 = std::time::Instant::now();
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    thumb_pixels(&job.doc)
+                }));
+                match out {
+                    Ok(img) => {
+                        tracing::debug!(
+                            id = %job.id,
+                            rev = job.rev,
+                            total_ms = t0.elapsed().as_secs_f64() * 1e3,
+                            "mosaic thumbnail built"
+                        );
+                        if done_tx
+                            .send(ThumbDone {
+                                id: job.id,
+                                rev: job.rev,
+                                img,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        ctx.request_repaint();
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            id = %job.id,
+                            rev = job.rev,
+                            "thumbnail worker panicked; job dropped"
+                        );
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::error!("could not spawn thumbnail worker: {e}");
+    }
+}
+
+/// Compute half of a thumbnail build — `render_to_image` (or the base
+/// when the document has no annotations) box-averaged to
+/// [`THUMB_MAX_SIDE`]. Shared by the worker and the test-only
+/// synchronous path.
+fn thumb_pixels(doc: &crate::editor::document::Document) -> egui::ColorImage {
+    // A document without annotations composites to its base — skip
+    // the full-resolution clone `render_to_image` would make.
+    let composited =
+        (!doc.annotations.is_empty()).then(|| crate::editor::render::render_to_image(doc));
+    let source = composited.as_ref().unwrap_or(&doc.base.image);
+    let (w, h) = (source.width(), source.height());
+    let scale = (THUMB_MAX_SIDE as f32 / w.max(h).max(1) as f32).min(1.0);
+    let (tw, th) = (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    );
+    // Box-average downscale — one pass over the source, the right
+    // quality/speed trade for a ≤880 px tile (Lanczos3 cost ~200 ms
+    // per 5K capture: its kernel support grows with the ratio).
+    let thumb = image::imageops::thumbnail(source, tw, th);
+    egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw())
+}
 
 /// Height of a mosaic tile's caption band, pt.
 const BAND_H: f32 = 22.0;
@@ -115,7 +227,7 @@ impl PixelOp {
     fn undo(&self, doc: &mut Document) {
         match self {
             Self::Resize { before, .. } => {
-                doc.base.image = before.clone();
+                doc.base.image = std::sync::Arc::new(before.clone());
             }
         }
     }
@@ -126,8 +238,8 @@ impl PixelOp {
             Self::Resize {
                 size, antialias, ..
             } => {
-                doc.base.image = image::imageops::resize(
-                    &doc.base.image,
+                doc.base.image = std::sync::Arc::new(image::imageops::resize(
+                    &*doc.base.image,
                     size.0,
                     size.1,
                     if *antialias {
@@ -135,7 +247,7 @@ impl PixelOp {
                     } else {
                         image::imageops::FilterType::Nearest
                     },
-                );
+                ));
             }
         }
     }
@@ -277,6 +389,17 @@ pub struct Viewer {
     /// invalidation point covering captures, annotation commits,
     /// undo/redo, crop, resize, imports and session restores.
     thumb_queue: std::collections::VecDeque<String>,
+    /// Channel pair to the background thumbnail worker.
+    thumb_pipe: ThumbPipe,
+    /// `(tab id, revision)` currently computed by the worker — one job
+    /// in flight at a time; its result is dropped if the revision or
+    /// the tab no longer matches.
+    thumb_in_flight: Option<(String, u64)>,
+    /// Whether the worker thread has been spawned (lazy, first job).
+    thumb_worker_live: bool,
+    /// Step counter for the `PIXME_DEBUG_EDIT` bench hook (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    debug_edit_step: u8,
 }
 
 impl Default for Viewer {
@@ -319,6 +442,11 @@ impl Default for Viewer {
             mos_ms_frame: std::time::Duration::ZERO,
             mos_pending: 0,
             thumb_queue: std::collections::VecDeque::new(),
+            thumb_pipe: ThumbPipe::new(),
+            thumb_in_flight: None,
+            thumb_worker_live: false,
+            #[cfg(feature = "dev-tools")]
+            debug_edit_step: 0,
         }
     }
 }
@@ -379,7 +507,8 @@ impl Tab {
         {
             return;
         }
-        self.doc.base.image = crate::editor::render::render_to_image(&self.doc);
+        self.doc.base.image =
+            std::sync::Arc::new(crate::editor::render::render_to_image(&self.doc));
         self.base_dirty = true;
         self.doc.annotations.clear();
         self.anno_undo.clear();
@@ -477,7 +606,7 @@ impl Viewer {
         self.tabs.push(Tab {
             title,
             doc: Document::new(Capture {
-                image: image::RgbaImage::new(1, 1),
+                image: std::sync::Arc::new(image::RgbaImage::new(1, 1)),
                 scale_factor: 1.0,
                 monitor: MonitorInfo {
                     id: 0,
@@ -611,8 +740,13 @@ impl Viewer {
         t.anno_undo = undo;
         t.anno_redo = redo;
         if doc_changed {
+            let t0 = std::time::Instant::now();
             t.doc = doc;
             t.doc.revision += 1;
+            tracing::debug!(
+                op_ms = t0.elapsed().as_secs_f64() * 1e3,
+                "annotation commit"
+            );
             // New annotations sit on top of the current base image —
             // reverting an older PixelOp (Resize) under them would
             // desynchronise coordinates, so the pixel history ends here.
@@ -633,7 +767,7 @@ impl Viewer {
     pub fn save_target_at(&self, index: usize) -> Option<SaveTarget> {
         let tab = self.tabs.get(index)?;
         let mut capture = tab.doc.base.clone();
-        capture.image = crate::editor::render::render_to_image(&tab.doc);
+        capture.image = std::sync::Arc::new(crate::editor::render::render_to_image(&tab.doc));
         Some(SaveTarget {
             index,
             title: tab.title.clone(),
@@ -724,8 +858,10 @@ impl Viewer {
         let Some(op) = self.tabs[i].undo.pop_back() else {
             return false;
         };
+        let t0 = std::time::Instant::now();
         let tab = &mut self.tabs[i];
         op.undo(&mut tab.doc);
+        tracing::debug!(op_ms = t0.elapsed().as_secs_f64() * 1e3, "pixel undo");
         tab.base_dirty = true;
         tab.doc.revision += 1;
         tab.saved = false;
@@ -742,8 +878,10 @@ impl Viewer {
         let Some(op) = self.tabs[i].redo.pop_back() else {
             return false;
         };
+        let t0 = std::time::Instant::now();
         let tab = &mut self.tabs[i];
         op.redo(&mut tab.doc);
+        tracing::debug!(op_ms = t0.elapsed().as_secs_f64() * 1e3, "pixel redo");
         tab.base_dirty = true;
         tab.doc.revision += 1;
         tab.saved = false;
@@ -763,9 +901,9 @@ impl Viewer {
         }
         let tab = &mut self.tabs[i];
         tab.flatten();
-        let before = tab.doc.base.image.clone();
-        tab.doc.base.image = image::imageops::resize(
-            &tab.doc.base.image,
+        let before = tab.doc.base.image.as_ref().clone();
+        tab.doc.base.image = std::sync::Arc::new(image::imageops::resize(
+            &*tab.doc.base.image,
             w,
             h,
             if antialias {
@@ -773,7 +911,7 @@ impl Viewer {
             } else {
                 image::imageops::FilterType::Nearest
             },
-        );
+        ));
         tab.push_op(PixelOp::Resize {
             before,
             size: (w, h),
@@ -968,11 +1106,11 @@ impl Viewer {
         self.sort_tabs();
         self.recompute_dirty();
         self.persisted_sigs = (!had_live_tabs).then(|| self.sigs());
-        // Perf hook (dev builds only): `PIXME_DEBUG_MOSAIC=1` lands a
-        // restored session straight on the thumbnail grid so first-
-        // paint cost is measurable without driving the UI by hand.
-        // Compiled out of release — the viewer always opens in Tabs.
-        #[cfg(debug_assertions)]
+        // Perf hook (dev-tools builds only): `PIXME_DEBUG_MOSAIC=1`
+        // lands a restored session straight on the thumbnail grid so
+        // first-paint cost is measurable without driving the UI by
+        // hand. Compiled out of distributed binaries.
+        #[cfg(feature = "dev-tools")]
         if std::env::var_os("PIXME_DEBUG_MOSAIC").is_some() {
             self.view_mode = ViewMode::Mosaic;
             self.mos_since = Some(std::time::Instant::now());
@@ -1129,15 +1267,11 @@ impl Viewer {
         self.mos_since = None;
     }
 
-    /// Builds `index`'s downscaled thumbnail: the composited document
-    /// is resampled so its longest side is ≤ [`THUMB_MAX_SIDE`] px and
-    /// cached on the tab keyed by the document revision. Called only
-    /// from the budgeted queue — protected tabs never reach it, and
-    /// the full-resolution `Tab::texture` is never involved.
+    /// Test-only synchronous build — production thumbnails are rasterized
+    /// on the background worker so the UI thread never composites.
+    /// Protected tabs never reach it.
+    #[cfg(test)]
     fn build_thumb(&mut self, ctx: &egui::Context, index: usize) {
-        // Protected tabs never generate pixel data — locked or not
-        // (the "proven password" only unlocks the canvas, the mosaic
-        // tile stays a padlock).
         let protected = self
             .tabs
             .get(index)
@@ -1151,52 +1285,15 @@ impl Viewer {
         if tab.thumb.as_ref().map(|(rev, _)| *rev) == Some(tab.doc.revision) {
             return;
         }
-        // A stale thumbnail keeps painting its old pixels until the
-        // rebuild lands — the revision key, not the frame, decides what
-        // counts as current. Cheaper visually than a blank card flash.
-        let t_all = std::time::Instant::now();
-        let (w, h) = (tab.doc.base.image.width(), tab.doc.base.image.height());
-        let t0 = std::time::Instant::now();
-        // A document without annotations composites to its base — skip
-        // the full-resolution clone `render_to_image` would make.
-        let composited = (!tab.doc.annotations.is_empty())
-            .then(|| crate::editor::render::render_to_image(&tab.doc));
-        let render_ms = t0.elapsed();
-        let source = composited.as_ref().unwrap_or(&tab.doc.base.image);
-        let scale = (THUMB_MAX_SIDE as f32 / w.max(h).max(1) as f32).min(1.0);
-        let (tw, th) = (
-            ((w as f32 * scale).round() as u32).max(1),
-            ((h as f32 * scale).round() as u32).max(1),
-        );
-        let t1 = std::time::Instant::now();
-        // Box-average downscale — one pass over the source, the right
-        // quality/speed trade for a ≤480 px tile (Lanczos3 cost ~200 ms
-        // per 5K capture: its kernel support grows with the ratio).
-        let thumb = image::imageops::thumbnail(source, tw, th);
-        let resample_ms = t1.elapsed();
-        let t2 = std::time::Instant::now();
-        let handle = ctx.load_texture(
-            format!("thumb-{index}-{}", tab.doc.revision),
-            egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw()),
-            egui::TextureOptions::LINEAR,
-        );
-        let tex_ms = t2.elapsed();
-        let total = t_all.elapsed();
-        self.mos_built_frame += 1;
-        self.mos_built_total += 1;
-        self.mos_ms_frame += total;
-        self.mos_ms_total += total;
-        tracing::debug!(
-            index,
-            rev = tab.doc.revision,
-            px = w * h,
-            render_ms = render_ms.as_secs_f64() * 1e3,
-            resample_ms = resample_ms.as_secs_f64() * 1e3,
-            tex_ms = tex_ms.as_secs_f64() * 1e3,
-            total_ms = total.as_secs_f64() * 1e3,
-            "mosaic thumbnail built"
-        );
-        tab.thumb = Some((tab.doc.revision, handle));
+        let img = thumb_pixels(&tab.doc);
+        tab.thumb = Some((
+            tab.doc.revision,
+            ctx.load_texture(
+                format!("thumb-{index}-{}", tab.doc.revision),
+                img,
+                egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+            ),
+        ));
     }
 
     /// The single thumbnail-invalidation point: every document whose
@@ -1233,32 +1330,191 @@ impl Viewer {
         }
     }
 
-    /// Budgeted thumbnail generation: at least one build per frame,
-    /// then stops once ~[`THUMB_FRAME_BUDGET`] is spent; asks for
-    /// another repaint only while the queue still has work — the CPU
-    /// idles the moment every thumbnail is current. Runs whatever the
-    /// view mode is, so tiles are ready before the mosaic ever opens.
+    /// Drains finished worker results and feeds the queue — every frame,
+    /// whatever the view mode, so tiles are ready before the mosaic
+    /// ever opens. No thumbnail work happens on this thread: the UI
+    /// only receives results (repaint comes from the worker) and sends
+    /// at most one job per round-trip.
     fn pump_thumb_queue(&mut self, ctx: &egui::Context) {
-        self.pump_thumb_queue_budget(ctx, THUMB_FRAME_BUDGET);
-    }
-
-    /// [`Self::pump_thumb_queue`] with an explicit budget — unit tests
-    /// drive it with `0` to pin the always-one-per-frame rule.
-    fn pump_thumb_queue_budget(&mut self, ctx: &egui::Context, budget: std::time::Duration) {
-        let t0 = std::time::Instant::now();
-        while let Some(id) = self.thumb_queue.front().cloned() {
-            if let Some(index) = self.tabs.iter().position(|t| t.doc.meta.id == id) {
-                self.build_thumb(ctx, index);
+        let mut drained = 0u32;
+        while let Ok(done) = self.thumb_pipe.done_rx.try_recv() {
+            drained += 1;
+            self.thumb_in_flight = None;
+            if self.apply_thumb_done(ctx, done) {
+                ctx.request_repaint();
             }
-            // Closed tabs resolve to nothing and are simply dropped.
-            self.thumb_queue.pop_front();
-            if t0.elapsed() >= budget {
-                break;
-            }
+            // Dispatch in the same frame so the worker never idles.
+            self.dispatch_thumb_job(ctx);
         }
-        if !self.thumb_queue.is_empty() {
+        if self.thumb_in_flight.is_none() {
+            self.dispatch_thumb_job(ctx);
+        }
+        // UI-side heartbeat while work remains: `Context::request_repaint`
+        // from a worker thread does not reliably wake the winit loop in
+        // this integration (verified empirically — the pipeline stalled
+        // after one job), so the frame that dispatched or drained keeps
+        // frames coming itself. Stops dead the moment the queue and the
+        // in-flight job are both empty — zero repaint activity at rest.
+        if self.thumb_in_flight.is_some() || !self.thumb_queue.is_empty() {
             ctx.request_repaint();
         }
+        tracing::trace!(
+            drained,
+            in_flight = self.thumb_in_flight.is_some(),
+            queued = self.thumb_queue.len(),
+            "thumb pump"
+        );
+    }
+
+    /// Stores a worker result on its tab — only when the tab still
+    /// exists, still wants that revision, and isn't protected: a stale
+    /// or cancelled job's pixels are dropped, never displayed as
+    /// current.
+    fn apply_thumb_done(&mut self, ctx: &egui::Context, done: ThumbDone) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.doc.meta.id == done.id) else {
+            return false; // tab closed while the job ran
+        };
+        if tab.doc.revision != done.rev || tab.doc.meta.is_protected() {
+            return false; // stale revision or protected since dispatch
+        }
+        let handle = ctx.load_texture(
+            format!("thumb-{}-{}", done.id, done.rev),
+            done.img,
+            egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+        );
+        tab.thumb = Some((done.rev, handle));
+        self.mos_built_frame += 1;
+        self.mos_built_total += 1;
+        true
+    }
+
+    /// Sends the next queued id to the worker when it is idle — one job
+    /// in flight at a time, deduplicated by `(tab, revision)` since a
+    /// stale in-flight job's result is dropped on receipt. Jobs for
+    /// closed tabs, protected tabs and already-current thumbnails are
+    /// silently discarded.
+    fn dispatch_thumb_job(&mut self, ctx: &egui::Context) {
+        while let Some(id) = self.thumb_queue.pop_front() {
+            let Some((rev, doc)) = self
+                .tabs
+                .iter()
+                .find(|t| t.doc.meta.id == id)
+                .filter(|t| {
+                    !t.doc.meta.is_protected()
+                        && t.thumb.as_ref().map(|(r, _)| *r) != Some(t.doc.revision)
+                })
+                .map(|t| (t.doc.revision, t.doc.clone()))
+            else {
+                continue; // closed tab, protected, or already current
+            };
+            self.ensure_thumb_worker(ctx);
+            // A failed send means the worker thread died — rebuild it
+            // once; a second failure keeps the queue stuck rather than
+            // silently dropping pixel work.
+            let job = |id: &str, doc: &crate::editor::document::Document| ThumbJob {
+                id: id.to_owned(),
+                rev,
+                doc: doc.clone(),
+            };
+            let sent = self.thumb_pipe.job_tx.send(job(&id, &doc)).is_ok() || {
+                self.thumb_worker_live = false;
+                self.ensure_thumb_worker(ctx);
+                self.thumb_pipe.job_tx.send(job(&id, &doc)).is_ok()
+            };
+            if sent {
+                self.thumb_in_flight = Some((id, rev));
+            } else {
+                tracing::error!("thumbnail worker unavailable; job dropped");
+            }
+            return;
+        }
+    }
+
+    /// Lazily starts the thumbnail worker on the first job.
+    fn ensure_thumb_worker(&mut self, ctx: &egui::Context) {
+        if self.thumb_worker_live {
+            return;
+        }
+        if let (Some(job_rx), Some(done_tx)) = (
+            self.thumb_pipe.job_rx.take(),
+            self.thumb_pipe.done_tx.take(),
+        ) {
+            spawn_thumb_worker(ctx, job_rx, done_tx);
+            self.thumb_worker_live = true;
+        }
+    }
+
+    /// Dev-only bench (dev-tools builds): `PIXME_DEBUG_EDIT=1` replays
+    /// annotation-commit → resize → undo → redo on the first annotated
+    /// tab, one op per frame, timing each op — the edit-path jank
+    /// measurement for the thumbnail pipeline. Compiled out of every
+    /// distributed binary.
+    #[cfg(feature = "dev-tools")]
+    fn debug_edit_tick(&mut self, ctx: &egui::Context) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("PIXME_DEBUG_EDIT").is_some()) {
+            return;
+        }
+        let Some(i) = self.tabs.iter().position(|t| !t.doc.annotations.is_empty()) else {
+            // Session restore is async — retry next frame until an
+            // annotated tab lands.
+            return;
+        };
+        self.set_active(i);
+        let t0 = std::time::Instant::now();
+        let op = match self.debug_edit_step {
+            0 => {
+                let mut d = self.tabs[i].doc.clone();
+                let id = d.alloc_id();
+                d.annotations.push(crate::editor::document::Annotation {
+                    id,
+                    kind: crate::editor::document::AnnotationKind::Step(
+                        crate::editor::document::StepObj {
+                            pos: egui::pos2(64.0, 64.0),
+                            count: 1,
+                            mode: crate::editor::document::StepMode::Numbers,
+                            style: crate::editor::document::StepStyle::Circle,
+                            size: crate::editor::document::StepSize::Medium,
+                            bg: Color32::RED,
+                            fg: Color32::WHITE,
+                            ring: 0.0,
+                            ring_color: Color32::WHITE,
+                            opacity: 1.0,
+                            shadow: 0.0,
+                            lower: false,
+                        },
+                    ),
+                });
+                self.commit_draw(
+                    i,
+                    d,
+                    std::collections::VecDeque::new(),
+                    std::collections::VecDeque::new(),
+                );
+                "annotation-commit"
+            }
+            1 => {
+                self.resize_active(4096, 2304, true);
+                "resize"
+            }
+            2 => {
+                self.undo_active();
+                "undo"
+            }
+            3 => {
+                self.redo_active();
+                "redo"
+            }
+            _ => return,
+        };
+        tracing::debug!(
+            step = self.debug_edit_step,
+            op,
+            op_ms = t0.elapsed().as_secs_f64() * 1e3,
+            "debug edit op"
+        );
+        self.debug_edit_step += 1;
+        ctx.request_repaint();
     }
 
     /// Draws the viewer for this frame. `shared` routes actions back to the
@@ -1270,10 +1526,12 @@ impl Viewer {
         shared
             .viewer_dialog_open
             .store(self.dialog_open(), std::sync::atomic::Ordering::Relaxed);
-        // The budgeted thumbnail queue runs whatever the view mode —
-        // tiles are ready before the mosaic ever opens.
+        // The background thumbnail pipeline runs whatever the view
+        // mode — tiles are ready before the mosaic ever opens.
         self.sync_thumb_queue();
         self.pump_thumb_queue(&ctx);
+        #[cfg(feature = "dev-tools")]
+        self.debug_edit_tick(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
             // The state machine owns this window's lifetime: always cancel
             // and let dispatch() decide whether closing is allowed.
@@ -3435,7 +3693,11 @@ mod tests {
         v.tabs.push(Tab {
             title: "t".to_owned(),
             doc: Document::new(Capture {
-                image: image::RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255])),
+                image: std::sync::Arc::new(image::RgbaImage::from_pixel(
+                    w,
+                    h,
+                    image::Rgba([10, 20, 30, 255]),
+                )),
                 scale_factor: 1.0,
                 monitor: MonitorInfo {
                     id: 0,
@@ -3857,9 +4119,30 @@ mod tests {
             "unpersisted live tab must force a save on quit"
         );
     }
+    /// Intercepts worker jobs before a thread could spawn — the
+    /// receiver is taken, so dispatch stays test-inspectable.
+    fn hijack_job_rx(v: &mut Viewer) -> std::sync::mpsc::Receiver<ThumbJob> {
+        v.thumb_pipe.job_rx.take().expect("job receiver")
+    }
+
+    /// Simulates a worker completing `job` — a fabricated 1×1 result
+    /// through the same store-and-clear path real results take.
+    fn finish_job(v: &mut Viewer, ctx: &egui::Context, job: ThumbJob) -> bool {
+        let ok = v.apply_thumb_done(
+            ctx,
+            ThumbDone {
+                id: job.id,
+                rev: job.rev,
+                img: egui::ColorImage::filled([1, 1], Color32::WHITE),
+            },
+        );
+        v.thumb_in_flight = None;
+        ok
+    }
+
     /// The queue is fed by revision drift alone: stale/missing
     /// thumbnails enqueue, protected tabs never do, `prioritize_thumb`
-    /// pulls visible work to the front and the pump drains in order.
+    /// pulls visible work to the front and dispatch follows the queue.
     #[test]
     fn thumb_queue_feeds_on_revision_and_prioritizes_visible() {
         let ctx = egui::Context::default();
@@ -3873,15 +4156,21 @@ mod tests {
         let c_id = v.tabs[2].doc.meta.id.clone();
         v.prioritize_thumb(2);
         assert_eq!(v.thumb_queue.front(), Some(&c_id));
-        // The pump drains every entry (stub docs are 1×1 — instant).
-        v.pump_thumb_queue(&ctx);
-        assert!(v.thumb_queue.is_empty());
+        // The pump dispatches in queue order: c first, then a, then b.
+        let job_rx = hijack_job_rx(&mut v);
+        for expected in [2, 0, 1] {
+            v.pump_thumb_queue(&ctx);
+            let job = job_rx.try_recv().expect("a job must be dispatched");
+            assert_eq!(job.id, v.tabs[expected].doc.meta.id);
+            assert!(finish_job(&mut v, &ctx, job));
+        }
         assert!(v.tabs.iter().all(|t| t.thumb.is_some()));
         // A revision bump re-queues only that tab.
         v.tabs[0].doc.revision += 1;
         v.sync_thumb_queue();
         assert_eq!(v.thumb_queue.len(), 1);
         v.pump_thumb_queue(&ctx);
+        assert!(finish_job(&mut v, &ctx, job_rx.try_recv().unwrap()));
         // Protected tabs never generate pixel data — no queue, no thumb.
         v.tabs[1].doc.meta.set_password("pw");
         v.tabs[1].doc.revision += 1;
@@ -3890,21 +4179,71 @@ mod tests {
         assert!(v.tabs[1].thumb.is_none());
     }
 
-    /// Budget zero still builds exactly one thumbnail per call — the
-    /// "at least one per frame" rule never starves the queue.
+    /// One job in flight at a time: while the worker is busy, dispatch
+    /// holds the queue; a finished job frees the next one.
     #[test]
-    fn thumb_queue_budget_always_builds_one() {
+    fn thumb_queue_dispatches_one_job_at_a_time() {
         let ctx = egui::Context::default();
         let mut v = Viewer::default();
         for t in ["a", "b", "c"] {
             v.push_stub(t);
         }
         v.sync_thumb_queue();
-        v.pump_thumb_queue_budget(&ctx, std::time::Duration::ZERO);
+        let job_rx = hijack_job_rx(&mut v);
+        v.pump_thumb_queue(&ctx);
+        assert!(job_rx.try_recv().is_ok());
+        assert!(v.thumb_in_flight.is_some());
+        // Busy worker: nothing else is sent — the queue waits.
+        v.pump_thumb_queue(&ctx);
         assert_eq!(v.thumb_queue.len(), 2);
-        assert_eq!(v.tabs.iter().filter(|t| t.thumb.is_some()).count(), 1);
-        v.pump_thumb_queue_budget(&ctx, std::time::Duration::ZERO);
+        assert!(job_rx.try_recv().is_err());
+        // Finished: the next queued job goes out.
+        v.thumb_in_flight = None;
+        v.pump_thumb_queue(&ctx);
         assert_eq!(v.thumb_queue.len(), 1);
+        assert!(job_rx.try_recv().is_ok());
+    }
+
+    /// Results apply only when the revision still matches and the tab
+    /// still exists — stale or closed-tab jobs drop their pixels.
+    #[test]
+    fn thumb_results_drop_stale_and_closed_tabs() {
+        let ctx = egui::Context::default();
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        let id = v.tabs[0].doc.meta.id.clone();
+        let img = || egui::ColorImage::filled([1, 1], Color32::WHITE);
+        // Stale revision → dropped.
+        let old_rev = v.tabs[0].doc.revision;
+        v.tabs[0].doc.revision += 1;
+        assert!(!v.apply_thumb_done(
+            &ctx,
+            ThumbDone {
+                id: id.clone(),
+                rev: old_rev,
+                img: img()
+            }
+        ));
+        assert!(v.tabs[0].thumb.is_none());
+        // Closed tab → dropped.
+        assert!(!v.apply_thumb_done(
+            &ctx,
+            ThumbDone {
+                id: "gone".to_owned(),
+                rev: v.tabs[0].doc.revision,
+                img: img(),
+            }
+        ));
+        // Current revision → stored.
+        assert!(v.apply_thumb_done(
+            &ctx,
+            ThumbDone {
+                id,
+                rev: v.tabs[0].doc.revision,
+                img: img(),
+            }
+        ));
+        assert!(v.tabs[0].thumb.is_some());
     }
 
     /// Every mutating op bumps the document revision, which re-queues
@@ -3914,15 +4253,14 @@ mod tests {
         let ctx = egui::Context::default();
         let mut v = Viewer::default();
         v.push_stub("a");
-        v.sync_thumb_queue();
-        v.pump_thumb_queue(&ctx);
-        assert!(v.thumb_queue.is_empty());
-        let mut stale_after = |v: &mut Viewer, what: &str| {
+        let job_rx = hijack_job_rx(&mut v);
+        let stale_after = |v: &mut Viewer, what: &str| {
             v.sync_thumb_queue();
             assert_eq!(v.thumb_queue.len(), 1, "{what} left a stale thumbnail");
             v.pump_thumb_queue(&ctx);
-            assert!(v.thumb_queue.is_empty());
+            assert!(finish_job(v, &ctx, job_rx.try_recv().unwrap()));
         };
+        stale_after(&mut v, "initial tab");
         // Pixel op: resize bumps revision and re-queues.
         let rev = v.tabs[0].doc.revision;
         v.resize_active(8, 8, false);
