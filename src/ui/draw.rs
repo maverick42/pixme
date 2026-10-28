@@ -3720,21 +3720,7 @@ impl DrawSession {
                 );
             }
             Tool::Blur => {
-                enum_combo(
-                    ui,
-                    "draw.opt.style",
-                    o.blur_style,
-                    &[
-                        (BlurStyle::Blur, t!("draw.opt.blur")),
-                        (BlurStyle::Pixelate, t!("draw.opt.pixelate")),
-                    ],
-                    |v| o.blur_style = v,
-                );
-                let mut bs = f32::from(o.blur_strength);
-                if slider(ui, t!("draw.opt.strength"), &mut bs, 1.0..=100.0).changed() {
-                    o.blur_strength = bs as u8;
-                }
-                shape_combo(ui, &mut o.shape);
+                blur_options_row(ui, &mut o.blur_style, &mut o.blur_strength, &mut o.shape);
             }
             Tool::Pipette => {
                 ui.label(t!("draw.opt.pipette_hint"));
@@ -4056,9 +4042,10 @@ impl DrawSession {
                     // the section strip shows again for fast placing).
                 }
                 AnnotationKind::Blur(o) => {
-                    let mut s = f32::from(o.strength);
-                    if slider(ui, t!("draw.opt.strength"), &mut s, 1.0..=100.0).changed() {
-                        o.strength = s as u8;
+                    if blur_options_row(ui, &mut o.style, &mut o.strength, &mut o.shape) {
+                        self.opts.blur_style = o.style;
+                        self.opts.blur_strength = o.strength;
+                        self.opts.shape = o.shape;
                         changed = true;
                     }
                 }
@@ -5116,6 +5103,34 @@ fn shape_combo(ui: &mut Ui, shape: &mut AreaShape) {
             ui.selectable_value(shape, AreaShape::Round, t!("draw.shape.round").to_string());
             ui.selectable_value(shape, AreaShape::Ellipse, t!("draw.shape.oval").to_string());
         });
+}
+
+/// Blur option strip shared by `Tool::Blur` and a selected `BlurObj`.
+fn blur_options_row(
+    ui: &mut Ui,
+    style: &mut BlurStyle,
+    strength: &mut u8,
+    shape: &mut AreaShape,
+) -> bool {
+    let cur_style = *style;
+    enum_combo(
+        ui,
+        "draw.opt.style",
+        cur_style,
+        &[
+            (BlurStyle::Blur, t!("draw.opt.blur")),
+            (BlurStyle::Pixelate, t!("draw.opt.pixelate")),
+        ],
+        |v| *style = v,
+    );
+    let mut s = f32::from(*strength);
+    let str_changed = slider(ui, t!("draw.opt.strength"), &mut s, 1.0..=100.0).changed();
+    if str_changed {
+        *strength = s as u8;
+    }
+    let cur_shape = *shape;
+    shape_combo(ui, shape);
+    *style != cur_style || str_changed || *shape != cur_shape
 }
 
 /// Text-align combo.
