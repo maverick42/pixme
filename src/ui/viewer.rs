@@ -2076,19 +2076,33 @@ impl Viewer {
         self.eff_scale = scale;
         let size = logical * scale;
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        egui::ScrollArea::both()
-            .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                let canvas = size.max(avail.size());
-                let (canvas_rect, resp) = ui.allocate_exact_size(canvas, Sense::click());
-                let img_rect = Rect::from_center_size(canvas_rect.center(), size);
-                ui.painter().image(tex, img_rect, uv, egui::Color32::WHITE);
-                // Double-click on the capture opens the Draw editor on
-                // it — the same action as the toolbar's Pencil.
-                if resp.double_clicked() {
-                    shared.push(Command::OpenDraw);
-                }
-            });
+        let area = egui::ScrollArea::both().auto_shrink([false; 2]);
+        let mut out = area.show(ui, |ui| {
+            let canvas = size.max(avail.size());
+            let (canvas_rect, resp) = ui.allocate_exact_size(canvas, Sense::click_and_drag());
+            let img_rect = Rect::from_center_size(canvas_rect.center(), size);
+            ui.painter().image(tex, img_rect, uv, egui::Color32::WHITE);
+            // Double-click on the capture opens the Draw editor on
+            // it — the same action as the toolbar's Pencil.
+            if resp.double_clicked() {
+                shared.push(Command::OpenDraw);
+            }
+            resp
+        });
+        // Hold-and-drag pans the zoomed canvas directly instead of the
+        // scrollbars; a fitted image never overflows, so the gesture
+        // stays inert until the view actually scrolls. The grab cursor
+        // advertises the pan while the image overflows the window.
+        let overflows = size.x > avail.width() || size.y > avail.height();
+        if overflows && out.inner.hovered() && !out.inner.is_pointer_button_down_on() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if out.inner.dragged_by(egui::PointerButton::Primary) && overflows {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let delta = ui.input(|i| i.pointer.delta());
+            out.state.offset -= delta;
+            out.state.store(ui.ctx(), out.id);
+        }
     }
 
     /// The mosaic grid: one thumbnail tile per capture plus a trailing
