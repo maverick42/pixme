@@ -24,7 +24,7 @@ use crate::editor::document::{
 };
 use crate::editor::history::{ANNO_HISTORY_CAP, AnnoEdit};
 use crate::editor::render;
-use crate::ui::icons::Icon;
+use crate::ui::icons::{self, Icon};
 use crate::ui::{theme, widgets};
 
 /// One drawable tool of the strip (two-column grid).
@@ -685,9 +685,12 @@ impl DrawSession {
             self.sel_copy();
         }
         // Eyedropper mode: pressing `C` copies the hovered `#RRGGBB` and
-        // picks the colour (dedicated Pipette tool, or the eraser's pick).
-        let pipetting =
-            self.tool == Tool::Pipette || (self.tool == Tool::Eraser && self.opts.eraser_pick);
+        // picks the colour (armed swatch pick, Pipette tool, or the
+        // eraser's pick).
+        let pick_id = armed_pick(ctx);
+        let pipetting = pick_id.is_some()
+            || self.tool == Tool::Pipette
+            || (self.tool == Tool::Eraser && self.opts.eraser_pick);
         if pipetting
             && let Some(p) = self.last_pointer
             && ctx.input_mut(|i| {
@@ -700,12 +703,19 @@ impl DrawSession {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 let _ = cb.set_text(&hex);
             }
-            match self.tool {
-                Tool::Eraser => {
-                    self.opts.eraser_color = c;
-                    self.opts.eraser_mode = EraserMode::Color;
+            if let Some(id) = pick_id {
+                ctx.data_mut(|d| {
+                    d.insert_persisted(pick_done_key(id), c);
+                });
+                arm_pick(ctx, None);
+            } else {
+                match self.tool {
+                    Tool::Eraser => {
+                        self.opts.eraser_color = c;
+                        self.opts.eraser_mode = EraserMode::Color;
+                    }
+                    _ => self.opts.color = c,
                 }
-                _ => self.opts.color = c,
             }
             self.copied_at = Some(std::time::Instant::now());
         }
@@ -723,6 +733,7 @@ impl DrawSession {
             }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            arm_pick(ctx, None);
             if self.opts.eraser_pick {
                 self.opts.eraser_pick = false;
             } else if self.text_panel.is_some() {
@@ -805,10 +816,12 @@ impl DrawSession {
     }
 
     /// Handles a tool click.
-    fn pick_tool(&mut self, tool: Tool, _ctx: &egui::Context) {
+    fn pick_tool(&mut self, tool: Tool, ctx: &egui::Context) {
         self.tool = tool;
         self.sel_area = None;
         self.close_text_panel();
+        // A swatch's armed pick dies with the tool change.
+        arm_pick(ctx, None);
     }
 
     /// Zoom ×factor, starting from the current effective scale.
@@ -1205,7 +1218,7 @@ impl DrawSession {
                 self.open_text_panel(id);
             }
         } else if resp.drag_started_by(egui::PointerButton::Primary) {
-            self.start_drag(img_p);
+            self.start_drag(img_p, ui.ctx());
         } else if resp.dragged() {
             self.continue_drag(img_p);
         } else if resp.clicked() && self.drag.is_none() {
@@ -1219,7 +1232,17 @@ impl DrawSession {
     }
 
     /// Press: begin a creation drag or grab an object.
-    fn start_drag(&mut self, p: Pos2) {
+    fn start_drag(&mut self, p: Pos2, ctx: &egui::Context) {
+        // An armed swatch pick consumes the press: the pixel colour goes
+        // to the swatch's pending slot and the picker disarms.
+        if let Some(id) = armed_pick(ctx) {
+            let c = self.pixel_at(p);
+            ctx.data_mut(|d| {
+                d.insert_persisted(pick_done_key(id), c);
+            });
+            arm_pick(ctx, None);
+            return;
+        }
         // Handles of the currently selected object ALWAYS grab first,
         // unless hidden while a box's floating text panel is open.
         let panel_hides_chrome = self
@@ -1641,6 +1664,16 @@ impl DrawSession {
     /// (any non-pixel tool); clicking empty canvas closes an open text
     /// panel or places a point tool.
     fn click(&mut self, p: Pos2, ctx: &egui::Context) {
+        // Same armed-pick interception as `start_drag` — a click may not
+        // have crossed the drag threshold first.
+        if let Some(id) = armed_pick(ctx) {
+            let c = self.pixel_at(p);
+            ctx.data_mut(|d| {
+                d.insert_persisted(pick_done_key(id), c);
+            });
+            arm_pick(ctx, None);
+            return;
+        }
         let had_panel = self.text_panel.is_some();
         if had_panel {
             self.close_text_panel();
@@ -2008,9 +2041,10 @@ impl DrawSession {
                 painter.circle_stroke(cp, r, Stroke::new(1.2, Color32::WHITE));
             }
         }
-        // The dedicated Pipette tool gets the same loupe as the capture
-        // overlay: zoomed pixels, crosshair, coords, `#RRGGBB`, `C` hint.
-        if self.tool == Tool::Pipette
+        // The Pipette tool — or a swatch's armed pick — gets the same
+        // loupe as the capture overlay: zoomed pixels, crosshair, coords,
+        // `#RRGGBB`, `C` hint.
+        if (self.tool == Tool::Pipette || armed_pick(painter.ctx()).is_some())
             && let Some(p) = self.last_pointer
         {
             let cp = pos2(img_rect.min.x + p.x * scale, img_rect.min.y + p.y * scale);
@@ -3676,18 +3710,80 @@ fn slider(
     .inner
 }
 
+/// Ctx-memory key holding the `Id` of the swatch whose pipette is armed:
+/// `color_btn` is a free function, so the target is parked here and the
+/// session writes the result into [`pick_done_key`].
+const PICK_ARMED: &str = "draw.pick_armed";
+
+fn pick_done_key(id: egui::Id) -> egui::Id {
+    egui::Id::new(("draw.pick_done", id))
+}
+
+/// The swatch id currently targeted by the armed picker.
+fn armed_pick(ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.data_mut(|d| d.get_persisted(egui::Id::new(PICK_ARMED)))
+}
+
+fn arm_pick(ctx: &egui::Context, id: Option<egui::Id>) {
+    ctx.data_mut(|d| match id {
+        Some(id) => d.insert_persisted(egui::Id::new(PICK_ARMED), id),
+        None => d.remove::<egui::Id>(egui::Id::new(PICK_ARMED)),
+    });
+}
+
+/// Compact pipette riding beside a colour swatch — 15 px with a 10 px
+/// icon, 2 px right of the swatch's top-right corner so it hugs the
+/// picker rather than filling the option line like a toolbar button.
+fn pipette_btn(ui: &mut Ui, armed: bool, anchor: Rect) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let rect = Rect::from_min_size(pos2(anchor.max.x + 2.0, anchor.min.y), Vec2::splat(15.0));
+    let resp = ui.allocate_rect(rect, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let (fill, stroke) = if resp.is_pointer_button_down_on() {
+            (t.pressed, Stroke::NONE)
+        } else if armed {
+            (t.accent_soft, Stroke::new(1.0, t.accent_border))
+        } else if resp.hovered() {
+            (t.hover, Stroke::NONE)
+        } else {
+            (Color32::TRANSPARENT, Stroke::NONE)
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(t.radius_sm),
+            fill,
+            stroke,
+            StrokeKind::Inside,
+        );
+        icons::paint(ui, rect, Icon::Pipette, 10.0, t.icon);
+    }
+    resp
+}
+
 /// Colour swatch button with an explicit border so light swatches
-/// (e.g. white outline) remain visible on the light theme.
+/// (e.g. white outline) remain visible on the light theme. The trailing
+/// pipette arms a pick targeting THIS swatch.
 fn color_btn(ui: &mut Ui, c: &mut Color32) -> Response {
     let border = theme::tokens(ui.ctx()).field_border;
     let id = ui.next_auto_id();
+    let mut changed = false;
+    // A pick armed for this swatch lands here on the next frame.
+    let picked = ui.ctx().data_mut(|d| {
+        let v = d.get_persisted::<Color32>(pick_done_key(id));
+        d.remove::<Color32>(pick_done_key(id));
+        v
+    });
+    if let Some(picked) = picked {
+        *c = picked;
+        changed = true;
+    }
     let mut hsva: egui::epaint::Hsva = ui
         .ctx()
         .data_mut(|d| d.get_temp(id))
         .filter(|cached: &egui::epaint::Hsva| Color32::from(*cached) == *c)
         .unwrap_or_else(|| egui::epaint::Hsva::from(*c));
     let old_h = hsva.h;
-    let r = egui::widgets::color_picker::color_edit_button_hsva(
+    let mut r = egui::widgets::color_picker::color_edit_button_hsva(
         ui,
         &mut hsva,
         egui::widgets::color_picker::Alpha::Opaque,
@@ -3704,6 +3800,16 @@ fn color_btn(ui: &mut Ui, c: &mut Color32) -> Response {
         Stroke::new(1.0, border),
         StrokeKind::Outside,
     );
+    let armed = armed_pick(ui.ctx()) == Some(id);
+    if pipette_btn(ui, armed, r.rect)
+        .on_hover_text(t!("draw.opt.pick").to_string())
+        .clicked()
+    {
+        arm_pick(ui.ctx(), (!armed).then_some(id));
+    }
+    if changed {
+        r.mark_changed();
+    }
     r
 }
 
