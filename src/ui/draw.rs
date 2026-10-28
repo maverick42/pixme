@@ -1172,7 +1172,7 @@ impl DrawSession {
         let hit_id = self.hit(img_p, scale);
         // The marquee tool works on regions, not objects — it never
         // picks them (same for the pure pixel tools).
-        let can_pick_existing = !matches!(self.tool, Tool::Eraser | Tool::Blur | Tool::SelectArea)
+        let can_pick_existing = !matches!(self.tool, Tool::Eraser | Tool::SelectArea)
             && !matches!(self.drag, Some(Drag::Shape { .. } | Drag::Freehand { .. }));
         let in_sel = self.sel_area.is_some_and(|s| s.rect.contains(img_p));
         let cursor = if on_handle {
@@ -1278,10 +1278,8 @@ impl DrawSession {
         // Dragging over an existing object selects and moves it, regardless
         // of which creation tool is armed (except pure pixel tools and the
         // marquee, which frames regions rather than grabbing objects).
-        if !matches!(
-            self.tool,
-            Tool::Eraser | Tool::Blur | Tool::SelectArea | Tool::Pipette
-        ) && let Some(id) = self.hit(p, self.canvas_scale)
+        if !matches!(self.tool, Tool::Eraser | Tool::SelectArea | Tool::Pipette)
+            && let Some(id) = self.hit(p, self.canvas_scale)
             && let Some(before) = self.doc.annotation(id).cloned()
         {
             self.selected = Some(id);
@@ -1678,10 +1676,8 @@ impl DrawSession {
         if had_panel {
             self.close_text_panel();
         }
-        if !matches!(
-            self.tool,
-            Tool::Eraser | Tool::Blur | Tool::SelectArea | Tool::Pipette
-        ) && let Some(id) = self.hit(p, self.canvas_scale)
+        if !matches!(self.tool, Tool::Eraser | Tool::SelectArea | Tool::Pipette)
+            && let Some(id) = self.hit(p, self.canvas_scale)
         {
             self.selected = Some(id);
             self.sync_text_panel();
