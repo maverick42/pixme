@@ -287,6 +287,9 @@ enum Drag {
     /// Dragging one of the marquee's 8 resize anchors (0..=7, same
     /// order as object handles).
     SelResize { handle: usize },
+    /// Press on empty canvas with the Select tool while the image
+    /// overflows the window — the pointer scrolls the viewport.
+    Pan,
 }
 
 /// The marquee's live region (SelectArea tool) — a transient frame over
@@ -340,6 +343,9 @@ pub struct DrawSession {
     /// over the popup itself.
     ctx_menu_id: Option<AnnotationId>,
     drag: Option<Drag>,
+    /// The image is bigger than the viewport — Select's empty-canvas
+    /// press becomes a pan gesture (set per frame by `canvas`).
+    pan_ok: bool,
     /// The live marquee (SelectArea) — cleared on tool switch, Escape,
     /// click-outside, or when the region is lifted into an object.
     sel_area: Option<SelArea>,
@@ -396,6 +402,7 @@ impl DrawSession {
             selected: None,
             ctx_menu_id: None,
             drag: None,
+            pan_ok: false,
             sel_area: None,
             sel_patches: Vec::new(),
             paste_on_press: false,
@@ -1086,7 +1093,8 @@ impl DrawSession {
             .zoom
             .unwrap_or_else(|| ((avail.x - 24.0) / iw).min((avail.y - 24.0) / ih).max(0.05));
         let size = vec2(iw * scale, ih * scale);
-        ScrollArea::both()
+        self.pan_ok = size.x > avail.x || size.y > avail.y;
+        let mut out = ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let (resp, painter) =
@@ -1122,6 +1130,13 @@ impl DrawSession {
                     }
                 });
             });
+        // A Select pan drag scrolls the viewport by the pointer delta —
+        // the same drag-to-pan as the viewer's tabs canvas.
+        if matches!(self.drag, Some(Drag::Pan)) {
+            let delta = ui.input(|i| i.pointer.delta());
+            out.state.offset -= delta;
+            out.state.store(ui.ctx(), out.id);
+        }
     }
 
     /// Pointer routing per tool on the canvas.
@@ -1177,11 +1192,15 @@ impl DrawSession {
         let in_sel = self.sel_area.is_some_and(|s| s.rect.contains(img_p));
         let cursor = if on_handle {
             egui::CursorIcon::PointingHand
+        } else if matches!(self.drag, Some(Drag::Pan)) {
+            egui::CursorIcon::Grabbing
         } else if matches!(self.drag, Some(Drag::Moving { .. } | Drag::MoveSel { .. }))
             || (can_pick_existing && hit_id.is_some())
             || in_sel
         {
             egui::CursorIcon::Move
+        } else if self.tool == Tool::Select && self.pan_ok && hit_id.is_none() {
+            egui::CursorIcon::Grab
         } else if self.tool == Tool::Select {
             egui::CursorIcon::Default
         } else {
@@ -1309,7 +1328,15 @@ impl DrawSession {
                     self.drag = Some(Drag::Marquee { anchor: p });
                 }
             }
-            Tool::Select | Tool::Text | Tool::Step => {}
+            Tool::Select => {
+                // Press on empty canvas while the image overflows the
+                // window: the pointer pans the viewport (like the
+                // viewer's drag-to-pan) instead of doing nothing.
+                if self.pan_ok {
+                    self.drag = Some(Drag::Pan);
+                }
+            }
+            Tool::Text | Tool::Step => {}
             Tool::Pipette => {
                 // A press picks the pixel's colour into the shared
                 // stroke colour — `C` copies its `#RRGGBB`.
@@ -1412,7 +1439,7 @@ impl DrawSession {
                     resize_sel(&mut sel.rect, *handle, p);
                 }
             }
-            Some(Drag::MoveSel { .. } | Drag::Shape { .. }) | None => {}
+            Some(Drag::MoveSel { .. } | Drag::Shape { .. } | Drag::Pan) | None => {}
         }
     }
 
@@ -1448,7 +1475,7 @@ impl DrawSession {
                     self.sel_area = None;
                 }
             }
-            Drag::MoveSel { .. } | Drag::SelResize { .. } => {}
+            Drag::MoveSel { .. } | Drag::SelResize { .. } | Drag::Pan => {}
             Drag::Shape { anchor } => {
                 // Release position is implicit: the last pointer move
                 // already gave the preview; use the release point via
