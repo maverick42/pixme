@@ -1137,6 +1137,36 @@ impl DrawSession {
             out.state.offset -= delta;
             out.state.store(ui.ctx(), out.id);
         }
+        // Edge autoscroll: any drag reaching the viewport's edge keeps
+        // scrolling toward it — strokes, shapes and moves can extend
+        // past the visible area while zoomed. Speed follows how deep
+        // the pointer presses into the 24 px margin band.
+        if self.drag.is_some()
+            && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
+        {
+            const EDGE: f32 = 24.0;
+            let r = out.inner_rect;
+            let mut d = Vec2::ZERO;
+            if pos.x < r.min.x + EDGE {
+                d.x = pos.x - r.min.x - EDGE;
+            }
+            if pos.x > r.max.x - EDGE {
+                d.x = pos.x - r.max.x + EDGE;
+            }
+            if pos.y < r.min.y + EDGE {
+                d.y = pos.y - r.min.y - EDGE;
+            }
+            if pos.y > r.max.y - EDGE {
+                d.y = pos.y - r.max.y + EDGE;
+            }
+            if d != Vec2::ZERO {
+                out.state.offset += d * 0.5;
+                out.state.store(ui.ctx(), out.id);
+                // Keep frames coming while the button is held still at
+                // the edge — pointer delta alone would stop repaints.
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     /// Pointer routing per tool on the canvas.
