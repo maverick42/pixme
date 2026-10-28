@@ -197,9 +197,14 @@ impl Store {
         let Some(conn) = self.conn.as_mut() else {
             return StoredSession::default();
         };
+        let t0 = std::time::Instant::now();
         match load_inner(conn) {
             Ok(session) => {
-                tracing::info!(tabs = session.tabs.len(), "session restored");
+                tracing::info!(
+                    tabs = session.tabs.len(),
+                    ms = t0.elapsed().as_millis(),
+                    "session restored"
+                );
                 session
             }
             Err(err) => {
@@ -344,7 +349,7 @@ fn local_midnight() -> i64 {
 
 /// `data_dir()/session.db` (per-user application data); the bare
 /// fallback never silently fails to persist.
-fn db_path() -> PathBuf {
+pub(crate) fn db_path() -> PathBuf {
     directories::ProjectDirs::from("", "", "pixme").map_or_else(
         || PathBuf::from("session.db"),
         |dirs| dirs.data_dir().join("session.db"),
@@ -553,6 +558,12 @@ struct RawDoc {
 impl RawDoc {
     /// Decodes every blob of the row into a live [`StoredTab`].
     fn into_tab(self) -> anyhow::Result<StoredTab> {
+        let t_all = std::time::Instant::now();
+        let doc_id = self.doc_id.clone();
+        let png_kb = self.base_png.len() as f64 / 1024.0;
+        let t_png = std::time::Instant::now();
+        let image = ser::png_decode(&self.base_png)?;
+        let png_ms = t_png.elapsed();
         let captured_at = chrono::DateTime::parse_from_rfc3339(&self.captured_at)
             .map(|d| d.with_timezone(&chrono::Local))?;
         let saved_at = self
@@ -562,7 +573,7 @@ impl RawDoc {
             })
             .transpose()?;
         let mut doc = Document::new(crate::capture::Capture {
-            image: ser::png_decode(&self.base_png)?,
+            image,
             scale_factor: self.scale_factor,
             monitor: serde_json::from_str(&self.monitor_json)?,
         });
@@ -576,6 +587,13 @@ impl RawDoc {
         doc.annotations = postcard::from_bytes(&self.annotations)?;
         doc.set_next_id(self.next_id);
         doc.revision += 1;
+        tracing::debug!(
+            doc_id,
+            png_kb,
+            png_ms = png_ms.as_millis(),
+            row_ms = t_all.elapsed().as_millis(),
+            "session capture decoded"
+        );
         Ok(StoredTab {
             title: self.title,
             saved: self.saved,

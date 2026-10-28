@@ -996,3 +996,41 @@ Format: date — context — decision — consequences.
   (confirmation answers and Quit stay live, matching the existing
   rulings). The modal-command table test gained the ViewerDialog
   column (same expectations as SaveDialog).
+
+## 2026-10-28 — Mosaic thumbnails: box-average downscale, shared scratch layer, revision-fed queue
+
+- **Context**: opening the mosaic with 20 restored 5K captures froze
+  the UI for ~3.2 s — every visible thumbnail was built synchronously
+  in one frame. Measured breakdown per thumbnail (release): Lanczos3
+  resample ~200 ms, `render_to_image` 8–18 ms bare / 264–405 ms
+  annotated, texture upload ~0.1 ms.
+- **Decision**: (A) `imageops::thumbnail` box-average replaces
+  `resize(Lanczos3)` — ~200 → ~38 ms per 5K image, the right
+  quality trade for ≤880 px tiles. (B) documents without annotations
+  skip the full-resolution clone entirely. (E) layered annotations now
+  rasterize into ONE shared full-frame scratch layer per
+  `render_to_image` call (re-cleared only inside the painted bounds),
+  and only the object's padded bounds get composited — pixel-exact
+  parity with the old per-object full-frame layer, enforced by a
+  `#[cfg(test)]` oracle implementation and a parity test battery
+  (zero tolerance; a first translation-based variant was REJECTED —
+  f32 non-associativity produced ±1 channel drift on AA edges).
+  (C) a `thumb_queue` fed solely by revision drift
+  (`sync_thumb_queue`, the single invalidation point) builds ≥1
+  thumbnail per frame under an ~8 ms budget, visible tiles first via
+  `prioritize_thumb`, prefetches the rest, and only calls
+  `request_repaint` while work remains. Thumbnail resolution is fixed
+  (880 px) so display zoom never invalidates the cache.
+- **Measured after**: annotated-document `render_to_image` 264–405 →
+  144–264 ms; unannotated thumbnails ~37–55 ms end to end; all 20
+  tiles fill in ~3 s of background frames instead of one 3.2 s freeze;
+  CPU returns to 0 % when the queue drains.
+- **Consequences**: a single annotated-5K build still costs ~180–310 ms
+  (one `render_to_image` cannot be sliced below itself on the UI
+  thread), so frames during *pre*fill can still exceed the 100 ms
+  target — background threads (option D) stay a justified candidate.
+- **Future tracks (not implemented)**: decoded-image memory (~1.2 GB
+  for 20×5K) — lazy base decoding; persisting thumbnails in a
+  compatible `thumbs` table (no `SCHEMA_VERSION` bump, lazy load,
+  same secure-delete purge as the session); `image` release
+  `opt-level = 3` measured — no gain, rejected.

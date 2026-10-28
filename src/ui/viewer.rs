@@ -73,9 +73,16 @@ pub struct Tab {
 /// the worst case.
 const HISTORY_CAP: usize = 10;
 
-/// Longest side of a mosaic thumbnail, px — the lazy per-tab texture
-/// budget for the grid (~0.9 MB each at the cap).
-const THUMB_MAX_SIDE: u32 = 480;
+/// Longest side of a mosaic thumbnail, px — a FIXED cache budget,
+/// independent of tile size: it covers the largest displayable tile
+/// (~430 pt at 200% zoom × 2 HiDPI) so zooming never invalidates the
+/// cache.
+const THUMB_MAX_SIDE: u32 = 880;
+
+/// Per-frame budget for thumbnail builds — at least one thumbnail
+/// always builds, then the frame stops feeding the queue. ~8 ms keeps
+/// the grid responsive while big captures still stream in.
+const THUMB_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
 
 /// Height of a mosaic tile's caption band, pt.
 const BAND_H: f32 = 22.0;
@@ -253,6 +260,23 @@ pub struct Viewer {
     view_mode: ViewMode,
     /// Mosaic thumbnail scale (0.5–2.0; 1.0 = the base 220×160 tiles).
     mosaic_scale: f32,
+    /// Mosaic perf telemetry: the instant the grid was entered (logged
+    /// once every visible thumbnail exists, then cleared).
+    mos_since: Option<std::time::Instant>,
+    /// Thumbnails built since that entry, and their cumulative cost.
+    mos_built_total: usize,
+    mos_ms_total: std::time::Duration,
+    /// Per-frame build counters — `mosaic_content` resets them.
+    mos_built_frame: usize,
+    mos_ms_frame: std::time::Duration,
+    /// Visible tiles that still needed a thumbnail this frame.
+    mos_pending: usize,
+    /// Thumbnail build queue — document ids needing (re)generation, in
+    /// request order. Fed by `sync_thumb_queue` whenever a document's
+    /// revision no longer matches its cached thumbnail — the single
+    /// invalidation point covering captures, annotation commits,
+    /// undo/redo, crop, resize, imports and session restores.
+    thumb_queue: std::collections::VecDeque<String>,
 }
 
 impl Default for Viewer {
@@ -288,6 +312,13 @@ impl Default for Viewer {
             persisted_sigs: None,
             view_mode: ViewMode::Tabs,
             mosaic_scale: 1.0,
+            mos_since: None,
+            mos_built_total: 0,
+            mos_ms_total: std::time::Duration::ZERO,
+            mos_built_frame: 0,
+            mos_ms_frame: std::time::Duration::ZERO,
+            mos_pending: 0,
+            thumb_queue: std::collections::VecDeque::new(),
         }
     }
 }
@@ -937,6 +968,17 @@ impl Viewer {
         self.sort_tabs();
         self.recompute_dirty();
         self.persisted_sigs = (!had_live_tabs).then(|| self.sigs());
+        // Perf hook (dev builds only): `PIXME_DEBUG_MOSAIC=1` lands a
+        // restored session straight on the thumbnail grid so first-
+        // paint cost is measurable without driving the UI by hand.
+        // Compiled out of release — the viewer always opens in Tabs.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("PIXME_DEBUG_MOSAIC").is_some() {
+            self.view_mode = ViewMode::Mosaic;
+            self.mos_since = Some(std::time::Instant::now());
+            self.mos_built_total = 0;
+            self.mos_ms_total = std::time::Duration::ZERO;
+        }
     }
 
     /// Cheap fingerprints of what `save_session` persists, hashed in
@@ -1046,10 +1088,18 @@ impl Viewer {
     /// Toggles between the tab strip and the mosaic grid. Runtime-only:
     /// PixMe always opens in Tabs mode.
     fn toggle_view_mode(&mut self) {
-        self.view_mode = match self.view_mode {
-            ViewMode::Tabs => ViewMode::Mosaic,
-            ViewMode::Mosaic => ViewMode::Tabs,
-        };
+        match self.view_mode {
+            ViewMode::Tabs => {
+                self.view_mode = ViewMode::Mosaic;
+                self.mos_since = Some(std::time::Instant::now());
+                self.mos_built_total = 0;
+                self.mos_ms_total = std::time::Duration::ZERO;
+            }
+            ViewMode::Mosaic => {
+                self.view_mode = ViewMode::Tabs;
+                self.mos_since = None;
+            }
+        }
     }
 
     /// Mosaic zoom in: ×1.25, clamped to 200%.
@@ -1076,15 +1126,15 @@ impl Viewer {
             self.set_active(index);
         }
         self.view_mode = ViewMode::Tabs;
+        self.mos_since = None;
     }
 
-    /// Lazily builds `index`'s downscaled thumbnail: the composited
-    /// document is resampled so its longest side is ≤
-    /// [`THUMB_MAX_SIDE`] px and cached on the tab keyed by the
-    /// document revision. Locked tabs never get one — their pixels
-    /// stay hidden — and the full-resolution `Tab::texture` is never
-    /// involved.
-    fn ensure_thumb(&mut self, ui: &egui::Ui, index: usize) {
+    /// Builds `index`'s downscaled thumbnail: the composited document
+    /// is resampled so its longest side is ≤ [`THUMB_MAX_SIDE`] px and
+    /// cached on the tab keyed by the document revision. Called only
+    /// from the budgeted queue — protected tabs never reach it, and
+    /// the full-resolution `Tab::texture` is never involved.
+    fn build_thumb(&mut self, ctx: &egui::Context, index: usize) {
         // Protected tabs never generate pixel data — locked or not
         // (the "proven password" only unlocks the canvas, the mosaic
         // tile stays a padlock).
@@ -1101,21 +1151,114 @@ impl Viewer {
         if tab.thumb.as_ref().map(|(rev, _)| *rev) == Some(tab.doc.revision) {
             return;
         }
+        // A stale thumbnail keeps painting its old pixels until the
+        // rebuild lands — the revision key, not the frame, decides what
+        // counts as current. Cheaper visually than a blank card flash.
+        let t_all = std::time::Instant::now();
         let (w, h) = (tab.doc.base.image.width(), tab.doc.base.image.height());
-        let composited = crate::editor::render::render_to_image(&tab.doc);
+        let t0 = std::time::Instant::now();
+        // A document without annotations composites to its base — skip
+        // the full-resolution clone `render_to_image` would make.
+        let composited = (!tab.doc.annotations.is_empty())
+            .then(|| crate::editor::render::render_to_image(&tab.doc));
+        let render_ms = t0.elapsed();
+        let source = composited.as_ref().unwrap_or(&tab.doc.base.image);
         let scale = (THUMB_MAX_SIDE as f32 / w.max(h).max(1) as f32).min(1.0);
         let (tw, th) = (
             ((w as f32 * scale).round() as u32).max(1),
             ((h as f32 * scale).round() as u32).max(1),
         );
-        let thumb =
-            image::imageops::resize(&composited, tw, th, image::imageops::FilterType::Lanczos3);
-        let handle = ui.ctx().load_texture(
+        let t1 = std::time::Instant::now();
+        // Box-average downscale — one pass over the source, the right
+        // quality/speed trade for a ≤480 px tile (Lanczos3 cost ~200 ms
+        // per 5K capture: its kernel support grows with the ratio).
+        let thumb = image::imageops::thumbnail(source, tw, th);
+        let resample_ms = t1.elapsed();
+        let t2 = std::time::Instant::now();
+        let handle = ctx.load_texture(
             format!("thumb-{index}-{}", tab.doc.revision),
             egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw()),
             egui::TextureOptions::LINEAR,
         );
+        let tex_ms = t2.elapsed();
+        let total = t_all.elapsed();
+        self.mos_built_frame += 1;
+        self.mos_built_total += 1;
+        self.mos_ms_frame += total;
+        self.mos_ms_total += total;
+        tracing::debug!(
+            index,
+            rev = tab.doc.revision,
+            px = w * h,
+            render_ms = render_ms.as_secs_f64() * 1e3,
+            resample_ms = resample_ms.as_secs_f64() * 1e3,
+            tex_ms = tex_ms.as_secs_f64() * 1e3,
+            total_ms = total.as_secs_f64() * 1e3,
+            "mosaic thumbnail built"
+        );
         tab.thumb = Some((tab.doc.revision, handle));
+    }
+
+    /// The single thumbnail-invalidation point: every document whose
+    /// cached thumbnail no longer matches its revision is (re)queued —
+    /// captures, annotation commits, undo/redo, crop, resize, imports
+    /// and session restores all land here without call-site plumbing.
+    /// Protected tabs never queue: their pixels stay hidden.
+    fn sync_thumb_queue(&mut self) {
+        for tab in &mut self.tabs {
+            if tab.doc.meta.is_protected() {
+                // Protected tabs never keep pixel data — a thumbnail
+                // built before the password was set is dropped here,
+                // not just skipped in the queue.
+                tab.thumb = None;
+                continue;
+            }
+            let stale = tab.thumb.as_ref().map(|(rev, _)| *rev) != Some(tab.doc.revision);
+            if stale && !self.thumb_queue.iter().any(|id| id == &tab.doc.meta.id) {
+                self.thumb_queue.push_back(tab.doc.meta.id.clone());
+            }
+        }
+    }
+
+    /// A visible tile jumps the queue: its doc id moves to the front so
+    /// on-screen thumbnails build before off-screen prefetch.
+    fn prioritize_thumb(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let id = &self.tabs[index].doc.meta.id;
+        if let Some(p) = self.thumb_queue.iter().position(|q| q == id) {
+            let id = self.thumb_queue.remove(p).expect("queue position");
+            self.thumb_queue.push_front(id);
+        }
+    }
+
+    /// Budgeted thumbnail generation: at least one build per frame,
+    /// then stops once ~[`THUMB_FRAME_BUDGET`] is spent; asks for
+    /// another repaint only while the queue still has work — the CPU
+    /// idles the moment every thumbnail is current. Runs whatever the
+    /// view mode is, so tiles are ready before the mosaic ever opens.
+    fn pump_thumb_queue(&mut self, ctx: &egui::Context) {
+        self.pump_thumb_queue_budget(ctx, THUMB_FRAME_BUDGET);
+    }
+
+    /// [`Self::pump_thumb_queue`] with an explicit budget — unit tests
+    /// drive it with `0` to pin the always-one-per-frame rule.
+    fn pump_thumb_queue_budget(&mut self, ctx: &egui::Context, budget: std::time::Duration) {
+        let t0 = std::time::Instant::now();
+        while let Some(id) = self.thumb_queue.front().cloned() {
+            if let Some(index) = self.tabs.iter().position(|t| t.doc.meta.id == id) {
+                self.build_thumb(ctx, index);
+            }
+            // Closed tabs resolve to nothing and are simply dropped.
+            self.thumb_queue.pop_front();
+            if t0.elapsed() >= budget {
+                break;
+            }
+        }
+        if !self.thumb_queue.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     /// Draws the viewer for this frame. `shared` routes actions back to the
@@ -1127,6 +1270,10 @@ impl Viewer {
         shared
             .viewer_dialog_open
             .store(self.dialog_open(), std::sync::atomic::Ordering::Relaxed);
+        // The budgeted thumbnail queue runs whatever the view mode —
+        // tiles are ready before the mosaic ever opens.
+        self.sync_thumb_queue();
+        self.pump_thumb_queue(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
             // The state machine owns this window's lifetime: always cancel
             // and let dispatch() decide whether closing is allowed.
@@ -2159,6 +2306,12 @@ impl Viewer {
         // Base tile 220×160 pt at 100%, scaled by the mosaic zoom.
         let (tile_w, tile_h) = (220.0 * self.mosaic_scale, 160.0 * self.mosaic_scale);
         let spacing = 10.0;
+        // Per-frame perf counters: how many thumbnails this paint built
+        // and how many visible tiles still need one.
+        self.mos_built_frame = 0;
+        self.mos_ms_frame = std::time::Duration::ZERO;
+        self.mos_pending = 0;
+        let t_frame = std::time::Instant::now();
         egui::ScrollArea::vertical()
             .id_salt("pixme-mosaic")
             .auto_shrink([false, false])
@@ -2184,6 +2337,25 @@ impl Viewer {
                 }
                 ui.add_space(spacing);
             });
+        if self.mos_built_frame > 0 || t_frame.elapsed().as_millis() > 16 {
+            tracing::debug!(
+                frame_ms = t_frame.elapsed().as_secs_f64() * 1e3,
+                built = self.mos_built_frame,
+                build_ms = self.mos_ms_frame.as_secs_f64() * 1e3,
+                pending = self.mos_pending,
+                "mosaic frame"
+            );
+        }
+        if self.mos_pending == 0
+            && let Some(since) = self.mos_since.take()
+        {
+            tracing::info!(
+                built = self.mos_built_total,
+                build_ms = self.mos_ms_total.as_secs_f64() * 1e3,
+                "mosaic: all visible thumbnails ready in {:?}",
+                since.elapsed()
+            );
+        }
         if !modal_open
             && !ui.ctx().egui_wants_keyboard_input()
             && ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -2261,7 +2433,14 @@ impl Viewer {
                 t.text_dim,
             );
         } else if ui.is_rect_visible(rect) {
-            self.ensure_thumb(ui, index);
+            if self.tabs[index].thumb.as_ref().map(|(rev, _)| *rev)
+                != Some(self.tabs[index].doc.revision)
+            {
+                self.mos_pending += 1;
+                // Visible tiles get queue priority; the build itself
+                // happens in `pump_thumb_queue`'s per-frame budget.
+                self.prioritize_thumb(index);
+            }
             if let Some((_, thumb)) = &self.tabs[index].thumb {
                 // Fit, never distorted: the thumbnail keeps its aspect.
                 let img = fit_rect(image_area, thumb.size_vec2());
@@ -3505,11 +3684,11 @@ mod tests {
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut v = Viewer::default();
             push_doc(&mut v, 2000, 1000);
-            v.ensure_thumb(ui, 0);
+            v.build_thumb(ui.ctx(), 0);
             let (_, tex) = v.tabs[0].thumb.as_ref().expect("thumbnail missing");
             assert_eq!(
                 tex.size(),
-                [480, 240],
+                [THUMB_MAX_SIDE as usize, THUMB_MAX_SIDE as usize / 2],
                 "aspect ratio kept, longest side capped"
             );
         });
@@ -3524,7 +3703,7 @@ mod tests {
             v.push_stub("secret");
             v.tabs[0].doc.meta.set_password("pw");
             assert!(v.is_locked(0));
-            v.ensure_thumb(ui, 0);
+            v.build_thumb(ui.ctx(), 0);
             assert!(
                 v.tabs[0].thumb.is_none(),
                 "a locked tab must not generate pixel data"
@@ -3533,7 +3712,7 @@ mod tests {
             // stays a padlock — protected tabs never build thumbnails.
             v.tabs[0].unlocked = true;
             assert!(!v.is_locked(0));
-            v.ensure_thumb(ui, 0);
+            v.build_thumb(ui.ctx(), 0);
             assert!(
                 v.tabs[0].thumb.is_none(),
                 "a protected tab never shows its pixels in the mosaic"
@@ -3677,5 +3856,116 @@ mod tests {
             v.persisted_sigs.is_none(),
             "unpersisted live tab must force a save on quit"
         );
+    }
+    /// The queue is fed by revision drift alone: stale/missing
+    /// thumbnails enqueue, protected tabs never do, `prioritize_thumb`
+    /// pulls visible work to the front and the pump drains in order.
+    #[test]
+    fn thumb_queue_feeds_on_revision_and_prioritizes_visible() {
+        let ctx = egui::Context::default();
+        let mut v = Viewer::default();
+        for t in ["a", "b", "c"] {
+            v.push_stub(t);
+        }
+        v.sync_thumb_queue();
+        assert_eq!(v.thumb_queue.len(), 3);
+        // Visible tile jumps the queue — doc id moves to the front.
+        let c_id = v.tabs[2].doc.meta.id.clone();
+        v.prioritize_thumb(2);
+        assert_eq!(v.thumb_queue.front(), Some(&c_id));
+        // The pump drains every entry (stub docs are 1×1 — instant).
+        v.pump_thumb_queue(&ctx);
+        assert!(v.thumb_queue.is_empty());
+        assert!(v.tabs.iter().all(|t| t.thumb.is_some()));
+        // A revision bump re-queues only that tab.
+        v.tabs[0].doc.revision += 1;
+        v.sync_thumb_queue();
+        assert_eq!(v.thumb_queue.len(), 1);
+        v.pump_thumb_queue(&ctx);
+        // Protected tabs never generate pixel data — no queue, no thumb.
+        v.tabs[1].doc.meta.set_password("pw");
+        v.tabs[1].doc.revision += 1;
+        v.sync_thumb_queue();
+        assert!(v.thumb_queue.is_empty());
+        assert!(v.tabs[1].thumb.is_none());
+    }
+
+    /// Budget zero still builds exactly one thumbnail per call — the
+    /// "at least one per frame" rule never starves the queue.
+    #[test]
+    fn thumb_queue_budget_always_builds_one() {
+        let ctx = egui::Context::default();
+        let mut v = Viewer::default();
+        for t in ["a", "b", "c"] {
+            v.push_stub(t);
+        }
+        v.sync_thumb_queue();
+        v.pump_thumb_queue_budget(&ctx, std::time::Duration::ZERO);
+        assert_eq!(v.thumb_queue.len(), 2);
+        assert_eq!(v.tabs.iter().filter(|t| t.thumb.is_some()).count(), 1);
+        v.pump_thumb_queue_budget(&ctx, std::time::Duration::ZERO);
+        assert_eq!(v.thumb_queue.len(), 1);
+    }
+
+    /// Every mutating op bumps the document revision, which re-queues
+    /// the thumbnail through the single invalidation point.
+    #[test]
+    fn mutating_ops_requeue_the_thumbnail() {
+        let ctx = egui::Context::default();
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.sync_thumb_queue();
+        v.pump_thumb_queue(&ctx);
+        assert!(v.thumb_queue.is_empty());
+        let mut stale_after = |v: &mut Viewer, what: &str| {
+            v.sync_thumb_queue();
+            assert_eq!(v.thumb_queue.len(), 1, "{what} left a stale thumbnail");
+            v.pump_thumb_queue(&ctx);
+            assert!(v.thumb_queue.is_empty());
+        };
+        // Pixel op: resize bumps revision and re-queues.
+        let rev = v.tabs[0].doc.revision;
+        v.resize_active(8, 8, false);
+        assert!(v.tabs[0].doc.revision > rev);
+        stale_after(&mut v, "resize");
+        // Undo + redo of the pixel op re-queue too.
+        let rev = v.tabs[0].doc.revision;
+        assert!(v.undo_active());
+        assert!(v.tabs[0].doc.revision > rev);
+        stale_after(&mut v, "undo");
+        assert!(v.redo_active());
+        stale_after(&mut v, "redo");
+        // An annotation commit re-queues.
+        let mut d = v.tabs[0].doc.clone();
+        let id = d.alloc_id();
+        d.annotations.push(crate::editor::document::Annotation {
+            id,
+            kind: crate::editor::document::AnnotationKind::Step(crate::editor::document::StepObj {
+                pos: egui::pos2(2.0, 2.0),
+                count: 1,
+                mode: crate::editor::document::StepMode::Numbers,
+                style: crate::editor::document::StepStyle::Circle,
+                size: crate::editor::document::StepSize::Small,
+                bg: Color32::RED,
+                fg: Color32::WHITE,
+                ring: 0.0,
+                ring_color: Color32::WHITE,
+                opacity: 1.0,
+                shadow: 0.0,
+                lower: false,
+            }),
+        });
+        v.commit_draw(
+            0,
+            d,
+            std::collections::VecDeque::new(),
+            std::collections::VecDeque::new(),
+        );
+        stale_after(&mut v, "annotation commit");
+        // Changing the DISPLAY size never invalidates the cache — the
+        // revision key only tracks document content.
+        v.mosaic_zoom_in();
+        v.sync_thumb_queue();
+        assert!(v.thumb_queue.is_empty());
     }
 }

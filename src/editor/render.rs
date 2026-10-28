@@ -114,10 +114,52 @@ pub fn text_extent(o: &super::document::TextObj) -> (f32, f32) {
 /// Composites `doc` (base + annotations) to a flat RGBA bitmap.
 pub fn render_to_image(doc: &Document) -> RgbaImage {
     let mut img = doc.base.image.clone();
+    // One scratch layer for every layered object: the full-frame
+    // alloc happens once per document instead of once per
+    // annotation, and each object is rasterized at absolute
+    // coordinates — bit-identical to allocating per object.
+    let mut scratch = ScratchLayer::new(img.width(), img.height());
     for anno in &doc.annotations {
-        render_one(&mut img, anno);
+        render_one(&mut img, &mut scratch, anno);
     }
     img
+}
+
+/// A reusable full-frame transparent layer. Only the region the
+/// previous object painted needs re-clearing between annotations —
+/// a bounded memset instead of a fresh `RgbaImage::new`.
+struct ScratchLayer {
+    /// The buffer; always full image size.
+    buf: RgbaImage,
+    /// `(x, y, w, h)` last painted — every other pixel is known-zero.
+    dirty: Option<(u32, u32, u32, u32)>,
+}
+
+impl ScratchLayer {
+    /// A zeroed layer the size of one document image.
+    fn new(w: u32, h: u32) -> Self {
+        Self {
+            buf: RgbaImage::new(w, h),
+            dirty: None,
+        }
+    }
+
+    /// Zeroes the last painted region and lends the layer back.
+    fn take(&mut self) -> &mut RgbaImage {
+        if let Some((x, y, w, h)) = self.dirty.take() {
+            for row in self.buf.rows_mut().skip(y as usize).take(h as usize) {
+                for px in row.skip(x as usize).take(w as usize) {
+                    *px = Rgba([0, 0, 0, 0]);
+                }
+            }
+        }
+        &mut self.buf
+    }
+
+    /// Marks `(x, y, w, h)` painted — [`Self::take`] clears it next time.
+    fn mark(&mut self, bounds: (u32, u32, u32, u32)) {
+        self.dirty = Some(bounds);
+    }
 }
 
 /// Paints `doc` — kept for API parity with the original module contract;
@@ -126,7 +168,7 @@ pub fn render_to_image(doc: &Document) -> RgbaImage {
 pub fn paint_document(_ui: &mut egui::Ui, _doc: &Document, _rect: egui::Rect) {}
 
 /// Renders one annotation onto `img` (already a clone of the base).
-fn render_one(img: &mut RgbaImage, anno: &Annotation) {
+fn render_one(img: &mut RgbaImage, scratch: &mut ScratchLayer, anno: &Annotation) {
     match &anno.kind {
         // Region effects read + write the base directly.
         AnnotationKind::Blur(o) => apply_blur(img, o),
@@ -134,19 +176,100 @@ fn render_one(img: &mut RgbaImage, anno: &Annotation) {
             apply_freehand_effect(img, o);
         }
         _ => {
-            // Layered objects: rasterize to a transparent layer, then
-            // composite shadow + body — one path for every drawable.
-            let (layer, shadow, opacity) = object_layer(anno, img.width(), img.height());
-            if layer.width() == 0 {
+            // Layered objects rasterize into the shared full-frame
+            // scratch layer at absolute coordinates — identical to the
+            // old per-object layer — then only their padded bounds get
+            // composited (everything outside is transparent by
+            // construction). The parity tests pin this to the old
+            // path bit for bit.
+            let Some((bx, by, bw, bh)) = layer_bounds(anno, img.width(), img.height()) else {
                 return;
+            };
+            let (shadow, opacity) = object_layer(scratch.take(), anno);
+            #[cfg(test)]
+            {
+                // The bounds contract is what makes bounded compositing
+                // sound — a paint outside it would silently leak into
+                // the NEXT object's layer. Loud in tests only.
+                let (w, h) = (img.width(), img.height());
+                let (x1, y1) = (bx + bw, by + bh);
+                debug_assert!(
+                    (0..h * w).all(|i| {
+                        let (px, py) = (i % w, i / w);
+                        (px >= bx && px < x1 && py >= by && py < y1)
+                            || scratch.buf.get_pixel(px, py).0[3] == 0
+                    }),
+                    "annotation painted outside its layer bounds"
+                );
             }
+            scratch.mark((bx, by, bw, bh));
             if shadow > 0.0 {
-                let dark = tint_alpha(&layer, Rgba([0, 0, 0, 90]));
-                composite(img, &dark, shadow as i64, shadow as i64, 1.0);
+                // The shadow is the object re-tinted dark and shifted —
+                // crop just the bounds to tint, composite at +shadow.
+                let dark = tint_alpha(
+                    &image::imageops::crop_imm(&scratch.buf, bx, by, bw, bh).to_image(),
+                    Rgba([0, 0, 0, 90]),
+                );
+                composite(
+                    img,
+                    &dark,
+                    bx as i64 + shadow as i64,
+                    by as i64 + shadow as i64,
+                    1.0,
+                );
             }
-            composite(img, &layer, 0, 0, opacity);
+            composite_in(img, &scratch.buf, opacity, (bx, by, bw, bh));
         }
     }
+}
+
+/// Anti-aliasing slack every layered bounds gets on top of the
+/// stroke/shadow extras — a few transparent pixels of margin cost
+/// nothing, a clipped AA fringe would break pixel parity.
+const LAYER_AA_SLACK: f32 = 4.0;
+
+/// Image-space `(x, y, w, h)` a layered annotation can touch, clipped
+/// to the image — `None` when fully outside. `AnnotationKind::bounds()`
+/// grown by the object's stroke/outline/shadow extras plus
+/// [`LAYER_AA_SLACK`]; the speech-box tail is unioned in separately
+/// since it leaves `BoxObj::rect` entirely.
+fn layer_bounds(anno: &Annotation, iw: u32, ih: u32) -> Option<(u32, u32, u32, u32)> {
+    let extra = match &anno.kind {
+        AnnotationKind::Rect(o) => o.stroke_w * 0.5 + o.outline + o.shadow,
+        AnnotationKind::Ellipse(o) => o.stroke_w * 0.5 + o.outline + o.shadow,
+        AnnotationKind::Line(o) => o.shadow,
+        AnnotationKind::Freehand(o) => o.width + o.outline + o.shadow,
+        AnnotationKind::HighlightArea(_) => 0.0,
+        AnnotationKind::Text(o) => {
+            // Glyphs wider than the baseline spill past `b` (the
+            // ribbon in `bounds()` stops at the curve) — pad by the
+            // overflow on every side, direction notwithstanding.
+            let len = (o.b - o.a).length();
+            let overflow = (text_extent(o).0 - len).max(0.0);
+            o.outline + o.shadow + overflow
+        }
+        AnnotationKind::TextBox(o) => o.border_w + o.shadow,
+        AnnotationKind::Step(o) => o.shadow,
+        AnnotationKind::Picture(o) => o.shadow,
+        AnnotationKind::Blur(_) => 0.0, // never layered — a region effect
+        AnnotationKind::Brace(o) => o.shadow,
+    } + LAYER_AA_SLACK;
+    let b = anno.kind.bounds();
+    let m = extra.ceil() as i32;
+    let (mut x0, mut y0) = (b.x - m, b.y - m);
+    let (mut x1, mut y1) = (b.x + b.width as i32 + m, b.y + b.height as i32 + m);
+    if let AnnotationKind::TextBox(o) = &anno.kind
+        && let Some(t) = o.tail
+    {
+        // Tail triangle: box centre → apex, ~10 px base half-width.
+        x0 = x0.min((t.x - 14.0) as i32);
+        y0 = y0.min((t.y - 14.0) as i32);
+        x1 = x1.max((t.x + 14.0) as i32);
+        y1 = y1.max((t.y + 14.0) as i32);
+    }
+    let (x0, y0) = (x0.clamp(0, iw as i32), y0.clamp(0, ih as i32));
+    let (x1, y1) = (x1.clamp(x0, iw as i32), y1.clamp(y0, ih as i32));
+    (x1 > x0 && y1 > y0).then(|| (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
 /// Shadow/opacity accessors shared by the layered objects.
@@ -166,13 +289,14 @@ fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
     }
 }
 
-/// Rasterizes a layered object onto a fresh transparent layer.
-fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
+/// Rasterizes a layered object into `layer` — a cleared full-frame
+/// scratch buffer — at absolute image coordinates. Returns
+/// `(shadow, opacity)`.
+fn object_layer(layer: &mut RgbaImage, anno: &Annotation) -> (f32, f32) {
     let (shadow, opacity) = shadow_opacity(anno);
-    let mut layer = RgbaImage::new(w, h);
     match &anno.kind {
         AnnotationKind::Rect(o) => draw_shape_sdf(
-            &mut layer,
+            layer,
             o.rect,
             false,
             o.radius,
@@ -185,7 +309,7 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
             o.shadow,
         ),
         AnnotationKind::Ellipse(o) => draw_shape_sdf(
-            &mut layer,
+            layer,
             o.rect,
             true,
             0.0,
@@ -197,12 +321,12 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
             o.outline_color,
             o.shadow,
         ),
-        AnnotationKind::Line(o) => draw_line_obj(&mut layer, o),
+        AnnotationKind::Line(o) => draw_line_obj(layer, o),
         AnnotationKind::Freehand(o) => {
-            stroke_freehand(&mut layer, o);
+            stroke_freehand(layer, o);
         }
         AnnotationKind::HighlightArea(o) => draw_shape_sdf(
-            &mut layer,
+            layer,
             o.rect,
             o.shape != AreaShape::Rect,
             0.0,
@@ -214,19 +338,19 @@ fn object_layer(anno: &Annotation, w: u32, h: u32) -> (RgbaImage, f32, f32) {
             Color32::TRANSPARENT,
             0.0,
         ),
-        AnnotationKind::Text(o) => draw_text_obj(&mut layer, o),
-        AnnotationKind::TextBox(o) => draw_textbox(&mut layer, o),
-        AnnotationKind::Step(o) => draw_step(&mut layer, o),
-        AnnotationKind::Picture(o) => draw_picture(&mut layer, o),
+        AnnotationKind::Text(o) => draw_text_obj(layer, o),
+        AnnotationKind::TextBox(o) => draw_textbox(layer, o),
+        AnnotationKind::Step(o) => draw_step(layer, o),
+        AnnotationKind::Picture(o) => draw_picture(layer, o),
         AnnotationKind::Blur(_) => {}
-        AnnotationKind::Brace(o) => draw_brace(&mut layer, o),
+        AnnotationKind::Brace(o) => draw_brace(layer, o),
     }
     // Per-object alpha (freehand strokes carry theirs on the colour).
     let extra = match &anno.kind {
         AnnotationKind::Freehand(o) => o.opacity,
         _ => 1.0,
     };
-    (layer, shadow, opacity * extra)
+    (shadow, opacity * extra)
 }
 
 /// Signed distance to a rounded box of half-extents `(hx, hy)` and corner radius `r`.
@@ -2146,6 +2270,38 @@ fn composite(dst: &mut RgbaImage, src: &RgbaImage, ox: i64, oy: i64, alpha_mul: 
     }
 }
 
+/// `composite` restricted to `(x, y, w, h)` of `src` at the same
+/// position — the bounded variant used for the shared scratch layer:
+/// pixels outside the object's bounds are transparent by construction.
+fn composite_in(
+    dst: &mut RgbaImage,
+    src: &RgbaImage,
+    alpha_mul: f32,
+    region: (u32, u32, u32, u32),
+) {
+    let (x0, y0, w, h) = region;
+    let (x1, y1) = ((x0 + w).min(src.width()), (y0 + h).min(src.height()));
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut s = *src.get_pixel(x, y);
+            if alpha_mul < 1.0 {
+                s.0[3] = (s.0[3] as f32 * alpha_mul) as u8;
+            }
+            if s.0[3] == 0 {
+                continue;
+            }
+            let d = dst.get_pixel_mut(x, y);
+            let sa = s.0[3] as f32 / 255.0;
+            for ch in 0..3 {
+                d.0[ch] = (s.0[ch] as f32 * sa + d.0[ch] as f32 * (1.0 - sa)) as u8;
+            }
+            d.0[3] = (sa + d.0[3] as f32 / 255.0 * (1.0 - sa))
+                .min(1.0)
+                .mul_add(255.0, 0.5) as u8;
+        }
+    }
+}
+
 /// Clips a `PhysicalRect` to image bounds → (x, y, w, h).
 fn clip_rect(r: PhysicalRect, w: u32, h: u32) -> (u32, u32, u32, u32) {
     let x = r.x.clamp(0, w as i32) as u32;
@@ -2163,4 +2319,583 @@ fn c32(c: Color32) -> Rgba<u8> {
 /// `Color32` with a forced alpha.
 fn with_alpha(c: Color32, a: u8) -> Rgba<u8> {
     Rgba([c.r(), c.g(), c.b(), a])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::document::{
+        AreaObj, BlurObj, BoxObj, BoxVAlign, EllipseObj, LineObj, PicObj, RectObj, StepObj, TextObj,
+    };
+    use super::*;
+    use crate::capture::{Capture, MonitorInfo};
+    use egui::pos2;
+
+    /// A deterministic patterned base — compositing against a flat
+    /// colour would hide half the blend bugs.
+    pub(super) fn base() -> Capture {
+        let mut img = RgbaImage::new(340, 260);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = Rgba([
+                ((x % 64) * 4) as u8,
+                ((y % 64) * 4) as u8,
+                (((x + y) % 128) * 2) as u8,
+                255,
+            ]);
+        }
+        Capture {
+            image: img,
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 340,
+                    height: 260,
+                },
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        }
+    }
+
+    pub(super) fn anno(id: u64, kind: AnnotationKind) -> Annotation {
+        Annotation { id, kind }
+    }
+
+    pub(super) fn doc_with(annos: Vec<Annotation>) -> Document {
+        let mut doc = Document::new(base());
+        doc.annotations = annos;
+        doc
+    }
+
+    /// Pixel-exact comparison with a first-mismatch report — `assert_eq!`
+    /// on the raw buffers would dump a megabyte on failure.
+    fn assert_same_pixels(a: &RgbaImage, b: &RgbaImage) {
+        assert_eq!(a.dimensions(), b.dimensions());
+        let mut diffs = 0usize;
+        let mut max_delta = 0i32;
+        let mut first = None;
+        for (i, (x, y)) in a.as_raw().iter().zip(b.as_raw().iter()).enumerate() {
+            if x != y {
+                diffs += 1;
+                max_delta = max_delta.max((*x as i32 - *y as i32).abs());
+                if first.is_none() {
+                    first = Some(i);
+                }
+            }
+        }
+        if let Some(i) = first {
+            let (x, y) = ((i / 4) % a.width() as usize, (i / 4) / a.width() as usize);
+            panic!(
+                "{diffs} channel diffs (max delta {max_delta}); first at ({x},{y}) ch {}: {} vs {}",
+                i % 4,
+                a.as_raw()[i],
+                b.as_raw()[i]
+            );
+        }
+    }
+
+    /// The bounded-layer path must reproduce the old full-frame
+    /// rasterization EXACTLY — zero tolerance: the same code path
+    /// serves canvas, thumbnails and export, so any drift is a
+    /// rendering bug, not a quality trade-off.
+    fn assert_render_parity(annos: Vec<Annotation>) {
+        let doc = doc_with(annos);
+        assert_same_pixels(&render_to_image(&doc), &render_to_image_ref(&doc));
+    }
+
+    /// Reference implementation of `render_one`: the pre-bounded-layer
+    /// path, kept ONLY as the test oracle. It rasterizes every layered
+    /// object into a full-frame transparent layer like the code did
+    /// before [`layer_bounds`].
+    fn render_one_ref(img: &mut RgbaImage, anno: &Annotation) {
+        match &anno.kind {
+            AnnotationKind::Blur(o) => apply_blur(img, o),
+            AnnotationKind::Freehand(o)
+                if o.eraser_mode != super::super::document::EraserMode::Color =>
+            {
+                apply_freehand_effect(img, o);
+            }
+            _ => {
+                let mut layer = RgbaImage::new(img.width(), img.height());
+                let (shadow, opacity) = object_layer(&mut layer, anno);
+                if shadow > 0.0 {
+                    let dark = tint_alpha(&layer, Rgba([0, 0, 0, 90]));
+                    composite(img, &dark, shadow as i64, shadow as i64, 1.0);
+                }
+                composite(img, &layer, 0, 0, opacity);
+            }
+        }
+    }
+
+    /// Reference [`render_to_image`], oracle for the parity tests.
+    pub(super) fn render_to_image_ref(doc: &Document) -> RgbaImage {
+        let mut img = doc.base.image.clone();
+        for anno in &doc.annotations {
+            render_one_ref(&mut img, anno);
+        }
+        img
+    }
+
+    /// Stroked + filled rects: radius, outline, shadow, dash and a
+    /// transparent-fill variant — plus one clipped by the image edge.
+    #[test]
+    fn parity_rects() {
+        let mk = |x, y| RectObj {
+            rect: PhysicalRect {
+                x,
+                y,
+                width: 120,
+                height: 80,
+            },
+            stroke: Color32::from_rgb(230, 70, 60),
+            stroke_w: 6.0,
+            dash: Dash::Dash,
+            fill: Some(Color32::from_rgba_premultiplied(60, 120, 220, 90)),
+            radius: 10.0,
+            outline: 3.0,
+            outline_color: Color32::WHITE,
+            opacity: 0.9,
+            shadow: 5.0,
+        };
+        let mut border_only = mk(180, 140);
+        border_only.fill = None;
+        border_only.stroke_w = 12.0;
+        border_only.dash = Dash::Dot;
+        assert_render_parity(vec![
+            anno(1, AnnotationKind::Rect(mk(20, 30))),
+            anno(2, AnnotationKind::Rect(border_only)),
+            anno(3, AnnotationKind::Rect(mk(290, 210))), // clipped at edge
+        ]);
+    }
+
+    /// Stroked and filled ellipses, dashed and outlined.
+    #[test]
+    fn parity_ellipses() {
+        let mk = |x, y, fill| EllipseObj {
+            rect: PhysicalRect {
+                x,
+                y,
+                width: 150,
+                height: 100,
+            },
+            stroke: Color32::from_rgb(55, 142, 240),
+            stroke_w: 8.0,
+            dash: Dash::DashDot,
+            fill,
+            outline: 2.0,
+            outline_color: Color32::BLACK,
+            opacity: 1.0,
+            shadow: 4.0,
+        };
+        assert_render_parity(vec![
+            anno(1, AnnotationKind::Ellipse(mk(30, 30, None))),
+            anno(
+                2,
+                AnnotationKind::Ellipse(mk(150, 120, Some(Color32::from_rgb(40, 200, 120)))),
+            ),
+        ]);
+    }
+
+    /// Bézier lines with arrow/dot/ring ends, thick and dashed.
+    #[test]
+    fn parity_lines() {
+        let mk = |start, end| LineObj {
+            a: pos2(20.0, 200.0),
+            b: pos2(320.0, 60.0),
+            ka: pos2(120.0, 260.0),
+            kb: pos2(240.0, 20.0),
+            color: Color32::from_rgb(255, 170, 30),
+            width: 10.0,
+            dash: Dash::DashDot,
+            start,
+            end,
+            outline: 3.0,
+            outline_color: Color32::WHITE,
+            opacity: 1.0,
+            shadow: 4.0,
+        };
+        assert_render_parity(vec![
+            anno(1, AnnotationKind::Line(mk(LineEnd::Arrow, LineEnd::Arrow))),
+            anno(2, AnnotationKind::Line(mk(LineEnd::Dot, LineEnd::Ring))),
+            anno(3, AnnotationKind::Line(mk(LineEnd::None, LineEnd::None))),
+        ]);
+    }
+
+    /// Freehand colour strokes: soft feather, outline, shadow, dash.
+    #[test]
+    fn parity_freehand() {
+        let points: Vec<Pos2> = (0..40)
+            .map(|i| pos2(20.0 + i as f32 * 8.0, 130.0 + (i as f32 * 0.7).sin() * 60.0))
+            .collect();
+        assert_render_parity(vec![anno(
+            1,
+            AnnotationKind::Freehand(FreeObj {
+                points,
+                color: Color32::from_rgba_premultiplied(200, 40, 60, 200),
+                width: 12.0,
+                tip: TipShape::Round,
+                dash: Dash::Solid,
+                outline: 2.0,
+                outline_color: Color32::WHITE,
+                shadow: 3.0,
+                eraser_mode: EraserMode::Color,
+                soft: true,
+                opacity: 0.7,
+            }),
+        )]);
+    }
+
+    /// Zone highlighter in all three shapes.
+    #[test]
+    fn parity_highlight() {
+        let mk = |x, y, shape| {
+            AnnotationKind::HighlightArea(AreaObj {
+                rect: PhysicalRect {
+                    x,
+                    y,
+                    width: 200,
+                    height: 50,
+                },
+                color: Color32::from_rgb(255, 235, 60),
+                shape,
+                border: Some(Color32::from_rgb(180, 140, 0)),
+                dash: Dash::Solid,
+                soft: true,
+                opacity: 0.35,
+            })
+        };
+        assert_render_parity(vec![
+            anno(1, mk(20, 30, AreaShape::Rect)),
+            anno(2, mk(60, 100, AreaShape::Round)),
+            anno(3, mk(100, 170, AreaShape::Ellipse)),
+        ]);
+    }
+
+    /// Text on an angled Bézier baseline with outline and shadow —
+    /// Inter is embedded so glyphs rasterize deterministically.
+    #[test]
+    fn parity_text() {
+        assert_render_parity(vec![anno(
+            1,
+            AnnotationKind::Text(TextObj {
+                a: pos2(30.0, 200.0),
+                b: pos2(310.0, 120.0),
+                ka: pos2(60.0, 200.0),
+                kb: pos2(280.0, 120.0),
+                content: "Héllo wörld — ¿Qué?".to_owned(),
+                font: "Inter".to_owned(),
+                color: Color32::WHITE,
+                size: 40.0,
+                bold: true,
+                italic: false,
+                align: TextAlign::Left,
+                outline: 2.0,
+                outline_color: Color32::BLACK,
+                opacity: 1.0,
+                shadow: 3.0,
+            }),
+        )]);
+    }
+
+    /// Speech boxes, one with the tail apex far outside the rect.
+    #[test]
+    fn parity_textbox() {
+        let mk = |rect, oval, tail| BoxObj {
+            rect,
+            oval,
+            content: "note".to_owned(),
+            bg: Color32::from_rgb(250, 250, 250),
+            border: Color32::from_rgb(30, 30, 30),
+            border_w: 2.0,
+            radius: 8.0,
+            fg: Color32::BLACK,
+            size: 18.0,
+            bold: false,
+            italic: false,
+            align: TextAlign::Center,
+            valign: BoxVAlign::Center,
+            line_gap: 4.0,
+            tail,
+            opacity: 1.0,
+            shadow: 5.0,
+        };
+        assert_render_parity(vec![
+            anno(
+                1,
+                AnnotationKind::TextBox(mk(
+                    PhysicalRect {
+                        x: 40,
+                        y: 30,
+                        width: 140,
+                        height: 60,
+                    },
+                    false,
+                    Some(pos2(300.0, 240.0)),
+                )),
+            ),
+            anno(
+                2,
+                AnnotationKind::TextBox(mk(
+                    PhysicalRect {
+                        x: 120,
+                        y: 120,
+                        width: 120,
+                        height: 80,
+                    },
+                    true,
+                    Some(pos2(60.0, 20.0)),
+                )),
+            ),
+        ]);
+    }
+
+    /// Step badges in every size and style.
+    #[test]
+    fn parity_steps() {
+        let mk = |x, y, size, style, count| {
+            AnnotationKind::Step(StepObj {
+                pos: pos2(x, y),
+                count,
+                mode: StepMode::Numbers,
+                style,
+                size,
+                bg: Color32::from_rgb(55, 142, 240),
+                fg: Color32::WHITE,
+                ring: 4.0,
+                ring_color: Color32::WHITE,
+                opacity: 1.0,
+                shadow: 5.0,
+                lower: false,
+            })
+        };
+        assert_render_parity(vec![
+            anno(1, mk(50.0, 50.0, StepSize::Small, StepStyle::Circle, 1)),
+            anno(2, mk(170.0, 130.0, StepSize::Medium, StepStyle::Square, 12)),
+            anno(3, mk(300.0, 220.0, StepSize::Large, StepStyle::Circle, 7)),
+        ]);
+    }
+
+    /// An inserted bitmap with shadow and partial transparency.
+    #[test]
+    fn parity_picture() {
+        let mut pic = RgbaImage::new(40, 30);
+        for (x, y, p) in pic.enumerate_pixels_mut() {
+            *p = if (x + y) % 2 == 0 {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 0, 255, 180])
+            };
+        }
+        assert_render_parity(vec![anno(
+            1,
+            AnnotationKind::Picture(PicObj {
+                rect: PhysicalRect {
+                    x: 60,
+                    y: 40,
+                    width: 110,
+                    height: 70,
+                },
+                image: pic,
+                opacity: 0.9,
+                shadow: 6.0,
+            }),
+        )]);
+    }
+
+    /// Braces between anchors, several shapes.
+    #[test]
+    fn parity_braces() {
+        let mk = |kind| {
+            AnnotationKind::Brace(BraceObj {
+                a: pos2(60.0, 30.0),
+                b: pos2(60.0, 230.0),
+                kind,
+                color: Color32::WHITE,
+                width: 4.0,
+                dash: Dash::Solid,
+                outline: 1.0,
+                outline_color: Color32::BLACK,
+                opacity: 1.0,
+                shadow: 2.0,
+            })
+        };
+        assert_render_parity(vec![
+            anno(1, mk(BraceKind::CurlyLeft)),
+            anno(2, mk(BraceKind::SquareRight)),
+        ]);
+    }
+
+    /// Region effects bypass the layer path entirely — regression net
+    /// only: pixelate, gaussian, clipped and fully outside.
+    #[test]
+    fn parity_blur() {
+        let mk = |x, y, w, h, style| {
+            AnnotationKind::Blur(BlurObj {
+                rect: PhysicalRect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+                style,
+                shape: AreaShape::Ellipse,
+                strength: 60,
+            })
+        };
+        assert_render_parity(vec![
+            anno(1, mk(50, 50, 120, 90, BlurStyle::Pixelate)),
+            anno(2, mk(200, 100, 100, 80, BlurStyle::Blur)),
+            anno(3, mk(-30, 200, 80, 80, BlurStyle::Blur)), // clipped
+            anno(4, mk(-500, -500, 40, 40, BlurStyle::Pixelate)), // outside
+        ]);
+    }
+
+    /// Eraser effects are the other direct-to-base path.
+    #[test]
+    fn parity_eraser_modes() {
+        let points: Vec<Pos2> = (0..20)
+            .map(|i| pos2(40.0 + i as f32 * 12.0, 130.0))
+            .collect();
+        let mk = |mode| {
+            AnnotationKind::Freehand(FreeObj {
+                points: points.clone(),
+                color: Color32::WHITE,
+                width: 20.0,
+                tip: TipShape::Round,
+                dash: Dash::Solid,
+                outline: 0.0,
+                outline_color: Color32::WHITE,
+                shadow: 0.0,
+                eraser_mode: mode,
+                soft: false,
+                opacity: 1.0,
+            })
+        };
+        assert_render_parity(vec![
+            anno(1, mk(EraserMode::Pixelate)),
+            anno(2, mk(EraserMode::Blur)),
+        ]);
+    }
+
+    /// Stacked semi-transparent objects — z-order and alpha
+    /// accumulation must survive the split into per-object layers.
+    #[test]
+    fn parity_overlapping() {
+        assert_render_parity(vec![
+            anno(
+                1,
+                AnnotationKind::HighlightArea(AreaObj {
+                    rect: PhysicalRect {
+                        x: 60,
+                        y: 60,
+                        width: 220,
+                        height: 140,
+                    },
+                    color: Color32::from_rgb(255, 235, 60),
+                    shape: AreaShape::Round,
+                    border: None,
+                    dash: Dash::Solid,
+                    soft: false,
+                    opacity: 0.4,
+                }),
+            ),
+            anno(
+                2,
+                AnnotationKind::Rect(RectObj {
+                    rect: PhysicalRect {
+                        x: 90,
+                        y: 90,
+                        width: 160,
+                        height: 90,
+                    },
+                    stroke: Color32::from_rgb(230, 70, 60),
+                    stroke_w: 14.0,
+                    dash: Dash::Solid,
+                    fill: Some(Color32::from_rgba_premultiplied(60, 120, 220, 120)),
+                    radius: 6.0,
+                    outline: 4.0,
+                    outline_color: Color32::WHITE,
+                    opacity: 0.8,
+                    shadow: 8.0,
+                }),
+            ),
+            anno(3, mk_step(200.0, 130.0, 5)),
+        ]);
+    }
+
+    fn mk_step(x: f32, y: f32, count: u32) -> AnnotationKind {
+        AnnotationKind::Step(StepObj {
+            pos: pos2(x, y),
+            count,
+            mode: StepMode::Numbers,
+            style: StepStyle::Circle,
+            size: StepSize::Large,
+            bg: Color32::from_rgb(230, 70, 60),
+            fg: Color32::WHITE,
+            ring: 3.0,
+            ring_color: Color32::WHITE,
+            opacity: 0.9,
+            shadow: 4.0,
+            lower: false,
+        })
+    }
+
+    /// Objects fully or partially outside the image: the bounded layer
+    /// must clip or skip without losing a pixel of the in-bounds part.
+    #[test]
+    fn parity_clipped_and_outside() {
+        let mut r = RectObj {
+            rect: PhysicalRect {
+                x: -40,
+                y: -20,
+                width: 100,
+                height: 60,
+            },
+            stroke: Color32::RED,
+            stroke_w: 10.0,
+            dash: Dash::Solid,
+            fill: Some(Color32::BLUE),
+            radius: 0.0,
+            outline: 0.0,
+            outline_color: Color32::WHITE,
+            opacity: 1.0,
+            shadow: 12.0,
+        };
+        let clipped = anno(1, AnnotationKind::Rect(r.clone()));
+        r.rect = PhysicalRect {
+            x: 500,
+            y: 400,
+            width: 60,
+            height: 60,
+        };
+        let outside = anno(2, AnnotationKind::Rect(r));
+        let line_through = anno(
+            3,
+            AnnotationKind::Line(LineObj {
+                a: pos2(-30.0, 130.0),
+                b: pos2(200.0, 130.0),
+                ka: pos2(50.0, 130.0),
+                kb: pos2(150.0, 130.0),
+                color: Color32::GREEN,
+                width: 22.0,
+                dash: Dash::Solid,
+                start: LineEnd::Dot,
+                end: LineEnd::Arrow,
+                outline: 2.0,
+                outline_color: Color32::WHITE,
+                opacity: 1.0,
+                shadow: 6.0,
+            }),
+        );
+        assert_render_parity(vec![clipped, outside, line_through]);
+    }
+
+    /// An empty document renders its base verbatim.
+    #[test]
+    fn parity_empty_document() {
+        assert_render_parity(Vec::new());
+    }
 }

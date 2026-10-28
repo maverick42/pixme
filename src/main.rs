@@ -13,6 +13,7 @@ extern crate rust_i18n;
 mod app;
 mod capture;
 mod config;
+mod devseed;
 mod editor;
 mod export;
 mod i18n;
@@ -29,6 +30,19 @@ fn main() -> eframe::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Dev tool: `pixme --seed-session [N]` writes N large synthetic
+    // captures into session.db and exits — performance test data. It
+    // owns the store like the app, so a running instance blocks it.
+    if let Some(count) = devseed::requested() {
+        let instance = instance_guard();
+        if instance.as_ref().is_some_and(|i| !i.is_single()) {
+            eprintln!("pixme: quit the running instance before seeding the session");
+            std::process::exit(2);
+        }
+        let _guard = instance;
+        std::process::exit(devseed::run(count));
+    }
 
     // Single instance: PixMe is a resident app (menu bar / tray) owning
     // one session and its database — a second process would race both.

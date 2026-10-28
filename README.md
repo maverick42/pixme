@@ -31,3 +31,29 @@ cargo test -- --ignored
 ```
 
 Currently none exist; capture/permission tests land with the capture feature.
+
+### Performance test data
+
+`pixme --seed-session [N]` (default 20) writes N synthetic 5120×2880
+captures — half carrying annotations — into the real `session.db` and
+exits, so thumbnail and session-restore costs are measurable on a
+realistic session. Seeding **replaces** the current session; the
+existing database is copied aside to `session.db.preseed` first.
+
+In dev builds, `PIXME_DEBUG_MOSAIC=1` opens the restored session
+straight into the mosaic grid (release builds always open in Tabs —
+the hook is compiled out). Combined with `RUST_LOG=pixme=debug`, the
+per-stage timings (`session capture decoded`, `mosaic thumbnail
+built`, `mosaic frame`) give the full first-paint breakdown.
+
+To reproduce the mosaic benchmark on Windows (PowerShell):
+
+```powershell
+cargo build                                   # dev build keeps the hook
+.\target\debug\pixme.exe --seed-session    # 20 synthetic 5K captures
+$env:PIXME_DEBUG_MOSAIC="1"; $env:RUST_LOG="pixme=debug"
+.\target\debug\pixme.exe                   # log shows the timings
+```
+
+Dev-profile dependencies already build at `opt-level = 2`, so the
+numbers are representative (though not identical to release).
