@@ -1100,6 +1100,7 @@ impl DrawSession {
     fn pick_tool(&mut self, tool: Tool, ctx: &egui::Context) {
         self.tool = tool;
         self.sel_area = None;
+        self.selected = None;
         self.close_text_panel();
         // A pending arrow-nudge commits before the tool switch; a
         // half-finished emoji drag-out dies with it too.
