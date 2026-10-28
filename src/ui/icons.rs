@@ -123,6 +123,8 @@ pub enum Icon {
     Pipette,
     /// Gaussian blur brush toggle.
     Blur,
+    /// Emoji sticker tool.
+    Smile,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

@@ -1071,3 +1071,53 @@ Format: date — context — decision — consequences.
 - **Future tracks (not implemented)**: persisted thumbnails in a
   compatible `thumbs` table (no `SCHEMA_VERSION` bump), lazy base
   decoding for decoded-image memory.
+
+## 2026-10-28 — Emoji sticker tool (Noto Color Emoji PNGs, Apache 2.0)
+
+- **Context**: the Draw editor needed an emoticon tool. FastStone's
+  `Draw.db` holds 138 embedded PNGs, but its assets are proprietary and
+  the project rules forbid reusing them. Emoji-as-text was rejected:
+  Inter has no emoji glyphs and egui's rasterizer (ab_glyph) cannot
+  render colour fonts (COLR/CBDT/sbix).
+- **Decision**: `AnnotationKind::Emoji(EmojiObj)` stores the emoji id
+  (Unicode code point, u32) — never the pixels — appended LAST in the
+  enum so postcard blobs written before the variant still decode (no
+  `SCHEMA_VERSION` bump; verified by `pre_emoji_session_blob_still_
+  deserializes`). Rendering resolves id → lazily decoded `RgbaImage`
+  (per-entry `OnceLock`, thread-safe for the thumbnail worker) and
+  reuses the same Lanczos3+composite path as `Picture`; unknown ids
+  draw a neutral placeholder (dashed square + cross), never an error.
+- **Asset provenance**: Noto Color Emoji PNG 128 px from
+  googlefonts/noto-emoji, pinned to commit
+  `41e31b110b4eb929dffb410264694a06205b7ad7` — the last commit whose
+  root LICENSE is literally Apache 2.0 (image resources per README).
+  UPSTREAM INCONSISTENCY ON RECORD: commit `254596e5f8` (2024-07-29)
+  switched the root LICENSE to OFL while the README still claims image
+  resources are Apache 2.0 — the pre-change commit keeps our paper
+  trail unambiguous. No NOTICE file exists upstream (AUTHORS/
+  CONTRIBUTORS only). 64 curated single-code-point ids
+  (`assets/emoji/manifest.txt` + `emoji_u*.png`, build.rs-generated
+  table — one file + one line per new emoji, permanent ids).
+- **Size budget**: ≤ 350 KB embedded (measured ~290 KB raw at the pin;
+  no oxipng — vendored verbatim, per user decision). Session impact: ~6 bytes per emoji
+  vs a full PNG for `Picture`.
+- **Interaction**: egui's own 6 pt `max_click_dist` is the click/drag
+  threshold; click = 5 % of the image's small side bounded to
+  [24, 96] × `scale_factor` (the Step-badge footprint family — Step
+  itself uses FIXED 12/18/26 px radii, so on a Retina ×2 frame a Step
+  looks half-size; emoji compensates instead of copying that bug);
+  drag = directional square (aspect-locked, also on resize), capped at
+  256 px (2× the 128 px source — beyond, the square just stops
+  growing); last dragged side remembered per session; ghost preview
+  under the cursor; sticky tool, Esc cancels an in-flight drag then
+  exits to Select. Arrow keys nudge the selection (1 px, ⇧ = 10 px),
+  a whole burst committing as ONE Replace.
+- **Deferred**: tabbed categories/search/tooltips (option B) stay
+  possible later without format change — the manifest already defines
+  order and sections.
+  - **Follow-up (same day)**: the picker became section tabs in the
+    bottom bar (one translated chip per manifest section —
+    `EmojiDef.section` parsed from the nearest `#` comment — cells of
+    the active tab only), icons only: no opacity/shadow fields on
+    `EmojiObj`. Cells are click-to-arm AND drag-out-to-canvas (drop =
+    place at default side), matching the reference's emoticon strip.

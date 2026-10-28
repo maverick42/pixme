@@ -466,6 +466,18 @@ pub struct BlurObj {
     pub strength: u8,
 }
 
+/// An embedded emoji sticker (the 🙂 tool) — stores the emoji id, NOT
+/// its pixels: the bitmap comes from [`super::emoji`] at render time,
+/// so documents stay tiny and an id missing from the set renders a
+/// neutral placeholder.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EmojiObj {
+    /// Placement bounds — always square (aspect-locked at 1:1).
+    pub rect: PhysicalRect,
+    /// Unicode code point of the emoji (manifest id, permanent).
+    pub id: u32,
+}
+
 /// A bracket / curly-brace annotation spanning between two endpoints `a` and `b`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BraceObj {
@@ -517,6 +529,9 @@ pub enum AnnotationKind {
     Blur(BlurObj),
     /// `{` / `}` / `[` / `]` / `(` / `)` bracket between two anchors.
     Brace(BraceObj),
+    /// 🙂 embedded emoji sticker — LAST variant: postcard encodes the
+    /// variant index, so appending keeps every older blob readable.
+    Emoji(EmojiObj),
 }
 
 /// One annotation object.
@@ -608,6 +623,7 @@ impl AnnotationKind {
                 r.height = (r.height as i32 + pad * 2).max(1) as u32;
                 r
             }
+            Self::Emoji(o) => o.rect,
         }
     }
 
@@ -655,6 +671,7 @@ impl AnnotationKind {
                 shift(&mut o.a);
                 shift(&mut o.b);
             }
+            Self::Emoji(o) => shift_rect(&mut o.rect),
         }
     }
 
@@ -712,6 +729,7 @@ impl AnnotationKind {
                 scale_pt(&mut o.a, &b);
                 scale_pt(&mut o.b, &b);
             }
+            Self::Emoji(o) => o.rect = rect,
         }
     }
 }

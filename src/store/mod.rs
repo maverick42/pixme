@@ -952,6 +952,18 @@ mod tests {
                     lower: false,
                 }),
             },
+            Annotation {
+                id: 3,
+                kind: AnnotationKind::Emoji(super::super::editor::document::EmojiObj {
+                    rect: PhysicalRect {
+                        x: 10,
+                        y: 20,
+                        width: 48,
+                        height: 48,
+                    },
+                    id: 0x1F449,
+                }),
+            },
         ];
         let undo: Vec<AnnoEdit> = vec![
             AnnoEdit::Add {
@@ -981,7 +993,71 @@ mod tests {
     }
 
     /// See `postcard_layout_is_golden`.
-    const EXPECTED: &str = "02010002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404002070000f04000000841030001020a141effffffffff00000040ffffffff0000403f0000c03f000200040002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400202050002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f00004040060002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400101070002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404000";
+    const EXPECTED: &str = "03010002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404002070000f04000000841030001020a141effffffffff00000040ffffffff0000403f0000c03f00030b14283030c9e8070200040002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400202050002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f00004040060002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400101070002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404000";
+
+    /// Sessions written BEFORE the Emoji variant existed must still
+    /// restore — postcard encodes variant indices and `Emoji` was
+    /// appended last, so every older blob keeps decoding. This blob is
+    /// the pre-Emoji golden layout (annotations + undo + redo).
+    #[test]
+    fn pre_emoji_session_blob_still_deserializes() {
+        const PRE_EMOJI: &str = "02010002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404002070000f04000000841030001020a141effffffffff00000040ffffffff0000403f0000c03f000200040002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400202050002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f00004040060002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400101070002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404000";
+        let bytes: Vec<u8> = (0..PRE_EMOJI.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&PRE_EMOJI[i..i + 2], 16).unwrap())
+            .collect();
+        let mut rest: &[u8] = &bytes;
+        let (annos, r) = postcard::take_from_bytes::<Vec<Annotation>>(rest).unwrap();
+        rest = r;
+        let (undo, r) = postcard::take_from_bytes::<Vec<AnnoEdit>>(rest).unwrap();
+        rest = r;
+        let (redo, r) = postcard::take_from_bytes::<Vec<AnnoEdit>>(rest).unwrap();
+        assert!(r.is_empty(), "trailing bytes after redo stack");
+        assert_eq!(annos.len(), 2);
+        assert_eq!(undo.len(), 2);
+        assert_eq!(redo.len(), 1);
+    }
+
+    /// An emoji annotation survives a full session save/load — the doc
+    /// stores the id only, pixels come back from the embedded set.
+    #[test]
+    fn emoji_annotation_roundtrips_session() {
+        let mut store = Store::open_in_memory();
+        let mut viewer = Viewer::default();
+        let idx = push_tab(&mut viewer, "emoji-tab", 16, [10, 20, 30, 255]);
+        viewer.tabs[idx].doc.annotations.push(Annotation {
+            id: 42,
+            kind: AnnotationKind::Emoji(super::super::editor::document::EmojiObj {
+                rect: PhysicalRect {
+                    x: 4,
+                    y: 4,
+                    width: 24,
+                    height: 24,
+                },
+                id: 0x1F525,
+            }),
+        });
+        save(&mut store, &viewer);
+        let restored = store.load_session();
+        assert_eq!(restored.tabs.len(), 1);
+        let doc = &restored.tabs[0].doc;
+        assert_eq!(doc.annotations.len(), 1);
+        match &doc.annotations[0].kind {
+            AnnotationKind::Emoji(o) => {
+                assert_eq!(o.id, 0x1F525);
+                assert_eq!(
+                    o.rect,
+                    PhysicalRect {
+                        x: 4,
+                        y: 4,
+                        width: 24,
+                        height: 24
+                    }
+                );
+            }
+            other => panic!("expected Emoji, got {other:?}"),
+        }
+    }
     /// `Today` keeps only captures taken this morning or later;
     /// `Never` empties the store and `document_count` reports them.
     #[test]

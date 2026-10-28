@@ -23,6 +23,8 @@ enum SettingsPage {
     General,
     /// The saved-file filename template and its editable presets.
     Filename,
+    /// App version and bundled third-party notices.
+    About,
 }
 
 /// egui-temp keys: the active page, and a draft parked behind the
@@ -53,6 +55,7 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
             match page {
                 SettingsPage::General => general_page(ui, draft),
                 SettingsPage::Filename => filename_page(ui, draft),
+                SettingsPage::About => about_page(ui),
             }
         });
     }
@@ -89,6 +92,7 @@ fn sidebar(ui: &mut egui::Ui, page: &mut SettingsPage) {
         for (value, key) in [
             (SettingsPage::General, "settings.page.general"),
             (SettingsPage::Filename, "settings.page.filename"),
+            (SettingsPage::About, "settings.page.about"),
         ] {
             if ui
                 .selectable_label(*page == value, t!(key).to_string())
@@ -189,6 +193,45 @@ fn filename_page(ui: &mut egui::Ui, draft: &mut Settings) {
         }
     });
 }
+
+/// About page: name, version and the third-party notices shipped in
+/// `THIRD_PARTY_NOTICES.md` (embedded — readable offline, in-app).
+fn about_page(ui: &mut egui::Ui) {
+    let t = theme::tokens(ui.ctx());
+    ui.vertical(|ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("PixMe").color(t.text).strong());
+            ui.label(
+                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).color(t.text_dim),
+            );
+        });
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(t!("settings.about.notices").to_string())
+                .color(t.text)
+                .strong(),
+        );
+        ui.add_space(4.0);
+        widgets::hairline(ui);
+        egui::ScrollArea::vertical()
+            .id_salt("settings.about.scroll")
+            .max_height(260.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(THIRD_PARTY_NOTICES)
+                        .monospace()
+                        .size(10.5)
+                        .color(t.text_dim),
+                );
+            });
+    });
+}
+
+/// `THIRD_PARTY_NOTICES.md`, embedded so the About page works offline
+/// and the file ships inside the binary.
+const THIRD_PARTY_NOTICES: &str = include_str!("../../THIRD_PARTY_NOTICES.md");
 
 /// Writes the draft back and persists it — unless the new retention
 /// would lose stored captures, which parks the draft behind the confirm

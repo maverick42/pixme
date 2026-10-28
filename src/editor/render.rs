@@ -253,6 +253,7 @@ fn layer_bounds(anno: &Annotation, iw: u32, ih: u32) -> Option<(u32, u32, u32, u
         AnnotationKind::Picture(o) => o.shadow,
         AnnotationKind::Blur(_) => 0.0, // never layered — a region effect
         AnnotationKind::Brace(o) => o.shadow,
+        AnnotationKind::Emoji(_) => 0.0,
     } + LAYER_AA_SLACK;
     let b = anno.kind.bounds();
     let m = extra.ceil() as i32;
@@ -286,6 +287,7 @@ fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
         AnnotationKind::Picture(o) => (o.shadow, o.opacity),
         AnnotationKind::Blur(_) => (0.0, 1.0),
         AnnotationKind::Brace(o) => (0.0, o.opacity),
+        AnnotationKind::Emoji(_) => (0.0, 1.0),
     }
 }
 
@@ -344,6 +346,7 @@ fn object_layer(layer: &mut RgbaImage, anno: &Annotation) -> (f32, f32) {
         AnnotationKind::Picture(o) => draw_picture(layer, o),
         AnnotationKind::Blur(_) => {}
         AnnotationKind::Brace(o) => draw_brace(layer, o),
+        AnnotationKind::Emoji(o) => draw_emoji(layer, o),
     }
     // Per-object alpha (freehand strokes carry theirs on the colour).
     let extra = match &anno.kind {
@@ -2148,6 +2151,71 @@ fn draw_picture(img: &mut RgbaImage, o: &super::document::PicObj) {
     composite(img, &scaled, o.rect.x as i64, o.rect.y as i64, 1.0);
 }
 
+/// An embedded emoji sticker — the same Lanczos3 + composite path as
+/// [`draw_picture`], but the pixels come from the embedded set via the
+/// stored id. An unknown/undecodable id renders the neutral
+/// placeholder — never an error, never a panic.
+fn draw_emoji(img: &mut RgbaImage, o: &super::document::EmojiObj) {
+    if o.rect.width == 0 || o.rect.height == 0 {
+        return;
+    }
+    match super::emoji::image(o.id) {
+        Some(src) => {
+            let scaled = image::imageops::resize(
+                src,
+                o.rect.width,
+                o.rect.height,
+                image::imageops::FilterType::Lanczos3,
+            );
+            composite(img, &scaled, o.rect.x as i64, o.rect.y as i64, 1.0);
+        }
+        None => draw_emoji_placeholder(img, o.rect),
+    }
+}
+
+/// Neutral marker standing in for an emoji id without an embedded
+/// image: dashed grey square + diagonal cross (theme-independent, like
+/// every document pixel).
+fn draw_emoji_placeholder(img: &mut RgbaImage, rect: PhysicalRect) {
+    let grey = Color32::from_rgb(150, 150, 150);
+    draw_shape_sdf(
+        img,
+        rect,
+        false,
+        0.0,
+        Some(Color32::from_rgba_unmultiplied(150, 150, 150, 48)),
+        grey,
+        2.0,
+        super::document::Dash::Dash,
+        0.0,
+        Color32::TRANSPARENT,
+        0.0,
+    );
+    // Diagonal cross inside the box, inset ~20 %, 2 px thick.
+    let (x0, y0) = (rect.x as i64, rect.y as i64);
+    let (w, h) = (rect.width as i64, rect.height as i64);
+    let (ix, iy) = (x0 + w / 5, y0 + h / 5);
+    let (iw, ih) = (w * 3 / 5, h * 3 / 5);
+    let n = iw.min(ih).max(1);
+    let (dw, dh) = (img.width() as i64, img.height() as i64);
+    let px = image::Rgba([150, 150, 150, 255]);
+    for t in 0..=n {
+        for (cx, cy) in [
+            (ix + t * iw / n, iy + t * ih / n),
+            (ix + t * iw / n, iy + ih - t * ih / n),
+        ] {
+            for dx in 0..2i64 {
+                for dy in 0..2i64 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if (0..dw).contains(&x) && (0..dh).contains(&y) {
+                        img.put_pixel(x as u32, y as u32, px);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Blur/pixelate applied to a document region.
 fn apply_blur(img: &mut RgbaImage, o: &super::document::BlurObj) {
     let (x, y, w, h) = clip_rect(o.rect, img.width(), img.height());
@@ -2324,7 +2392,8 @@ fn with_alpha(c: Color32, a: u8) -> Rgba<u8> {
 #[cfg(test)]
 mod tests {
     use super::super::document::{
-        AreaObj, BlurObj, BoxObj, BoxVAlign, EllipseObj, LineObj, PicObj, RectObj, StepObj, TextObj,
+        AreaObj, BlurObj, BoxObj, BoxVAlign, EllipseObj, EmojiObj, LineObj, PicObj, RectObj,
+        StepObj, TextObj,
     };
     use super::*;
     use crate::capture::{Capture, MonitorInfo};
@@ -2703,6 +2772,91 @@ mod tests {
                 shadow: 6.0,
             }),
         )]);
+    }
+
+    /// Emoji stickers: downscale, 2× upscale past the 128 px source,
+    /// edge clip — the same bounded/ref contract as every layered
+    /// object (emojis are icons: no opacity/shadow to vary).
+    #[test]
+    fn parity_emoji() {
+        let mk = |x, y, side, id| {
+            AnnotationKind::Emoji(EmojiObj {
+                rect: PhysicalRect {
+                    x,
+                    y,
+                    width: side,
+                    height: side,
+                },
+                id,
+            })
+        };
+        assert_render_parity(vec![
+            // 👉 downscaled to 48 px.
+            anno(1, mk(20, 20, 48, 0x1F449)),
+            // 🔥 upscaled past the 128 px source (2× = max side).
+            anno(2, mk(140, 60, 256, 0x1F525)),
+            // ⚠️ clipped by the bottom-right edge.
+            anno(3, mk(300, 220, 64, 0x26A0)),
+        ]);
+    }
+
+    /// An emoji id absent from the embedded set renders the neutral
+    /// placeholder — deterministic pixels, no error, no panic — and
+    /// the bounded/ref paths still agree bit for bit.
+    #[test]
+    fn emoji_unknown_id_renders_placeholder() {
+        let doc = doc_with(vec![anno(
+            1,
+            AnnotationKind::Emoji(EmojiObj {
+                rect: PhysicalRect {
+                    x: 40,
+                    y: 40,
+                    width: 64,
+                    height: 64,
+                },
+                id: 0x10FFFE,
+            }),
+        )]);
+        let bounded = render_to_image(&doc);
+        let reference = render_to_image_ref(&doc);
+        assert_same_pixels(&bounded, &reference);
+        // The placeholder actually painted inside the rect (the base
+        // pattern has no pure mid-grey run like the marker's).
+        let painted = (40..104).any(|y| {
+            (40..104).any(|x| {
+                let p = bounded.get_pixel(x, y).0;
+                p[0] == 150 && p[1] == 150 && p[2] == 150 && p[3] == 255
+            })
+        });
+        assert!(painted, "placeholder drew no mid-grey pixels");
+    }
+
+    /// Emoji on a fully transparent base (e.g. a clipboard-imported
+    /// RGBA document): parity holds and the sticker's own pixels land
+    /// uncomposited-by-mistake — alpha survives in the output.
+    #[test]
+    fn emoji_on_transparent_base() {
+        let mut doc = doc_with(vec![anno(
+            1,
+            AnnotationKind::Emoji(EmojiObj {
+                rect: PhysicalRect {
+                    x: 10,
+                    y: 10,
+                    width: 96,
+                    height: 96,
+                },
+                id: 0x2764, // ❤️
+            }),
+        )]);
+        doc.base.image = std::sync::Arc::new(RgbaImage::from_pixel(340, 260, Rgba([0, 0, 0, 0])));
+        let bounded = render_to_image(&doc);
+        assert_same_pixels(&bounded, &render_to_image_ref(&doc));
+        // Some opaque emoji pixels exist and transparent corners stay.
+        assert!(
+            (10..106).any(|y| (10..106).any(|x| bounded.get_pixel(x, y).0[3] == 255)),
+            "no opaque emoji pixels on transparent base"
+        );
+        assert_eq!(bounded.get_pixel(0, 0).0[3], 0);
     }
 
     /// Braces between anchors, several shapes.

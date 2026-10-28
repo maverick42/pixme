@@ -6,6 +6,7 @@
 //! [`render::render_to_image`] path so WYSIWYG holds.
 
 pub mod document;
+pub mod emoji;
 pub mod history;
 pub mod meta;
 pub mod render;

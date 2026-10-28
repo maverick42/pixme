@@ -7,11 +7,11 @@
 //! the viewer `Tab`, so they survive editor close/reopen and die with
 //! the tab or on flattening pixel ops.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use egui::{
     Color32, ColorImage, CornerRadius, Key, Pos2, Rect, Response, ScrollArea, Sense, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
+    StrokeKind, TextureHandle, TextureId, TextureOptions, Ui, Vec2, pos2, vec2,
 };
 use rust_i18n::t;
 
@@ -19,8 +19,8 @@ use crate::app::Shared;
 use crate::capture::PhysicalRect;
 use crate::editor::document::{
     Annotation, AnnotationId, AnnotationKind, AreaObj, AreaShape, BlurObj, BlurStyle, BoxObj,
-    BraceKind, BraceObj, Dash, Document, EllipseObj, EraserMode, FreeObj, LineEnd, LineObj, PicObj,
-    RectObj, StepMode, StepObj, StepSize, StepStyle, TextAlign, TextObj, TipShape,
+    BraceKind, BraceObj, Dash, Document, EllipseObj, EmojiObj, EraserMode, FreeObj, LineEnd,
+    LineObj, PicObj, RectObj, StepMode, StepObj, StepSize, StepStyle, TextAlign, TextObj, TipShape,
 };
 use crate::editor::history::{ANNO_HISTORY_CAP, AnnoEdit};
 use crate::editor::render;
@@ -50,11 +50,15 @@ enum Tool {
     /// Colour eyedropper: the loupe follows the cursor, a click picks
     /// the pixel's colour, `C` copies its `#RRGGBB`.
     Pipette,
+    /// Emoji sticker: click places it at the remembered/default size,
+    /// dragging frames a free square. Sticky — Esc or another tool
+    /// leaves it.
+    Emoji,
 }
 
 impl Tool {
     /// The strip grid in display order (row-major, two columns).
-    const ALL: [Tool; 17] = [
+    const ALL: [Tool; 18] = [
         Self::Select,
         Self::SelectArea,
         Self::TextBoxRect,
@@ -72,6 +76,7 @@ impl Tool {
         Self::HighlightArea,
         Self::Blur,
         Self::Pipette,
+        Self::Emoji,
     ];
 
     fn icon(self) -> Icon {
@@ -93,6 +98,7 @@ impl Tool {
             Self::HighlightArea => Icon::Highlighter,
             Self::Blur => Icon::Pixelate,
             Self::Pipette => Icon::Pipette,
+            Self::Emoji => Icon::Smile,
         }
     }
 
@@ -115,6 +121,7 @@ impl Tool {
             Self::HighlightArea => t!("draw.tool.harea"),
             Self::Blur => t!("draw.tool.blur"),
             Self::Pipette => t!("draw.tool.pipette"),
+            Self::Emoji => t!("draw.tool.emoji"),
         }
     }
 }
@@ -175,6 +182,12 @@ struct Opts {
     step_ring_color: Color32,
     step_shadow: bool,
     step_lower: bool,
+    // Emoji tool.
+    /// Emoji id (Unicode code point) the tool places.
+    emoji_id: u32,
+    /// Last side the user dragged an emoji to, image px — reused by the
+    /// next click placement (session memory, not persisted).
+    emoji_size: Option<f32>,
 }
 
 impl Opts {
@@ -243,6 +256,8 @@ impl Default for Opts {
             step_ring_color: Color32::WHITE,
             step_shadow: true,
             step_lower: false,
+            emoji_id: 0x1F449, // 👉 — a good annotation default
+            emoji_size: None,
         }
     }
 }
@@ -378,6 +393,18 @@ pub struct DrawSession {
     img_rect: Rect,
     /// Canvas zoom actually used for painting (screen→image px for grabs).
     canvas_scale: f32,
+    /// Lazily decoded emoji textures (strip cells, ghost, drag preview).
+    /// `None` caches a known-bad id so it is not re-decoded every frame.
+    emoji_texs: HashMap<u32, Option<TextureHandle>>,
+    /// Sticker being dragged out of the options-bar strip — drops on
+    /// release inside the image (anywhere else: quietly cancelled).
+    emoji_dnd: Option<u32>,
+    /// Active emoji-section tab in the bottom bar (index into
+    /// [`crate::editor::emoji::sections`]).
+    emoji_section: usize,
+    /// Arrow-nudge accumulation: `(id, before, last-press)` of the
+    /// live-nudged object — the whole burst commits as ONE Replace.
+    nudge: Option<(AnnotationId, Annotation, std::time::Instant)>,
 }
 
 impl DrawSession {
@@ -420,6 +447,10 @@ impl DrawSession {
             snap_hv: false,
             img_rect: Rect::NOTHING,
             canvas_scale: 1.0,
+            emoji_texs: HashMap::new(),
+            emoji_dnd: None,
+            emoji_section: 0,
+            nudge: None,
         }
     }
 
@@ -453,6 +484,9 @@ impl DrawSession {
 
     /// Applies an edit chronologically (kills redo, bumps revision).
     fn apply(&mut self, edit: AnnoEdit) {
+        // A pending arrow-nudge burst belongs BEFORE this edit on the
+        // undo stack — flush it first so history stays chronological.
+        self.commit_nudge();
         edit.apply(&mut self.doc);
         self.undo.push_back(edit);
         if self.undo.len() > ANNO_HISTORY_CAP {
@@ -611,7 +645,7 @@ impl DrawSession {
             .show(ui, |ui| self.strip(ui, shared));
         egui::Panel::bottom("draw.opts")
             .resizable(false)
-            .exact_size(58.0)
+            .exact_size(62.0)
             .show(ui, |ui| self.options_bar(ui, shared));
         egui::CentralPanel::default().show(ui, |ui| self.canvas(ui));
         self.text_panel_window(ui.ctx(), shared);
@@ -741,16 +775,93 @@ impl DrawSession {
                 self.delete_selected();
             }
         }
+        // Arrow keys fine-nudge the selected object (1 px, ⇧ = 10 px)
+        // in image space — presses in one burst fold into a single
+        // Replace committed 400 ms after the last press.
+        if self.selected.is_some() && self.text_panel.is_none() {
+            let mut d = Vec2::ZERO;
+            for (key, dv) in [
+                (Key::ArrowLeft, Vec2::new(-1.0, 0.0)),
+                (Key::ArrowRight, Vec2::new(1.0, 0.0)),
+                (Key::ArrowUp, Vec2::new(0.0, -1.0)),
+                (Key::ArrowDown, Vec2::new(0.0, 1.0)),
+            ] {
+                if ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::SHIFT, key)
+                        || i.consume_key(egui::Modifiers::NONE, key)
+                }) {
+                    d += dv;
+                }
+            }
+            if d != Vec2::ZERO
+                && let Some(id) = self.selected
+            {
+                let step = if ctx.input(|i| i.modifiers.shift) {
+                    10.0
+                } else {
+                    1.0
+                };
+                // Start/refresh the burst BEFORE borrowing the document.
+                if matches!(self.nudge, Some((nid, ..)) if nid == id) {
+                    if let Some(n) = &mut self.nudge {
+                        n.2 = std::time::Instant::now();
+                    }
+                } else {
+                    self.commit_nudge();
+                    if let Some(a) = self.doc.annotation(id) {
+                        self.nudge = Some((id, a.clone(), std::time::Instant::now()));
+                    }
+                }
+                if self.nudge.is_some()
+                    && let Some(a) = self.doc.annotation_mut(id)
+                {
+                    a.kind.translate(d.x * step, d.y * step);
+                    self.doc.revision += 1;
+                }
+            }
+        }
+        self.commit_nudge_due(ctx);
+
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             arm_pick(ctx, None);
             if self.opts.eraser_pick {
                 self.opts.eraser_pick = false;
             } else if self.text_panel.is_some() {
                 self.close_text_panel();
+            } else if matches!(self.drag, Some(Drag::Shape { .. })) {
+                // Esc mid-drag cancels the in-flight creation (emoji
+                // drag included) — nothing was committed yet.
+                self.drag = None;
+            } else if self.emoji_dnd.is_some() {
+                self.emoji_dnd = None;
             } else if self.sel_area.is_some() {
                 self.sel_area = None;
+            } else if self.tool == Tool::Emoji {
+                // Esc leaves the sticky emoji tool (back to Select).
+                self.tool = Tool::Select;
             } else {
                 self.request_cancel();
+            }
+        }
+    }
+
+    /// Commits a finished arrow-nudge burst as ONE undoable Replace.
+    fn commit_nudge(&mut self) {
+        if let Some((id, before, _)) = self.nudge.take()
+            && let Some(after) = self.doc.annotation(id).cloned()
+        {
+            self.apply(AnnoEdit::Replace { before, after });
+        }
+    }
+
+    /// Fires [`Self::commit_nudge`] once the burst has been quiet for
+    /// 400 ms (keeps repaints coming until then).
+    fn commit_nudge_due(&mut self, ctx: &egui::Context) {
+        if let Some((_, _, at)) = self.nudge {
+            if at.elapsed() > std::time::Duration::from_millis(400) {
+                self.commit_nudge();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
     }
@@ -829,6 +940,10 @@ impl DrawSession {
         self.tool = tool;
         self.sel_area = None;
         self.close_text_panel();
+        // A pending arrow-nudge commits before the tool switch; a
+        // half-finished emoji drag-out dies with it too.
+        self.commit_nudge();
+        self.emoji_dnd = None;
         // A swatch's armed pick dies with the tool change.
         arm_pick(ctx, None);
     }
@@ -840,6 +955,62 @@ impl DrawSession {
     }
 
     // ── Marquee selection (SelectArea) ─────────────────────────────
+
+    /// Lazily decoded emoji texture (picker cells, ghost, drag preview).
+    /// A `None` entry caches a known-bad id so it is not re-decoded
+    /// every frame. Static so field-level borrows of `self` suffice.
+    fn emoji_tex(
+        map: &mut HashMap<u32, Option<TextureHandle>>,
+        ctx: &egui::Context,
+        id: u32,
+    ) -> Option<TextureId> {
+        map.entry(id)
+            .or_insert_with(|| {
+                crate::editor::emoji::image(id).map(|img| {
+                    ctx.load_texture(
+                        format!("emoji-{id:x}"),
+                        ColorImage::from_rgba_unmultiplied(
+                            [img.width() as usize, img.height() as usize],
+                            img.as_raw(),
+                        ),
+                        TextureOptions::LINEAR,
+                    )
+                })
+            })
+            .as_ref()
+            .map(|t| t.id())
+    }
+
+    /// Places the armed emoji centred on `p` (image px) at the
+    /// remembered/default side — shared by the click gesture and the
+    /// strip drag-out; one placement = one undo step, stays selected.
+    fn place_emoji(&mut self, p: Pos2) {
+        let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
+        let side = emoji_default_side(
+            iw.min(ih) as f32,
+            self.doc.base.scale_factor,
+            self.opts.emoji_size,
+        );
+        self.add(AnnotationKind::Emoji(EmojiObj {
+            rect: emoji_centered(p, side, iw, ih),
+            id: self.opts.emoji_id,
+        }));
+        // One shot per pick: after a placement the tool drops back to
+        // Select — placing again means arming another emoji below.
+        self.tool = Tool::Select;
+    }
+
+    /// Largest emoji side this document allows, image px: 2× the 128 px
+    /// source (beyond that the PNG smears), never past the small side.
+    fn emoji_side_cap(&self) -> f32 {
+        EMOJI_MAX_SIDE.min(
+            self.doc
+                .base
+                .image
+                .width()
+                .min(self.doc.base.image.height()) as f32,
+        )
+    }
 
     /// Colour of the rendered document pixel at `p` — what the marquee
     /// memorises to fill the hole a move/cut/delete leaves behind.
@@ -1180,6 +1351,23 @@ impl DrawSession {
         to_img: impl Fn(Pos2) -> Pos2,
         scale: f32,
     ) {
+        // A sticker dragged out of the options-bar strip drops on
+        // release: inside the image it is placed, anywhere else the
+        // drag-out is quietly cancelled.
+        if self.emoji_dnd.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            self.emoji_dnd = None;
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                let p = to_img(pos);
+                let (iw, ih) = (
+                    self.doc.base.image.width() as f32,
+                    self.doc.base.image.height() as f32,
+                );
+                if p.x >= 0.0 && p.y >= 0.0 && p.x < iw && p.y < ih {
+                    self.place_emoji(p);
+                }
+            }
+            return;
+        }
         let Some(hover) = resp.hover_pos().or_else(|| {
             // While dragging, keep tracking even under the floating
             // text panel (its layer shadows hover_pos).
@@ -1276,9 +1464,16 @@ impl DrawSession {
             self.click(img_p, ui.ctx());
         }
 
+        // The emoji drag preview needs its texture — fetched BEFORE the
+        // `&self.drag` borrow so `emoji_tex` can take `&mut` of the cache.
+        let emoji_tex = if self.tool == Tool::Emoji {
+            Self::emoji_tex(&mut self.emoji_texs, ui.ctx(), self.opts.emoji_id)
+        } else {
+            None
+        };
         // Live preview while dragging.
         if let Some(drag) = &self.drag {
-            self.preview(painter, drag, img_p, scale);
+            self.preview(painter, drag, img_p, scale, emoji_tex);
         }
     }
 
@@ -1399,6 +1594,8 @@ impl DrawSession {
         {
             self.sel_lift(start);
         }
+        // Needed inside the `&mut self.drag` match — fetch it first.
+        let emoji_cap = self.emoji_side_cap();
         match &mut self.drag {
             Some(Drag::Freehand { points }) => points.push(p),
             Some(Drag::Moving { id, last, .. }) => {
@@ -1413,7 +1610,12 @@ impl DrawSession {
                 let h = *handle;
                 if let Some(a) = self.doc.annotation_mut(*id) {
                     let mut r = a.kind.bounds();
-                    resize_rect(&mut r, h, p);
+                    if matches!(a.kind, AnnotationKind::Emoji(_)) {
+                        // Emojis stay square — aspect-locked resize.
+                        resize_square(&mut r, h, p, EMOJI_MIN_SIDE, emoji_cap);
+                    } else {
+                        resize_rect(&mut r, h, p);
+                    }
                     a.kind.set_bounds(r);
                     self.doc.revision += 1;
                 }
@@ -1571,6 +1773,9 @@ impl DrawSession {
             height: (a.y - b.y).abs().max(1.0) as u32,
         };
         let o = &self.opts;
+        // The emoji arm can't write `self.opts.emoji_size` while `o`
+        // borrows `self.opts` — stashed here, applied after the match.
+        let mut emoji_side: Option<f32> = None;
         let kind = match self.tool {
             Tool::Rect => AnnotationKind::Rect(RectObj {
                 rect: r,
@@ -1674,6 +1879,14 @@ impl DrawSession {
                 shape: o.shape,
                 strength: o.blur_strength,
             }),
+            Tool::Emoji => {
+                let r = emoji_square(a, b, EMOJI_MIN_SIDE, self.emoji_side_cap());
+                emoji_side = Some(r.width as f32);
+                AnnotationKind::Emoji(EmojiObj {
+                    rect: r,
+                    id: o.emoji_id,
+                })
+            }
             Tool::TextBoxRect | Tool::TextBoxOval => {
                 let oval = self.tool == Tool::TextBoxOval;
                 let id = self.doc.alloc_id();
@@ -1714,7 +1927,15 @@ impl DrawSession {
             }
             _ => return,
         };
+        // A dragged emoji size becomes the next click's remembered side.
+        if let Some(side) = emoji_side {
+            self.opts.emoji_size = Some(side);
+        }
+        let one_shot = matches!(kind, AnnotationKind::Emoji(_));
         self.add(kind);
+        if one_shot {
+            self.tool = Tool::Select;
+        }
     }
 
     /// A plain click (no drag): clicking an existing object selects it
@@ -1750,6 +1971,7 @@ impl DrawSession {
             Tool::Select => {
                 self.sync_text_panel();
             }
+            Tool::Emoji => self.place_emoji(p),
             Tool::Eraser => {
                 if self.opts.eraser_pick {
                     self.opts.eraser_color = self.pixel_at(p);
@@ -1870,7 +2092,14 @@ impl DrawSession {
     }
 
     /// Live drag preview drawn over the canvas.
-    fn preview(&self, painter: &egui::Painter, drag: &Drag, cur: Pos2, scale: f32) {
+    fn preview(
+        &self,
+        painter: &egui::Painter,
+        drag: &Drag,
+        cur: Pos2,
+        scale: f32,
+        emoji_tex: Option<TextureId>,
+    ) {
         // Text anchors: `draw_overlay` already draws the live Bézier +
         // both tangent levers (`a→ka`, `b→kb`).
         if let Drag::Endpoint { id, .. } = drag
@@ -2070,6 +2299,35 @@ impl DrawSession {
                         painter.circle_stroke(end_c, 4.0, Stroke::new(1.0, Color32::from_gray(60)));
                     }
                 }
+                Tool::Emoji => {
+                    // The dragged square at its real content — what the
+                    // release will commit, cap included.
+                    let r = emoji_square(*anchor, cur, EMOJI_MIN_SIDE, self.emoji_side_cap());
+                    let cr = Rect::from_min_max(
+                        to_canvas(pos2(r.x as f32, r.y as f32), img_rect),
+                        to_canvas(
+                            pos2(
+                                (r.x + r.width as i32) as f32,
+                                (r.y + r.height as i32) as f32,
+                            ),
+                            img_rect,
+                        ),
+                    );
+                    if let Some(tex) = emoji_tex {
+                        painter.image(
+                            tex,
+                            cr,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::from_white_alpha(215),
+                        );
+                    }
+                    painter.rect_stroke(
+                        cr,
+                        CornerRadius::ZERO,
+                        Stroke::new(1.5, accent),
+                        StrokeKind::Inside,
+                    );
+                }
                 _ => {}
             }
         }
@@ -2104,6 +2362,53 @@ impl DrawSession {
         {
             let cp = pos2(img_rect.min.x + p.x * scale, img_rect.min.y + p.y * scale);
             self.paint_eyedropper_loupe(painter, cp, p);
+        }
+        // The emoji tool rides the cursor with a translucent ghost at
+        // the size a click would place — aim the real pixels first.
+        // During a strip drag-out the hover position may be missing;
+        // fall back to the global pointer position.
+        // No resting ghost under the cursor — the only travelling
+        // emoji is the strip drag-out's payload itself.
+        if self.emoji_dnd.is_some()
+            && let Some(pos) = painter.ctx().input(|i| i.pointer.latest_pos())
+        {
+            let p = pos2(
+                (pos.x - img_rect.min.x) / scale,
+                (pos.y - img_rect.min.y) / scale,
+            );
+            let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
+            let side = emoji_default_side(
+                iw.min(ih) as f32,
+                self.doc.base.scale_factor,
+                self.opts.emoji_size,
+            );
+            let r = emoji_centered(p, side, iw, ih);
+            let cr = Rect::from_min_max(
+                pos2(
+                    img_rect.min.x + r.x as f32 * scale,
+                    img_rect.min.y + r.y as f32 * scale,
+                ),
+                pos2(
+                    img_rect.min.x + (r.x + r.width as i32) as f32 * scale,
+                    img_rect.min.y + (r.y + r.height as i32) as f32 * scale,
+                ),
+            );
+            if let Some(tex) =
+                Self::emoji_tex(&mut self.emoji_texs, painter.ctx(), self.opts.emoji_id)
+            {
+                painter.image(
+                    tex,
+                    cr,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::from_white_alpha(140),
+                );
+            }
+            painter.rect_stroke(
+                cr,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, accent),
+                StrokeKind::Inside,
+            );
         }
         // The live marquee frames its region above the document — with
         // 8 resize anchors once the initial framing drag is over.
@@ -2731,6 +3036,7 @@ impl DrawSession {
                 AnnotationKind::Picture(_) => t!("draw.tab.image"),
                 AnnotationKind::Blur(_) => t!("draw.tool.blur"),
                 AnnotationKind::Brace(_) => t!("draw.brace.title"),
+                AnnotationKind::Emoji(_) => t!("draw.tool.emoji"),
             };
         }
         if self.tool == Tool::Brace {
@@ -2755,8 +3061,20 @@ impl DrawSession {
             || (self.sel_area.is_none()
                 && self.selected.is_none()
                 && matches!(self.tool, Tool::Step));
+        // Emoji tabs too: tool armed, or the selection is an emoji.
+        let sel_is_emoji = self
+            .selected
+            .and_then(|id| self.doc.annotation(id))
+            .is_some_and(|a| matches!(a.kind, AnnotationKind::Emoji(_)));
+        let emoji_bar = sel_is_emoji
+            || (self.sel_area.is_none()
+                && self.selected.is_none()
+                && matches!(self.tool, Tool::Emoji));
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
+            // Air above the tab chips — the panel's top edge must not
+            // sit right on them.
+            ui.add_space(4.0);
             // Tab header chip (two clickable mode tabs for the step marker);
             // OK/Annuler stay pinned to its right edge, always visible.
             ui.horizontal(|ui| {
@@ -2816,6 +3134,45 @@ impl DrawSession {
                             }
                         }
                     }
+                } else if emoji_bar {
+                    // One tab per manifest section — same chip chrome
+                    // as the Step tabs.
+                    for (i, sec) in crate::editor::emoji::sections().iter().enumerate() {
+                        let on = self.emoji_section == i;
+                        let label = emoji_section_label(sec);
+                        let inner = egui::Frame::NONE
+                            .fill(if on { tk.field } else { tk.dock })
+                            .stroke(Stroke::new(
+                                if on { 1.5 } else { 1.0 },
+                                if on { tk.accent } else { tk.field_border },
+                            ))
+                            .corner_radius(CornerRadius {
+                                nw: 4,
+                                ne: 4,
+                                sw: 0,
+                                se: 0,
+                            })
+                            .inner_margin(egui::Margin::symmetric(10, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(label.as_ref())
+                                        .size(11.5)
+                                        .strong()
+                                        .color(if on { tk.text } else { tk.text_dim }),
+                                );
+                            });
+                        let resp = ui.interact(
+                            inner.response.rect,
+                            ui.id().with(("pixme-emoji-tab", i)),
+                            egui::Sense::click(),
+                        );
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() && !on {
+                            self.emoji_section = i;
+                        }
+                    }
                 } else {
                     egui::Frame::NONE
                         .fill(tk.field)
@@ -2871,7 +3228,18 @@ impl DrawSession {
         if self.sel_area.is_some() {
             self.sel_options(ui);
         } else if self.selected.is_some() {
-            self.selected_options(ui, shared);
+            // A selected emoji keeps the strip up (icons only — no
+            // styling options) so the user can arm another one fast.
+            if matches!(
+                self.selected
+                    .and_then(|id| self.doc.annotation(id))
+                    .map(|a| &a.kind),
+                Some(AnnotationKind::Emoji(_))
+            ) {
+                self.emoji_row(ui);
+            } else {
+                self.selected_options(ui, shared);
+            }
         } else {
             self.tool_options(ui, shared);
         }
@@ -2912,6 +3280,30 @@ impl DrawSession {
         if do_fill {
             let c = self.opts.fill_color;
             self.sel_fill(c);
+        }
+    }
+
+    /// The emoji cell row for the ACTIVE section tab (the tab chips
+    /// live in the bar header). Click a cell to arm it (accent border);
+    /// DRAG one onto the canvas to drop it where it lands. Icons only —
+    /// no styling options by design.
+    fn emoji_row(&mut self, ui: &mut Ui) {
+        let sections = crate::editor::emoji::sections();
+        let cur = sections.get(self.emoji_section).copied().unwrap_or("");
+        for def in crate::editor::emoji::all() {
+            if def.section != cur {
+                continue;
+            }
+            let Some(tex) = Self::emoji_tex(&mut self.emoji_texs, ui.ctx(), def.id) else {
+                continue;
+            };
+            let resp = emoji_cell(ui, tex, 26.0, def.id == self.opts.emoji_id);
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                self.opts.emoji_id = def.id;
+                self.emoji_dnd = Some(def.id);
+            } else if resp.clicked() {
+                self.opts.emoji_id = def.id;
+            }
         }
     }
 
@@ -3165,6 +3557,7 @@ impl DrawSession {
                     &mut o.step_shadow,
                 );
             }
+            Tool::Emoji => self.emoji_row(ui),
             Tool::SelectArea => {
                 ui.label(t!("draw.sel.hint"));
             }
@@ -3388,6 +3781,11 @@ impl DrawSession {
                         changed = true;
                     }
                 }
+                AnnotationKind::Emoji(_) => {
+                    // No per-object options — emojis are icons, nothing
+                    // to style (handled by `bottom_content` instead:
+                    // the section strip shows again for fast placing).
+                }
                 AnnotationKind::Blur(o) => {
                     let mut s = f32::from(o.strength);
                     if slider(ui, t!("draw.opt.strength"), &mut s, 1.0..=100.0).changed() {
@@ -3470,6 +3868,135 @@ fn corner_handle(r: PhysicalRect, p: Pos2, grab: f32) -> Option<Handle> {
     pts.iter()
         .position(|q| p.distance(*q) < grab)
         .map(Handle::Corner)
+}
+
+// ── Emoji tool ─────────────────────────────────────────────────────
+
+/// Smallest emoji side, image px.
+const EMOJI_MIN_SIDE: f32 = 8.0;
+/// Largest emoji side, image px — 2× the 128 px source; dragged or
+/// resized past it the square just stops growing (the PNG would smear).
+const EMOJI_MAX_SIDE: f32 = 256.0;
+/// Click-placed side = this fraction of the image's small side…
+const EMOJI_DEFAULT_FRACTION: f32 = 0.05;
+/// …bounded to the Step-badge footprint range, scaled by the capture's
+/// device-pixel factor (Step uses fixed 12/18/26 px radii — on a
+/// Retina ×2 frame the same *point* size needs ×2 the device px).
+const EMOJI_DEFAULT_MIN_PT: f32 = 24.0;
+const EMOJI_DEFAULT_MAX_PT: f32 = 96.0;
+
+/// Side of a click-placed emoji, image px: `last` when the user has
+/// dragged one before, else `fraction` of the image's small side —
+/// always inside the scaled Step-badge bounds (and the image itself).
+fn emoji_default_side(min_side: f32, scale_factor: f32, last: Option<f32>) -> f32 {
+    let hi = (EMOJI_DEFAULT_MAX_PT * scale_factor).min(min_side);
+    let lo = (EMOJI_DEFAULT_MIN_PT * scale_factor).min(hi);
+    last.unwrap_or(min_side * EMOJI_DEFAULT_FRACTION)
+        .clamp(lo, hi)
+}
+
+/// Square from an emoji drag: `anchor` is the fixed corner, the square
+/// extends toward `cur` on both axes (`max(|dx|, |dy|)`, sign-following),
+/// side clamped to `[min, cap]`.
+fn emoji_square(anchor: Pos2, cur: Pos2, min: f32, cap: f32) -> PhysicalRect {
+    let (dx, dy) = (cur.x - anchor.x, cur.y - anchor.y);
+    let side = dx.abs().max(dy.abs()).clamp(min, cap.max(min));
+    PhysicalRect {
+        x: (anchor.x - if dx < 0.0 { side } else { 0.0 }) as i32,
+        y: (anchor.y - if dy < 0.0 { side } else { 0.0 }) as i32,
+        width: side.max(1.0) as u32,
+        height: side.max(1.0) as u32,
+    }
+}
+
+/// `side`-sided square centred on `c`, shifted to stay inside `w×h`
+/// (image px) — clicking near an edge never loses half the emoji.
+fn emoji_centered(c: Pos2, side: f32, w: u32, h: u32) -> PhysicalRect {
+    let side = side.min(w.min(h) as f32).max(1.0);
+    let x = (c.x - side * 0.5).clamp(0.0, (w as f32 - side).max(0.0));
+    let y = (c.y - side * 0.5).clamp(0.0, (h as f32 - side).max(0.0));
+    PhysicalRect {
+        x: x as i32,
+        y: y as i32,
+        width: side as u32,
+        height: side as u32,
+    }
+}
+
+/// Aspect-locked resize for square objects: the handle's opposite
+/// point (corner, or opposite edge's centre for edge handles) stays
+/// fixed and the square side follows the larger drag delta, clamped.
+fn resize_square(r: &mut PhysicalRect, h: usize, p: Pos2, min: f32, max: f32) {
+    let (x1, y1) = (r.x as f32, r.y as f32);
+    let (x2, y2) = (x1 + r.width as f32, y1 + r.height as f32);
+    let (mx, my) = ((x1 + x2) * 0.5, (y1 + y2) * 0.5);
+    let (ax, ay) = match h {
+        0 => (x2, y2),
+        1 => (mx, y2),
+        2 => (x1, y2),
+        3 => (x1, my),
+        4 => (x1, y1),
+        5 => (mx, y1),
+        6 => (x2, y1),
+        _ => (x2, my),
+    };
+    let (dx, dy) = (p.x - ax, p.y - ay);
+    let side = dx.abs().max(dy.abs()).clamp(min, max.max(min));
+    *r = PhysicalRect {
+        x: (ax - if dx < 0.0 { side } else { 0.0 }) as i32,
+        y: (ay - if dy < 0.0 { side } else { 0.0 }) as i32,
+        width: side.max(1.0) as u32,
+        height: side.max(1.0) as u32,
+    };
+}
+
+/// Translated label of a manifest section (the tab chip text).
+fn emoji_section_label(sec: &str) -> std::borrow::Cow<'static, str> {
+    match sec {
+        "validation / alerts" => t!("draw.emoji.sec.validation"),
+        "pointing" => t!("draw.emoji.sec.pointing"),
+        "markers" => t!("draw.emoji.sec.markers"),
+        "reactions / gestures" => t!("draw.emoji.sec.reactions"),
+        "faces" => t!("draw.emoji.sec.faces"),
+        "ideas / objects" => t!("draw.emoji.sec.objects"),
+        _ => t!("draw.emoji.sec.objects"),
+    }
+}
+
+/// One emoji grid cell — [`widgets::icon_button`] chrome (same theme
+/// tokens) wrapped around a centred emoji image.
+fn emoji_cell(ui: &mut Ui, tex: TextureId, size: f32, selected: bool) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+    if ui.is_rect_visible(rect) {
+        let (fill, stroke) = if response.is_pointer_button_down_on() {
+            (t.pressed, Stroke::NONE)
+        } else if selected {
+            (t.accent_soft, Stroke::new(1.0, t.accent_border))
+        } else if response.hovered() {
+            (t.hover, Stroke::NONE)
+        } else {
+            (Color32::TRANSPARENT, Stroke::NONE)
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(t.radius_sm),
+            fill,
+            stroke,
+            StrokeKind::Inside,
+        );
+        let img_rect = rect.shrink(4.0);
+        ui.painter().image(
+            tex,
+            img_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "emoji")
+    });
+    response
 }
 
 /// Applies handle `h` drag of `p` onto rect `r`.
@@ -4489,4 +5016,202 @@ fn step_options_row(
         .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
         .changed();
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{Capture, MonitorInfo};
+    use crate::editor::document::Document;
+
+    /// `emoji_default_side` honouring: a remembered `last` wins but is
+    /// still re-bounded to the (scale-scaled) Step-badge range.
+    #[test]
+    fn emoji_default_side_bounds_and_memory() {
+        // 5 % of a 1080-tall capture, sf=1 → 54 px (Step-L footprint).
+        assert_eq!(emoji_default_side(1080.0, 1.0, None), 54.0);
+        // Small image: 5 % of 300 → 24 px floor.
+        assert_eq!(emoji_default_side(300.0, 1.0, None), 24.0);
+        // Retina ×2 doubles the bounds, not the fraction: 5 % → 54 but
+        // the floor moved to 48 and the ceiling to 192.
+        assert_eq!(emoji_default_side(4000.0, 2.0, None), 192.0);
+        assert_eq!(emoji_default_side(300.0, 2.0, None), 48.0);
+        // Remembered size is reused, re-clamped to bounds.
+        assert_eq!(emoji_default_side(1080.0, 1.0, Some(80.0)), 80.0);
+        assert_eq!(emoji_default_side(1080.0, 1.0, Some(500.0)), 96.0);
+        assert_eq!(emoji_default_side(1080.0, 1.0, Some(4.0)), 24.0);
+        // Tiny image clamps the ceiling to the small side itself.
+        assert_eq!(emoji_default_side(20.0, 1.0, None), 20.0);
+    }
+
+    /// `emoji_square`: side = max delta, direction follows the drag,
+    /// capped at `cap`, floored at `min`.
+    #[test]
+    fn emoji_square_direction_and_cap() {
+        let a = pos2(100.0, 100.0);
+        // Down-right.
+        let r = emoji_square(a, pos2(160.0, 140.0), 8.0, 256.0);
+        assert_eq!(
+            r,
+            PhysicalRect {
+                x: 100,
+                y: 100,
+                width: 60,
+                height: 60
+            }
+        );
+        // Up-left (larger |dy| wins) — square grows up-left of anchor.
+        let r = emoji_square(a, pos2(70.0, 20.0), 8.0, 256.0);
+        assert_eq!(
+            r,
+            PhysicalRect {
+                x: 20,
+                y: 20,
+                width: 80,
+                height: 80
+            }
+        );
+        // Past the cap it just stops growing.
+        let r = emoji_square(a, pos2(900.0, 100.0), 8.0, 256.0);
+        assert_eq!(r.width, 256);
+        // Under min it floors.
+        let r = emoji_square(a, pos2(103.0, 101.0), 8.0, 256.0);
+        assert_eq!(r.width, 8);
+    }
+
+    /// `emoji_centered`: centred on the pointer, shifted back inside
+    /// the image near edges.
+    #[test]
+    fn emoji_centered_stays_inside() {
+        let r = emoji_centered(pos2(200.0, 200.0), 64.0, 800, 600);
+        assert_eq!(
+            r,
+            PhysicalRect {
+                x: 168,
+                y: 168,
+                width: 64,
+                height: 64
+            }
+        );
+        let r = emoji_centered(pos2(4.0, 596.0), 64.0, 800, 600);
+        assert_eq!(
+            r,
+            PhysicalRect {
+                x: 0,
+                y: 536,
+                width: 64,
+                height: 64
+            }
+        );
+        // Side bigger than the image is clamped to it.
+        let r = emoji_centered(pos2(50.0, 50.0), 400.0, 200, 150);
+        assert_eq!(r.width, 150);
+    }
+
+    /// `resize_square`: opposite corner stays fixed, the square follows
+    /// the larger axis, clamped — aspect always 1:1.
+    #[test]
+    fn resize_square_keeps_ratio_and_anchor() {
+        let mut r = PhysicalRect {
+            x: 10,
+            y: 10,
+            width: 40,
+            height: 40,
+        };
+        // Corner 4 (bottom-right) drag → top-left stays at (10,10).
+        resize_square(&mut r, 4, pos2(80.0, 70.0), 8.0, 256.0);
+        assert_eq!(
+            r,
+            PhysicalRect {
+                x: 10,
+                y: 10,
+                width: 70,
+                height: 70
+            }
+        );
+        // Corner 0 (top-left) drag → bottom-right stays at (80,80);
+        // the larger delta (|dx|=50) sets the square — y snaps to keep
+        // the 1:1 ratio, it does NOT follow the pointer.
+        resize_square(&mut r, 0, pos2(30.0, 40.0), 8.0, 256.0);
+        assert_eq!(
+            r,
+            PhysicalRect {
+                x: 30,
+                y: 30,
+                width: 50,
+                height: 50
+            }
+        );
+        // Clamped to max.
+        resize_square(&mut r, 4, pos2(900.0, 900.0), 8.0, 256.0);
+        assert_eq!(r.width, 256);
+        assert_eq!(r.width, r.height);
+    }
+
+    /// The full click path: placing an emoji bumps the document
+    /// revision (thumbnail queues are revision-keyed), selects it with
+    /// handles and records exactly ONE undo step.
+    #[test]
+    fn click_places_emoji_one_undo() {
+        let doc = Document::new(Capture {
+            image: std::sync::Arc::new(image::RgbaImage::from_pixel(
+                800,
+                600,
+                image::Rgba([30, 30, 30, 255]),
+            )),
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect::default(),
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        });
+        let mut s = DrawSession::open(
+            doc,
+            0,
+            "t".to_owned(),
+            VecDeque::new(),
+            VecDeque::new(),
+            &crate::config::Settings::default(),
+        );
+        s.tool = Tool::Emoji;
+        let rev0 = s.doc.revision;
+        s.click(pos2(400.0, 300.0), &egui::Context::default());
+        assert!(s.doc.revision > rev0, "placement must bump revision");
+        assert_eq!(s.undo.len(), 1, "one placement = one undo step");
+        let id = s.selected.expect("placed emoji stays selected");
+        match &s.doc.annotation(id).unwrap().kind {
+            AnnotationKind::Emoji(o) => {
+                assert_eq!(o.id, 0x1F449);
+                assert_eq!(o.rect.width, o.rect.height);
+                assert_eq!(o.rect.width, 30); // 5 % of 600
+            }
+            other => panic!("expected Emoji, got {other:?}"),
+        }
+        // Moving then resizing the emoji bumps the revision again —
+        // the thumbnail queue keys off it.
+        let rev = s.doc.revision;
+        s.doc.annotation_mut(id).unwrap().kind.translate(5.0, -3.0);
+        s.doc.revision += 1;
+        assert!(s.doc.revision > rev);
+        let rev = s.doc.revision;
+        let a = s.doc.annotation_mut(id).unwrap();
+        let mut r = a.kind.bounds();
+        resize_square(
+            &mut r,
+            4,
+            pos2(500.0, 500.0),
+            EMOJI_MIN_SIDE,
+            EMOJI_MAX_SIDE,
+        );
+        a.kind.set_bounds(r);
+        s.doc.revision += 1;
+        assert!(s.doc.revision > rev);
+        match &s.doc.annotation(id).unwrap().kind {
+            AnnotationKind::Emoji(o) => assert_eq!(o.rect.width, o.rect.height),
+            _ => unreachable!(),
+        }
+    }
 }

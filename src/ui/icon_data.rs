@@ -280,4 +280,9 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         "blur",
         include_bytes!("../../assets/icons/blur.svg"),
     ),
+    (
+        Icon::Smile,
+        "smile",
+        include_bytes!("../../assets/icons/smile.svg"),
+    ),
 ];
