@@ -1161,6 +1161,14 @@ impl Shared {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
             return;
         }
+        // A restore still decoding owns the real Store — wait for it and
+        // install the session first, or quit would save into the disabled
+        // placeholder and the whole session would be silently lost.
+        if let Some(rx) = lock(&self.restore_rx).take()
+            && let Ok((session, store)) = rx.recv()
+        {
+            self.finish_restore(session, store);
+        }
         // An open Draw editor still owns its tab's document clone —
         // finalize any open text panel and commit it back so a quit
         // mid-edit loses nothing.
@@ -1695,10 +1703,44 @@ fn draw_builder(title: &str) -> egui::ViewportBuilder {
         .with_active(true)
 }
 
+/// Writes panics to `data_dir()/panic.log` before the abort — a
+/// `panic = "abort"` release binary otherwise dies with no trace of
+/// the panic site. Installed once at startup.
+fn install_panic_hook() {
+    let log =
+        directories::ProjectDirs::from("", "", "pixme").map(|d| d.data_dir().join("panic.log"));
+    std::panic::set_hook(Box::new(move |info| {
+        let line = format!(
+            "[{}] panic on '{}': {info}",
+            chrono::Local::now().to_rfc3339(),
+            std::thread::current().name().unwrap_or("worker"),
+        );
+        tracing::error!("{line}");
+        // stderr write errors must NOT re-panic inside the hook.
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        let _ = std::io::stderr().write_all(b"\n");
+        if let Some(path) = &log {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.write_all(b"\n");
+            }
+        }
+    }));
+}
+
 /// Runs the app. The root viewport is the permanent 1×1 transparent anchor
 /// window (never in the taskbar); the app first lives in the menu bar /
 /// tray (`Idle`) until the user asks for a capture.
 pub fn run() -> eframe::Result<()> {
+    install_panic_hook();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PixMe")
@@ -1940,6 +1982,37 @@ mod tests {
             lock(&shared.quit_rx).is_none(),
             "unchanged quit must not write"
         );
+    }
+
+    /// A quit landing while the restore worker still owns the real
+    /// Store must drain it first — otherwise the session is written
+    /// into the disabled placeholder and silently lost.
+    #[test]
+    fn quit_drains_an_in_flight_restore() {
+        let (shared, ctx) = harness();
+        // Simulate a loader that finished decoding but whose result
+        // pump() has not drained yet.
+        let mut store = crate::store::Store::open_in_memory();
+        let mut v = Viewer::default();
+        v.push_stub("from_db");
+        store.save_session(&v.tabs, 0, v.next_title());
+        let session = store.load_session();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((session, store)).unwrap();
+        *lock(&shared.restore_rx) = Some(rx);
+
+        drive(&shared, &ctx, Command::Quit);
+        drain_quit(&shared);
+        assert!(
+            lock(&shared.restore_rx).is_none(),
+            "pending restore drained at quit"
+        );
+
+        *lock(&shared.viewer) = Viewer::default();
+        drive(&shared, &ctx, Command::OpenViewer);
+        drain_restore(&shared);
+        assert_eq!(lock(&shared.viewer).tabs.len(), 1);
+        assert_eq!(lock(&shared.viewer).tabs[0].title, "from_db");
     }
 
     /// A real change still takes the worker path — the store goes away
