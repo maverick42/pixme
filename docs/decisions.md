@@ -1121,3 +1121,39 @@ Format: date — context — decision — consequences.
     the active tab only), icons only: no opacity/shadow fields on
     `EmojiObj`. Cells are click-to-arm AND drag-out-to-canvas (drop =
     place at default side), matching the reference's emoticon strip.
+
+## 2026-10-28 — Deferred-render drags (region-bounded re-render)
+
+- **Cause**: `Drag::Moving`/`Resizing`/`Endpoint`/`Tail` bumped
+  `doc.revision` per pointer move → `canvas()` ran a FULL
+  `render_to_image` + `tex.set` per frame. Measured on a 5K
+  (5120×2880) doc with 16 annotations, release: `render_to_image`
+  ~310 ms + `ColorImage` ~14 ms → ~330 ms/frame — the drag stutter.
+  Thumbnail-queue suspicion disproven by code: `DrawSession` edits a
+  `doc.clone()`; `sync_thumb_queue` only reads the viewer tabs.
+- **Fix**: doc + revision stay frozen for the whole gesture. The drag
+  mutates a `live` clone; the canvas texture is patched by
+  `render_region` (same draw fns/scratch/composites — bit-identical to
+  the full render's crop, pinned by seeded parity tests at tolerance
+  0), the overlay paints `live` via `DragPreview` (same pipeline,
+  ~6 ms/frame). Release = ONE `Replace` + ONE region patch (union of
+  old+new bounds). Esc re-patches the exclusion region — no
+  revision/undo side effects. Arrow nudges use the same mechanism.
+- **Approximations (documented)**: z-order — the preview always paints
+  on top during the gesture (exact again at release); region effects
+  (Blur/eraser-blur) show a plain accent frame as preview — the real
+  pixels return on release/cancel.
+- **Region growth**: `expand_for_effects` grows the patch region
+  iteratively until it covers every overlapping effect's full
+  footprint; >50 % of the image → full-render fallback.
+- **Measurements (release, 5K×16 annos)** — before → after:
+  per-frame 330 ms → ~6 ms (preview patch); drag-start 330 ms →
+  ~6–70 ms; release 330 ms → ~10–145 ms; Esc 330 ms → ~10–145 ms.
+  **Caveat**: region cost is CONTENT-driven — a bezier `Line` costs
+  ~70 ms to rasterize (≈270 ns/px; the 4 bench lines are ~280 ms of
+  the 310 ms full render). Any region intersecting a curve pays that;
+  pure-shape regions run 2–10 ms.
+- **Next unit**: per-annotation cached layers (painted patch + bounds,
+  keyed by annotation revision) — region and full renders then become
+  bounded composites of cached layers; also fixes commit-time
+  re-renders and undo/redo. Not implemented here.

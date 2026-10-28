@@ -113,6 +113,13 @@ pub fn text_extent(o: &super::document::TextObj) -> (f32, f32) {
 
 /// Composites `doc` (base + annotations) to a flat RGBA bitmap.
 pub fn render_to_image(doc: &Document) -> RgbaImage {
+    render_to_image_filtered(doc, None)
+}
+
+/// [`render_to_image`] with one annotation skipped — used by the
+/// live-drag overlay so the moved object leaves its old spot without
+/// a full per-frame re-render.
+pub fn render_to_image_filtered(doc: &Document, skip: Option<u64>) -> RgbaImage {
     let mut img = doc.base.image.as_ref().clone();
     // One scratch layer for every layered object: the full-frame
     // alloc happens once per document instead of once per
@@ -120,6 +127,9 @@ pub fn render_to_image(doc: &Document) -> RgbaImage {
     // coordinates — bit-identical to allocating per object.
     let mut scratch = ScratchLayer::new(img.width(), img.height());
     for anno in &doc.annotations {
+        if skip == Some(anno.id) {
+            continue;
+        }
         render_one(&mut img, &mut scratch, anno);
     }
     img
@@ -223,17 +233,323 @@ fn render_one(img: &mut RgbaImage, scratch: &mut ScratchLayer, anno: &Annotation
     }
 }
 
+/// Live-drag preview rasterizer: owns ONE persistent full-frame
+/// transparent layer — allocated once, only the painted patch is
+/// re-cleared between frames (a bounded memset, never a 59 MB alloc).
+///
+/// The patch is produced by THE SAME draw functions and the same
+/// shadow/opacity composite as [`render_to_image`], so preview pixels
+/// equal the committed render's — the only approximation is z-order
+/// (the preview is painted on top) and region effects (Blur,
+/// blur-eraser Freehand), which return `None`: the caller draws a
+/// simplified outline instead.
+pub struct DragPreview {
+    layer: RgbaImage,
+    /// `(x, y, w, h)` painted last frame — the only region needing a
+    /// clear before the next render.
+    dirty: Option<(u32, u32, u32, u32)>,
+}
+
+impl DragPreview {
+    /// A cleared layer covering the whole document image.
+    pub fn new(iw: u32, ih: u32) -> Self {
+        Self {
+            layer: RgbaImage::new(iw, ih),
+            dirty: None,
+        }
+    }
+
+    /// Renders `anno` at document scale into the shared layer and
+    /// returns `(patch, origin_x, origin_y)` — `patch` is the cropped
+    /// layer bounds with shadow and opacity folded in. `None` for
+    /// region-effect annotations (Blur, blur/pixelate eraser
+    /// strokes): they read the base pixels, no layered render exists
+    /// — the caller draws a plain outline instead.
+    pub fn render(&mut self, anno: &Annotation) -> Option<(RgbaImage, u32, u32)> {
+        match &anno.kind {
+            AnnotationKind::Blur(_) => return None,
+            AnnotationKind::Freehand(o) if o.eraser_mode != super::document::EraserMode::Color => {
+                return None;
+            }
+            _ => {}
+        }
+        let (bx, by, bw, bh) = layer_bounds(anno, self.layer.width(), self.layer.height())?;
+        self.clear_dirty();
+        let (shadow, opacity) = object_layer(&mut self.layer, anno);
+        // Same shadow composite as render_one's tail — the dark-tinted
+        // crop shifted inside the layer itself.
+        if shadow > 0.0 {
+            let dark = tint_alpha(
+                &image::imageops::crop_imm(&self.layer, bx, by, bw, bh).to_image(),
+                Rgba([0, 0, 0, 90]),
+            );
+            composite(
+                &mut self.layer,
+                &dark,
+                bx as i64 + shadow as i64,
+                by as i64 + shadow as i64,
+                1.0,
+            );
+        }
+        // Opacity folds into the patch's alpha (the compositing
+        // destination IS the patch — nothing below it).
+        if opacity < 1.0 {
+            for row in self.layer.rows_mut().skip(by as usize).take(bh as usize) {
+                for px in row.skip(bx as usize).take(bw as usize) {
+                    px.0[3] = (px.0[3] as f32 * opacity).round() as u8;
+                }
+            }
+        }
+        let mut patch = RgbaImage::new(bw, bh);
+        image::imageops::overlay(
+            &mut patch,
+            &image::imageops::crop_imm(&self.layer, bx, by, bw, bh).to_image(),
+            0,
+            0,
+        );
+        self.dirty = Some((bx, by, bw, bh));
+        Some((patch, bx, by))
+    }
+
+    /// Zeroes only the previously painted region — bounded memset,
+    /// never a full-frame clear.
+    fn clear_dirty(&mut self) {
+        if let Some((x, y, w, h)) = self.dirty.take() {
+            for row in self.layer.rows_mut().skip(y as usize).take(h as usize) {
+                for px in row.skip(x as usize).take(w as usize) {
+                    *px = Rgba([0, 0, 0, 0]);
+                }
+            }
+        }
+    }
+}
+
+impl DragPreview {
+    /// Re-composites `doc` restricted to `region` (absolute image px,
+    /// `(x, y, w, h)` already grown by the caller — see
+    /// [`expand_for_effects`]) into a fresh patch image, clipped to
+    /// the image. **Bit-identical to the same crop of
+    /// [`render_to_image`]** — same draw fns, same scratch, same
+    /// shadow/opacity composites, just bounded. The parity tests pin
+    /// this at tolerance 0. `skip` drops one annotation id entirely
+    /// (the live-dragged object excluded mid-gesture).
+    pub fn render_region(
+        &mut self,
+        doc: &Document,
+        region: (u32, u32, u32, u32),
+        skip: u64,
+    ) -> RgbaImage {
+        let (rx, ry, rw, rh) = region;
+        let (iw, ih) = (self.layer.width(), self.layer.height());
+        let mut patch =
+            image::imageops::crop_imm(doc.base.image.as_ref(), rx, ry, rw, rh).to_image();
+        for anno in &doc.annotations {
+            if anno.id == skip {
+                continue;
+            }
+            let Some((bx, by, bw, bh)) = layer_bounds(anno, iw, ih) else {
+                continue;
+            };
+            let Some((ix, iy, iw_, ih_)) = intersect((bx, by, bw, bh), region) else {
+                continue;
+            };
+            if region_effect(anno) {
+                // Region effects write absolute coords — replay them
+                // on the patch with a coordinate-shifted clone. The
+                // caller guaranteed `region ⊇ footprint`, so the
+                // shifted rect still covers every pixel the effect
+                // reads or writes.
+                let mut shifted = anno.clone();
+                shifted.kind.translate(-(rx as f32), -(ry as f32));
+                match &shifted.kind {
+                    AnnotationKind::Blur(o) => apply_blur(&mut patch, o),
+                    AnnotationKind::Freehand(o) => {
+                        apply_freehand_effect(&mut patch, o);
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                self.layer_object(
+                    &mut patch,
+                    anno,
+                    (bx, by, bw, bh),
+                    (ix, iy, iw_, ih_),
+                    (rx, ry),
+                );
+            }
+        }
+        patch
+    }
+
+    /// One layered annotation composited into `patch` — mirrors
+    /// `render_one`'s tail exactly (shared scratch, dark-tint shadow,
+    /// bounded composite) but at patch-local coordinates. `bounds` is
+    /// the object's full painted bounds, `zone` their intersection
+    /// with the region.
+    fn layer_object(
+        &mut self,
+        patch: &mut RgbaImage,
+        anno: &Annotation,
+        (bx, by, bw, bh): (u32, u32, u32, u32),
+        (ix, iy, iw_, ih_): (u32, u32, u32, u32),
+        (rx, ry): (u32, u32),
+    ) {
+        self.clear_dirty();
+        let (shadow, opacity) = object_layer(&mut self.layer, anno);
+        if shadow > 0.0 {
+            // The shadow lands at bounds+shift — its SOURCE is the
+            // bounds area that, shifted, falls inside the region:
+            // `bounds ∩ (region − shift)`, which may reach OUTSIDE the
+            // region (the object sits left of it, its shadow inside).
+            let s = shadow as i64;
+            let want = (
+                (rx as i64 - s).clamp(0, self.layer.width() as i64) as u32,
+                (ry as i64 - s).clamp(0, self.layer.height() as i64) as u32,
+                patch.width() + s.unsigned_abs() as u32,
+                patch.height() + s.unsigned_abs() as u32,
+            );
+            if let Some((sx, sy, sw, sh)) = intersect((bx, by, bw, bh), want) {
+                let dark = tint_alpha(
+                    &image::imageops::crop_imm(&self.layer, sx, sy, sw, sh).to_image(),
+                    Rgba([0, 0, 0, 90]),
+                );
+                composite(
+                    patch,
+                    &dark,
+                    sx as i64 + s - rx as i64,
+                    sy as i64 + s - ry as i64,
+                    1.0,
+                );
+            }
+            // Mark the union of the FULL painted bounds and their
+            // shifted copy — paint outside the region still dirties
+            // the scratch and must be cleared before the next crop.
+            self.dirty = Some(union_rect(
+                (bx, by, bw, bh),
+                (
+                    (bx as i64 + s).max(0) as u32,
+                    (by as i64 + s).max(0) as u32,
+                    bw,
+                    bh,
+                ),
+            ));
+        } else {
+            self.dirty = Some((bx, by, bw, bh));
+        }
+        composite(
+            patch,
+            &image::imageops::crop_imm(&self.layer, ix, iy, iw_, ih_).to_image(),
+            ix as i64 - rx as i64,
+            iy as i64 - ry as i64,
+            opacity,
+        );
+    }
+}
+
+/// `(x, y, w, h)` intersection, or `None` when disjoint.
+pub(crate) fn intersect(
+    (ax, ay, aw, ah): (u32, u32, u32, u32),
+    (bx, by, bw, bh): (u32, u32, u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    let (x0, y0) = (ax.max(bx), ay.max(by));
+    let (x1, y1) = ((ax + aw).min(bx + bw), (ay + ah).min(by + bh));
+    // `then`, not `then_some`: the tuple's subtraction must stay lazy
+    // or it underflows when the rects are disjoint.
+    (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
+}
+
+/// `(x, y, w, h)` union of two rects (either may be empty — a 0-size
+/// side contributes its origin only).
+pub(crate) fn union_rect(
+    (ax, ay, aw, ah): (u32, u32, u32, u32),
+    (bx, by, bw, bh): (u32, u32, u32, u32),
+) -> (u32, u32, u32, u32) {
+    let (x0, y0) = (ax.min(bx), ay.min(by));
+    let (x1, y1) = ((ax + aw).max(bx + bw), (ay + ah).max(by + bh));
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// True for annotations that read/write the base directly (Blur,
+/// blur/pixelate eraser strokes) rather than compositing a layer.
+pub(crate) fn region_effect(anno: &Annotation) -> bool {
+    match &anno.kind {
+        AnnotationKind::Blur(_) => true,
+        AnnotationKind::Freehand(o) => o.eraser_mode != super::document::EraserMode::Color,
+        _ => false,
+    }
+}
+
+/// The absolute image-px footprint a region effect can read or
+/// modify — its own bounds grown by the effect's padding, matching
+/// the arm inside `apply_blur`/`apply_freehand_effect`. (Their
+/// read/write region is self-contained inside the footprint: the
+/// gaussian runs on the cropped patch with edge clamping, never on
+/// pixels outside it.)
+pub(crate) fn effect_footprint(
+    anno: &Annotation,
+    iw: u32,
+    ih: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let pad = match &anno.kind {
+        AnnotationKind::Blur(_) => 4.0,
+        AnnotationKind::Freehand(o) => o.width + 8.0,
+        _ => return None,
+    };
+    let b = anno.kind.bounds();
+    let m = pad.ceil() as i32;
+    let x0 = (b.x - m).clamp(0, iw as i32);
+    let y0 = (b.y - m).clamp(0, ih as i32);
+    let x1 = (b.x + b.width as i32 + m).clamp(x0, iw as i32);
+    let y1 = (b.y + b.height as i32 + m).clamp(y0, ih as i32);
+    (x1 > x0 && y1 > y0).then_some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
+/// Grows `region` until it covers the FULL footprint of every region
+/// effect (blur/gomme) it touches — iterative fixpoint since one
+/// effect can pull in another. `None` when the fixpoint would exceed
+/// `max_frac` of the image area (caller falls back to a full render).
+pub fn expand_for_effects(
+    doc: &Document,
+    mut region: (u32, u32, u32, u32),
+    iw: u32,
+    ih: u32,
+    max_frac: f32,
+) -> Option<(u32, u32, u32, u32)> {
+    loop {
+        let mut grown = region;
+        for anno in &doc.annotations {
+            if !region_effect(anno) {
+                continue;
+            }
+            let Some(fp) = effect_footprint(anno, iw, ih) else {
+                continue;
+            };
+            if intersect(fp, grown).is_some() {
+                grown = union_rect(grown, fp);
+            }
+        }
+        if grown == region {
+            break;
+        }
+        region = grown;
+    }
+    ((region.2 as u64 * region.3 as u64) as f32 / (iw as u64 * ih as u64) as f32 <= max_frac)
+        .then_some(region)
+}
+
 /// Anti-aliasing slack every layered bounds gets on top of the
 /// stroke/shadow extras — a few transparent pixels of margin cost
-/// nothing, a clipped AA fringe would break pixel parity.
-const LAYER_AA_SLACK: f32 = 4.0;
+/// nothing, a clipped AA fringe would break pixel parity. 6 px, not
+/// 4: `draw_shape_sdf` paints the shadow's own AA fringe ~1–2 px past
+/// `rect + shadow + stroke/2 + outline`.
+const LAYER_AA_SLACK: f32 = 6.0;
 
 /// Image-space `(x, y, w, h)` a layered annotation can touch, clipped
 /// to the image — `None` when fully outside. `AnnotationKind::bounds()`
 /// grown by the object's stroke/outline/shadow extras plus
 /// [`LAYER_AA_SLACK`]; the speech-box tail is unioned in separately
 /// since it leaves `BoxObj::rect` entirely.
-fn layer_bounds(anno: &Annotation, iw: u32, ih: u32) -> Option<(u32, u32, u32, u32)> {
+pub(crate) fn layer_bounds(anno: &Annotation, iw: u32, ih: u32) -> Option<(u32, u32, u32, u32)> {
     let extra = match &anno.kind {
         AnnotationKind::Rect(o) => o.stroke_w * 0.5 + o.outline + o.shadow,
         AnnotationKind::Ellipse(o) => o.stroke_w * 0.5 + o.outline + o.shadow,
@@ -2441,7 +2757,7 @@ mod tests {
 
     /// Pixel-exact comparison with a first-mismatch report — `assert_eq!`
     /// on the raw buffers would dump a megabyte on failure.
-    fn assert_same_pixels(a: &RgbaImage, b: &RgbaImage) {
+    pub(super) fn assert_same_pixels(a: &RgbaImage, b: &RgbaImage) {
         assert_eq!(a.dimensions(), b.dimensions());
         let mut diffs = 0usize;
         let mut max_delta = 0i32;
@@ -3051,5 +3367,497 @@ mod tests {
     #[test]
     fn parity_empty_document() {
         assert_render_parity(Vec::new());
+    }
+}
+
+#[cfg(test)]
+pub(super) mod bench {
+    //! Timing harness for the drag re-render cost — run manually:
+    //! `cargo test --release bench -- --ignored --nocapture`
+    use super::super::document::{
+        AreaShape, BlurObj, BlurStyle, Dash, EmojiObj, LineEnd, LineObj, RectObj,
+    };
+    use super::*;
+    use crate::capture::{Capture, MonitorInfo};
+    use egui::pos2;
+    use std::time::Instant;
+
+    /// A realistic 5K annotated document (macOS Retina frame + a
+    /// spread of annotation kinds incl. blur and an emoji).
+    pub(super) fn doc5k() -> Document {
+        let mut img = RgbaImage::new(5120, 2880);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = Rgba([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8, 255]);
+        }
+        let mut doc = Document::new(Capture {
+            image: std::sync::Arc::new(img),
+            scale_factor: 2.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect::default(),
+                scale_factor: 2.0,
+                is_primary: true,
+            },
+        });
+        let mut id = 1u64;
+        for i in 0..4 {
+            doc.annotations.push(Annotation {
+                id,
+                kind: AnnotationKind::Rect(RectObj {
+                    rect: PhysicalRect {
+                        x: 200 + i * 700,
+                        y: 300 + i * 400,
+                        width: 600,
+                        height: 350,
+                    },
+                    stroke: Color32::from_rgb(230, 60, 60),
+                    stroke_w: 4.0,
+                    dash: Dash::Solid,
+                    fill: Some(Color32::from_rgb(230, 60, 60)),
+                    radius: 12.0,
+                    outline: 1.0,
+                    outline_color: Color32::BLACK,
+                    opacity: 1.0,
+                    shadow: 3.0,
+                }),
+            });
+            id += 1;
+            doc.annotations.push(Annotation {
+                id,
+                kind: AnnotationKind::Line(LineObj {
+                    a: pos2(400.0 + i as f32 * 600.0, 500.0),
+                    b: pos2(900.0 + i as f32 * 600.0, 900.0),
+                    ka: pos2(550.0 + i as f32 * 600.0, 700.0),
+                    kb: pos2(750.0 + i as f32 * 600.0, 700.0),
+                    color: Color32::WHITE,
+                    width: 5.0,
+                    dash: Dash::Solid,
+                    start: LineEnd::None,
+                    end: LineEnd::Arrow,
+                    outline: 1.0,
+                    outline_color: Color32::BLACK,
+                    opacity: 1.0,
+                    shadow: 0.0,
+                }),
+            });
+            id += 1;
+            doc.annotations.push(Annotation {
+                id,
+                kind: AnnotationKind::Emoji(EmojiObj {
+                    rect: PhysicalRect {
+                        x: 300 + i * 500,
+                        y: 2200,
+                        width: 96,
+                        height: 96,
+                    },
+                    id: 0x1F449,
+                }),
+            });
+            id += 1;
+            doc.annotations.push(Annotation {
+                id,
+                kind: AnnotationKind::Blur(BlurObj {
+                    rect: PhysicalRect {
+                        x: 1000 + i * 800,
+                        y: 1400,
+                        width: 400,
+                        height: 300,
+                    },
+                    style: BlurStyle::Pixelate,
+                    shape: AreaShape::Rect,
+                    strength: 50,
+                }),
+            });
+            id += 1;
+        }
+        doc
+    }
+
+    fn stats(label: &str, v: &mut Vec<f64>) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "{label:28} min {:.1} ms | median {:.1} ms | p95 {:.1} ms | max {:.1} ms",
+            v[0],
+            v[v.len() / 2],
+            v[(v.len() as f64 * 0.95) as usize - 1],
+            v[v.len() - 1]
+        );
+    }
+
+    #[test]
+    #[ignore = "manual bench — cargo test --release bench -- --ignored --nocapture"]
+    fn bench_render_to_image_5k() {
+        let doc = doc5k();
+        let _ = render_to_image(&doc); // warm-up: decode emoji PNGs
+        let mut render_ms = Vec::new();
+        let mut buf_ms = Vec::new();
+        for _ in 0..15 {
+            let t = Instant::now();
+            let img = render_to_image(&doc);
+            render_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            let t = Instant::now();
+            let _c = egui::ColorImage::from_rgba_unmultiplied(
+                [img.width() as usize, img.height() as usize],
+                img.as_raw(),
+            );
+            buf_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        stats("render_to_image 5K annotated", &mut render_ms);
+        stats("ColorImage buffer prep", &mut buf_ms);
+    }
+
+    /// Patch-only preview path: render_one on a full-frame scratch +
+    /// crop of the annotation's layer bounds — the proposed drag
+    /// overlay cost.
+    #[test]
+    #[ignore = "manual bench"]
+    fn bench_patch_render_5k() {
+        let doc = doc5k();
+        let anno = doc.annotations[2].clone(); // an emoji @96 px
+        let mut prev = DragPreview::new(doc.base.image.width(), doc.base.image.height());
+        let mut times = Vec::new();
+        for _ in 0..30 {
+            let t = Instant::now();
+            let patch = prev.render(&anno);
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+            let _ = patch;
+        }
+        stats("DragPreview patch (96px emoji)", &mut times);
+        // Big object: a rect spanning 600x350.
+        let anno = doc.annotations[0].clone();
+        let mut times = Vec::new();
+        for _ in 0..30 {
+            let t = Instant::now();
+            let patch = prev.render(&anno);
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+            let _ = patch;
+        }
+        stats("DragPreview patch (600x350)", &mut times);
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    //! Region-vs-full parity at tolerance 0 — seeded pseudo-random
+    //! documents (deterministic LCG, no rand crate) with objects at
+    //! edges / half outside, sequential moves re-checked every step.
+    use super::tests::{anno, assert_same_pixels, doc_with};
+    use super::*;
+    use crate::editor::document::{BlurObj, BlurStyle, Dash, EmojiObj, RectObj, TextObj};
+    use egui::pos2;
+
+    /// Tiny deterministic PRNG (xorshift64) — reproducible sequences.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick(&mut self, n: u32) -> u32 {
+            (self.next() % n as u64) as u32
+        }
+        fn range(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() % ((hi - lo) as u64 + 1)) as i32
+        }
+    }
+
+    /// A 340×260 doc with a mixed pile incl. edge-clipped objects.
+    fn varied_doc(seed: u64) -> Document {
+        let mut rng = Rng(seed);
+        let mut v = Vec::new();
+        for i in 0..8u64 {
+            let x = rng.range(-60, 360);
+            let y = rng.range(-40, 280);
+            let (w, h) = (rng.pick(120) + 20, rng.pick(80) + 20);
+            let kind = match rng.pick(4) {
+                0 => AnnotationKind::Rect(RectObj {
+                    rect: PhysicalRect {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    },
+                    stroke: Color32::from_rgb(230, 60, 60),
+                    stroke_w: 2.0 + rng.pick(6) as f32,
+                    dash: Dash::Solid,
+                    fill: (rng.pick(2) == 0).then_some(Color32::from_rgb(30, 120, 240)),
+                    radius: rng.pick(20) as f32,
+                    outline: 1.0,
+                    outline_color: Color32::BLACK,
+                    opacity: 0.5 + rng.pick(2) as f32 * 0.5,
+                    shadow: rng.pick(6) as f32,
+                }),
+                1 => AnnotationKind::Emoji(EmojiObj {
+                    rect: PhysicalRect {
+                        x,
+                        y,
+                        width: w.max(h),
+                        height: w.max(h),
+                    },
+                    id: [0x1F449, 0x1F525, 0x26A0][i as usize % 3],
+                }),
+                2 => AnnotationKind::Blur(BlurObj {
+                    rect: PhysicalRect {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    },
+                    style: if rng.pick(2) == 0 {
+                        BlurStyle::Pixelate
+                    } else {
+                        BlurStyle::Blur
+                    },
+                    shape: crate::editor::document::AreaShape::Rect,
+                    strength: 20 + rng.pick(60) as u8,
+                }),
+                _ => AnnotationKind::Text(TextObj {
+                    a: pos2(x as f32, y as f32),
+                    b: pos2(x as f32 + 100.0, y as f32 + 10.0),
+                    ka: pos2(x as f32 + 30.0, y as f32),
+                    kb: pos2(x as f32 + 70.0, y as f32 + 10.0),
+                    content: "ab".into(),
+                    size: 20.0,
+                    color: Color32::WHITE,
+                    font: "Regular".into(),
+                    bold: false,
+                    italic: false,
+                    align: crate::editor::document::TextAlign::Left,
+                    outline: 1.0,
+                    outline_color: Color32::BLACK,
+                    opacity: 1.0,
+                    shadow: rng.pick(4) as f32,
+                }),
+            };
+            v.push(anno(i + 1, kind));
+        }
+        doc_with(v)
+    }
+
+    /// render_region == crop(render_to_image) — tolerance 0, over a
+    /// random walk of patch regions on several seeded docs.
+    #[test]
+    fn region_render_matches_full_crop() {
+        for seed in 1..6u64 {
+            let doc = varied_doc(seed * 7919);
+            let full = render_to_image(&doc);
+            let mut prev = DragPreview::new(340, 260);
+            let mut rng = Rng(seed);
+            for _ in 0..12 {
+                let x = rng.range(0, 330) as u32;
+                let y = rng.range(0, 250) as u32;
+                let w = rng.pick(80) + 20;
+                let h = rng.pick(60) + 20;
+                let region = (x.min(339), y.min(259), w.min(340 - x), h.min(260 - y));
+                // Region over the 50% cap → the caller falls back to a
+                // full render; there is nothing to patch-compare.
+                let Some(region) = expand_for_effects(&doc, region, 340, 260, 0.5) else {
+                    continue;
+                };
+                let (rx, ry, rw, rh) = region;
+                let patch = prev.render_region(&doc, region, u64::MAX);
+                let expect = image::imageops::crop_imm(&full, rx, ry, rw, rh).to_image();
+                assert_same_pixels(&patch, &expect);
+            }
+        }
+    }
+
+    /// The expansion fixpoint: a blur overlapping the region pulls it
+    /// wide enough that the patch still matches the full render —
+    /// AND a blur just outside a too-small region stays a fallback.
+    #[test]
+    fn region_expand_covers_blur_footprint() {
+        let mut doc = doc_with(vec![
+            anno(
+                1,
+                AnnotationKind::Blur(BlurObj {
+                    rect: PhysicalRect {
+                        x: 100,
+                        y: 100,
+                        width: 60,
+                        height: 40,
+                    },
+                    style: BlurStyle::Blur,
+                    shape: crate::editor::document::AreaShape::Rect,
+                    strength: 80,
+                }),
+            ),
+            anno(
+                2,
+                AnnotationKind::Rect(RectObj {
+                    rect: PhysicalRect {
+                        x: 120,
+                        y: 110,
+                        width: 30,
+                        height: 20,
+                    },
+                    stroke: Color32::RED,
+                    stroke_w: 3.0,
+                    dash: Dash::Solid,
+                    fill: None,
+                    radius: 0.0,
+                    outline: 0.0,
+                    outline_color: Color32::BLACK,
+                    opacity: 1.0,
+                    shadow: 0.0,
+                }),
+            ),
+        ]);
+        // Region covering the rect overlaps the blur footprint →
+        // grows to contain the whole blur; parity still holds.
+        let (iw, ih) = (doc.base.image.width(), doc.base.image.height());
+        let grown =
+            expand_for_effects(&doc, (110, 105, 40, 30), iw, ih, 0.5).expect("within the 50% cap");
+        assert!(
+            grown.0 <= 96 && grown.2 >= 68,
+            "blur footprint grown: {grown:?}"
+        );
+        let mut prev = DragPreview::new(iw, ih);
+        let patch = prev.render_region(&doc, grown, u64::MAX);
+        let expect =
+            image::imageops::crop_imm(&render_to_image(&doc), grown.0, grown.1, grown.2, grown.3)
+                .to_image();
+        assert_same_pixels(&patch, &expect);
+        // A doc-sized blur forces the fallback (region > cap → None).
+        doc.annotations.push(anno(
+            3,
+            AnnotationKind::Blur(BlurObj {
+                rect: PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 340,
+                    height: 260,
+                },
+                style: BlurStyle::Pixelate,
+                shape: crate::editor::document::AreaShape::Rect,
+                strength: 50,
+            }),
+        ));
+        assert!(expand_for_effects(&doc, (10, 10, 20, 20), iw, ih, 0.5).is_none());
+    }
+}
+
+#[cfg(test)]
+mod region_bench {
+    //! Live-drag pipeline timings on the 5K doc — run manually:
+    //! `cargo test --release region_bench -- --ignored --nocapture`
+    use super::bench::doc5k;
+    use super::*;
+    use std::time::Instant;
+
+    fn stats(label: &str, v: &mut Vec<f64>) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "{label:44} min {:.2} | med {:.2} | p95 {:.2} | max {:.2} ms",
+            v[0],
+            v[v.len() / 2],
+            v[(v.len() as f64 * 0.95) as usize - 1],
+            v[v.len() - 1]
+        );
+    }
+
+    #[test]
+    #[ignore = "manual bench"]
+    fn bench_live_drag_pipeline_5k() {
+        let doc = doc5k();
+        let (iw, ih) = (doc.base.image.width(), doc.base.image.height());
+        let mut prev = DragPreview::new(iw, ih);
+        let _ = prev.render_region(&doc, (0, 0, iw, ih), u64::MAX); // warm
+
+        // ── drag start: exclusion patch of one object's bounds ──
+        let anno = doc.annotations[0].clone(); // rect 600×350
+        let region =
+            expand_for_effects(&doc, layer_bounds(&anno, iw, ih).unwrap(), iw, ih, 0.5).unwrap();
+        let mut t = Vec::new();
+        for _ in 0..30 {
+            let i = Instant::now();
+            let p = prev.render_region(&doc, region, anno.id);
+            t.push(i.elapsed().as_secs_f64() * 1000.0);
+            let _ = p;
+        }
+        stats("drag-start exclusion patch (600x350)", &mut t);
+
+        // ── per-frame: live preview patch of the same object ──
+        let mut t = Vec::new();
+        for _ in 0..60 {
+            let i = Instant::now();
+            let p = prev.render(&anno);
+            t.push(i.elapsed().as_secs_f64() * 1000.0);
+            let _ = p;
+        }
+        stats("per-frame live preview patch (600x350)", &mut t);
+
+        // ── release: union of old+new bounds ──
+        let mut moved = anno.clone();
+        moved.kind.translate(400.0, 300.0);
+        let union = union_rect(
+            layer_bounds(&anno, iw, ih).unwrap(),
+            layer_bounds(&moved, iw, ih).unwrap(),
+        );
+        let union = expand_for_effects(&doc, union, iw, ih, 0.5).unwrap();
+        let mut t = Vec::new();
+        for _ in 0..30 {
+            let i = Instant::now();
+            let p = prev.render_region(&doc, union, u64::MAX);
+            t.push(i.elapsed().as_secs_f64() * 1000.0);
+            let _ = p;
+        }
+        stats("release union patch (~1000x650)", &mut t);
+
+        // ── blur-overlap expansion cost ──
+        // Region overlapping a blur → grows over its footprint.
+        let blur_region = (950, 1350, 500, 400);
+        let grown = expand_for_effects(&doc, blur_region, iw, ih, 0.5);
+        eprintln!("blur-overlap expansion: {blur_region:?} → {grown:?}");
+        if let Some(g) = grown {
+            let mut t = Vec::new();
+            for _ in 0..30 {
+                let i = Instant::now();
+                let p = prev.render_region(&doc, g, u64::MAX);
+                t.push(i.elapsed().as_secs_f64() * 1000.0);
+                let _ = p;
+            }
+            stats("blur-overlap region patch", &mut t);
+        }
+
+        // ── big object: region ≈ full frame (worst case) ──
+        let mut t = Vec::new();
+        for _ in 0..10 {
+            let i = Instant::now();
+            let p = prev.render_region(&doc, (0, 0, iw, ih), u64::MAX);
+            t.push(i.elapsed().as_secs_f64() * 1000.0);
+            let _ = p;
+        }
+        stats("full-frame region (worst case)", &mut t);
+    }
+}
+
+#[cfg(test)]
+mod region_bench2 {
+    use super::bench::doc5k;
+    use super::*;
+    use std::time::Instant;
+
+    /// Which annotation dominates a region render — per-anno cost.
+    #[test]
+    #[ignore = "manual"]
+    fn per_anno_cost() {
+        let doc = doc5k();
+        let (iw, ih) = (doc.base.image.width(), doc.base.image.height());
+        let mut prev = DragPreview::new(iw, ih);
+        for (i, anno) in doc.annotations.iter().enumerate() {
+            let Some(b) = layer_bounds(anno, iw, ih) else {
+                continue;
+            };
+            let t = Instant::now();
+            let _ = prev.render_region(&doc, b, u64::MAX);
+            eprintln!(
+                "anno {i} bounds {b:?}: {:.1} ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 }
