@@ -518,6 +518,19 @@ impl Viewer {
         self.active_index().map(|i| &self.tabs[i].doc)
     }
 
+    /// An in-viewer dialog is up (rename, resize, protection,
+    /// delete-file, unsaved confirm, dup names) — synced to
+    /// `Shared::viewer_dialog_open` every pass so `modal_state()`
+    /// never locks the viewer while `show` holds it.
+    pub fn dialog_open(&self) -> bool {
+        self.confirm_close
+            || self.resize.is_some()
+            || self.rename.is_some()
+            || self.protect.is_some()
+            || self.confirm_delete.is_some()
+            || self.dup_names
+    }
+
     /// `(tab index, doc clone, anno stacks)` — opening Draw snapshots
     /// the document while its history stays on the tab until commit.
     /// A floating paste flattens first so it isn't lost by the session.
@@ -1109,6 +1122,11 @@ impl Viewer {
     /// state machine (the deferred-viewport callback cannot borrow the app).
     pub fn show(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let ctx = ui.ctx().clone();
+        // One frame of lag is fine for menu greying — the atomic keeps
+        // `modal_state()` readable while `self` is locked here.
+        shared
+            .viewer_dialog_open
+            .store(self.dialog_open(), std::sync::atomic::Ordering::Relaxed);
         if ctx.input(|i| i.viewport().close_requested()) {
             // The state machine owns this window's lifetime: always cancel
             // and let dispatch() decide whether closing is allowed.
@@ -2480,189 +2498,142 @@ impl Viewer {
         let mut apply = false;
         let mut dismiss = false;
         let t = theme::tokens(ctx);
-        let resp = egui::Modal::new(egui::Id::new("pixme-resize"))
-            .frame(
-                egui::Frame::default()
-                    .fill(t.dock)
-                    .stroke(Stroke::new(1.0, t.card_border))
-                    .corner_radius(CornerRadius::same(t.radius_lg)),
-            )
-            .show(ctx, |ui| {
-                ui.set_width(340.0);
-                ui.spacing_mut().item_spacing.y = 0.0;
-                // Title-bar band like the other modals: card tint rounded on
-                // the top corners, with the painted close cross (red on
-                // hover) instead of native chrome.
-                egui::Frame::default()
-                    .inner_margin(Margin::symmetric(12, 8))
-                    .fill(t.card)
-                    .corner_radius(CornerRadius {
-                        nw: t.radius_lg,
-                        ne: t.radius_lg,
-                        sw: 0,
-                        se: 0,
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(340.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(t!("resize.title").to_string())
-                                    .color(t.text)
-                                    .strong(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let (rect, _) =
-                                        ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                                    let resp = ui.interact(
-                                        rect,
-                                        ui.id().with("resize-close"),
-                                        Sense::click(),
-                                    );
-                                    paint_tab_close(ui, rect, resp.hovered());
-                                    if resp.clicked() {
-                                        dismiss = true;
-                                    }
-                                },
-                            );
-                        });
-                    });
-                egui::Frame::default()
-                    .inner_margin(Margin::symmetric(14, 14))
-                    .show(ui, |ui| {
-                        ui.set_width(320.0);
-                        ui.spacing_mut().item_spacing.y = 7.0;
-                        // Unit toggle: pixels or percentage of the original. Switching
-                        // converts the draft so the target size never jumps.
-                        let mut px_on = state.unit == ResizeUnit::Pixels;
-                        let mut pct_on = state.unit == ResizeUnit::Percent;
-                        ui.horizontal(|ui| {
-                            ui.label(t!("resize.unit").to_string());
-                            if ui
-                                .toggle_value(&mut px_on, t!("resize.unit_px").to_string())
-                                .clicked()
-                            {
-                                // Fields hold percentages — resolve them to pixels.
-                                if let (Ok(w), Ok(h)) = (
-                                    state.width.trim().parse::<f64>(),
-                                    state.height.trim().parse::<f64>(),
-                                ) {
-                                    state.width = (orig_w as f64 * w / 100.0).round().to_string();
-                                    state.height = (orig_h as f64 * h / 100.0).round().to_string();
-                                }
-                                state.unit = ResizeUnit::Pixels;
-                            } else if ui
-                                .toggle_value(&mut pct_on, t!("resize.unit_pct").to_string())
-                                .clicked()
-                            {
-                                if let (Ok(w), Ok(h)) = (
-                                    state.width.trim().parse::<f64>(),
-                                    state.height.trim().parse::<f64>(),
-                                ) {
-                                    state.width =
-                                        (w / orig_w.max(1) as f64 * 100.0).round().to_string();
-                                    state.height =
-                                        (h / orig_h.max(1) as f64 * 100.0).round().to_string();
-                                }
-                                state.unit = ResizeUnit::Percent;
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-resize"),
+            &t!("resize.title"),
+            340.0,
+            |ui| {
+                {
+                    // Unit toggle: pixels or percentage of the original. Switching
+                    // converts the draft so the target size never jumps.
+                    let mut px_on = state.unit == ResizeUnit::Pixels;
+                    let mut pct_on = state.unit == ResizeUnit::Percent;
+                    ui.horizontal(|ui| {
+                        ui.label(t!("resize.unit").to_string());
+                        if ui
+                            .toggle_value(&mut px_on, t!("resize.unit_px").to_string())
+                            .clicked()
+                        {
+                            // Fields hold percentages — resolve them to pixels.
+                            if let (Ok(w), Ok(h)) = (
+                                state.width.trim().parse::<f64>(),
+                                state.height.trim().parse::<f64>(),
+                            ) {
+                                state.width = (orig_w as f64 * w / 100.0).round().to_string();
+                                state.height = (orig_h as f64 * h / 100.0).round().to_string();
                             }
-                        });
-                        // Original / new dimensions with MP count, like the
-                        // functional reference's dialog — the new side follows
-                        // the fields (percentages resolve against the original).
-                        let dims = |w: f64, h: f64| format!("{w:.0}x{h:.0}  {:.2}MP", w * h / 1e6);
-                        let new_dims = match state.unit {
-                            ResizeUnit::Pixels => match (
+                            state.unit = ResizeUnit::Pixels;
+                        } else if ui
+                            .toggle_value(&mut pct_on, t!("resize.unit_pct").to_string())
+                            .clicked()
+                        {
+                            if let (Ok(w), Ok(h)) = (
                                 state.width.trim().parse::<f64>(),
                                 state.height.trim().parse::<f64>(),
                             ) {
-                                (Ok(w), Ok(h)) if w > 0.0 && h > 0.0 => dims(w, h),
-                                _ => "—".to_owned(),
-                            },
-                            ResizeUnit::Percent => match (
-                                state.width.trim().parse::<f64>(),
-                                state.height.trim().parse::<f64>(),
-                            ) {
-                                (Ok(wp), Ok(hp)) if wp > 0.0 && hp > 0.0 => {
-                                    dims(orig_w as f64 * wp / 100.0, orig_h as f64 * hp / 100.0)
-                                }
-                                _ => "—".to_owned(),
-                            },
-                        };
-                        for (key, value) in [
-                            ("resize.original", dims(orig_w as f64, orig_h as f64)),
-                            ("resize.new_dim", new_dims),
-                        ] {
-                            ui.horizontal(|ui| {
-                                ui.label(t!(key).to_string());
-                                ui.label(egui::RichText::new(value).color(t.text_dim));
-                            });
+                                state.width =
+                                    (w / orig_w.max(1) as f64 * 100.0).round().to_string();
+                                state.height =
+                                    (h / orig_h.max(1) as f64 * 100.0).round().to_string();
+                            }
+                            state.unit = ResizeUnit::Percent;
                         }
-                        ui.add_space(6.0);
-                        let ratio = orig_h as f64 / orig_w.max(1) as f64;
-                        let w_changed = ui
-                            .horizontal(|ui| {
-                                ui.label(t!("resize.width").to_string());
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut state.width)
-                                        .desired_width(80.0)
-                                        .font(theme::medium(12.0)),
-                                )
-                            })
-                            .inner
-                            .changed();
-                        let h_changed = ui
-                            .horizontal(|ui| {
-                                ui.label(t!("resize.height").to_string());
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut state.height)
-                                        .desired_width(80.0)
-                                        .font(theme::medium(12.0)),
-                                )
-                            })
-                            .inner
-                            .changed();
-                        // Editing one field rewrites the other while locked. In
-                        // percent mode the same percentage applies to both sides,
-                        // so the fields simply mirror each other.
-                        if state.keep_ratio {
-                            if state.unit == ResizeUnit::Percent {
-                                if w_changed && let Ok(w) = state.width.trim().parse::<f64>() {
-                                    state.height = w.round().to_string();
-                                } else if h_changed
-                                    && let Ok(h) = state.height.trim().parse::<f64>()
-                                {
-                                    state.width = h.round().to_string();
-                                }
-                            } else if w_changed && let Ok(w) = state.width.trim().parse::<f64>() {
-                                state.height = ((w * ratio).round() as u64).to_string();
+                    });
+                    // Original / new dimensions with MP count, like the
+                    // functional reference's dialog — the new side follows
+                    // the fields (percentages resolve against the original).
+                    let dims = |w: f64, h: f64| format!("{w:.0}x{h:.0}  {:.2}MP", w * h / 1e6);
+                    let new_dims = match state.unit {
+                        ResizeUnit::Pixels => match (
+                            state.width.trim().parse::<f64>(),
+                            state.height.trim().parse::<f64>(),
+                        ) {
+                            (Ok(w), Ok(h)) if w > 0.0 && h > 0.0 => dims(w, h),
+                            _ => "—".to_owned(),
+                        },
+                        ResizeUnit::Percent => match (
+                            state.width.trim().parse::<f64>(),
+                            state.height.trim().parse::<f64>(),
+                        ) {
+                            (Ok(wp), Ok(hp)) if wp > 0.0 && hp > 0.0 => {
+                                dims(orig_w as f64 * wp / 100.0, orig_h as f64 * hp / 100.0)
+                            }
+                            _ => "—".to_owned(),
+                        },
+                    };
+                    for (key, value) in [
+                        ("resize.original", dims(orig_w as f64, orig_h as f64)),
+                        ("resize.new_dim", new_dims),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(t!(key).to_string());
+                            ui.label(egui::RichText::new(value).color(t.text_dim));
+                        });
+                    }
+                    ui.add_space(6.0);
+                    let ratio = orig_h as f64 / orig_w.max(1) as f64;
+                    let w_changed = ui
+                        .horizontal(|ui| {
+                            ui.label(t!("resize.width").to_string());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.width)
+                                    .desired_width(80.0)
+                                    .font(theme::medium(12.0)),
+                            )
+                        })
+                        .inner
+                        .changed();
+                    let h_changed = ui
+                        .horizontal(|ui| {
+                            ui.label(t!("resize.height").to_string());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.height)
+                                    .desired_width(80.0)
+                                    .font(theme::medium(12.0)),
+                            )
+                        })
+                        .inner
+                        .changed();
+                    // Editing one field rewrites the other while locked. In
+                    // percent mode the same percentage applies to both sides,
+                    // so the fields simply mirror each other.
+                    if state.keep_ratio {
+                        if state.unit == ResizeUnit::Percent {
+                            if w_changed && let Ok(w) = state.width.trim().parse::<f64>() {
+                                state.height = w.round().to_string();
                             } else if h_changed && let Ok(h) = state.height.trim().parse::<f64>() {
-                                state.width = ((h / ratio).round() as u64).to_string();
+                                state.width = h.round().to_string();
                             }
+                        } else if w_changed && let Ok(w) = state.width.trim().parse::<f64>() {
+                            state.height = ((w * ratio).round() as u64).to_string();
+                        } else if h_changed && let Ok(h) = state.height.trim().parse::<f64>() {
+                            state.width = ((h / ratio).round() as u64).to_string();
                         }
-                        ui.checkbox(&mut state.keep_ratio, t!("resize.keep_ratio"));
-                        ui.checkbox(&mut state.anti_alias, t!("resize.antialias"));
-                        if state.invalid {
-                            ui.add_space(4.0);
-                            ui.colored_label(t.danger, t!("resize.invalid"));
-                        }
-                        ui.add_space(10.0);
-                        // Right-aligned pair: Cancel rightmost, Apply to its left.
-                        ui.horizontal(|ui| {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
-                                    dismiss = true;
-                                }
-                                if widgets::primary_button(ui, &t!("resize.apply")).clicked() {
-                                    apply = true;
-                                }
-                            });
+                    }
+                    ui.checkbox(&mut state.keep_ratio, t!("resize.keep_ratio"));
+                    ui.checkbox(&mut state.anti_alias, t!("resize.antialias"));
+                    if state.invalid {
+                        ui.add_space(4.0);
+                        ui.colored_label(t.danger, t!("resize.invalid"));
+                    }
+                    ui.add_space(10.0);
+                    // Primary drawn first → far right; [Annuler][Appliquer].
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if widgets::primary_button(ui, &t!("resize.apply")).clicked() {
+                                apply = true;
+                            }
+                            if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                                dismiss = true;
+                            }
                         });
                     });
-            });
-        // Backdrop click or Escape = Cancel.
-        if resp.should_close() {
+                }
+            },
+        );
+        // Backdrop click, Escape or the painted cross = Cancel.
+        if resp.should_close() || resp.inner.0 {
             dismiss = true;
         }
         let mut applied = false;
@@ -2720,88 +2691,80 @@ impl Viewer {
             .active_index()
             .map(|i| self.tabs.len().saturating_sub(i + 1))
             .unwrap_or(0);
-        let resp = egui::Modal::new(egui::Id::new("pixme-rename")).show(ctx, |ui| {
-            ui.set_width(300.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(t!("dialog.rename.title").to_string())
-                        .font(theme::semibold(14.0)),
-                );
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-rename"),
+            &t!("dialog.rename.title"),
+            340.0,
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t!("dialog.rename.label").to_string());
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut state.draft)
+                            .desired_width(200.0)
+                            .font(theme::medium(12.0)),
+                    );
+                    // Focus once on open — every frame would steal it back
+                    // from the follow field.
+                    if !state.focused {
+                        field.request_focus();
+                        state.focused = true;
+                    }
+                    // Enter applies, like the Rename button.
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                });
+                // Optional batch rename: the current tab plus the next
+                // `follow` tabs become `{name} - 1`, ` - 2`… in the current
+                // order. Digits-only field, clamped on use; disabled when
+                // the active tab is already last.
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(t!("dialog.rename.follow").to_string());
+                    ui.add_enabled(
+                        max_follow > 0,
+                        egui::DragValue::new(&mut state.follow)
+                            .range(0..=max_follow)
+                            .speed(1.0),
+                    );
+                });
+                let follow = state.follow.min(max_follow);
+                if follow > 0 {
+                    let base = state.draft.trim();
+                    let mut names: Vec<String> = (1..=(follow + 1).min(4))
+                        .map(|k| format!("{base} - {k}"))
+                        .collect();
+                    if follow + 1 > 4 {
+                        names.push("…".to_owned());
+                    }
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            t!("dialog.rename.preview"),
+                            names.join(", ")
+                        ))
+                        .color(t.text_dim)
+                        .font(theme::medium(10.5)),
+                    );
+                }
+                if state.taken {
+                    ui.add_space(4.0);
+                    ui.colored_label(t.danger, t!("dialog.rename.empty").to_string());
+                }
+                ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if dialog_close(ui) {
+                    if widgets::primary_button(ui, &t!("dialog.rename.ok")).clicked() {
+                        apply = true;
+                    }
+                    if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
                         cancel = true;
                     }
                 });
-            });
-            widgets::hairline(ui);
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(t!("dialog.rename.label").to_string());
-                let field = ui.add(
-                    egui::TextEdit::singleline(&mut state.draft)
-                        .desired_width(200.0)
-                        .font(theme::medium(12.0)),
-                );
-                // Focus once on open — every frame would steal it back
-                // from the follow field.
-                if !state.focused {
-                    field.request_focus();
-                    state.focused = true;
-                }
-                // Enter applies, like the Rename button.
-                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    apply = true;
-                }
-            });
-            // Optional batch rename: the current tab plus the next
-            // `follow` tabs become `{name} - 1`, ` - 2`… in the current
-            // order. Digits-only field, clamped on use; disabled when
-            // the active tab is already last.
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(t!("dialog.rename.follow").to_string());
-                ui.add_enabled(
-                    max_follow > 0,
-                    egui::DragValue::new(&mut state.follow)
-                        .range(0..=max_follow)
-                        .speed(1.0),
-                );
-            });
-            let follow = state.follow.min(max_follow);
-            if follow > 0 {
-                let base = state.draft.trim();
-                let mut names: Vec<String> = (1..=(follow + 1).min(4))
-                    .map(|k| format!("{base} - {k}"))
-                    .collect();
-                if follow + 1 > 4 {
-                    names.push("…".to_owned());
-                }
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} {}",
-                        t!("dialog.rename.preview"),
-                        names.join(", ")
-                    ))
-                    .color(t.text_dim)
-                    .font(theme::medium(10.5)),
-                );
-            }
-            if state.taken {
-                ui.add_space(4.0);
-                ui.colored_label(t.danger, t!("dialog.rename.empty").to_string());
-            }
-            ui.add_space(10.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
-                    cancel = true;
-                }
-                if widgets::primary_button(ui, &t!("dialog.rename.ok")).clicked() {
-                    apply = true;
-                }
-            });
-        });
-        if resp.should_close() {
+            },
+        );
+        if resp.should_close() || resp.inner.0 {
             cancel = true;
         }
         if apply {
@@ -2829,17 +2792,24 @@ impl Viewer {
         if !self.dup_names {
             return;
         }
-        egui::Window::new(t!("dialog.dup_names.title").to_string())
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-dup-names"),
+            &t!("dialog.dup_names.title"),
+            340.0,
+            |ui| {
                 ui.label(t!("dialog.dup_names.body").to_string());
                 ui.add_space(8.0);
-                if ui.button(t!("draw.ok").to_string()).clicked() {
-                    self.dup_names = false;
-                }
-            });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::primary_button(ui, &t!("draw.ok")).clicked() {
+                        self.dup_names = false;
+                    }
+                });
+            },
+        );
+        if resp.should_close() || resp.inner.0 {
+            self.dup_names = false;
+        }
     }
 
     /// The Protection… dialog — the context menu's only entry to the
@@ -2857,49 +2827,44 @@ impl Viewer {
         let already = tab.doc.meta.is_protected();
         let mut apply = false;
         let mut cancel = false;
-        let resp = egui::Modal::new(egui::Id::new("pixme-protect")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.label(
-                egui::RichText::new(t!("protect.title").to_string()).font(theme::semibold(14.0)),
-            );
-            widgets::hairline(ui);
-            ui.add_space(6.0);
-            let field = |ui: &mut egui::Ui, key: &str, buf: &mut String| {
-                ui.horizontal(|ui| {
-                    ui.label(t!(key).to_string());
-                    ui.add(
-                        egui::TextEdit::singleline(buf)
-                            .password(true)
-                            .desired_width(160.0)
-                            .font(theme::medium(12.0)),
-                    );
-                });
-            };
-            if already {
-                field(ui, "protect.current", &mut state.current);
-            }
-            field(ui, "protect.new", &mut state.new);
-            field(ui, "protect.confirm", &mut state.confirm);
-            if already {
-                ui.add_space(4.0);
-                ui.colored_label(t.text_dim, t!("protect.hint_remove").to_string());
-            }
-            match state.error {
-                Some(ProtectError::Current) => {
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-protect"),
+            &t!("protect.title"),
+            340.0,
+            |ui| {
+                let field = |ui: &mut egui::Ui, key: &str, buf: &mut String| {
+                    ui.horizontal(|ui| {
+                        ui.label(t!(key).to_string());
+                        ui.add(
+                            egui::TextEdit::singleline(buf)
+                                .password(true)
+                                .desired_width(160.0)
+                                .font(theme::medium(12.0)),
+                        );
+                    });
+                };
+                if already {
+                    field(ui, "protect.current", &mut state.current);
+                }
+                field(ui, "protect.new", &mut state.new);
+                field(ui, "protect.confirm", &mut state.confirm);
+                if already {
                     ui.add_space(4.0);
-                    ui.colored_label(t.danger, t!("protect.wrong_current").to_string());
+                    ui.colored_label(t.text_dim, t!("protect.hint_remove").to_string());
                 }
-                Some(ProtectError::Mismatch) => {
-                    ui.add_space(4.0);
-                    ui.colored_label(t.danger, t!("protect.mismatch").to_string());
+                match state.error {
+                    Some(ProtectError::Current) => {
+                        ui.add_space(4.0);
+                        ui.colored_label(t.danger, t!("protect.wrong_current").to_string());
+                    }
+                    Some(ProtectError::Mismatch) => {
+                        ui.add_space(4.0);
+                        ui.colored_label(t.danger, t!("protect.mismatch").to_string());
+                    }
+                    None => {}
                 }
-                None => {}
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
-                    cancel = true;
-                }
+                ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // Nothing to apply while an unprotected tab has an
                     // empty new password.
@@ -2908,10 +2873,13 @@ impl Viewer {
                             apply = true;
                         }
                     });
+                    if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                        cancel = true;
+                    }
                 });
-            });
-        });
-        if resp.should_close() {
+            },
+        );
+        if resp.should_close() || resp.inner.0 {
             cancel = true;
         }
         if apply {
@@ -2958,32 +2926,29 @@ impl Viewer {
             .unwrap_or_default();
         let mut confirm = false;
         let mut cancel = false;
-        let resp = egui::Modal::new(egui::Id::new("pixme-delete-file")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.label(
-                egui::RichText::new(t!("dialog.delete_file.title").to_string())
-                    .font(theme::semibold(14.0)),
-            );
-            widgets::hairline(ui);
-            ui.add_space(4.0);
-            ui.label(t!("dialog.delete_file.body", name = name.as_str()).to_string());
-            if let Some(err) = &state.error {
-                ui.add_space(4.0);
-                ui.colored_label(t.danger, err.clone());
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
-                    cancel = true;
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-delete-file"),
+            &t!("dialog.delete_file.title"),
+            340.0,
+            |ui| {
+                ui.label(t!("dialog.delete_file.body", name = name.as_str()).to_string());
+                if let Some(err) = &state.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(t.danger, err.clone());
                 }
+                ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::primary_button(ui, &t!("dialog.delete_file.confirm")).clicked() {
                         confirm = true;
                     }
+                    if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                        cancel = true;
+                    }
                 });
-            });
-        });
-        if resp.should_close() {
+            },
+        );
+        if resp.should_close() || resp.inner.0 {
             cancel = true;
         }
         if confirm {
@@ -3005,32 +2970,33 @@ impl Viewer {
         if !self.confirm_close {
             return;
         }
-        let resp = egui::Modal::new(egui::Id::new("pixme-confirm")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.label(
-                egui::RichText::new(t!("dialog.unsaved.title").to_string())
-                    .font(theme::semibold(14.0)),
-            );
-            widgets::hairline(ui);
-            ui.add_space(4.0);
-            ui.label(t!("dialog.unsaved.body").to_string());
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if widgets::primary_button(ui, &t!("dialog.unsaved.save")).clicked() {
-                    shared.push(Command::ConfirmSave);
-                }
-                if widgets::secondary_button(ui, &t!("dialog.unsaved.discard")).clicked() {
-                    shared.push(Command::ConfirmDiscard);
-                }
-                if widgets::secondary_button(ui, &t!("dialog.unsaved.cancel")).clicked() {
-                    shared.push(Command::ConfirmCancel);
-                }
-            });
-        });
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-confirm"),
+            &t!("dialog.unsaved.title"),
+            340.0,
+            |ui| {
+                ui.label(t!("dialog.unsaved.body").to_string());
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Primary at far right: [Jeter]  [Annuler][Enregistrer].
+                    if widgets::primary_button(ui, &t!("dialog.unsaved.save")).clicked() {
+                        shared.push(Command::ConfirmSave);
+                    }
+                    if widgets::secondary_button(ui, &t!("dialog.unsaved.cancel")).clicked() {
+                        shared.push(Command::ConfirmCancel);
+                    }
+                    ui.add_space(12.0);
+                    if widgets::secondary_button(ui, &t!("dialog.unsaved.discard")).clicked() {
+                        shared.push(Command::ConfirmDiscard);
+                    }
+                });
+            },
+        );
         // A backdrop click is ambiguous here — only explicit buttons
-        // resolve the save/discard/cancel choice, so Esc/backdrop maps
-        // to Cancel.
-        if resp.should_close() {
+        // resolve the save/discard/cancel choice, so Esc/backdrop/cross
+        // maps to Cancel.
+        if resp.should_close() || resp.inner.0 {
             shared.push(Command::ConfirmCancel);
         }
     }

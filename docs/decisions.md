@@ -963,3 +963,36 @@ Format: date — context — decision — consequences.
   sub-millisecond; a content rewrite keeps the window up with a
   spinner instead of freezing silently. Tests cover the unchanged-skip
   and the threaded path (`drain_quit`/`drain_restore` helpers).
+
+## 2026-10-28 — One modal chrome for every in-app dialog
+
+- **Context**: in-app dialogs had drifted apart: the Redimensionner
+  dialog used a card-tinted title band with a painted close cross,
+  others had a plain title + hairline, the dup-names notice still used
+  the native `egui::Window` chrome, and button rows mixed left-aligned
+  and split layouts. Menu commands also stayed live behind in-viewer
+  dialogs (only top-level modal surfaces were gated).
+- **Decision**:
+  - New shared chrome in `src/ui/widgets/modal.rs`: `modal_frame`
+    (`egui::Modal` + dock fill + card border + `radius_lg` + card title
+    band with the red-hover painted cross, 14 px body margin),
+    `close_cross`, `modal_buttons`. The cross click is reported via
+    `ModalResponse.inner.0`; backdrop click and Escape still go through
+    `should_close()`.
+  - The 7 in-app dialogs are all converted: resize, rename, protection,
+    delete-file, unsaved confirm, dup names (dropped `egui::Window`),
+    and the Draw editor's quit warning. Every action row is
+    right-aligned with the PRIMARY (blue) button at the far right;
+    destructive answers (Jeter/Ignorer) sit leftmost of the group.
+  - `ModalState::ViewerDialog` greys menus behind in-viewer dialogs.
+    `modal_state()` must not lock the viewer (viewer.show calls it
+    while holding the lock — would self-deadlock), so the flag lives
+    in `Shared::viewer_dialog_open` (atomic), synced every viewer pass
+    from `Viewer::dialog_open()` (one frame of lag for menu greying is
+    acceptable). Unlock/pin screens are not dialogs and stay exempt.
+- **Consequences**: identical header band, colour, red close cross and
+  `[Annuler][OK]` ordering in every modal; OS menus, tray menu, egui
+  menu strip and dispatch all block behind any of the 7 dialogs
+  (confirmation answers and Quit stay live, matching the existing
+  rulings). The modal-command table test gained the ViewerDialog
+  column (same expectations as SaveDialog).

@@ -183,17 +183,15 @@ pub fn show(ui: &mut Ui, state: &mut SaveDialog) -> Outcome {
             }
 
             ui.add_space(12.0);
-            ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(!taken, |ui| {
+                    if widgets::primary_button(ui, &t!("save.confirm")).clicked() {
+                        outcome = Outcome::Confirm;
+                    }
+                });
                 if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
                     outcome = Outcome::Cancel;
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_enabled_ui(!taken, |ui| {
-                        if widgets::primary_button(ui, &t!("save.confirm")).clicked() {
-                            outcome = Outcome::Confirm;
-                        }
-                    });
-                });
             });
         });
 

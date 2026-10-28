@@ -66,16 +66,16 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
         let template_ok = lock(&shared.settings_draft)
             .as_ref()
             .is_some_and(|d| !d.filename_template.trim().is_empty());
-        // right_to_left draws rightmost-first: Annuler first → visual
-        // order [OK][Annuler], OK primary like every other dialog.
-        if widgets::secondary_button(ui, &t!("draw.cancel")).clicked() {
-            discard(shared);
-        }
+        // right_to_left draws rightmost-first: OK first → visual order
+        // [Annuler][OK], the primary rightmost like every other dialog.
         ui.add_enabled_ui(template_ok, |ui| {
             if widgets::primary_button(ui, &t!("draw.ok")).clicked() {
                 apply(ui.ctx(), shared);
             }
         });
+        if widgets::secondary_button(ui, &t!("draw.cancel")).clicked() {
+            discard(shared);
+        }
     });
     retention_confirm(ui.ctx(), shared);
 }

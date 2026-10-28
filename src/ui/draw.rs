@@ -624,26 +624,28 @@ impl DrawSession {
         if !self.confirm_quit {
             return;
         }
-        let resp = egui::Modal::new(egui::Id::new("pixme-draw-quit")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.label(
-                egui::RichText::new(t!("draw.quit.title").to_string()).font(theme::semibold(14.0)),
-            );
-            widgets::hairline(ui);
-            ui.add_space(4.0);
-            ui.label(t!("draw.quit.body").to_string());
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if widgets::primary_button(ui, &t!("draw.quit.stay")).clicked() {
-                    self.confirm_quit = false;
-                }
-                if widgets::secondary_button(ui, &t!("draw.quit.discard")).clicked() {
-                    self.confirm_quit = false;
-                    self.outcome = Some(Outcome::Cancel);
-                }
-            });
-        });
-        if resp.should_close() {
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-draw-quit"),
+            &t!("draw.quit.title"),
+            340.0,
+            |ui| {
+                ui.label(t!("draw.quit.body").to_string());
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Stay is the safe action — primary at far right;
+                    // [Jeter][Continuer].
+                    if widgets::primary_button(ui, &t!("draw.quit.stay")).clicked() {
+                        self.confirm_quit = false;
+                    }
+                    if widgets::secondary_button(ui, &t!("draw.quit.discard")).clicked() {
+                        self.confirm_quit = false;
+                        self.outcome = Some(Outcome::Cancel);
+                    }
+                });
+            },
+        );
+        if resp.should_close() || resp.inner.0 {
             self.confirm_quit = false;
         }
     }
@@ -2836,12 +2838,12 @@ impl DrawSession {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
-                    if widgets::secondary_button(ui, &t!("draw.cancel")).clicked() {
-                        self.request_cancel();
-                    }
                     if widgets::primary_button(ui, &t!("draw.ok")).clicked() {
                         self.close_text_panel();
                         self.outcome = Some(Outcome::Ok);
+                    }
+                    if widgets::secondary_button(ui, &t!("draw.cancel")).clicked() {
+                        self.request_cancel();
                     }
                 });
             });

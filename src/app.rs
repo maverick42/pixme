@@ -144,6 +144,9 @@ pub enum ModalState {
     SaveDialog,
     /// The Draw (Dessiner) editor window.
     Draw,
+    /// A dialog living inside the viewer window (rename, resize,
+    /// protection, delete-file, unsaved confirmation, dup names).
+    ViewerDialog,
     /// The quit-time session save is writing on a worker — the UI is
     /// frozen behind the saving veil until the app actually closes.
     Saving,
@@ -305,6 +308,11 @@ pub struct Shared {
     /// Last modal state pushed to the OS menus — diffs drive the
     /// enable/disable sync so menu greying tracks every transition.
     last_modal: Mutex<ModalState>,
+    /// An in-viewer dialog (rename, resize, protection, delete-file,
+    /// unsaved confirm, dup names) is up — synced every viewer pass so
+    /// `modal_state()` never locks the viewer while `viewer.show` holds
+    /// it (and would self-deadlock).
+    pub viewer_dialog_open: AtomicBool,
 }
 
 /// A running background save-all: the moved tabs come back over `rx`,
@@ -350,6 +358,8 @@ impl Shared {
             ModalState::SaveDialog
         } else if self.settings_open.load(Ordering::Relaxed) {
             ModalState::Settings
+        } else if self.viewer_dialog_open.load(Ordering::Relaxed) {
+            ModalState::ViewerDialog
         } else {
             ModalState::None
         }
@@ -1306,6 +1316,7 @@ impl PixMeApp {
                 state: Mutex::new(AppState::Idle),
                 last_language: Mutex::new(settings.language),
                 last_modal: Mutex::new(ModalState::None),
+                viewer_dialog_open: AtomicBool::new(false),
                 settings: Mutex::new(settings),
                 viewer: Mutex::new(Viewer::default()),
                 toolbar: Mutex::new(Toolbar::default()),
@@ -1794,6 +1805,7 @@ mod tests {
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
             last_modal: Mutex::new(ModalState::None),
+            viewer_dialog_open: AtomicBool::new(false),
         };
         (shared, egui::Context::default())
     }
@@ -2127,39 +2139,51 @@ mod tests {
     /// — one row per variant of `all_commands()`.
     #[test]
     fn modal_command_table() {
-        // (Command, Settings?, SaveDialog?, Draw?)
-        let table: &[(Command, bool, bool, bool)] = &[
-            (Command::Capture(CaptureMode::Region), false, false, false),
-            (Command::CaptureNow(CaptureMode::Pin), false, false, false),
-            (Command::ConfirmCapture, true, true, true),
-            (Command::CancelCapture, true, true, true),
-            (Command::ShowBar, false, false, false),
-            (Command::OpenViewer, true, false, false),
-            (Command::CloseBar, true, true, true),
-            (Command::ViewerClosed, true, true, true),
-            (Command::OpenSettings, true, false, false),
-            (Command::CloseSettings, true, true, true),
-            (Command::Quit, true, true, true),
-            (Command::ImportClipboard, false, false, false),
-            (Command::OpenFile, false, false, false),
-            (Command::OpenLastDir, false, false, false),
-            (Command::NewDocument, false, false, false),
-            (Command::SaveActive, false, false, false),
-            (Command::SaveAll, false, false, false),
-            (Command::RenameActive, false, false, false),
-            (Command::CopyActive, false, false, true),
-            (Command::OpenDraw, false, false, false),
-            (Command::UndoActive, false, false, true),
-            (Command::RedoActive, false, false, true),
-            (Command::PrintActive, false, false, false),
-            (Command::ConfirmSave, true, true, true),
-            (Command::ConfirmDiscard, true, true, true),
-            (Command::ConfirmCancel, true, true, true),
-            (Command::ClosePin(1), true, true, true),
-            (Command::CopyPin(1), true, true, true),
-            (Command::SavePin(1), false, false, false),
+        // (Command, Settings?, SaveDialog?, ViewerDialog?, Draw?)
+        let table: &[(Command, bool, bool, bool, bool)] = &[
+            (
+                Command::Capture(CaptureMode::Region),
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                Command::CaptureNow(CaptureMode::Pin),
+                false,
+                false,
+                false,
+                false,
+            ),
+            (Command::ConfirmCapture, true, true, true, true),
+            (Command::CancelCapture, true, true, true, true),
+            (Command::ShowBar, false, false, false, false),
+            (Command::OpenViewer, true, false, false, false),
+            (Command::CloseBar, true, true, true, true),
+            (Command::ViewerClosed, true, true, true, true),
+            (Command::OpenSettings, true, false, false, false),
+            (Command::CloseSettings, true, true, true, true),
+            (Command::Quit, true, true, true, true),
+            (Command::ImportClipboard, false, false, false, false),
+            (Command::OpenFile, false, false, false, false),
+            (Command::OpenLastDir, false, false, false, false),
+            (Command::NewDocument, false, false, false, false),
+            (Command::SaveActive, false, false, false, false),
+            (Command::SaveAll, false, false, false, false),
+            (Command::RenameActive, false, false, false, false),
+            (Command::CopyActive, false, false, false, true),
+            (Command::OpenDraw, false, false, false, false),
+            (Command::UndoActive, false, false, false, true),
+            (Command::RedoActive, false, false, false, true),
+            (Command::PrintActive, false, false, false, false),
+            (Command::ConfirmSave, true, true, true, true),
+            (Command::ConfirmDiscard, true, true, true, true),
+            (Command::ConfirmCancel, true, true, true, true),
+            (Command::ClosePin(1), true, true, true, true),
+            (Command::CopyPin(1), true, true, true, true),
+            (Command::SavePin(1), false, false, false, false),
         ];
-        for (command, settings, save_dialog, draw) in table {
+        for (command, settings, save_dialog, viewer_dialog, draw) in table {
             assert_eq!(
                 is_command_enabled(command, ModalState::Settings),
                 *settings,
@@ -2169,6 +2193,11 @@ mod tests {
                 is_command_enabled(command, ModalState::SaveDialog),
                 *save_dialog,
                 "SaveDialog: {command:?}"
+            );
+            assert_eq!(
+                is_command_enabled(command, ModalState::ViewerDialog),
+                *viewer_dialog,
+                "ViewerDialog: {command:?}"
             );
             assert_eq!(
                 is_command_enabled(command, ModalState::Draw),
