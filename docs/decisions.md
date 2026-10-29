@@ -1147,12 +1147,15 @@ Format: date — context — decision — consequences.
   iteratively until it covers every overlapping effect's full
   footprint; >50 % of the image → full-render fallback.
 - **Measurements (release, 5K×16 annos)** — before → after:
-  per-frame 330 ms → ~6 ms (preview patch); drag-start 330 ms →
-  ~6–70 ms; release 330 ms → ~10–145 ms; Esc 330 ms → ~10–145 ms.
-  **Caveat**: region cost is CONTENT-driven — a bezier `Line` costs
-  ~70 ms to rasterize (≈270 ns/px; the 4 bench lines are ~280 ms of
-  the 310 ms full render). Any region intersecting a curve pays that;
-  pure-shape regions run 2–10 ms.
+  per-frame 330 ms → ~5 ms (preview patch, 0 ms when stationary via
+  `preview_dirty`); drag-start 330 ms → ~3–17 ms; release 330 ms →
+  ~6–22 ms; Esc 330 ms → ~3–17 ms; full `render_to_image` 310 ms →
+  ~66 ms.
+  **Bézier `Line` optimization**: `draw_line_obj` uses 1-Lipschitz 8×8
+  tile SDF culling (`tile_reach`) to skip empty tiles in one check and
+  filter active tiles down to their 1–3 local curve segments —
+  bit-identical at tolerance 0, cutting per-line rasterization from
+  ~70 ms to ~3–6 ms.
 - **Next unit**: per-annotation cached layers (painted patch + bounds,
   keyed by annotation revision) — region and full renders then become
   bounded composites of cached layers; also fixes commit-time

@@ -276,20 +276,17 @@ impl DragPreview {
         let (bx, by, bw, bh) = layer_bounds(anno, self.layer.width(), self.layer.height())?;
         self.clear_dirty();
         let (shadow, opacity) = object_layer(&mut self.layer, anno);
+        self.dirty = Some((bx, by, bw, bh));
         // Same shadow composite as render_one's tail — the dark-tinted
-        // crop shifted inside the layer itself.
+        // crop lands UNDER the object inside the returned patch.
         if shadow > 0.0 {
-            let dark = tint_alpha(
-                &image::imageops::crop_imm(&self.layer, bx, by, bw, bh).to_image(),
-                Rgba([0, 0, 0, 90]),
-            );
-            composite(
-                &mut self.layer,
-                &dark,
-                bx as i64 + shadow as i64,
-                by as i64 + shadow as i64,
-                1.0,
-            );
+            let mut patch = RgbaImage::new(bw, bh);
+            let s = shadow as i64;
+            let body = image::imageops::crop_imm(&self.layer, bx, by, bw, bh).to_image();
+            let dark = tint_alpha(&body, Rgba([0, 0, 0, 90]));
+            composite(&mut patch, &dark, s, s, 1.0);
+            composite(&mut patch, &body, 0, 0, opacity);
+            return Some((patch, bx, by));
         }
         // Opacity folds into the patch's alpha (the compositing
         // destination IS the patch — nothing below it).
@@ -300,14 +297,7 @@ impl DragPreview {
                 }
             }
         }
-        let mut patch = RgbaImage::new(bw, bh);
-        image::imageops::overlay(
-            &mut patch,
-            &image::imageops::crop_imm(&self.layer, bx, by, bw, bh).to_image(),
-            0,
-            0,
-        );
-        self.dirty = Some((bx, by, bw, bh));
+        let patch = image::imageops::crop_imm(&self.layer, bx, by, bw, bh).to_image();
         Some((patch, bx, by))
     }
 
@@ -458,12 +448,18 @@ pub(crate) fn intersect(
     (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
 }
 
-/// `(x, y, w, h)` union of two rects (either may be empty — a 0-size
-/// side contributes its origin only).
+/// `(x, y, w, h)` union of two rects (an empty `0`-width or `0`-height
+/// rect is ignored so `(0, 0, 0, 0)` sentinels never pull the origin).
 pub(crate) fn union_rect(
     (ax, ay, aw, ah): (u32, u32, u32, u32),
     (bx, by, bw, bh): (u32, u32, u32, u32),
 ) -> (u32, u32, u32, u32) {
+    if aw == 0 || ah == 0 {
+        return (bx, by, bw, bh);
+    }
+    if bw == 0 || bh == 0 {
+        return (ax, ay, aw, ah);
+    }
     let (x0, y0) = (ax.min(bx), ay.min(by));
     let (x1, y1) = ((ax + aw).max(bx + bw), (ay + ah).max(by + bh));
     (x0, y0, x1 - x0, y1 - y0)
@@ -554,7 +550,7 @@ pub(crate) fn layer_bounds(anno: &Annotation, iw: u32, ih: u32) -> Option<(u32, 
         AnnotationKind::Rect(o) => o.stroke_w * 0.5 + o.outline + o.shadow,
         AnnotationKind::Ellipse(o) => o.stroke_w * 0.5 + o.outline + o.shadow,
         AnnotationKind::Line(o) => o.shadow,
-        AnnotationKind::Freehand(o) => o.width + o.outline + o.shadow,
+        AnnotationKind::Freehand(o) => o.width + o.outline + o.shadow + 2.0,
         AnnotationKind::HighlightArea(_) => 0.0,
         AnnotationKind::Text(o) => {
             // Glyphs wider than the baseline spill past `b` (the
@@ -1305,16 +1301,6 @@ fn draw_line_obj(img: &mut RgbaImage, o: &super::document::LineObj) {
         }
     };
 
-    let shape_sdf = |p: Pos2| -> f32 {
-        let mut d = f32::INFINITY;
-        for &(a, b) in &segs {
-            d = d.min(pt_seg_dist(p, a, b) - hw);
-        }
-        d = d.min(end_sdf(p, pa, o.start, va.as_ref()));
-        d = d.min(end_sdf(p, pb, o.end, vb.as_ref()));
-        d
-    };
-
     // Bounding box of the curve + heads + outline + shadow.
     let mut x0f = pa.x.min(pb.x);
     let mut y0f = pa.y.min(pb.y);
@@ -1334,46 +1320,92 @@ fn draw_line_obj(img: &mut RgbaImage, o: &super::document::LineObj) {
     let x1 = (x1f.ceil() as i32 + pad).min(iw - 1);
     let y1 = (y1f.ceil() as i32 + pad).min(ih - 1);
 
+    // 8×8 tile SDF culling: every component of `shape_sdf` is 1-Lipschitz
+    // (`|sdf(p) - sdf(c)| <= ||p - c||`). From an 8×8 tile centre `c`, any
+    // pixel `p` lies within `sqrt(3.5² + 3.5²) ≈ 4.95 px` and any shadow
+    // sample `p - (1.2, 2.0)` within `sqrt(4.7² + 5.5²) ≈ 7.24 px`. Any
+    // segment or end-cap whose distance at `c` exceeds `tile_reach` is
+    // guaranteed outside the AA/shadow band (`out_px + 0.5` / `out_px + 4.4`)
+    // at every pixel of the tile — skipping empty tiles in 1 check and
+    // narrowing active tiles to the 1–3 local segments (bit-identical).
+    let tile_reach = out_px + if o.shadow > 0.0 { 12.0 } else { 6.0 };
+    let mut near_segs: Vec<(Pos2, Pos2)> = Vec::with_capacity(segs.len());
     let (fc, rc) = (o.color, o.outline_color);
-    for py in y0..=y1 {
-        for px in x0..=x1 {
-            let p = Pos2::new(px as f32, py as f32);
-            let din = shape_sdf(p);
-            let dout = din - out_px;
-            let cov_out = (0.5 - dout).clamp(0.0, 1.0);
-
-            let sh_a = if o.shadow > 0.0 && cov_out < 1.0 {
-                let dsh = shape_sdf(Pos2::new(p.x - 1.2, p.y - 2.0)) - out_px;
-                let t = (1.0 - (dsh + 0.8) / 5.2).clamp(0.0, 1.0);
-                t * t * (3.0 - 2.0 * t) * 0.42
-            } else {
-                0.0
-            };
-
-            let total_a = cov_out + sh_a * (1.0 - cov_out);
-            if total_a <= 1.0 / 255.0 {
+    let mut ty0 = y0;
+    while ty0 <= y1 {
+        let ty1 = (ty0 + 7).min(y1);
+        let mut tx0 = x0;
+        while tx0 <= x1 {
+            let tx1 = (tx0 + 7).min(x1);
+            let c = Pos2::new((tx0 + tx1) as f32 * 0.5, (ty0 + ty1) as f32 * 0.5);
+            near_segs.clear();
+            for &(a, b) in &segs {
+                if pt_seg_dist(c, a, b) - hw <= tile_reach {
+                    near_segs.push((a, b));
+                }
+            }
+            let near_start = end_sdf(c, pa, o.start, va.as_ref()) <= tile_reach;
+            let near_end = end_sdf(c, pb, o.end, vb.as_ref()) <= tile_reach;
+            if near_segs.is_empty() && !near_start && !near_end {
+                tx0 += 8;
                 continue;
             }
+            let tile_sdf = |p: Pos2| -> f32 {
+                let mut d = f32::INFINITY;
+                for &(a, b) in &near_segs {
+                    d = d.min(pt_seg_dist(p, a, b) - hw);
+                }
+                if near_start {
+                    d = d.min(end_sdf(p, pa, o.start, va.as_ref()));
+                }
+                if near_end {
+                    d = d.min(end_sdf(p, pb, o.end, vb.as_ref()));
+                }
+                d
+            };
+            for py in ty0..=ty1 {
+                for px in tx0..=tx1 {
+                    let p = Pos2::new(px as f32, py as f32);
+                    let din = tile_sdf(p);
+                    let dout = din - out_px;
+                    let cov_out = (0.5 - dout).clamp(0.0, 1.0);
 
-            let (mut br, mut bg_c, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
-            if cov_out > 0.0 {
-                let cov_in = if out_px > 0.0 {
-                    (0.5 - din).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                br = f32::from(rc.r()) * (1.0 - cov_in) + f32::from(fc.r()) * cov_in;
-                bg_c = f32::from(rc.g()) * (1.0 - cov_in) + f32::from(fc.g()) * cov_in;
-                bb = f32::from(rc.b()) * (1.0 - cov_in) + f32::from(fc.b()) * cov_in;
+                    let sh_a = if o.shadow > 0.0 && cov_out < 1.0 {
+                        let dsh = tile_sdf(Pos2::new(p.x - 1.2, p.y - 2.0)) - out_px;
+                        let t = (1.0 - (dsh + 0.8) / 5.2).clamp(0.0, 1.0);
+                        t * t * (3.0 - 2.0 * t) * 0.42
+                    } else {
+                        0.0
+                    };
+
+                    let total_a = cov_out + sh_a * (1.0 - cov_out);
+                    if total_a <= 1.0 / 255.0 {
+                        continue;
+                    }
+
+                    let (mut br, mut bg_c, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
+                    if cov_out > 0.0 {
+                        let cov_in = if out_px > 0.0 {
+                            (0.5 - din).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        br = f32::from(rc.r()) * (1.0 - cov_in) + f32::from(fc.r()) * cov_in;
+                        bg_c = f32::from(rc.g()) * (1.0 - cov_in) + f32::from(fc.g()) * cov_in;
+                        bb = f32::from(rc.b()) * (1.0 - cov_in) + f32::from(fc.b()) * cov_in;
+                    }
+
+                    let w_body = cov_out / total_a;
+                    let out_r = (br * w_body).round().clamp(0.0, 255.0) as u8;
+                    let out_g = (bg_c * w_body).round().clamp(0.0, 255.0) as u8;
+                    let out_b = (bb * w_body).round().clamp(0.0, 255.0) as u8;
+                    let out_a = (total_a * 255.0).round().clamp(0.0, 255.0) as u8;
+                    img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
+                }
             }
-
-            let w_body = cov_out / total_a;
-            let out_r = (br * w_body).round().clamp(0.0, 255.0) as u8;
-            let out_g = (bg_c * w_body).round().clamp(0.0, 255.0) as u8;
-            let out_b = (bb * w_body).round().clamp(0.0, 255.0) as u8;
-            let out_a = (total_a * 255.0).round().clamp(0.0, 255.0) as u8;
-            img.put_pixel(px as u32, py as u32, Rgba([out_r, out_g, out_b, out_a]));
+            tx0 += 8;
         }
+        ty0 += 8;
     }
 }
 

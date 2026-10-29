@@ -419,14 +419,18 @@ pub struct DrawSession {
     region_scratch: Option<render::DragPreview>,
     /// Texture carrying the per-frame live-drag preview patch.
     preview_tex: Option<TextureHandle>,
+    /// `(origin_x, origin_y, width, height)` of the last uploaded
+    /// [`Self::preview_tex`] patch — reused without re-rasterizing or
+    /// re-uploading when `live` has not moved since the last frame.
+    preview_patch: Option<(u32, u32, u32, u32)>,
+    /// Whether `live` mutated since [`Self::preview_tex`] was last updated.
+    preview_dirty: bool,
     /// The region currently excluded from the canvas texture by a
     /// live drag (patched back on release or Esc).
     drag_region: Option<(u32, u32, u32, u32)>,
     /// Active emoji-section tab in the bottom bar (index into
     /// [`crate::editor::emoji::sections`]).
     emoji_section: usize,
-    /// Arrow-nudge accumulation: `(id, before, last-press)` of the
-    /// live-nudged object — the whole burst commits as ONE Replace.
     /// An in-flight arrow-nudge burst: `before` for the undo entry,
     /// `live` the travelling copy painted by the overlay (doc and
     /// revision frozen until the burst commits — same mechanism as
@@ -479,6 +483,8 @@ impl DrawSession {
             emoji_section: 0,
             region_scratch: None,
             preview_tex: None,
+            preview_patch: None,
+            preview_dirty: false,
             drag_region: None,
             nudge: None,
         }
@@ -489,21 +495,25 @@ impl DrawSession {
         self.outcome
     }
 
-    /// Commits any in-flight text panel edit into `self.doc` and `self.undo`
-    /// before the session is inspected or committed.
+    /// Commits any in-flight text panel edit or arrow-nudge burst into
+    /// `self.doc` and `self.undo` before the session is inspected or committed.
     pub fn finalize_pending(&mut self) {
+        self.commit_nudge();
         self.close_text_panel();
     }
 
     /// Whether the annotations currently differ from the state at `open`.
     pub fn has_uncommitted_edits(&self) -> bool {
-        postcard::to_allocvec(&self.doc.annotations).unwrap_or_default() != self.open_snapshot
+        self.nudge.is_some()
+            || postcard::to_allocvec(&self.doc.annotations).unwrap_or_default()
+                != self.open_snapshot
     }
 
     /// Cancels the session — discarding edits is only silent when there
     /// are none; otherwise the user confirms through a warning box.
     /// Called by Annuler, Escape and the window's close control.
     pub fn request_cancel(&mut self) {
+        self.commit_nudge();
         self.close_text_panel();
         if !self.has_uncommitted_edits() {
             self.outcome = Some(Outcome::Cancel);
@@ -521,16 +531,7 @@ impl DrawSession {
         let Some(before) = self.drag_before() else {
             return;
         };
-        let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
-        let region = render::layer_bounds(&before, iw, ih).unwrap_or((0, 0, 0, 0));
-        let region = render::expand_for_effects(&self.doc, region, iw, ih, 0.5);
-        self.drag_region = region;
-        let Some(region) = region else {
-            // Fixpoint over the 50%-of-image cap → one full re-render.
-            self.rendered_rev = u64::MAX;
-            return;
-        };
-        self.patch_canvas_region_skip(region, before.id);
+        self.begin_nudge_live(&before);
     }
 
     /// The `before` annotation of the live object-drag in progress.
@@ -568,6 +569,11 @@ impl DrawSession {
     /// [`Self::patch_canvas_region`] taking the skip id raw
     /// (`u64::MAX` = none — never a real id).
     fn patch_canvas_region_skip(&mut self, region: (u32, u32, u32, u32), skip: u64) {
+        let (rx, ry, rw, rh) = region;
+        if rw == 0 || rh == 0 {
+            self.rendered_rev = self.doc.revision;
+            return;
+        }
         let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
         let Some(img) = self.rendered_img.as_mut() else {
             return;
@@ -576,7 +582,6 @@ impl DrawSession {
             .region_scratch
             .get_or_insert_with(|| render::DragPreview::new(iw, ih));
         let patch = scratch.render_region(&self.doc, region, skip);
-        let (rx, ry, rw, rh) = region;
         image::imageops::replace(img, &patch, rx as i64, ry as i64);
         if let Some(tex) = self.texture.as_mut() {
             tex.set_partial(
@@ -592,12 +597,67 @@ impl DrawSession {
         self.rendered_rev = self.doc.revision;
     }
 
+    /// Full-canvas re-render with an optional skipped annotation — used
+    /// when `expand_for_effects` exceeds the 50%-of-image threshold so
+    /// the dragged object still leaves its original spot cleanly.
+    fn render_canvas_filtered(&mut self, skip: Option<u64>) {
+        if self.rendered_img.is_none() {
+            return;
+        }
+        let img = render::render_to_image_filtered(&self.doc, skip);
+        if let Some(tex) = self.texture.as_mut() {
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            tex.set(
+                ColorImage::from_rgba_unmultiplied([w, h], img.as_raw()),
+                TextureOptions::LINEAR,
+            );
+        }
+        self.rendered_img = Some(img);
+        self.rendered_rev = self.doc.revision;
+    }
+
     /// Esc mid-object-drag: restore the exclusion patch (object at its
     /// original spot) — no revision bump, no undo entry, no blink.
     fn cancel_live_drag(&mut self) {
         self.drag = None;
+        self.preview_patch = None;
+        self.preview_dirty = false;
         if let Some(region) = self.drag_region.take() {
             self.patch_canvas_region(region, None);
+        } else {
+            self.render_canvas_filtered(None);
+        }
+    }
+
+    /// Commits a finished live-drag or arrow-nudge `Replace` and
+    /// patches the effect-expanded union of old and new bounds on the
+    /// same frame.
+    fn commit_live_replace(&mut self, before: Annotation, after: Annotation) {
+        let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
+        let had_region = self.drag_region.is_some();
+        let old_r = self
+            .drag_region
+            .take()
+            .or_else(|| render::layer_bounds(&before, iw, ih))
+            .unwrap_or((0, 0, 0, 0));
+        let new_r = render::layer_bounds(&after, iw, ih).unwrap_or((0, 0, 0, 0));
+        let union = render::union_rect(old_r, new_r);
+        self.preview_patch = None;
+        self.preview_dirty = false;
+        let edit = AnnoEdit::Replace { before, after };
+        edit.apply(&mut self.doc);
+        self.undo.push_back(edit);
+        if self.undo.len() > ANNO_HISTORY_CAP {
+            self.undo.pop_front();
+        }
+        self.redo.clear();
+        self.doc.revision += 1;
+        if had_region
+            && let Some(region) = render::expand_for_effects(&self.doc, union, iw, ih, 0.5)
+        {
+            self.patch_canvas_region(region, None);
+        } else {
+            self.render_canvas_filtered(None);
         }
     }
 
@@ -616,6 +676,7 @@ impl DrawSession {
     }
 
     pub fn undo_once(&mut self) {
+        self.commit_nudge();
         if let Some(edit) = self.undo.pop_back() {
             edit.revert(&mut self.doc);
             self.redo.push_back(edit);
@@ -625,6 +686,7 @@ impl DrawSession {
     }
 
     pub fn redo_once(&mut self) {
+        self.commit_nudge();
         if let Some(edit) = self.redo.pop_back() {
             edit.apply(&mut self.doc);
             self.undo.push_back(edit);
@@ -635,6 +697,7 @@ impl DrawSession {
 
     /// Deletes the selected object (Suppr key and the X button).
     fn delete_selected(&mut self) {
+        self.commit_nudge();
         if let Some(id) = self.selected
             && let Some(idx) = self.doc.index_of(id)
         {
@@ -671,7 +734,9 @@ impl DrawSession {
 
     /// Topmost annotation under `p` (image coords), inflated by stroke.
     fn hit(&self, p: Pos2, scale: f32) -> Option<AnnotationId> {
-        for a in self.doc.annotations.iter().rev() {
+        let live = self.live_anno();
+        for doc_a in self.doc.annotations.iter().rev() {
+            let a = live.filter(|l| l.id == doc_a.id).unwrap_or(doc_a);
             // Marquee fill patches read as pixels, not objects.
             if self.sel_patches.contains(&a.id) {
                 continue;
@@ -941,6 +1006,7 @@ impl DrawSession {
                 }
                 if let Some(n) = &mut self.nudge {
                     n.live.kind.translate(d.x * step, d.y * step);
+                    self.preview_dirty = true;
                 }
             }
         }
@@ -981,18 +1047,20 @@ impl DrawSession {
         }
     }
 
-    /// The exclusion patch behind an arrow-nudge burst — same work as
-    /// [`Self::begin_live_drag`] but the "drag" lives in `self.nudge`.
+    /// The exclusion patch behind an arrow-nudge burst or live drag —
+    /// patches `before`'s expanded region without `before.id`, or falls
+    /// back to a filtered full render when the region exceeds 50% of
+    /// the image area.
     fn begin_nudge_live(&mut self, before: &Annotation) {
         let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
         let region = render::layer_bounds(before, iw, ih).unwrap_or((0, 0, 0, 0));
         let region = render::expand_for_effects(&self.doc, region, iw, ih, 0.5);
         self.drag_region = region;
-        let Some(region) = region else {
-            self.rendered_rev = u64::MAX;
-            return;
-        };
-        self.patch_canvas_region_skip(region, before.id);
+        self.preview_dirty = true;
+        match region {
+            Some(r) => self.patch_canvas_region_skip(r, before.id),
+            None => self.render_canvas_filtered(Some(before.id)),
+        }
     }
 
     /// Commits a finished arrow-nudge burst as ONE undoable Replace —
@@ -1001,25 +1069,17 @@ impl DrawSession {
         let Some(n) = self.nudge.take() else {
             return;
         };
-        let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
-        let union = render::union_rect(
-            render::layer_bounds(&n.before, iw, ih).unwrap_or((0, 0, 0, 0)),
-            render::layer_bounds(&n.live, iw, ih).unwrap_or((0, 0, 0, 0)),
-        );
-        self.apply(AnnoEdit::Replace {
-            before: n.before,
-            after: n.live,
-        });
-        if self.drag_region.take().is_some() {
-            self.patch_canvas_region(union, None);
-        }
+        self.commit_live_replace(n.before, n.live);
     }
 
     /// Fires [`Self::commit_nudge`] once the burst has been quiet for
-    /// 400 ms (keeps repaints coming until then).
+    /// 400 ms or as soon as a pointer button is pressed (keeps repaints
+    /// coming while the burst is still open).
     fn commit_nudge_due(&mut self, ctx: &egui::Context) {
         if let Some(n) = &self.nudge {
-            if n.at.elapsed() > std::time::Duration::from_millis(400) {
+            if n.at.elapsed() > std::time::Duration::from_millis(400)
+                || ctx.input(|i| i.pointer.any_pressed())
+            {
                 self.commit_nudge();
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1643,6 +1703,7 @@ impl DrawSession {
 
     /// Press: begin a creation drag or grab an object.
     fn start_drag(&mut self, p: Pos2, ctx: &egui::Context) {
+        self.commit_nudge();
         // An armed swatch pick consumes the press: the pixel colour goes
         // to the swatch's pending slot and the picker disarms.
         if let Some(id) = armed_pick(ctx) {
@@ -1778,6 +1839,7 @@ impl DrawSession {
                 let (dx, dy) = (p.x - last.x, p.y - last.y);
                 *last = p;
                 live.kind.translate(dx, dy);
+                self.preview_dirty = true;
             }
             Some(Drag::Resizing { handle, live, .. }) => {
                 let h = *handle;
@@ -1789,6 +1851,7 @@ impl DrawSession {
                     resize_rect(&mut r, h, p);
                 }
                 live.kind.set_bounds(r);
+                self.preview_dirty = true;
             }
             Some(Drag::Endpoint {
                 live, which_b, top, ..
@@ -1817,11 +1880,13 @@ impl DrawSession {
                     }
                     _ => {}
                 }
+                self.preview_dirty = true;
             }
             Some(Drag::Tail { live, .. }) => {
                 if let AnnotationKind::TextBox(o) = &mut live.kind {
                     o.tail = Some(p);
                 }
+                self.preview_dirty = true;
             }
             Some(Drag::Marquee { anchor }) => {
                 if let Some(sel) = &mut self.sel_area {
@@ -1873,19 +1938,10 @@ impl DrawSession {
                     o.b = pos2(o.a.x + d.x * 16.0, o.a.y + d.y * 16.0);
                 }
                 // ONE revision bump for the whole gesture, then patch
-                // the union of old+new bounds — same frame, no flicker.
-                let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
-                let union = render::union_rect(
-                    render::layer_bounds(&before, iw, ih).unwrap_or((0, 0, 0, 0)),
-                    render::layer_bounds(&live, iw, ih).unwrap_or((0, 0, 0, 0)),
-                );
-                self.apply(AnnoEdit::Replace {
-                    before,
-                    after: live,
-                });
+                // the effect-expanded union of old+new bounds — same
+                // frame, no flicker.
+                self.commit_live_replace(before, live);
                 self.selected = Some(id);
-                self.patch_canvas_region(union, None);
-                self.drag_region = None;
             }
             Drag::Freehand { points } => self.finish_freehand(points),
             Drag::Marquee { .. } => {
@@ -2131,6 +2187,7 @@ impl DrawSession {
     /// (any non-pixel tool); clicking empty canvas closes an open text
     /// panel or places a point tool.
     fn click(&mut self, p: Pos2, ctx: &egui::Context) {
+        self.commit_nudge();
         // Same armed-pick interception as `start_drag` — a click may not
         // have crossed the drag threshold first.
         if let Some(id) = armed_pick(ctx) {
@@ -2256,7 +2313,10 @@ impl DrawSession {
     /// the grab radius from screen px into image px so anchors stay
     /// reachable at any zoom.
     fn handle_at(&self, id: AnnotationId, p: Pos2, scale: f32) -> Option<Handle> {
-        let a = self.doc.annotation(id)?;
+        let a = self
+            .live_anno()
+            .filter(|a| a.id == id)
+            .or_else(|| self.doc.annotation(id))?;
         let grab = 10.0 / scale.max(0.05);
         match &a.kind {
             AnnotationKind::Line(o) => bezier_handle_at(o.a, o.ka, o.kb, o.b, p, grab),
@@ -2529,78 +2589,53 @@ impl DrawSession {
         // Live-drag / nudge overlay: the travelling annotation rendered
         // by the shared bounded pipeline (same pixels as the committed
         // render — z-order is the one documented approximation). Region
-        // effects (blur) have no layered render → plain accent frame.
-        if let Some(anno) = self.live_anno() {
-            let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
-            let anno = anno.clone();
-            let scratch = self
-                .region_scratch
-                .get_or_insert_with(|| render::DragPreview::new(iw, ih));
-            match scratch.render(&anno) {
-                Some((patch, ox, oy)) => {
-                    let ci = egui::ColorImage::from_rgba_unmultiplied(
-                        [patch.width() as usize, patch.height() as usize],
-                        patch.as_raw(),
-                    );
-                    let tex = self.preview_tex.get_or_insert_with(|| {
-                        painter.ctx().load_texture(
-                            "draw-live-preview",
-                            egui::ColorImage::filled([1, 1], Color32::TRANSPARENT),
-                            egui::TextureOptions::LINEAR,
-                        )
-                    });
-                    tex.set(ci, egui::TextureOptions::LINEAR);
-                    painter.image(
-                        tex.id(),
-                        Rect::from_min_max(
-                            pos2(
-                                img_rect.min.x + ox as f32 * scale,
-                                img_rect.min.y + oy as f32 * scale,
-                            ),
-                            pos2(
-                                img_rect.min.x + (ox + patch.width()) as f32 * scale,
-                                img_rect.min.y + (oy + patch.height()) as f32 * scale,
-                            ),
-                        ),
-                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                }
-                None => {
-                    // Region-effect object (blur/gomme): simplified
-                    // preview — just its frame, documented.
-                    let b = anno.kind.bounds();
-                    let r = Rect::from_min_max(
-                        pos2(
-                            img_rect.min.x + b.x as f32 * scale,
-                            img_rect.min.y + b.y as f32 * scale,
-                        ),
-                        pos2(
-                            img_rect.min.x + (b.x + b.width as i32) as f32 * scale,
-                            img_rect.min.y + (b.y + b.height as i32) as f32 * scale,
-                        ),
-                    );
-                    painter.rect_stroke(
-                        r,
-                        CornerRadius::ZERO,
-                        Stroke::new(1.0, accent),
-                        StrokeKind::Inside,
-                    );
-                }
+        // effects (blur) have no layered render → their live selection
+        // chrome below frames the moved bounds.
+        if self.live_anno().is_some() {
+            if self.preview_dirty || self.preview_tex.is_none() {
+                let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
+                let anno = self.live_anno().cloned();
+                let scratch = self
+                    .region_scratch
+                    .get_or_insert_with(|| render::DragPreview::new(iw, ih));
+                self.preview_patch =
+                    anno.as_ref()
+                        .and_then(|a| scratch.render(a))
+                        .map(|(patch, ox, oy)| {
+                            let (pw, ph) = (patch.width(), patch.height());
+                            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                [pw as usize, ph as usize],
+                                patch.as_raw(),
+                            );
+                            let tex = self.preview_tex.get_or_insert_with(|| {
+                                painter.ctx().load_texture(
+                                    "draw-live-preview",
+                                    egui::ColorImage::filled([1, 1], Color32::TRANSPARENT),
+                                    egui::TextureOptions::LINEAR,
+                                )
+                            });
+                            tex.set(ci, egui::TextureOptions::LINEAR);
+                            (ox, oy, pw, ph)
+                        });
+                self.preview_dirty = false;
             }
-            // Handles track the LIVE bounds, not the doc's old spot.
-            let b = anno.kind.bounds();
-            let r = Rect::from_min_max(
-                pos2(
-                    img_rect.min.x + b.x as f32 * scale,
-                    img_rect.min.y + b.y as f32 * scale,
-                ),
-                pos2(
-                    img_rect.min.x + (b.x + b.width as i32) as f32 * scale,
-                    img_rect.min.y + (b.y + b.height as i32) as f32 * scale,
-                ),
-            );
-            sel_chrome(painter, r, accent);
+            if let (Some(tex), Some((ox, oy, pw, ph))) = (&self.preview_tex, self.preview_patch) {
+                painter.image(
+                    tex.id(),
+                    Rect::from_min_max(
+                        pos2(
+                            img_rect.min.x + ox as f32 * scale,
+                            img_rect.min.y + oy as f32 * scale,
+                        ),
+                        pos2(
+                            img_rect.min.x + (ox + pw) as f32 * scale,
+                            img_rect.min.y + (oy + ph) as f32 * scale,
+                        ),
+                    ),
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
         }
         // Eraser brush circle or eyedropper magnifier under the cursor.
         if self.tool == Tool::Eraser
@@ -2702,11 +2737,6 @@ impl DrawSession {
             }
         }
         let Some(id) = self.selected else { return };
-        // A live object-drag / nudge already painted its chrome at the
-        // live bounds above — the doc still sits at the old spot.
-        if self.live_anno().is_some() {
-            return;
-        }
         // While a box's floating editor is open its selection frame
         // stays hidden (matches the reference editor).
         if self
@@ -2716,7 +2746,15 @@ impl DrawSession {
         {
             return;
         }
-        let Some(a) = self.doc.annotation(id).cloned() else {
+        // Track the live copy during an object drag / arrow-nudge burst
+        // so Bézier levers, green/grey anchors and resize handles follow
+        // the gesture in real time.
+        let Some(a) = self
+            .live_anno()
+            .filter(|a| a.id == id)
+            .cloned()
+            .or_else(|| self.doc.annotation(id).cloned())
+        else {
             return;
         };
         let to_canvas = |p: Pos2| pos2(img_rect.min.x + p.x * scale, img_rect.min.y + p.y * scale);
@@ -3466,7 +3504,7 @@ impl DrawSession {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
                     if widgets::primary_button(ui, &t!("draw.ok")).clicked() {
-                        self.close_text_panel();
+                        self.finalize_pending();
                         self.outcome = Some(Outcome::Ok);
                     }
                     if widgets::secondary_button(ui, &t!("draw.cancel")).clicked() {
@@ -5657,5 +5695,124 @@ mod live_drag_tests {
             _ => unreachable!(),
         };
         assert_eq!(doc_x, 103);
+    }
+
+    #[test]
+    fn release_expands_overlapping_blur_and_matches_full_render() {
+        let mut s = session();
+        let rect_id = s.selected.unwrap();
+        let blur_id = s.doc.alloc_id();
+        s.doc.annotations.push(Annotation {
+            id: blur_id,
+            kind: AnnotationKind::Blur(BlurObj {
+                rect: PhysicalRect {
+                    x: 200,
+                    y: 90,
+                    width: 120,
+                    height: 80,
+                },
+                style: BlurStyle::Pixelate,
+                shape: AreaShape::Rect,
+                strength: 60,
+            }),
+        });
+        s.doc.revision += 1;
+        s.rendered_img = Some(crate::editor::render::render_to_image(&s.doc));
+        s.rendered_rev = s.doc.revision;
+
+        let before = s.doc.annotation(rect_id).unwrap().clone();
+        s.drag = Some(Drag::Moving {
+            id: rect_id,
+            live: before.clone(),
+            before,
+            last: pos2(130.0, 120.0),
+        });
+        s.begin_live_drag();
+        s.continue_drag(pos2(220.0, 120.0));
+        let drag = s.drag.take().unwrap();
+        s.finish_drag(drag);
+
+        let expect = crate::editor::render::render_to_image(&s.doc);
+        assert_eq!(s.rendered_img.as_ref().unwrap().as_raw(), expect.as_raw());
+    }
+
+    #[test]
+    fn fallback_over_half_image_excludes_dragged_object() {
+        let mut s = session();
+        let rect_id = s.selected.unwrap();
+        let blur_id = s.doc.alloc_id();
+        // A blur covering >50% of the 800×600 canvas overlapping the rect.
+        s.doc.annotations.push(Annotation {
+            id: blur_id,
+            kind: AnnotationKind::Blur(BlurObj {
+                rect: PhysicalRect {
+                    x: 50,
+                    y: 50,
+                    width: 700,
+                    height: 500,
+                },
+                style: BlurStyle::Pixelate,
+                shape: AreaShape::Rect,
+                strength: 40,
+            }),
+        });
+        s.doc.revision += 1;
+        s.rendered_img = Some(crate::editor::render::render_to_image(&s.doc));
+        s.rendered_rev = s.doc.revision;
+
+        let before = s.doc.annotation(rect_id).unwrap().clone();
+        s.drag = Some(Drag::Moving {
+            id: rect_id,
+            live: before.clone(),
+            before,
+            last: pos2(130.0, 120.0),
+        });
+        s.begin_live_drag();
+        assert!(s.drag_region.is_none(), ">50% region must trigger fallback");
+        let expect_excluded =
+            crate::editor::render::render_to_image_filtered(&s.doc, Some(rect_id));
+        assert_eq!(
+            s.rendered_img.as_ref().unwrap().as_raw(),
+            expect_excluded.as_raw(),
+            "fallback render must exclude the dragged annotation"
+        );
+        s.cancel_live_drag();
+        let expect_full = crate::editor::render::render_to_image(&s.doc);
+        assert_eq!(
+            s.rendered_img.as_ref().unwrap().as_raw(),
+            expect_full.as_raw()
+        );
+    }
+
+    #[test]
+    fn delete_and_undo_flush_pending_nudge_first() {
+        let mut s = session();
+        let id = s.selected.unwrap();
+        let a = s.doc.annotation(id).unwrap().clone();
+        let mut moved = a.clone();
+        moved.kind.translate(15.0, 0.0);
+        s.nudge = Some(NudgeBurst {
+            id,
+            before: a.clone(),
+            live: moved,
+            at: std::time::Instant::now(),
+        });
+        s.begin_nudge_live(&a);
+        // Delete before the 400 ms timer fires: must commit the nudge
+        // first so the first undo restores the nudged position (x = 115).
+        s.delete_selected();
+        assert_eq!(s.undo.len(), 2);
+        s.undo_once();
+        let x_after_undo_delete = match &s.doc.annotation(id).unwrap().kind {
+            AnnotationKind::Rect(o) => o.rect.x,
+            _ => unreachable!(),
+        };
+        assert_eq!(x_after_undo_delete, 115);
+        s.undo_once();
+        let x_after_undo_nudge = match &s.doc.annotation(id).unwrap().kind {
+            AnnotationKind::Rect(o) => o.rect.x,
+            _ => unreachable!(),
+        };
+        assert_eq!(x_after_undo_nudge, 100);
     }
 }
