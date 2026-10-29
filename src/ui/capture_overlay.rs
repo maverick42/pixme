@@ -104,11 +104,12 @@ pub struct OverlaySession {
     /// once after the freeze, and the currently proposed window id.
     window_list: Option<Vec<WindowInfo>>,
     picked_window_id: Option<u32>,
-    /// Pre-seeded selection (`(monitor_id, rect)` in monitor-logical space):
+    /// Pre-seeded selection `(monitor_id, rect)` in monitor-logical space:
     /// materialized into `selection` once the overlay is on that monitor and
-    /// `screen_offset` is known. The fixed-region memory recalls the previous
-    /// fixed capture's exact monitor, size and position; the pin prefill
-    /// recalls the last confirmed capture rect of any mode.
+    /// `screen_offset` is known. Only the fixed-region memory uses this — the
+    /// fixed frame recalls the previous capture's exact monitor, size and
+    /// position. Every other mode (including Pin) starts blank like a plain
+    /// region capture.
     restore_sel: Option<(u32, Rect)>,
     /// Full-screen frozen frame texture for the current `monitor`.
     texture: Option<egui::TextureHandle>,
@@ -120,9 +121,9 @@ pub struct OverlaySession {
 
 impl OverlaySession {
     /// A fresh session for `mode`; `return_to` is where Esc lands.
-    /// `remembered` is the previous fixed-region / pin `(monitor_id, rect)`
-    /// in monitor-logical space: when present on the target monitor, the
-    /// frame reappears there instead of riding the cursor.
+    /// `remembered` is the previous fixed-region `(monitor_id, rect)` in
+    /// monitor-logical space: when present, the fixed frame reappears
+    /// there instead of riding the cursor.
     pub fn new(mode: CaptureMode, return_to: AppState, remembered: Option<(u32, Rect)>) -> Self {
         Self {
             mode,
@@ -141,7 +142,7 @@ impl OverlaySession {
             failed: false,
             window_list: None,
             picked_window_id: None,
-            restore_sel: if matches!(mode, CaptureMode::FixedRegion | CaptureMode::Pin) {
+            restore_sel: if matches!(mode, CaptureMode::FixedRegion) {
                 remembered
             } else {
                 None
@@ -735,8 +736,8 @@ impl OverlaySession {
         self.selection.map(|s| s.translate(self.screen_offset))
     }
 
-    /// `(monitor_id, selection)` in monitor-logical space for fixed-region
-    /// and pin prefill memory.
+    /// `(monitor_id, selection)` in monitor-logical space for the
+    /// fixed-region memory.
     pub fn monitor_and_selection(&self) -> Option<(u32, Rect)> {
         Some((self.monitor.as_ref()?.id, self.monitor_space_selection()?))
     }

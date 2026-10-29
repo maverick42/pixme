@@ -1191,3 +1191,18 @@ Format: date — context — decision — consequences.
   top-centred on the monitor where the cursor sits, and confirming a capture
   opens the viewer on the captured monitor (keeping its existing position when
   already on that monitor, or centring it there).
+
+## 2026-10-29 — Pin capture behaves exactly like a region capture
+
+- **Context**: the Pin capture pre-filled its selection from the last confirmed
+  capture rect (`last_capture_rect`), so a frame appeared immediately on the
+  remembered monitor and the crosshair never followed the cursor across
+  displays. The user wants Pin to start exactly like a rectangle capture and
+  only differ at confirmation: double-click creates the autonomous floating
+  pin window instead of a viewer tab.
+- **Decision**: Pin no longer pre-fills any selection — `restore_sel` is only
+  fed by the fixed-region memory, and the `last_capture_rect` memory was
+  removed. Pin now roams across monitors like Region, draws a free rectangle,
+  and double-click confirms into a pin window at the drawn spot.
+- **Consequences**: pin captures always reflect where the user actually
+  clicked/drew, on any monitor; one less piece of cross-session state.

@@ -275,10 +275,6 @@ pub struct Shared {
     /// monitor-logical space: the next fixed capture opens at the same
     /// size and position on that monitor.
     pub last_fixed_region: Mutex<Option<(u32, egui::Rect)>>,
-    /// The last confirmed capture `(monitor_id, rect)` of ANY mode
-    /// (monitor-logical space): the `Pin` capture's selection opens
-    /// there.
-    pub last_capture_rect: Mutex<Option<(u32, egui::Rect)>>,
     /// The monitor the pending capture was launched from — set by
     /// [`Shared::push_capture`] when a window (the bar, the viewer) starts
     /// a capture, consumed by `begin_capture`. `None` for resident-icon
@@ -1065,11 +1061,12 @@ impl Shared {
                     tracing::error!("cannot enumerate monitors");
                     return;
                 };
-                // Fixed region recalls ITS memory; Pin recalls the last
-                // confirmed capture rect whatever the mode was.
+                // Fixed region recalls ITS memory — the next fixed
+                // capture reopens at the same size and position. Every
+                // other mode (including Pin) starts blank: the crosshair
+                // follows the cursor and the region is drawn by hand.
                 let remembered = match mode {
                     CaptureMode::FixedRegion => *lock(&self.last_fixed_region),
-                    CaptureMode::Pin => *lock(&self.last_capture_rect),
                     _ => None,
                 };
                 let mut session = OverlaySession::new(mode, return_to, remembered);
@@ -1107,22 +1104,6 @@ impl Shared {
         // (same monitor, same size, same position — monitor-logical space).
         if matches!(session.mode, CaptureMode::FixedRegion) {
             *lock(&self.last_fixed_region) = session.monitor_and_selection();
-        }
-        // Pin prefill memory: the confirmed rect whatever the mode — a
-        // full screen counts as the whole monitor.
-        let confirmed_rect = session.monitor_and_selection().or_else(|| {
-            session.monitor.as_ref().map(|m| {
-                (
-                    m.id,
-                    egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(m.rect.width as f32, m.rect.height as f32),
-                    ),
-                )
-            })
-        });
-        if let Some(sel) = confirmed_rect {
-            *lock(&self.last_capture_rect) = Some(sel);
         }
         // A Pin capture becomes an autonomous floating window — nothing
         // is added to the viewer.
@@ -1429,7 +1410,6 @@ impl PixMeApp {
                 settings_draft: Mutex::new(None),
                 capture: Mutex::new(None),
                 last_fixed_region: Mutex::new(None),
-                last_capture_rect: Mutex::new(None),
                 capture_start_monitor: Mutex::new(None),
                 pins: Mutex::new(Vec::new()),
                 next_pin_id: Mutex::new(0),
@@ -1951,7 +1931,6 @@ mod tests {
             settings_draft: Mutex::new(None),
             capture: Mutex::new(None),
             last_fixed_region: Mutex::new(None),
-            last_capture_rect: Mutex::new(None),
             capture_start_monitor: Mutex::new(None),
             pins: Mutex::new(Vec::new()),
             next_pin_id: Mutex::new(0),
