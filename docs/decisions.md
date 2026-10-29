@@ -1206,3 +1206,49 @@ Format: date — context — decision — consequences.
   and double-click confirms into a pin window at the drawn spot.
 - **Consequences**: pin captures always reflect where the user actually
   clicked/drew, on any monitor; one less piece of cross-session state.
+
+## 2026-10-29 — Capture delay shows a countdown card + tick sound
+
+- **Context**: a non-zero `capture_delay_secs` used to sleep a worker thread
+  then fire `Command::CaptureNow` — the user got no feedback during the wait.
+  The delay menu also asked for a quick "5 s" pick above the 1–9 s range, and
+  its popup turned out to be clipped: egui constrains popup `Area`s to the
+  viewport rect, and the bar window only hugs the bar (~2 menu rows fit).
+- **Decision**: the delayed wait is a UI-owned `Countdown` (deferred viewport,
+  outside the state machine like the pins): a floating card pinned
+  bottom-right of the monitor under the cursor — it follows the mouse across
+  displays — showing the remaining seconds in a large monospace digit while
+  `platform::tick()` sounds the OS alert each second (macOS `NSBeep`, Windows
+  `MessageBeep`, plain FFI — no audio dependency). At zero it fires
+  `Command::CaptureNow`; Esc cancels. The delay thread is gone. For the popup
+  clipping, the bar viewport reserves extra transparent height below the bar
+  while one of its menus is open (`MENU_RESERVE`) instead of reimplementing
+  menu open/close semantics.
+- **Consequences**: a delayed capture is visible and audible, cancellable with
+  Esc, and works from every state (bar, viewer, idle); the countdown card can
+  hop monitors with the cursor. The delay menu now shows "No delay", the
+  quick 5 s pick, a separator, the full 1–9 s range and the auto-reset toggle
+  without clipping (options menu benefits too).
+
+## 2026-10-29 — Delay persists for the session; countdown anchors under the bar
+
+- **Context**: the first countdown version parked the card at the monitor's
+  bottom-right corner — unreadable under the macOS Dock (the Dock owns a
+  full-screen window at layer 20, so no slab can be extracted by window
+  enumeration; `NSScreen.visibleFrame` would have meant a new dependency).
+  Separately, `delay_auto_reset` (default `true`) wiped the chosen delay after
+  every capture.
+- **Decision** (user): the countdown card is anchored just below the floating
+  capture bar, centred on it, and follows the bar when it is dragged (the Bar
+  viewport reports its outer rect every frame into `Shared::bar_rect`; the
+  card repositions each repaint). With no visible bar (capture launched from
+  a menu while the bar is closed) it falls back to the centre of the monitor
+  under the cursor — no dock geometry is computed at all. `delay_auto_reset`
+  is removed (the delay menu is exactly "No delay", a quick 5 s pick, a
+  separator, then 1–9 s); `capture_delay_secs` is `#[serde(skip)]` — session
+  state, reset at launch. The bar's clock button shows the accent-soft-fill+
+  border "selected" style while a delay is armed.
+- **Consequences**: the countdown digit is always readable next to the window
+  that armed it, on whichever monitor the bar sits, and moves with the bar;
+  the chosen delay stays armed for every capture until changed or the app
+  quits, with a blue-framed clock icon as the tell. No dependency change.

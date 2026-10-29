@@ -233,6 +233,10 @@ fn pin_id(id: u32) -> egui::ViewportId {
 fn save_dialog_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.save_dialog")
 }
+/// The capture-delay countdown card.
+fn countdown_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("pixme.countdown")
+}
 /// The Draw (Dessiner) editor window.
 fn draw_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.draw")
@@ -264,6 +268,9 @@ pub struct Shared {
     pub toolbar: Mutex<Toolbar>,
     /// Last on-screen position of the bar viewport (restored on reopen).
     pub bar_pos: Mutex<Option<egui::Pos2>>,
+    /// Last on-screen outer rect of the bar viewport — the countdown card
+    /// anchors below it and follows its drags.
+    pub bar_rect: Mutex<Option<egui::Rect>>,
     /// Whether the settings window is open.
     pub settings_open: AtomicBool,
     /// The editable copy shown by the settings window — written back to
@@ -271,6 +278,10 @@ pub struct Shared {
     pub settings_draft: Mutex<Option<Settings>>,
     /// The live capture session while in `Capturing` (`None` otherwise).
     pub capture: Mutex<Option<OverlaySession>>,
+    /// The armed capture-delay countdown — a floating card outside the
+    /// state machine that ticks the seconds down and fires
+    /// [`Command::CaptureNow`] at zero.
+    pub countdown: Mutex<Option<ui::countdown::Countdown>>,
     /// The last confirmed fixed-region `(monitor_id, rect)` in
     /// monitor-logical space: the next fixed capture opens at the same
     /// size and position on that monitor.
@@ -504,24 +515,14 @@ impl Shared {
         }
         match command {
             Command::Capture(mode) => {
-                let (delay, auto_reset) = {
-                    let s = lock(&self.settings);
-                    (s.capture_delay_secs, s.delay_auto_reset)
-                };
+                let delay = lock(&self.settings).capture_delay_secs;
                 if delay > 0 {
-                    // Post the real capture after the delay; the ctx clone
-                    // wakes the (possibly windowless) pump.
-                    let wake = ctx.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(delay as u64));
-                        platform::queue_menu_command(Command::CaptureNow(mode));
-                        wake.request_repaint_of(egui::ViewportId::ROOT);
-                    });
-                    if auto_reset {
-                        let mut s = lock(&self.settings);
-                        s.capture_delay_secs = 0;
-                        s.save();
-                    }
+                    // The countdown viewport owns the wait: it ticks and
+                    // shows the remaining seconds bottom-right of the
+                    // monitor under the cursor, then fires CaptureNow.
+                    // The delay is session state: it persists between
+                    // captures but is never saved to disk.
+                    *lock(&self.countdown) = Some(ui::countdown::Countdown::new(mode, delay));
                 } else {
                     self.begin_capture(mode, ctx);
                 }
@@ -1406,9 +1407,11 @@ impl PixMeApp {
                 viewer_target_monitor: Mutex::new(None),
                 toolbar: Mutex::new(Toolbar::default()),
                 bar_pos: Mutex::new(None),
+                bar_rect: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
                 settings_draft: Mutex::new(None),
                 capture: Mutex::new(None),
+                countdown: Mutex::new(None),
                 last_fixed_region: Mutex::new(None),
                 capture_start_monitor: Mutex::new(None),
                 pins: Mutex::new(Vec::new()),
@@ -1592,6 +1595,38 @@ impl eframe::App for PixMeApp {
             }
             // `Idle` shows nothing.
             AppState::Idle => {}
+        }
+
+        // The capture-delay countdown: like the pins it lives outside the
+        // state machine — it can run on top of the bar, the viewer or an
+        // empty desktop. It repaints itself to zero, then fires CaptureNow.
+        if lock(&self.shared.countdown).is_some() {
+            let shared = Arc::clone(&self.shared);
+            ctx.show_viewport_deferred(countdown_id(), countdown_builder(), move |ui, _class| {
+                let ctx = ui.ctx().clone();
+                shared.pump(&ctx);
+                ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                // Esc cancels the pending capture.
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    *lock(&shared.countdown) = None;
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    return;
+                }
+                // Anchor the card under the floating bar when one is
+                // visible; otherwise it falls back to the cursor monitor.
+                let bar = (*lock(&shared.state) == AppState::Bar)
+                    .then(|| *lock(&shared.bar_rect))
+                    .flatten();
+                let running = lock(&shared.countdown)
+                    .as_mut()
+                    .is_some_and(|c| c.show(ui, bar));
+                if !running && let Some(cd) = lock(&shared.countdown).take() {
+                    shared.push(Command::CaptureNow(cd.mode));
+                    // Wake the anchor pass: it unregisters this viewport
+                    // and dispatches the pending capture.
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            });
         }
 
         // Pinned captures: autonomous always-on-top windows living outside
@@ -1828,6 +1863,22 @@ fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
         .with_position(origin)
 }
 
+/// The capture-delay countdown: borderless, transparent, always on top,
+/// sized to its painted card. The position only applies at creation —
+/// the card then tracks the monitor under the cursor.
+fn countdown_builder() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_title("PixMe")
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_resizable(false)
+        .with_always_on_top()
+        .with_has_shadow(false)
+        .with_taskbar(false)
+        .with_active(true)
+        .with_inner_size([140.0, 140.0])
+}
+
 /// The pin save-as window: a small decorated form floating above the
 /// (always-on-top) pins it saves, not a taskbar entry.
 fn save_dialog_builder() -> egui::ViewportBuilder {
@@ -1927,9 +1978,11 @@ mod tests {
             viewer_target_monitor: Mutex::new(None),
             toolbar: Mutex::new(Toolbar::default()),
             bar_pos: Mutex::new(None),
+            bar_rect: Mutex::new(None),
             settings_open: AtomicBool::new(false),
             settings_draft: Mutex::new(None),
             capture: Mutex::new(None),
+            countdown: Mutex::new(None),
             last_fixed_region: Mutex::new(None),
             capture_start_monitor: Mutex::new(None),
             pins: Mutex::new(Vec::new()),

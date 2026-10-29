@@ -472,3 +472,13 @@ pub fn cursor_position() -> Option<(f32, f32)> {
     let loc = CGEvent::new(source).ok()?.location();
     Some((loc.x as f32, loc.y as f32))
 }
+
+/// One short tick — AppKit `NSBeep`, a plain C symbol playing the user's
+/// chosen system alert sound (respects its volume and mute).
+pub fn tick() {
+    #[link(name = "AppKit", kind = "framework")]
+    unsafe extern "C" {
+        fn NSBeep();
+    }
+    unsafe { NSBeep() }
+}

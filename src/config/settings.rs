@@ -98,11 +98,10 @@ pub struct Settings {
     /// Also copy every capture to the clipboard.
     pub copy_to_clipboard: bool,
     /// Seconds to wait before capturing (0 = capture immediately).
+    /// Session-only by user decision: it survives between captures but
+    /// is never written to disk — every launch starts with no delay.
+    #[serde(skip)]
     pub capture_delay_secs: u32,
-    /// Reset the capture delay to 0 after each capture (the reference's
-    /// default behaviour).
-    #[serde(default = "default_true")]
-    pub delay_auto_reset: bool,
     /// Last folder a capture/document was saved to — reopens the next
     /// save dialog there (was session-only before prefs persisted it).
     pub last_save_dir: Option<PathBuf>,
@@ -142,9 +141,6 @@ pub struct Settings {
     pub filename_counter: u64,
 }
 
-fn default_true() -> bool {
-    true
-}
 fn default_text_color() -> [u8; 3] {
     [220, 40, 40]
 }
@@ -187,7 +183,6 @@ impl Default for Settings {
             include_pointer: false,
             copy_to_clipboard: false,
             capture_delay_secs: 0,
-            delay_auto_reset: true,
             last_save_dir: None,
             last_open_dir: None,
             db_retention: DbRetention::default(),

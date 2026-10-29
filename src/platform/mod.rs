@@ -208,3 +208,11 @@ pub use macos::cursor_position;
 /// Global mouse position in the OS-native display space (see above).
 #[cfg(target_os = "windows")]
 pub use windows::cursor_position;
+
+/// The short tick sounded at each countdown second (and when a delayed
+/// capture is armed) — the OS alert sound.
+#[cfg(target_os = "macos")]
+pub use macos::tick;
+/// The short tick (see above).
+#[cfg(target_os = "windows")]
+pub use windows::tick;

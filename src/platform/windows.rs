@@ -210,3 +210,16 @@ pub fn cursor_position() -> Option<(f32, f32)> {
         None
     }
 }
+
+/// One short tick — the system "Asterisk" sound via `MessageBeep`
+/// (respects the sound scheme and volume).
+pub fn tick() {
+    const MB_ICONASTERISK: u32 = 0x40;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBeep(u_type: u32) -> i32;
+    }
+    unsafe {
+        MessageBeep(MB_ICONASTERISK);
+    }
+}

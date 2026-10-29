@@ -18,6 +18,12 @@ use crate::ui::{theme, widgets};
 /// clipped by the viewport bounds.
 const SHADOW_MARGIN: i8 = 14;
 
+/// Height reserved below the bar while one of its menus is open: egui
+/// constrains popup `Area`s to this viewport's rect, so a menu taller than
+/// the bar would be clipped without the extra room (the window is
+/// transparent there — nothing shows).
+const MENU_RESERVE: f32 = 360.0;
+
 /// Initial vertical position of the bar, as a fraction of the monitor height
 /// (sits near the top, below a menu bar, without clinging to the edge).
 const TOP_MARGIN: f32 = 0.12;
@@ -45,21 +51,35 @@ impl Toolbar {
             .frame(Frame::NONE.inner_margin(Margin::same(SHADOW_MARGIN)))
             .show(ui, |ui| {
                 let content = self.capture_bar(ui, settings, shared);
-                self.sync_viewport(&ctx, content.response.rect);
+                // The painted card's on-screen bounds (not the viewport's
+                // `outer_rect`, which is 360 pt taller while a menu is
+                // open): the countdown card anchors just below this.
+                if let Some(win) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
+                    let card = content.response.rect;
+                    *crate::app::lock(&shared.bar_rect) =
+                        Some(Rect::from_min_size(win + card.min.to_vec2(), card.size()));
+                }
+                let mut rect = content.response.rect;
+                if content.inner {
+                    rect.max.y += MENU_RESERVE;
+                }
+                self.sync_viewport(&ctx, rect);
             });
     }
 
     /// One row of capture-mode icon buttons, delay, options and quit.
+    /// Returns `true` in `inner` while one of the row's menus is open —
+    /// the caller then reserves room for it under the bar.
     fn capture_bar(
         &mut self,
         ui: &mut egui::Ui,
         settings: &mut Settings,
         shared: &Shared,
-    ) -> egui::InnerResponse<()> {
+    ) -> egui::InnerResponse<bool> {
         let t = theme::tokens(ui.ctx());
         let frame = widgets::card_frame(t).shadow(widgets::card_shadow(t));
         let inner = frame.show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal(|ui| -> bool {
                 ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
                 // Drag handle (functional reference's dotted grip): an
                 // explicit grab affordance so the bar reads as movable.
@@ -73,46 +93,59 @@ impl Toolbar {
                 // A modal window (save-as opened from a pin, etc.) can be
                 // up while the bar is visible: grey out every command it
                 // forbids, keep the close X live (`CloseBar` always runs).
-                ui.add_enabled_ui(!shared.modal_child_open(), |ui| {
-                    for (icon, tip, mode) in [
-                        (
-                            Icon::SquareDashedMousePointer,
-                            "toolbar.window.tooltip",
-                            CaptureMode::WindowOrObject,
-                        ),
-                        (
-                            Icon::SquareDashed,
-                            "toolbar.region.tooltip",
-                            CaptureMode::Region,
-                        ),
-                        (
-                            Icon::Monitor,
-                            "toolbar.fullscreen.tooltip",
-                            CaptureMode::FullScreen,
-                        ),
-                        (
-                            Icon::Crop,
-                            "toolbar.fixed_region.tooltip",
-                            CaptureMode::FixedRegion,
-                        ),
-                        (Icon::Pin, "toolbar.pin.tooltip", CaptureMode::Pin),
-                    ] {
-                        if cap_button(ui, icon, tip, false).clicked() {
-                            shared.push_capture(mode, ui.ctx());
+                let menu_open = ui
+                    .add_enabled_ui(!shared.modal_child_open(), |ui| {
+                        for (icon, tip, mode) in [
+                            (
+                                Icon::SquareDashedMousePointer,
+                                "toolbar.window.tooltip",
+                                CaptureMode::WindowOrObject,
+                            ),
+                            (
+                                Icon::SquareDashed,
+                                "toolbar.region.tooltip",
+                                CaptureMode::Region,
+                            ),
+                            (
+                                Icon::Monitor,
+                                "toolbar.fullscreen.tooltip",
+                                CaptureMode::FullScreen,
+                            ),
+                            (
+                                Icon::Crop,
+                                "toolbar.fixed_region.tooltip",
+                                CaptureMode::FixedRegion,
+                            ),
+                            (Icon::Pin, "toolbar.pin.tooltip", CaptureMode::Pin),
+                        ] {
+                            if cap_button(ui, icon, tip, false).clicked() {
+                                shared.push_capture(mode, ui.ctx());
+                            }
                         }
-                    }
-                    widgets::vline(ui, 18.0);
-                    let delay_btn = cap_button(ui, Icon::Clock, "toolbar.delay.tooltip", false);
-                    Self::delay_menu(&delay_btn, settings);
-                    widgets::vline(ui, 18.0);
-                    let opts_btn = cap_button(ui, Icon::Settings, "toolbar.options.tooltip", false);
-                    Self::options_menu(&opts_btn, settings);
-                    widgets::vline(ui, 18.0);
-                });
+                        widgets::vline(ui, 18.0);
+                        // Accent border + soft fill while a delay is
+                        // armed — the "small blue frame" marker.
+                        let delay_btn = cap_button(
+                            ui,
+                            Icon::Clock,
+                            "toolbar.delay.tooltip",
+                            settings.capture_delay_secs > 0,
+                        );
+                        Self::delay_menu(&delay_btn, settings);
+                        widgets::vline(ui, 18.0);
+                        let opts_btn =
+                            cap_button(ui, Icon::Settings, "toolbar.options.tooltip", false);
+                        Self::options_menu(&opts_btn, settings);
+                        widgets::vline(ui, 18.0);
+                        popup_open(ui, &delay_btn) || popup_open(ui, &opts_btn)
+                    })
+                    .inner;
                 if cap_button(ui, Icon::X, "toolbar.close.tooltip", false).clicked() {
                     shared.push(Command::CloseBar);
                 }
-            });
+                menu_open
+            })
+            .inner
         });
         if inner.response.drag_started() {
             ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
@@ -120,14 +153,19 @@ impl Toolbar {
         inner
     }
 
-    /// Dropdown on the clock button: delay in seconds before a capture, plus
-    /// the auto-reset-to-zero toggle. Changes persist immediately.
+    /// Dropdown on the clock button: delay in seconds before a capture.
+    /// The chosen delay is session state — it survives between captures
+    /// but is never saved to disk.
     fn delay_menu(btn: &egui::Response, settings: &mut Settings) {
-        let mut changed = false;
         egui::Popup::menu(btn).show(|ui| {
-            changed |= ui
-                .selectable_value(&mut settings.capture_delay_secs, 0, t!("delay.none"))
-                .changed();
+            ui.selectable_value(&mut settings.capture_delay_secs, 0, t!("delay.none"));
+            // A quick 5-second pick, then the full 1–9 s range below a
+            // separator.
+            ui.selectable_value(
+                &mut settings.capture_delay_secs,
+                5,
+                t!("delay.seconds", count = 5),
+            );
             ui.separator();
             for secs in 1..=9u32 {
                 let key = if secs == 1 {
@@ -135,22 +173,13 @@ impl Toolbar {
                 } else {
                     "delay.seconds"
                 };
-                changed |= ui
-                    .selectable_value(
-                        &mut settings.capture_delay_secs,
-                        secs,
-                        t!(key, count = secs),
-                    )
-                    .changed();
+                ui.selectable_value(
+                    &mut settings.capture_delay_secs,
+                    secs,
+                    t!(key, count = secs),
+                );
             }
-            ui.separator();
-            changed |= ui
-                .checkbox(&mut settings.delay_auto_reset, t!("delay.auto_reset"))
-                .changed();
         });
-        if changed {
-            settings.save();
-        }
     }
 
     /// Menu on the gear button: capture-related toggles only — application
@@ -209,4 +238,10 @@ fn cap_button(ui: &mut egui::Ui, icon: Icon, tip: &'static str, selected: bool) 
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
     }
     resp
+}
+
+/// Whether the [`egui::Popup::menu`] anchored on `btn` is currently open —
+/// egui derives the popup id from the anchor response id.
+fn popup_open(ui: &egui::Ui, btn: &egui::Response) -> bool {
+    egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(btn))
 }

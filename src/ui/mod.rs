@@ -5,6 +5,7 @@
 //! `widgets/` — everything reads [`theme::tokens`].
 
 pub mod capture_overlay;
+pub mod countdown;
 pub mod draw;
 pub mod icons;
 pub mod pin;
