@@ -564,6 +564,12 @@ impl Shared {
                 // it forward: `enter` only requests focus on a state
                 // CHANGE, so de-minimize and focus explicitly here.
                 ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Minimized(false));
+                // The direct Focus command both wakes the (possibly
+                // sleeping) viewport and, on macOS, activates the app
+                // (`activateIgnoringOtherApps` + `makeKeyAndOrderFront`)
+                // — a mere in-app focus request would do nothing while
+                // another application is frontmost.
+                ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Focus);
                 self.request_focus(viewer_id());
                 ctx.request_repaint_of(viewer_id());
             }
@@ -1007,7 +1013,9 @@ impl Shared {
 
     /// Runs inside a child viewport callback: keeps sending `Focus` while the
     /// window exists but has not been focused yet (~1.5 s cap so a window the
-    /// user deliberately backgrounds is not re-focused forever).
+    /// user deliberately backgrounds is not re-focused forever). Each retry
+    /// re-requests a repaint: a single Focus can race a not-yet-created or
+    /// still-minimized window, and a sleeping viewport would never retry.
     fn maybe_focus(&self, ctx: &egui::Context, id: egui::ViewportId) {
         let mut pending = lock(&self.pending_focus);
         let Some(entry) = pending.iter_mut().find(|(v, _)| *v == id) else {
@@ -1018,6 +1026,7 @@ impl Shared {
         } else {
             entry.1 += 1;
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
         }
     }
 
