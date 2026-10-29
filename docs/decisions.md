@@ -1160,3 +1160,34 @@ Format: date — context — decision — consequences.
   keyed by annotation revision) — region and full renders then become
   bounded composites of cached layers; also fixes commit-time
   re-renders and undo/redo. Not implemented here.
+
+## 2026-10-29 — Crosshair follows the cursor across monitors, locks to the screen where the zone starts
+
+- **Context**: with several monitors, the capture overlay always opened on the
+  PRIMARY monitor: `begin_capture` and the overlay freeze both called
+  `screen::primary_monitor()`. Worse, because a single overlay viewport only
+  receives pointer events inside its own bounds, moving the mouse onto the
+  other display froze the crosshair on the first screen and never showed it on
+  the second — and starting from a bar on the secondary screen showed nothing
+  until the cursor wandered back onto the primary.
+- **Decision**: `warm_freeze` photographs every connected monitor up front
+  (`screen::capture_all_monitors`). While no selection has started (`can_roam`
+  — no active drag and no placed selection), the overlay polls the OS global
+  cursor position (`platform::cursor_position`: `CGEvent::location` on macOS,
+  `GetCursorPos` on Windows) each frame and hops the overlay viewport + texture
+  to whichever monitor currently holds the cursor. As soon as the user clicks
+  to start dragging a region (or places a fixed-region frame), roaming stops
+  and the selection stays confined to that monitor — no cross-monitor spanning
+  (user decision). Fixed-region and pin prefill memories also carry the
+  `monitor_id` so a remembered rect on monitor A does not lock the overlay onto
+  monitor B.
+- **Consequences**: regardless of which screen holds the floating bar (or even
+  when launched from the menu bar / status item), the crosshair and magnifier
+  follow the cursor freely from one monitor to another until the user starts
+  drawing, then stay clamped to the monitor where the drag began. Coordinate
+  spaces between egui viewports and `MonitorInfo::rect` are bridged by
+  `platform::ui_to_native` / `native_to_ui`. Opening the floating bar
+  (`Command::ShowBar`, "+" button or status-item menu) always places it
+  top-centred on the monitor where the cursor sits, and confirming a capture
+  opens the viewer on the captured monitor (keeping its existing position when
+  already on that monitor, or centring it there).

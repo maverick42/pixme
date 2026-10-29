@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use eframe::egui;
 use rust_i18n::t;
 
+use crate::capture::MonitorInfo;
 use crate::config::Settings;
 use crate::editor::Document;
 use crate::i18n::{self, Language};
@@ -253,6 +254,12 @@ pub struct Shared {
     pub settings: Mutex<Settings>,
     /// Viewer session state (tabs, dirty flag, confirmation).
     pub viewer: Mutex<Viewer>,
+    /// Last on-screen outer rectangle of the viewer viewport (restored on
+    /// reopen and translated onto the captured monitor after a capture).
+    pub viewer_rect: Mutex<Option<egui::Rect>>,
+    /// Monitor the viewer must appear on when it next opens (set after a
+    /// capture confirms so the viewer lands on the captured screen).
+    pub viewer_target_monitor: Mutex<Option<MonitorInfo>>,
     /// The floating toolbar's transient state.
     pub toolbar: Mutex<Toolbar>,
     /// Last on-screen position of the bar viewport (restored on reopen).
@@ -264,12 +271,20 @@ pub struct Shared {
     pub settings_draft: Mutex<Option<Settings>>,
     /// The live capture session while in `Capturing` (`None` otherwise).
     pub capture: Mutex<Option<OverlaySession>>,
-    /// The last confirmed fixed-region rect, in monitor-logical space:
-    /// the next fixed capture opens at the same size and position.
-    pub last_fixed_region: Mutex<Option<egui::Rect>>,
-    /// The last confirmed capture rect of ANY mode (monitor-logical
-    /// space): the `Pin` capture's selection opens there.
-    pub last_capture_rect: Mutex<Option<egui::Rect>>,
+    /// The last confirmed fixed-region `(monitor_id, rect)` in
+    /// monitor-logical space: the next fixed capture opens at the same
+    /// size and position on that monitor.
+    pub last_fixed_region: Mutex<Option<(u32, egui::Rect)>>,
+    /// The last confirmed capture `(monitor_id, rect)` of ANY mode
+    /// (monitor-logical space): the `Pin` capture's selection opens
+    /// there.
+    pub last_capture_rect: Mutex<Option<(u32, egui::Rect)>>,
+    /// The monitor the pending capture was launched from — set by
+    /// [`Shared::push_capture`] when a window (the bar, the viewer) starts
+    /// a capture, consumed by `begin_capture`. `None` for resident-icon
+    /// launches (no window): `begin_capture` falls back to the monitor
+    /// under the cursor, then the primary monitor.
+    capture_start_monitor: Mutex<Option<MonitorInfo>>,
     /// Pinned captures — autonomous always-on-top windows, each backed
     /// by a deferred viewport. They outlive every state transition and
     /// die with the app.
@@ -329,6 +344,17 @@ impl Shared {
     /// Queues a command for dispatch on the next pump.
     pub fn push(&self, command: Command) {
         lock(&self.pending).push(command);
+    }
+
+    /// Queues a capture command and records the monitor the request came
+    /// from — the visible window (the bar, the viewer) under the cursor —
+    /// so the overlay opens on "the screen where the zone starts". The
+    /// record survives the capture delay: `begin_capture` may run later,
+    /// from the anchor's pass. Resident-icon launches (no window) leave
+    /// the slot empty and `begin_capture` falls back to the primary.
+    pub fn push_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
+        *lock(&self.capture_start_monitor) = monitor_under(ctx);
+        self.push(Command::Capture(mode));
     }
 
     /// Settings guard for UI code that edits preferences.
@@ -507,7 +533,30 @@ impl Shared {
             Command::CaptureNow(mode) => self.begin_capture(mode, ctx),
             Command::ConfirmCapture => self.confirm_capture(ctx),
             Command::CancelCapture => self.cancel_capture(ctx),
-            Command::ShowBar => self.enter(AppState::Bar, ctx),
+            Command::ShowBar => {
+                // Always open the floating bar top-centred on the monitor
+                // where the mouse currently is.
+                if let Some(m) = platform::cursor_position()
+                    .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
+                    .or_else(|| monitor_under(ctx))
+                    .or_else(|| crate::capture::screen::primary_monitor().ok())
+                {
+                    let scale = m.scale_factor.max(1.0);
+                    let origin =
+                        platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
+                    let size = platform::native_to_ui(
+                        egui::pos2(m.rect.width as f32, m.rect.height as f32),
+                        scale,
+                    )
+                    .to_vec2();
+                    *lock(&self.bar_pos) = Some(egui::pos2(
+                        origin.x + (size.x - 340.0) / 2.0,
+                        origin.y + size.y * 0.12,
+                    ));
+                    lock(&self.toolbar).place_on_monitor(m);
+                }
+                self.enter(AppState::Bar, ctx);
+            }
             Command::OpenViewer => {
                 self.enter(AppState::Viewer, ctx);
                 // Re-invoking while the window is already open (behind
@@ -994,28 +1043,35 @@ impl Shared {
             | CaptureMode::FixedRegion
             | CaptureMode::FullScreen
             | CaptureMode::WindowOrObject
-            | CaptureMode::Pin => match crate::capture::screen::primary_monitor() {
-                Ok(monitor) => {
-                    // Fixed region recalls ITS memory; Pin recalls the last
-                    // confirmed capture rect whatever the mode was.
-                    let remembered = match mode {
-                        CaptureMode::FixedRegion => *lock(&self.last_fixed_region),
-                        CaptureMode::Pin => *lock(&self.last_capture_rect),
-                        _ => None,
-                    };
-                    let mut session = OverlaySession::new(mode, return_to, remembered);
-                    session.monitor = Some(monitor);
-                    let instant = session.instant;
-                    *lock(&self.capture) = Some(session);
-                    self.enter(AppState::Capturing, ctx);
-                    if !instant {
-                        self.request_focus(overlay_id());
-                    }
+            | CaptureMode::Pin => {
+                // The overlay initially opens on the screen under the cursor
+                // (or where the capture was asked for), then follows the
+                // cursor across monitors until the user starts a selection.
+                let monitor = platform::cursor_position()
+                    .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
+                    .or_else(|| lock(&self.capture_start_monitor).take())
+                    .or_else(|| monitor_under(ctx))
+                    .or_else(|| crate::capture::screen::primary_monitor().ok());
+                let Some(monitor) = monitor else {
+                    tracing::error!("cannot enumerate monitors");
+                    return;
+                };
+                // Fixed region recalls ITS memory; Pin recalls the last
+                // confirmed capture rect whatever the mode was.
+                let remembered = match mode {
+                    CaptureMode::FixedRegion => *lock(&self.last_fixed_region),
+                    CaptureMode::Pin => *lock(&self.last_capture_rect),
+                    _ => None,
+                };
+                let mut session = OverlaySession::new(mode, return_to, remembered);
+                session.monitor = Some(monitor);
+                let instant = session.instant;
+                *lock(&self.capture) = Some(session);
+                self.enter(AppState::Capturing, ctx);
+                if !instant {
+                    self.request_focus(overlay_id());
                 }
-                Err(err) => {
-                    tracing::error!("cannot enumerate monitors: {err}");
-                }
-            },
+            }
         }
     }
 
@@ -1039,17 +1095,20 @@ impl Shared {
             return;
         };
         // Fixed-region memory: the next fixed capture reopens exactly here
-        // (same size, same position — monitor-logical space).
+        // (same monitor, same size, same position — monitor-logical space).
         if matches!(session.mode, CaptureMode::FixedRegion) {
-            *lock(&self.last_fixed_region) = session.monitor_space_selection();
+            *lock(&self.last_fixed_region) = session.monitor_and_selection();
         }
         // Pin prefill memory: the confirmed rect whatever the mode — a
         // full screen counts as the whole monitor.
-        let confirmed_rect = session.monitor_space_selection().or_else(|| {
+        let confirmed_rect = session.monitor_and_selection().or_else(|| {
             session.monitor.as_ref().map(|m| {
-                egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(m.rect.width as f32, m.rect.height as f32),
+                (
+                    m.id,
+                    egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(m.rect.width as f32, m.rect.height as f32),
+                    ),
                 )
             })
         });
@@ -1063,6 +1122,8 @@ impl Shared {
             self.enter(return_to, ctx);
             return;
         }
+        // Open the viewer on the monitor that was just captured.
+        *lock(&self.viewer_target_monitor) = Some(frame.monitor.clone());
         let title = {
             let mut viewer = lock(&self.viewer);
             let title = self.capture_title();
@@ -1082,10 +1143,18 @@ impl Shared {
         ctx: &egui::Context,
     ) {
         let monitor = frame.monitor.rect;
+        // The pin's viewport position is in egui points of its own
+        // display; `monitor_space_selection` already is in that space,
+        // so only the monitor origin needs the native→ui conversion
+        // (identity on macOS, ÷scale on Windows).
+        let origin_ui = crate::platform::native_to_ui(
+            egui::pos2(monitor.x as f32, monitor.y as f32),
+            frame.scale_factor,
+        );
         let origin = session
             .monitor_space_selection()
-            .map(|r| egui::pos2(monitor.x as f32 + r.min.x, monitor.y as f32 + r.min.y))
-            .unwrap_or(egui::pos2(monitor.x as f32 + 80.0, monitor.y as f32 + 80.0));
+            .map(|r| origin_ui + r.min.to_vec2())
+            .unwrap_or(origin_ui + egui::vec2(80.0, 80.0));
         let id = {
             let mut n = lock(&self.next_pin_id);
             *n += 1;
@@ -1288,6 +1357,29 @@ fn debug_mode(name: &str) -> Option<CaptureMode> {
     })
 }
 
+/// The monitor under the window dispatching a capture — its centre hit
+/// against `MonitorInfo::rect`. The invisible 1×1 anchor (resident-icon
+/// launches, delayed `CaptureNow`) returns `None`: there is no window to
+/// anchor the overlay to.
+///
+/// Coordinate space: `outer_rect` is in "ui points of the window's
+/// display" while `MonitorInfo::rect` is in the OS-native global space;
+/// [`platform::ui_to_native`] bridges the two (identity on macOS, ×scale
+/// on Windows).
+fn monitor_under(ctx: &egui::Context) -> Option<MonitorInfo> {
+    if ctx.viewport_id() == egui::ViewportId::ROOT {
+        return None;
+    }
+    ctx.input(|i| {
+        let vp = i.viewport();
+        match (vp.outer_rect, vp.native_pixels_per_point) {
+            (Some(r), Some(s)) if s > 0.0 => Some(platform::ui_to_native(r.center(), s)),
+            _ => None,
+        }
+    })
+    .and_then(|c| crate::capture::screen::monitor_at(c.x, c.y))
+}
+
 /// Root application state, created once in [`eframe::App::ui`]'s setup.
 pub struct PixMeApp {
     /// Everything the deferred-viewport callbacks reach.
@@ -1320,6 +1412,8 @@ impl PixMeApp {
                 viewer_dialog_open: AtomicBool::new(false),
                 settings: Mutex::new(settings),
                 viewer: Mutex::new(Viewer::default()),
+                viewer_rect: Mutex::new(None),
+                viewer_target_monitor: Mutex::new(None),
                 toolbar: Mutex::new(Toolbar::default()),
                 bar_pos: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
@@ -1327,6 +1421,7 @@ impl PixMeApp {
                 capture: Mutex::new(None),
                 last_fixed_region: Mutex::new(None),
                 last_capture_rect: Mutex::new(None),
+                capture_start_monitor: Mutex::new(None),
                 pins: Mutex::new(Vec::new()),
                 next_pin_id: Mutex::new(0),
                 save_dialog: Mutex::new(None),
@@ -1417,10 +1512,26 @@ impl eframe::App for PixMeApp {
             }
             AppState::Viewer => {
                 let shared = Arc::clone(&self.shared);
-                ctx.show_viewport_deferred(viewer_id(), viewer_builder(), move |ui, _class| {
+                // If a capture just landed on a specific monitor, make sure
+                // the viewer opens on that monitor (preserving its relative
+                // placement / size when already known, or centring it there).
+                let target_mon = lock(&shared.viewer_target_monitor).take();
+                if let Some(ref m) = target_mon {
+                    let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), m);
+                    *lock(&shared.viewer_rect) = Some(next);
+                }
+                let builder = viewer_builder(lock(&shared.viewer_rect).map(|r| r.min));
+                ctx.show_viewport_deferred(viewer_id(), builder, move |ui, _class| {
                     let ctx = ui.ctx().clone();
                     shared.pump(&ctx);
                     shared.maybe_focus(&ctx, viewer_id());
+                    if let Some(ref m) = target_mon {
+                        let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), m);
+                        *lock(&shared.viewer_rect) = Some(next);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(next.min));
+                    } else if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                        *lock(&shared.viewer_rect) = Some(outer);
+                    }
                     // Draw is modal to the viewer: deferred viewports are
                     // plain top-level windows with no OS child-window
                     // modality. Clicking the modal's parent (the dim veil
@@ -1641,13 +1752,49 @@ fn bar_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
 }
 
 /// The viewer window: decorated, resizable, the app's real home.
-fn viewer_builder() -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default()
+fn viewer_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
+    let builder = egui::ViewportBuilder::default()
         .with_title(t!("app.title"))
         .with_app_id("pixme")
         .with_inner_size([860.0, 560.0])
         .with_min_inner_size([420.0, 280.0])
-        .with_active(true)
+        .with_active(true);
+    match position {
+        Some(pos) => builder.with_position(pos),
+        None => builder,
+    }
+}
+
+/// Computes the viewer's outer rectangle on `monitor` (in egui ui points):
+/// if `current` is already on `monitor` (its centre falls inside `monitor`'s
+/// bounds), it is kept as-is; otherwise the window is centred on `monitor`
+/// (clamped inside it).
+fn place_viewer_on_monitor(current: Option<egui::Rect>, monitor: &MonitorInfo) -> egui::Rect {
+    let scale = monitor.scale_factor.max(1.0);
+    let mon_min = platform::native_to_ui(
+        egui::pos2(monitor.rect.x as f32, monitor.rect.y as f32),
+        scale,
+    );
+    let mon_size = platform::native_to_ui(
+        egui::pos2(monitor.rect.width as f32, monitor.rect.height as f32),
+        scale,
+    )
+    .to_vec2();
+    let mon_rect = egui::Rect::from_min_size(mon_min, mon_size);
+    if let Some(rect) = current
+        && mon_rect.contains(rect.center())
+    {
+        return rect;
+    }
+    let size = current
+        .map(|r| r.size())
+        .unwrap_or(egui::vec2(860.0, 588.0))
+        .min(mon_size);
+    let pos = egui::pos2(
+        mon_min.x + ((mon_size.x - size.x) * 0.5).max(0.0),
+        mon_min.y + ((mon_size.y - size.y) * 0.5).max(0.0),
+    );
+    egui::Rect::from_min_size(pos, size)
 }
 
 /// The capture overlay: a borderless always-on-top window covering the
@@ -1787,6 +1934,8 @@ mod tests {
             state: Mutex::new(AppState::Bar),
             settings: Mutex::new(Settings::default()),
             viewer: Mutex::new(Viewer::default()),
+            viewer_rect: Mutex::new(None),
+            viewer_target_monitor: Mutex::new(None),
             toolbar: Mutex::new(Toolbar::default()),
             bar_pos: Mutex::new(None),
             settings_open: AtomicBool::new(false),
@@ -1794,6 +1943,7 @@ mod tests {
             capture: Mutex::new(None),
             last_fixed_region: Mutex::new(None),
             last_capture_rect: Mutex::new(None),
+            capture_start_monitor: Mutex::new(None),
             pins: Mutex::new(Vec::new()),
             next_pin_id: Mutex::new(0),
             save_dialog: Mutex::new(None),

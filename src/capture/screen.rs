@@ -44,6 +44,21 @@ pub fn primary_monitor() -> Result<MonitorInfo, CaptureError> {
         .ok_or(CaptureError::Failed("no monitor".into()))
 }
 
+/// The monitor whose bounds contain the logical point `(x, y)` — the same
+/// global display space `MonitorInfo::rect` lives in. `None` when the point
+/// falls outside every monitor (gaps in a non-rectangular arrangement).
+pub fn monitor_at(x: f32, y: f32) -> Option<MonitorInfo> {
+    monitors().ok()?.into_iter().find(|m| {
+        let r = &m.rect;
+        let (x0, y0) = (r.x as f32, r.y as f32);
+        let (x1, y1) = (
+            (r.x + r.width as i32) as f32,
+            (r.y + r.height as i32) as f32,
+        );
+        x >= x0 && x < x1 && y >= y0 && y < y1
+    })
+}
+
 /// One `xcap` monitor as our [`MonitorInfo`] (logical-point bounds).
 pub fn monitor_info(m: &Monitor) -> Result<MonitorInfo, CaptureError> {
     Ok(MonitorInfo {
@@ -76,6 +91,32 @@ pub fn capture_monitor(id: u32) -> Result<Capture, CaptureError> {
         scale_factor: info.scale_factor,
         monitor: info,
     })
+}
+
+/// Captures the full frame of every connected monitor in one pass — the
+/// region overlay freezes all screens up front so the crosshair can follow
+/// the cursor across displays until the user clicks to start a selection.
+/// Any individual monitor that fails to capture is skipped; `Err` is
+/// returned only when no monitor could be captured at all.
+pub fn capture_all_monitors() -> Result<Vec<Capture>, CaptureError> {
+    let list = Monitor::all().map_err(|e| CaptureError::Failed(e.to_string()))?;
+    let mut out = Vec::with_capacity(list.len());
+    for m in list {
+        let Ok(info) = monitor_info(&m) else {
+            continue;
+        };
+        if let Ok(image) = m.capture_image() {
+            out.push(Capture {
+                image: std::sync::Arc::new(image),
+                scale_factor: info.scale_factor,
+                monitor: info,
+            });
+        }
+    }
+    if out.is_empty() {
+        return Err(CaptureError::Failed("no monitor captured".into()));
+    }
+    Ok(out)
 }
 
 /// Crops `rect` (physical pixels, relative to the monitor origin) out of a

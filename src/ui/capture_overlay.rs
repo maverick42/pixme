@@ -75,9 +75,13 @@ pub struct OverlaySession {
     /// Frames painted before the screenshot is taken — the bar's window must
     /// be torn down first or it would photograph itself.
     warm_frames: u8,
-    /// The frozen monitor frame (physical px), once armed.
+    /// All monitors frozen up front so the crosshair can follow the cursor
+    /// across screens until a selection starts.
+    frozen_all: Vec<Capture>,
+    /// The frozen frame of the currently active monitor (physical px), once
+    /// armed.
     pub frozen: Option<Capture>,
-    /// Monitor being covered.
+    /// Monitor currently covered by the overlay.
     pub monitor: Option<MonitorInfo>,
     /// Current selection in overlay-logical coordinates.
     pub selection: Option<Rect>,
@@ -100,12 +104,13 @@ pub struct OverlaySession {
     /// once after the freeze, and the currently proposed window id.
     window_list: Option<Vec<WindowInfo>>,
     picked_window_id: Option<u32>,
-    /// Pre-seeded selection (monitor-logical space): materialized into
-    /// `selection` once `screen_offset` is known. The fixed-region memory
-    /// recalls the previous fixed capture's exact size and position; the
-    /// pin prefill recalls the last confirmed capture rect of any mode.
-    restore_sel: Option<Rect>,
-    /// Full-screen frozen frame texture.
+    /// Pre-seeded selection (`(monitor_id, rect)` in monitor-logical space):
+    /// materialized into `selection` once the overlay is on that monitor and
+    /// `screen_offset` is known. The fixed-region memory recalls the previous
+    /// fixed capture's exact monitor, size and position; the pin prefill
+    /// recalls the last confirmed capture rect of any mode.
+    restore_sel: Option<(u32, Rect)>,
+    /// Full-screen frozen frame texture for the current `monitor`.
     texture: Option<egui::TextureHandle>,
     /// Magnifier source texture (rebuilt around the cursor each frame).
     loupe: Option<egui::TextureHandle>,
@@ -115,15 +120,16 @@ pub struct OverlaySession {
 
 impl OverlaySession {
     /// A fresh session for `mode`; `return_to` is where Esc lands.
-    /// `remembered` is the previous fixed-region rect (monitor-logical
-    /// space): when present, the fixed frame reappears exactly there
-    /// instead of riding the cursor.
-    pub fn new(mode: CaptureMode, return_to: AppState, remembered: Option<Rect>) -> Self {
+    /// `remembered` is the previous fixed-region / pin `(monitor_id, rect)`
+    /// in monitor-logical space: when present on the target monitor, the
+    /// frame reappears there instead of riding the cursor.
+    pub fn new(mode: CaptureMode, return_to: AppState, remembered: Option<(u32, Rect)>) -> Self {
         Self {
             mode,
             return_to,
             instant: matches!(mode, CaptureMode::FullScreen),
             warm_frames: 0,
+            frozen_all: Vec::new(),
             frozen: None,
             monitor: None,
             selection: None,
@@ -146,26 +152,95 @@ impl OverlaySession {
         }
     }
 
+    /// Switches the overlay to the frozen frame of monitor `id` (no-op if
+    /// already active or not in `frozen_all`). Clears the cached texture so
+    /// the next frame uploads the new monitor's image and re-arms `nudged`
+    /// so the viewport moves onto that monitor.
+    fn activate_monitor(&mut self, id: u32) -> bool {
+        if self.monitor.as_ref().map(|m| m.id) == Some(id) && self.frozen.is_some() {
+            return false;
+        }
+        let Some(frame) = self.frozen_all.iter().find(|c| c.monitor.id == id).cloned() else {
+            return false;
+        };
+        self.monitor = Some(frame.monitor.clone());
+        self.frozen = Some(frame);
+        self.texture = None;
+        self.nudged = false;
+        self.screen_offset = Vec2::ZERO;
+        // If a remembered selection belonged to a different monitor than the
+        // one we ended up on, drop it (in FixedRegion, let the frame ride the
+        // cursor instead).
+        if let Some((rem_id, _)) = self.restore_sel
+            && rem_id != id
+        {
+            self.restore_sel = None;
+            if matches!(self.mode, CaptureMode::FixedRegion) {
+                self.placed = false;
+            }
+        }
+        true
+    }
+
+    /// True while the overlay is allowed to follow the cursor onto another
+    /// monitor: no drag is in progress and no region has been locked in yet.
+    /// In `WindowOrObject` pick mode `selection` is merely the hovered window
+    /// proposal, so roaming stays open until the user clicks.
+    fn can_roam(&self) -> bool {
+        if self.drag.is_some() {
+            return false;
+        }
+        match self.mode {
+            CaptureMode::WindowOrObject => true,
+            CaptureMode::FixedRegion => !self.placed && self.selection.is_none(),
+            _ => self.selection.is_none() && self.restore_sel.is_none(),
+        }
+    }
+
     /// Freeze warm-up, called by the **anchor** pass while no capture window
     /// exists yet: two anchor frames let the floating bar finish tearing
-    /// down, then the screenshot is taken. Crucially this runs *before* the
-    /// overlay viewport is created — capturing while it is on screen would
-    /// photograph the overlay's own veil. Returns `true` once frozen.
+    /// down, then every connected monitor is photographed at once. Crucially
+    /// this runs *before* the overlay viewport is created — capturing while
+    /// it is on screen would photograph the overlay's own veil. Returns
+    /// `true` once frozen.
     pub fn warm_freeze(&mut self) -> bool {
         self.warm_frames += 1;
         if self.warm_frames < 2 {
             return false;
         }
         if self.frozen.is_none() && !self.failed {
-            let res = screen::primary_monitor().and_then(|m| screen::capture_monitor(m.id));
-            match res {
-                Ok(frame) => {
-                    // Dev hook: PIXME_DUMP_FROZEN=/path.png dumps the frozen frame.
-                    if let Some(path) = std::env::var_os("PIXME_DUMP_FROZEN") {
-                        let _ = frame.image.save(&path);
+            match screen::capture_all_monitors() {
+                Ok(frames) => {
+                    // Pick the monitor under the cursor right now; fall back
+                    // to the pre-selected monitor or the primary/first frame.
+                    let cursor_mon = crate::platform::cursor_position()
+                        .and_then(|(x, y)| screen::monitor_at(x, y))
+                        .map(|m| m.id);
+                    // For FixedRegion/Pin with a remembered rect on a known
+                    // monitor, open on that monitor initially unless the
+                    // cursor is elsewhere.
+                    let initial_id = cursor_mon
+                        .or_else(|| self.restore_sel.map(|(id, _)| id))
+                        .or_else(|| self.monitor.as_ref().map(|m| m.id))
+                        .or_else(|| {
+                            frames
+                                .iter()
+                                .find(|c| c.monitor.is_primary)
+                                .or_else(|| frames.first())
+                                .map(|c| c.monitor.id)
+                        });
+                    self.frozen_all = frames;
+                    if let Some(id) = initial_id {
+                        self.activate_monitor(id);
                     }
-                    self.monitor = Some(frame.monitor.clone());
-                    self.frozen = Some(frame);
+                    if let Some(frame) = &self.frozen {
+                        // Dev hook: PIXME_DUMP_FROZEN=/path.png dumps the frozen frame.
+                        if let Some(path) = std::env::var_os("PIXME_DUMP_FROZEN") {
+                            let _ = frame.image.save(&path);
+                        }
+                    } else {
+                        self.failed = true;
+                    }
                 }
                 Err(err) => {
                     tracing::error!("capture failed: {err}");
@@ -196,18 +271,61 @@ impl OverlaySession {
             return;
         }
 
+        // -- follow the cursor across monitors before selection starts ----
+        // While no region has been drawn or locked in, moving the mouse onto
+        // another display hops the overlay to that display's pre-frozen
+        // frame. Once the user starts dragging (or a selection is placed),
+        // `can_roam()` turns false and the overlay stays on that monitor.
+        if self.can_roam()
+            && self.frozen_all.len() > 1
+            && let Some((cx, cy)) = crate::platform::cursor_position()
+            && let Some(hit) = self
+                .frozen_all
+                .iter()
+                .find(|c| {
+                    let r = &c.monitor.rect;
+                    let (x0, y0) = (r.x as f32, r.y as f32);
+                    let (x1, y1) = (
+                        (r.x + r.width as i32) as f32,
+                        (r.y + r.height as i32) as f32,
+                    );
+                    cx >= x0 && cx < x1 && cy >= y0 && cy < y1
+                })
+                .map(|c| c.monitor.id)
+            && self.activate_monitor(hit)
+        {
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+
         // -- align the frozen frame to the real screen --------------------
         // Track where the window actually landed vs the monitor origin and
         // retry the true full-screen frame once (init clamps; setFrame may
-        // not). Either way `screen_offset` keeps the mapping exact.
+        // not). Either way `screen_offset` keeps the mapping exact: window
+        // origin minus monitor origin, in the overlay's ui points. The
+        // monitor origin is converted from native units via
+        // `platform::native_to_ui` (identity on macOS — egui points there
+        // already are native points; ÷scale on Windows).
         if let (Some(outer), Some(m)) =
             (ctx.input(|i| i.viewport().outer_rect), self.monitor.clone())
         {
-            self.screen_offset = outer.min.to_vec2() - egui::vec2(m.rect.x as f32, m.rect.y as f32);
+            let native_scale = ctx
+                .input(|i| i.viewport().native_pixels_per_point)
+                .or_else(|| self.frozen.as_ref().map(|f| f.scale_factor))
+                .unwrap_or(1.0);
+            let origin = crate::platform::native_to_ui(
+                egui::pos2(m.rect.x as f32, m.rect.y as f32),
+                native_scale,
+            );
+            self.screen_offset = outer.min.to_vec2() - origin.to_vec2();
             // Materialize the remembered fixed region now that the
             // monitor↔window mapping is known (stored in monitor space).
-            if let Some(stored) = self.restore_sel.take() {
-                self.selection = Some(slide_inside(stored.translate(-self.screen_offset), rect));
+            if let Some((rem_id, stored)) = self.restore_sel.take() {
+                if rem_id == m.id {
+                    self.selection =
+                        Some(slide_inside(stored.translate(-self.screen_offset), rect));
+                } else if matches!(self.mode, CaptureMode::FixedRegion) {
+                    self.placed = false;
+                }
             }
             if !self.nudged {
                 self.nudged = true;
@@ -266,12 +384,13 @@ impl OverlaySession {
 
         // -- input ---------------------------------------------------------
         let resp = ui.interact(rect, ui.id().with("overlay"), Sense::click_and_drag());
+        let cursor = self.cursor_pos(&ctx);
         if matches!(self.mode, CaptureMode::WindowOrObject) {
-            self.pick_window(&ctx);
+            self.pick_window(&ctx, cursor);
         } else {
             // Fixed-region: the frame follows the cursor until placed.
             if !self.placed {
-                if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                if let Some(pos) = cursor {
                     self.selection =
                         Some(slide_inside(Rect::from_center_size(pos, FIXED_SIZE), rect));
                 }
@@ -287,8 +406,30 @@ impl OverlaySession {
             shared.push(Command::ConfirmCapture);
         }
         self.keys(&ctx, shared);
-        self.paint(ui, &ctx);
+        self.paint(ui, &ctx, cursor);
         ctx.request_repaint(); // crosshair + loupe track every move
+    }
+
+    /// Cursor position in overlay-local coordinates: prefers egui's pointer
+    /// state, and falls back to the OS global cursor position mapped into
+    /// this window so the crosshair/loupe show up on the very first frame
+    /// after hopping onto a new monitor.
+    fn cursor_pos(&self, ctx: &egui::Context) -> Option<Pos2> {
+        if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+            return Some(pos);
+        }
+        let (cx, cy) = crate::platform::cursor_position()?;
+        let m = self.monitor.as_ref()?;
+        let native_scale = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .or_else(|| self.frozen.as_ref().map(|f| f.scale_factor))
+            .unwrap_or(1.0);
+        let cursor_ui = crate::platform::native_to_ui(egui::pos2(cx, cy), native_scale);
+        let origin_ui = crate::platform::native_to_ui(
+            egui::pos2(m.rect.x as f32, m.rect.y as f32),
+            native_scale,
+        );
+        Some(cursor_ui - origin_ui.to_vec2() - self.screen_offset)
     }
 
     /// Pointer input: hit-test handles → inside → outside, update selection.
@@ -353,11 +494,11 @@ impl OverlaySession {
 
     /// Pick mode (`WindowOrObject`): the hovered topmost window becomes the
     /// selection — undimmed and bordered; double-click captures it.
-    fn pick_window(&mut self, ctx: &egui::Context) {
+    fn pick_window(&mut self, ctx: &egui::Context, cursor: Option<Pos2>) {
         if self.window_list.is_none() {
             self.window_list = window::windows().ok();
         }
-        let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
+        let Some(pos) = cursor else {
             self.selection = None;
             return;
         };
@@ -418,14 +559,14 @@ impl OverlaySession {
     }
 
     /// Selection, crosshair, magnifier.
-    fn paint(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn paint(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, cursor: Option<Pos2>) {
         let rect = ui.max_rect();
         let pick = matches!(self.mode, CaptureMode::WindowOrObject);
         if let Some(sel) = self.selection {
             // Pick mode proposes a fixed rect: dashed border, no handles.
             paint_selection(ui, sel, !pick);
         }
-        let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
+        let Some(pos) = cursor else {
             return;
         };
         if !rect.contains(pos) {
@@ -577,7 +718,7 @@ impl OverlaySession {
     /// `#RRGGBB` of the physical pixel under the cursor.
     fn cursor_hex(&self, ctx: &egui::Context) -> Option<String> {
         let img = &self.frozen.as_ref()?.image;
-        let pos = ctx.input(|i| i.pointer.latest_pos())?;
+        let pos = self.cursor_pos(ctx)?;
         let scale = self.frozen.as_ref()?.scale_factor;
         let p = pos + self.screen_offset;
         let (x, y) = ((p.x * scale) as i64, (p.y * scale) as i64);
@@ -592,6 +733,12 @@ impl OverlaySession {
     /// fixed-region memory is kept across captures.
     pub fn monitor_space_selection(&self) -> Option<Rect> {
         self.selection.map(|s| s.translate(self.screen_offset))
+    }
+
+    /// `(monitor_id, selection)` in monitor-logical space for fixed-region
+    /// and pin prefill memory.
+    pub fn monitor_and_selection(&self) -> Option<(u32, Rect)> {
+        Some((self.monitor.as_ref()?.id, self.monitor_space_selection()?))
     }
 
     /// Crops the selection (physical px) out of the frozen frame — or, in

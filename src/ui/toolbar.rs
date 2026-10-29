@@ -25,11 +25,18 @@ const TOP_MARGIN: f32 = 0.12;
 /// State of the floating toolbar window.
 #[derive(Debug, Default)]
 pub struct Toolbar {
-    /// Whether the window has already been moved to its initial position.
-    positioned: bool,
+    /// Monitor the bar should be top-centred on once its content size is
+    /// known (`ShowBar` sets this to the monitor under the cursor).
+    target_monitor: Option<crate::capture::MonitorInfo>,
 }
 
 impl Toolbar {
+    /// Schedules the bar to move to the top-centre of `monitor` on its
+    /// next frame.
+    pub fn place_on_monitor(&mut self, monitor: crate::capture::MonitorInfo) {
+        self.target_monitor = Some(monitor);
+    }
+
     /// Draws the toolbar for this frame. Actions are pushed as [`Command`]s
     /// on `shared` — the state machine dispatches them.
     pub fn show(&mut self, ui: &mut egui::Ui, settings: &mut Settings, shared: &Shared) {
@@ -91,7 +98,7 @@ impl Toolbar {
                         (Icon::Pin, "toolbar.pin.tooltip", CaptureMode::Pin),
                     ] {
                         if cap_button(ui, icon, tip, false).clicked() {
-                            shared.push(Command::Capture(mode));
+                            shared.push_capture(mode, ui.ctx());
                         }
                     }
                     widgets::vline(ui, 18.0);
@@ -166,20 +173,29 @@ impl Toolbar {
         }
     }
 
-    /// Keeps the viewport hugging its content, and on the first frame with
-    /// known monitor geometry moves it to the top-center of the screen —
-    /// exactly once, so a user drag is never overridden afterwards.
+    /// Keeps the viewport hugging its content, and when `ShowBar` set a
+    /// `target_monitor`, moves it to the top-centre of that monitor once
+    /// the content size is known — consumed immediately so a user drag is
+    /// never overridden afterwards.
     fn sync_viewport(&mut self, ctx: &egui::Context, content: Rect) {
         let target = content.size() + Vec2::splat(2.0 * f32::from(SHADOW_MARGIN));
         let current = ctx.input(|i| i.viewport().inner_rect.map_or(Vec2::ZERO, |r| r.size()));
         if (target - current).abs().max_elem() > 1.0 {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
         }
-        if !self.positioned
-            && let Some(monitor) = ctx.input(|i| i.viewport().monitor_size)
-        {
-            self.positioned = true;
-            let pos = egui::pos2((monitor.x - target.x) / 2.0, monitor.y * TOP_MARGIN);
+        if let Some(m) = self.target_monitor.take() {
+            let scale = m.scale_factor.max(1.0);
+            let origin =
+                crate::platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
+            let size = crate::platform::native_to_ui(
+                egui::pos2(m.rect.width as f32, m.rect.height as f32),
+                scale,
+            )
+            .to_vec2();
+            let pos = egui::pos2(
+                origin.x + (size.x - target.x) / 2.0,
+                origin.y + size.y * TOP_MARGIN,
+            );
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
         }
     }

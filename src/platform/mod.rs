@@ -15,6 +15,7 @@ mod windows;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::app::{CaptureMode, Command};
+use eframe::egui;
 
 /// What the OS needs PixMe to handle.
 pub trait PlatformServices: Send + Sync {
@@ -158,9 +159,52 @@ pub use macos::reveal_in_file_manager;
 #[cfg(target_os = "windows")]
 pub use windows::reveal_in_file_manager;
 
+/// egui window "ui points" (`ViewportInfo::outer_rect`) → OS-native global
+/// units, the space `MonitorInfo::rect` lives in (CGDisplay bounds on
+/// macOS, virtual-screen pixels on Windows).
+///
+/// macOS: winit derives window positions from logical points
+/// (`LogicalPosition::to_physical`), so egui's division by
+/// `native_pixels_per_point` lands back on native points — identity.
+/// Windows: winit reports true physical pixels, so egui points must be
+/// scaled back up to match xcap's physical-pixel rects.
+pub fn ui_to_native(pos: egui::Pos2, native_pixels_per_point: f32) -> egui::Pos2 {
+    #[cfg(target_os = "windows")]
+    {
+        pos * native_pixels_per_point
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = native_pixels_per_point;
+        pos
+    }
+}
+
+/// OS-native global units (`MonitorInfo::rect` space) → egui window
+/// "ui points". The inverse of [`ui_to_native`].
+pub fn native_to_ui(pos: egui::Pos2, native_pixels_per_point: f32) -> egui::Pos2 {
+    #[cfg(target_os = "windows")]
+    {
+        pos / native_pixels_per_point
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = native_pixels_per_point;
+        pos
+    }
+}
+
 /// Sends a file to the OS default printer.
 #[cfg(target_os = "macos")]
 pub use macos::print_file;
 /// Sends a file to the OS default printer (see above).
 #[cfg(target_os = "windows")]
 pub use windows::print_file;
+
+/// Global mouse position in the OS-native display space (the same space
+/// `MonitorInfo::rect` lives in).
+#[cfg(target_os = "macos")]
+pub use macos::cursor_position;
+/// Global mouse position in the OS-native display space (see above).
+#[cfg(target_os = "windows")]
+pub use windows::cursor_position;

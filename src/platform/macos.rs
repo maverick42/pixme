@@ -460,3 +460,15 @@ pub fn print_file(path: &std::path::Path) -> Result<(), String> {
             }
         })
 }
+
+/// Global mouse position in the OS-native display space (CGDisplay
+/// bounds: top-left of the primary display is `(0, 0)`, points — the
+/// exact space `MonitorInfo::rect` uses).
+pub fn cursor_position() -> Option<(f32, f32)> {
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
+    let loc = CGEvent::new(source).ok()?.location();
+    Some((loc.x as f32, loc.y as f32))
+}

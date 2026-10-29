@@ -190,3 +190,23 @@ pub fn print_file(path: &std::path::Path) -> Result<(), String> {
             }
         })
 }
+
+/// Global mouse position in the OS-native display space (virtual-screen
+/// physical pixels — the exact space `MonitorInfo::rect` uses).
+pub fn cursor_position() -> Option<(f32, f32)> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCursorPos(point: *mut Point) -> i32;
+    }
+    let mut pt = Point { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut pt) } != 0 {
+        Some((pt.x as f32, pt.y as f32))
+    } else {
+        None
+    }
+}
