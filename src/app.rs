@@ -2024,11 +2024,10 @@ fn install_panic_hook() {
             chrono::Local::now().to_rfc3339(),
             std::thread::current().name().unwrap_or("worker"),
         );
-        tracing::error!("{line}");
-        // stderr write errors must NOT re-panic inside the hook.
+        // Write `panic.log` and `stderr` BEFORE calling `tracing::error!`:
+        // a double panic inside the hook aborts immediately without running
+        // the rest of the closure, so the on-disk log must land first.
         use std::io::Write as _;
-        let _ = std::io::stderr().write_all(line.as_bytes());
-        let _ = std::io::stderr().write_all(b"\n");
         if let Some(path) = &log {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -2042,6 +2041,9 @@ fn install_panic_hook() {
                 let _ = f.write_all(b"\n");
             }
         }
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        let _ = std::io::stderr().write_all(b"\n");
+        tracing::error!("{line}");
     }));
 }
 

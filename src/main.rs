@@ -26,6 +26,7 @@ i18n!("locales", fallback = "en");
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(|| LossyStdout)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -85,5 +86,27 @@ fn instance_guard() -> Option<single_instance::SingleInstance> {
             tracing::warn!("single-instance guard unavailable: {err}");
             None
         }
+    }
+}
+
+/// `stdout` writer that swallows write/flush errors (`BrokenPipe`, detached
+/// console). Without this, when the parent shell/terminal that launched
+/// PixMe exits and closes the pipe, `tracing-subscriber`'s default
+/// `io::stdout` writer returns `Err(BrokenPipe)`, which makes
+/// `tracing_subscriber::fmt` call `eprintln!("[tracing-subscriber] Unable
+/// to write an event…")`, which in turn **panics** (`failed printing to
+/// stderr`) because `stderr` points to the same closed pipe — aborting the
+/// resident app on the very next log event.
+struct LossyStdout;
+
+impl std::io::Write for LossyStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stdout().write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stdout().flush();
+        Ok(())
     }
 }
