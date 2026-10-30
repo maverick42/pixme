@@ -1149,8 +1149,10 @@ impl DrawSession {
                     let print = widgets::icon_button(ui, Icon::Printer, false)
                         .on_hover_text(t!("vbar.print.tooltip").to_string());
                     if print.clicked() {
-                        let _ =
-                            crate::export::file::print_image(&render::render_to_image(&self.doc));
+                        let _ = crate::export::file::print_image(
+                            &render::render_to_image(&self.doc),
+                            &self.title,
+                        );
                     }
                 });
         });

@@ -3506,7 +3506,7 @@ pub(super) mod bench {
         doc
     }
 
-    fn stats(label: &str, v: &mut Vec<f64>) {
+    fn stats(label: &str, v: &mut [f64]) {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         eprintln!(
             "{label:28} min {:.1} ms | median {:.1} ms | p95 {:.1} ms | max {:.1} ms",
@@ -3780,7 +3780,7 @@ mod region_bench {
     use super::*;
     use std::time::Instant;
 
-    fn stats(label: &str, v: &mut Vec<f64>) {
+    fn stats(label: &str, v: &mut [f64]) {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         eprintln!(
             "{label:44} min {:.2} | med {:.2} | p95 {:.2} | max {:.2} ms",

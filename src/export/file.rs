@@ -31,13 +31,11 @@ pub fn load_image(path: &Path) -> Result<image::RgbaImage, ExportError> {
         .map_err(|e| ExportError::Failed(e.to_string()))
 }
 
-/// Writes `img` to a temporary PNG and sends it to the OS default printer
-/// — the viewer's Print button. V1 prints the whole image fit to the page.
-pub fn print_image(img: &image::RgbaImage) -> Result<(), ExportError> {
-    let path = std::env::temp_dir().join("pixme-print.png");
-    img.save_with_format(&path, image::ImageFormat::Png)
-        .map_err(|e| ExportError::Failed(e.to_string()))?;
-    crate::platform::print_file(&path)
+/// Opens the native OS print dialog for `img` — the viewer's Print
+/// button. `job_title` (the capture title) names the job in the queue;
+/// the image is fit to the printable page on both OSes.
+pub fn print_image(img: &image::RgbaImage, job_title: &str) -> Result<(), ExportError> {
+    crate::platform::print_image(img, job_title)
         .map_err(|e| ExportError::Failed(format!("print failed: {e}")))
 }
 

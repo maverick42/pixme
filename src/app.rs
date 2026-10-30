@@ -794,8 +794,13 @@ impl Shared {
                 }
             }
             Command::PrintActive => {
-                if let Some(img) = lock(&self.viewer).active_image()
-                    && let Err(e) = crate::export::file::print_image(&img)
+                let (img, title) = {
+                    let viewer = lock(&self.viewer);
+                    (viewer.active_image(), viewer.active_title())
+                };
+                if let Some(img) = img
+                    && let Err(e) =
+                        crate::export::file::print_image(&img, title.as_deref().unwrap_or("PixMe"))
                 {
                     tracing::warn!("print failed: {e}");
                 }

@@ -195,12 +195,13 @@ pub fn native_to_ui(pos: egui::Pos2, native_pixels_per_point: f32) -> egui::Pos2
     }
 }
 
-/// Sends a file to the OS default printer.
+/// Shows the native OS print dialog for `img` (fit to the page),
+/// `job_title` naming the job. Modal — main thread only.
 #[cfg(target_os = "macos")]
-pub use macos::print_file;
-/// Sends a file to the OS default printer (see above).
+pub use macos::print_image;
+/// Shows the native OS print dialog for `img` (see above).
 #[cfg(target_os = "windows")]
-pub use windows::print_file;
+pub use windows::print_image;
 
 /// Global mouse position in the OS-native display space (the same space
 /// `MonitorInfo::rect` lives in).

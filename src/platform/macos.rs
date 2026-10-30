@@ -464,20 +464,164 @@ pub fn reveal_in_file_manager(path: &std::path::Path) {
     }
 }
 
-/// Prints `path` on the default printer via `lp` (CUPS scales the image
-/// to the page). Returns `Err` when the job could not be queued.
-pub fn print_file(path: &std::path::Path) -> Result<(), String> {
-    std::process::Command::new("lp")
-        .arg(path)
-        .status()
-        .map_err(|e| e.to_string())
-        .and_then(|s| {
-            if s.success() {
-                Ok(())
+/// Shows the native macOS print panel (printer picker, preview, copies)
+/// for `img` scaled to fit the page — `job_title` names the job in the
+/// queue. Runs modally, so it must be called on the main thread. Uses
+/// `NSPrintOperation` through the Objective-C runtime directly — no
+/// extra crate, matching `cursor_snapshot`'s FFI pattern.
+pub fn print_image(img: &image::RgbaImage, job_title: &str) -> Result<(), String> {
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    use std::ffi::{CString, c_void};
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendId1 = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendIdStr =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const std::ffi::c_char) -> *mut c_void;
+    type MsgSendIdBytes =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void;
+    type MsgSendIdRect = unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect) -> *mut c_void;
+    type MsgSendSize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGSize;
+    type MsgSendVoid = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    type MsgSendVoid1 = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+    type MsgSendVoidLong = unsafe extern "C" fn(*mut c_void, *mut c_void, isize);
+    type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
+    type MsgSendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+    type MsgSendBoolSel = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
+
+    // NSImage decodes PNG bytes — the same format the export path uses.
+    let png = crate::store::ser::png_encode(img).map_err(|e| e.to_string())?;
+    let title = CString::new(job_title).map_err(|e| e.to_string())?;
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_id1: MsgSendId1 = std::mem::transmute(objc_msgSend as *const ());
+        let send_str: MsgSendIdStr = std::mem::transmute(objc_msgSend as *const ());
+        let send_bytes: MsgSendIdBytes = std::mem::transmute(objc_msgSend as *const ());
+        let send_rect: MsgSendIdRect = std::mem::transmute(objc_msgSend as *const ());
+        let send_size: MsgSendSize = std::mem::transmute(objc_msgSend as *const ());
+        let send_void: MsgSendVoid = std::mem::transmute(objc_msgSend as *const ());
+        let send_void1: MsgSendVoid1 = std::mem::transmute(objc_msgSend as *const ());
+        let send_long: MsgSendVoidLong = std::mem::transmute(objc_msgSend as *const ());
+        let send_flag: MsgSendVoidBool = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool: MsgSendBool = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool_target: MsgSendBoolSel = std::mem::transmute(objc_msgSend as *const ());
+
+        // Class-method objects below are autoreleased: drain them with a
+        // pool on return. `image`/`view`/`pool` are alloc+init (+1) and
+        // get an explicit `release` — after `runOperation`, which keeps
+        // the view alive for the panel's whole lifetime.
+        let pool = send_id(
+            send_id(
+                objc_getClass(c"NSAutoreleasePool".as_ptr()),
+                sel_registerName(c"alloc".as_ptr()),
+            ),
+            sel_registerName(c"init".as_ptr()),
+        );
+
+        let data = send_bytes(
+            objc_getClass(c"NSData".as_ptr()),
+            sel_registerName(c"dataWithBytes:length:".as_ptr()),
+            png.as_ptr(),
+            png.len(),
+        );
+        let image = send_id1(
+            send_id(
+                objc_getClass(c"NSImage".as_ptr()),
+                sel_registerName(c"alloc".as_ptr()),
+            ),
+            sel_registerName(c"initWithData:".as_ptr()),
+            data,
+        );
+        let size = if image.is_null() {
+            CGSize::new(1.0, 1.0)
+        } else {
+            send_size(image, sel_registerName(c"size".as_ptr()))
+        };
+        let view = send_rect(
+            send_id(
+                objc_getClass(c"NSImageView".as_ptr()),
+                sel_registerName(c"alloc".as_ptr()),
+            ),
+            sel_registerName(c"initWithFrame:".as_ptr()),
+            CGRect::new(&CGPoint::new(0.0, 0.0), &size),
+        );
+
+        let op = if view.is_null() || image.is_null() {
+            std::ptr::null_mut()
+        } else {
+            send_void1(view, sel_registerName(c"setImage:".as_ptr()), image);
+            send_id1(
+                objc_getClass(c"NSPrintOperation".as_ptr()),
+                sel_registerName(c"printOperationWithView:".as_ptr()),
+                view,
+            )
+        };
+
+        let ok = if op.is_null() {
+            false
+        } else {
+            let info = send_id(op, sel_registerName(c"printInfo".as_ptr()));
+            // NSFitPagination = 1 on both axes: AppKit scales the view
+            // to a single printed page, keeping the image's aspect.
+            send_long(
+                info,
+                sel_registerName(c"setVerticalPagination:".as_ptr()),
+                1,
+            );
+            send_long(
+                info,
+                sel_registerName(c"setHorizontalPagination:".as_ptr()),
+                1,
+            );
+            let ns_title = send_str(
+                objc_getClass(c"NSString".as_ptr()),
+                sel_registerName(c"stringWithUTF8String:".as_ptr()),
+                title.as_ptr(),
+            );
+            // `jobTitle` moved from NSPrintInfo to NSPrintOperation on
+            // macOS 14 — send it to whichever object answers the selector.
+            let title_sel = sel_registerName(c"setJobTitle:".as_ptr());
+            let responds_sel = sel_registerName(c"respondsToSelector:".as_ptr());
+            let title_target = if send_bool_target(op, responds_sel, title_sel) {
+                op
+            } else if send_bool_target(info, responds_sel, title_sel) {
+                info
             } else {
-                Err(format!("lp exited with {s}"))
+                std::ptr::null_mut()
+            };
+            if !title_target.is_null() {
+                send_void1(title_target, title_sel, ns_title);
             }
-        })
+            send_flag(op, sel_registerName(c"setShowsPrintPanel:".as_ptr()), true);
+            send_flag(
+                op,
+                sel_registerName(c"setShowsProgressPanel:".as_ptr()),
+                true,
+            );
+            send_bool(op, sel_registerName(c"runOperation".as_ptr()))
+        };
+
+        if !image.is_null() {
+            send_void(image, sel_registerName(c"release".as_ptr()));
+        }
+        if !view.is_null() {
+            send_void(view, sel_registerName(c"release".as_ptr()));
+        }
+        send_void(pool, sel_registerName(c"drain".as_ptr()));
+
+        if ok {
+            Ok(())
+        } else {
+            Err("print panel cancelled or failed".into())
+        }
+    }
 }
 
 /// Global mouse position in the OS-native display space (CGDisplay

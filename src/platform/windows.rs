@@ -178,21 +178,256 @@ pub fn reveal_in_file_manager(path: &std::path::Path) {
         .status();
 }
 
-/// Prints `path` on the default printer via `mspaint /p`. V1 has no
-/// print dialog — a richer path (printer picker, margins) lands later.
-pub fn print_file(path: &std::path::Path) -> Result<(), String> {
-    std::process::Command::new("mspaint")
-        .arg("/p")
-        .arg(path)
-        .status()
-        .map_err(|e| e.to_string())
-        .and_then(|s| {
-            if s.success() {
-                Ok(())
+/// Shows the native Windows print dialog (`PrintDlgW` — printer picker,
+/// page range, copies) and prints `img` fit to the printable page via
+/// GDI `StretchDIBits` on the chosen printer's DC — no helper process.
+/// `job_title` names the job in the spooler queue. Runs modally on the
+/// calling (main) thread. `Err` covers both cancel and failure.
+pub fn print_image(img: &image::RgbaImage, job_title: &str) -> Result<(), String> {
+    use std::ffi::c_void;
+
+    // PRINTDLG flags.
+    const PD_ALLPAGES: u32 = 0x0;
+    const PD_NOSELECTION: u32 = 0x4;
+    const PD_NOPAGENUMS: u32 = 0x8;
+    const PD_RETURNDC: u32 = 0x100;
+    const PD_USEDEVMODECOPIESANDCOLLATE: u32 = 0x40000;
+    // GetDeviceCaps indices.
+    const PHYSICALWIDTH: i32 = 110;
+    const PHYSICALHEIGHT: i32 = 111;
+    const PHYSICALOFFSETX: i32 = 112;
+    const PHYSICALOFFSETY: i32 = 113;
+    const DIB_RGB_COLORS: u32 = 0;
+    const BI_RGB: u32 = 0;
+    const SRCCOPY: u32 = 0x00CC0020;
+    const GDI_ERROR: i32 = -1;
+
+    #[repr(C)]
+    struct PrintDlg {
+        lstruct_size: u32,
+        hwnd_owner: isize,
+        h_dev_mode: isize,
+        h_dev_names: isize,
+        h_dc: isize,
+        flags: u32,
+        n_from_page: u16,
+        n_to_page: u16,
+        n_min_page: u16,
+        n_max_page: u16,
+        n_copies: u16,
+        h_instance: isize,
+        l_cust_data: isize,
+        lpfn_print_hook: usize,
+        lpfn_setup_hook: usize,
+        lp_print_template_name: *const u16,
+        lp_setup_template_name: *const u16,
+        h_print_template: isize,
+        h_setup_template: isize,
+    }
+
+    #[repr(C)]
+    struct DocInfo {
+        cb_size: i32,
+        lpsz_doc_name: *const u16,
+        lpsz_output: *const u16,
+        lpsz_datatype: *const u16,
+        fw_type: u32,
+    }
+
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_x_pels_per_meter: i32,
+        bi_y_pels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    #[repr(C)]
+    struct BitmapInfo {
+        bmi_header: BitmapInfoHeader,
+        bmi_colors: [u32; 1],
+    }
+
+    #[link(name = "comdlg32")]
+    unsafe extern "system" {
+        fn PrintDlgW(pd: *mut PrintDlg) -> i32;
+        fn CommDlgExtendedError() -> u32;
+    }
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn GetDeviceCaps(hdc: isize, index: i32) -> i32;
+        fn StartDocW(hdc: isize, di: *const DocInfo) -> i32;
+        fn StartPage(hdc: isize) -> i32;
+        fn EndPage(hdc: isize) -> i32;
+        fn EndDoc(hdc: isize) -> i32;
+        fn AbortDoc(hdc: isize) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        fn StretchDIBits(
+            hdc: isize,
+            x_dest: i32,
+            y_dest: i32,
+            w_dest: i32,
+            h_dest: i32,
+            x_src: i32,
+            y_src: i32,
+            w_src: i32,
+            h_src: i32,
+            bits: *const c_void,
+            bmi: *const BitmapInfo,
+            usage: u32,
+            rop: u32,
+        ) -> i32;
+        fn DeleteDC(hdc: isize) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalFree(mem: isize) -> isize;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetActiveWindow() -> isize;
+        fn GetForegroundWindow() -> isize;
+    }
+
+    let title_w: Vec<u16> = job_title.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        // The dialog needs an owner hwnd so it stays above the calling
+        // window; the viewer (or pin) is active while printing.
+        let mut owner = GetActiveWindow();
+        if owner == 0 {
+            owner = GetForegroundWindow();
+        }
+        let mut pd = PrintDlg {
+            lstruct_size: std::mem::size_of::<PrintDlg>() as u32,
+            hwnd_owner: owner,
+            h_dev_mode: 0,
+            h_dev_names: 0,
+            h_dc: 0,
+            flags: PD_RETURNDC
+                | PD_ALLPAGES
+                | PD_NOSELECTION
+                | PD_NOPAGENUMS
+                | PD_USEDEVMODECOPIESANDCOLLATE,
+            n_from_page: 1,
+            n_to_page: 1,
+            n_min_page: 1,
+            n_max_page: u16::MAX,
+            n_copies: 1,
+            h_instance: 0,
+            l_cust_data: 0,
+            lpfn_print_hook: 0,
+            lpfn_setup_hook: 0,
+            lp_print_template_name: std::ptr::null(),
+            lp_setup_template_name: std::ptr::null(),
+            h_print_template: 0,
+            h_setup_template: 0,
+        };
+        if PrintDlgW(&mut pd) == 0 {
+            return Err(if CommDlgExtendedError() == 0 {
+                "print dialog cancelled".into()
             } else {
-                Err(format!("mspaint exited with {s}"))
+                format!("PrintDlg failed ({:#x})", CommDlgExtendedError())
+            });
+        }
+        // The common dialog allocates these; the printer DC is ours to
+        // delete after the job is spooled.
+        struct Global(isize);
+        impl Drop for Global {
+            fn drop(&mut self) {
+                unsafe {
+                    if self.0 != 0 {
+                        GlobalFree(self.0);
+                    }
+                }
             }
-        })
+        }
+        let _dev_mode = Global(pd.h_dev_mode);
+        let _dev_names = Global(pd.h_dev_names);
+
+        let hdc = pd.h_dc;
+        let page_w = GetDeviceCaps(hdc, PHYSICALWIDTH).max(1);
+        let page_h = GetDeviceCaps(hdc, PHYSICALHEIGHT).max(1);
+        let off_x = GetDeviceCaps(hdc, PHYSICALOFFSETX).max(0);
+        let off_y = GetDeviceCaps(hdc, PHYSICALOFFSETY).max(0);
+        let (iw, ih) = (img.width().max(1), img.height().max(1));
+        // Fit the whole image on one page, centred inside the printable
+        // margins (same intent as NSFitPagination on macOS).
+        let scale = (page_w as f32 / iw as f32).min(page_h as f32 / ih as f32);
+        let dw = ((iw as f32 * scale).round() as i32).max(1);
+        let dh = ((ih as f32 * scale).round() as i32).max(1);
+        let dx = off_x + (page_w - dw).max(0) / 2;
+        let dy = off_y + (page_h - dh).max(0) / 2;
+
+        // GDI 32-bpp DIBs read B,G,R,A per pixel — swap R and B, alpha
+        // forced opaque (BI_RGB ignores the byte anyway).
+        let mut bgra = Vec::with_capacity((iw * ih * 4) as usize);
+        for px in img.pixels() {
+            bgra.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+        let bmi = BitmapInfo {
+            bmi_header: BitmapInfoHeader {
+                bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: iw as i32,
+                // Negative height = top-down row order.
+                bi_height: -(ih as i32),
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: BI_RGB,
+                bi_size_image: bgra.len() as u32,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            bmi_colors: [0],
+        };
+        let doc = DocInfo {
+            cb_size: std::mem::size_of::<DocInfo>() as i32,
+            lpsz_doc_name: title_w.as_ptr(),
+            lpsz_output: std::ptr::null(),
+            lpsz_datatype: std::ptr::null(),
+            fw_type: 0,
+        };
+
+        let printed = StartDocW(hdc, &doc) > 0
+            && StartPage(hdc) > 0
+            && StretchDIBits(
+                hdc,
+                dx,
+                dy,
+                dw,
+                dh,
+                0,
+                0,
+                iw as i32,
+                ih as i32,
+                bgra.as_ptr() as *const c_void,
+                &bmi,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            ) != GDI_ERROR
+            && EndPage(hdc) > 0;
+        if printed {
+            EndDoc(hdc);
+        } else {
+            AbortDoc(hdc);
+        }
+        DeleteDC(hdc);
+
+        if printed {
+            Ok(())
+        } else {
+            Err("GDI print job failed".into())
+        }
+    }
 }
 
 /// Global mouse position in the OS-native display space (virtual-screen

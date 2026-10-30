@@ -1367,3 +1367,29 @@ Format: date — context — decision — consequences.
 - **Consequences**: dragging any mosaic tile by its top-left grip drops the
   full-resolution rendered PNG into Finder/Explorer, browsers, Slack, Discord,
   Mail, etc. on macOS and Windows.
+
+## 2026-10-30 — Native OS print dialog replaces `lp` / `mspaint /p`
+
+- **Context**: `platform::print_file` queued a temp PNG straight to the
+  default printer (`lp` on macOS, `mspaint /p` on Windows) — no print
+  dialog, no printer choice, and Paint flashed open on Windows. The user
+  wants the real OS print dialog.
+- **Decision**: `platform::print_image(img, job_title)` shows the native
+  print UI on both OSes, through plain FFI like the rest of `platform/`
+  (zero new dependencies):
+  - macOS: `NSPrintOperation` on an `NSImageView` holding the capture —
+    `objc_msgSend` FFI. `NSFitPagination` on both axes scales the image to
+    a single page; `setJobTitle:` carries the capture title into the
+    queue. PNG bytes feed `NSImage` via `NSData` — no temp file.
+  - Windows: `PrintDlgW` (printer picker, page range, copies) returns a
+    printer DC; `StretchDIBits` writes the RGBA→BGRA-swapped bitmap
+    letterboxed inside the physical page (`GetDeviceCaps`
+    PHYSICALWIDTH/HEIGHT/OFFSET). `DOCINFOW.lpszDocName` = capture title.
+    `CommDlgExtendedError` distinguishes cancel from failure.
+  - `export::file::print_image(img, job_title)` is the shared entry point;
+    callers pass the tab's title (`PrintActive`, Draw toolbar) with
+    `"PixMe"` as fallback. The temp `pixme-print.png` file is gone.
+- **Consequences**: the print button opens the real print panel on both
+  OSes with the capture's name as the job title; the image prints fit to
+  one page. Cancelling the dialog returns `Err` ("cancelled") — logged
+  as a warning like before.
