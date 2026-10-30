@@ -1,0 +1,317 @@
+//! Icon rendering, adapted from the visual reference (MIT OR Apache-2.0; see
+//! ATTRIBUTION.md). Lucide SVGs are embedded (see `icon_data.rs`), restyled
+//! to white strokes at 1.75 px, rasterized at the exact on-screen pixel size
+//! by egui's SVG image loader (crisp at any DPI), and tinted per use.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use egui::{Color32, ImageSource, Rect, Ui, Vec2, load::SizedTexture};
+
+use super::icon_data;
+
+/// Every icon PixMe bundles (see `icon_data.rs` for the byte table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Icon {
+    /// Capture the full screen.
+    Monitor,
+    /// Capture a rectangular region.
+    SquareDashed,
+    /// Capture the active (frontmost) window.
+    AppWindow,
+    /// Capture a window or an object picked under the cursor.
+    SquareDashedMousePointer,
+    /// Capture a fixed-size (resizable) region.
+    Crop,
+    /// Pin a capture to the screen as a floating window.
+    Pin,
+    /// Delay before capture.
+    Clock,
+    /// File menu (capture viewer's documents).
+    Folder,
+    /// Capture options menu.
+    Settings,
+    /// Quit the app / close.
+    X,
+    /// Dropdown affordance.
+    ChevronDown,
+    /// Tab strip scroll-left arrow.
+    ChevronLeft,
+    /// Tab strip scroll-right arrow.
+    ChevronRight,
+    /// Checkmark (selected menu item).
+    Check,
+    /// Add a tab / start a new capture (viewer's "+").
+    Plus,
+    /// Viewfinder frame (menu-bar status item glyph).
+    Scan,
+    /// Drag handle on the left edge of the floating bar.
+    GripVertical,
+    /// Copy to clipboard (overlapping rectangles).
+    Copy,
+    /// Save to file (download arrow).
+    Download,
+    /// Open an image file (viewer toolbar).
+    FolderOpen,
+    /// Save the active document (floppy).
+    Save,
+    /// Zoom the canvas in.
+    ZoomIn,
+    /// Zoom the canvas out.
+    ZoomOut,
+    /// Draw mode toggle (annotation tools).
+    Pencil,
+    /// Resize the image (diagonal arrows).
+    Scaling,
+    /// Paste from the clipboard into a new tab.
+    ClipboardPaste,
+    /// Print the active document.
+    Printer,
+    /// Draw: select/move objects.
+    MousePointer,
+    /// Draw: rectangular text box.
+    MessageSquare,
+    /// Draw: oval text box.
+    MessageCircle,
+    /// Draw: text tool.
+    Type,
+    /// Draw: step badge tool + Info stamp.
+    Info,
+    /// Draw: straight line/arrow.
+    ArrowUpRight,
+    /// Draw: curly brace / bracket.
+    Braces,
+    /// Draw: eraser.
+    Eraser,
+    /// Draw: outlined rectangle.
+    Square,
+    /// Draw: filled rectangle / highlight area.
+    SquareFill,
+    /// Draw: outlined ellipse.
+    Circle,
+    /// Draw: filled ellipse.
+    CircleFill,
+    /// Draw: area highlighter.
+    Highlighter,
+    /// Draw: blur/pixelate.
+    Pixelate,
+    /// Draw: undo.
+    Undo2,
+    /// Draw: redo.
+    Redo2,
+    /// Text justify: left.
+    AlignLeft,
+    /// Text justify: centre.
+    AlignCenter,
+    /// Text justify: right.
+    AlignRight,
+    /// Text justify: justified.
+    AlignJustify,
+    /// Vertical align: top.
+    AlignStartVertical,
+    /// Vertical align: middle.
+    AlignCenterVertical,
+    /// Vertical align: bottom.
+    AlignEndVertical,
+    /// Password-protected tab.
+    Lock,
+    /// Toggle the viewer between the tab strip and the mosaic grid.
+    LayoutGrid,
+    /// Show the tab strip — the mosaic toggle's paired icon.
+    PanelTop,
+    /// Eyedropper / colour picker.
+    Pipette,
+    /// Gaussian blur brush toggle.
+    Blur,
+    /// Emoji sticker tool.
+    Smile,
+}
+
+/// One styled icon ready for egui's image loaders: white-stroked SVG bytes
+/// behind a `bytes://` URI.
+struct StyledIcon {
+    uri: &'static str,
+    bytes: egui::load::Bytes,
+}
+
+fn styled_icons() -> &'static HashMap<Icon, StyledIcon> {
+    static MAP: OnceLock<HashMap<Icon, StyledIcon>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        icon_data::DATA
+            .iter()
+            .map(|&(icon, name, raw)| {
+                // Lucide strokes `currentColor`; we rasterize white once, then
+                // tint per widget state. 1.75 keeps strokes crisp at 16 px.
+                let mut svg = String::from_utf8_lossy(raw).into_owned();
+                svg = svg.replace("currentColor", "#ffffff");
+                svg = svg.replace("stroke-width=\"2\"", "stroke-width=\"1.75\"");
+                (
+                    icon,
+                    StyledIcon {
+                        uri: Box::leak(format!("bytes://icons/{name}.svg").into_boxed_str()),
+                        bytes: egui::load::Bytes::from(svg.into_bytes()),
+                    },
+                )
+            })
+            .collect()
+    })
+}
+
+/// Whether `icon` has embedded bytes (always true; used by tests).
+pub fn exists(icon: Icon) -> bool {
+    styled_icons().contains_key(&icon)
+}
+
+/// Embedded application icons (original artwork — see
+/// `assets/app/README.md`). The window/taskbar icon is the Windows variant
+/// (`pixme-window-256.png`, full-bleed); the macOS Dock icon uses
+/// `pixme-1024.png` (Apple icon grid with margins and shadow); the status
+/// item uses the black-on-transparent template the menu bar recolours.
+const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/app/pixme-window-256.png");
+const DOCK_ICON_PNG: &[u8] = include_bytes!("../../assets/app/pixme-1024.png");
+const MENUBAR_ICON_PNG: &[u8] = include_bytes!("../../assets/app/menubar-template@2x.png");
+
+/// Decodes `png` to straight-alpha RGBA resized to `size`×`size` — every OS
+/// icon surface (`winit` window icon, tray icon, status item) takes pixels.
+fn decode_icon_png(png: &[u8], size: u32) -> Vec<u8> {
+    image::load_from_memory(png)
+        .map(|img| {
+            img.resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+                .to_rgba8()
+                .into_raw()
+        })
+        .unwrap_or_default()
+}
+
+/// The application icon as [`egui::IconData`] for
+/// `ViewportBuilder::with_icon` — Windows title bar and taskbar. Decoded once.
+pub fn app_icon_data() -> std::sync::Arc<egui::IconData> {
+    static ICON: OnceLock<std::sync::Arc<egui::IconData>> = OnceLock::new();
+    std::sync::Arc::clone(ICON.get_or_init(|| {
+        std::sync::Arc::new(egui::IconData {
+            rgba: decode_icon_png(APP_ICON_PNG, 256),
+            width: 256,
+            height: 256,
+        })
+    }))
+}
+
+/// The macOS Dock icon as [`egui::IconData`] for `eframe::NativeOptions`
+/// (`pixme-1024.png`, which carries the Apple icon-grid margins and shadow
+/// so the Dock tile matches native apps in size). Decoded once at 512 px.
+pub fn dock_icon_data() -> std::sync::Arc<egui::IconData> {
+    static ICON: OnceLock<std::sync::Arc<egui::IconData>> = OnceLock::new();
+    std::sync::Arc::clone(ICON.get_or_init(|| {
+        std::sync::Arc::new(egui::IconData {
+            rgba: decode_icon_png(DOCK_ICON_PNG, 512),
+            width: 512,
+            height: 512,
+        })
+    }))
+}
+
+/// Raw RGBA of the app icon at `size` px — the Windows tray icon has no
+/// template mode, so it uses the full-colour artwork.
+pub fn app_icon_rgba(size: u32) -> Vec<u8> {
+    decode_icon_png(APP_ICON_PNG, size)
+}
+
+/// Texture of the PixMe artwork (`pixme-1024.png`, the master with margins
+/// and shadow) for the Settings About page. Uploaded once per context.
+pub fn app_icon_texture(ctx: &egui::Context) -> SizedTexture {
+    use std::cell::RefCell;
+    thread_local! {
+        static TEX: RefCell<Option<SizedTexture>> = const { RefCell::new(None) };
+    }
+    TEX.with(|tex| {
+        if let Some(t) = *tex.borrow() {
+            return t;
+        }
+        let rgba = decode_icon_png(DOCK_ICON_PNG, 256);
+        let img = egui::ColorImage::from_rgba_unmultiplied([256, 256], &rgba);
+        let handle = ctx.load_texture("pixme://app-icon", img, egui::TextureOptions::LINEAR);
+        let t = SizedTexture::from_handle(&handle);
+        *tex.borrow_mut() = Some(t);
+        t
+    })
+}
+
+/// Raw RGBA of the menu-bar template icon — already 44 px (the 22 pt slot
+/// @2x), passed through unchanged to `tray_icon::Icon::from_rgba`.
+pub fn menubar_icon_rgba() -> Vec<u8> {
+    decode_icon_png(MENUBAR_ICON_PNG, 44)
+}
+
+/// An egui image for `icon`, tinted. Relies on
+/// `egui_extras::install_image_loaders` (done in `ui::install`).
+pub fn image(icon: Icon, size: f32, tint: Color32) -> egui::Image<'static> {
+    let styled = &styled_icons()[&icon];
+    egui::Image::new(ImageSource::Bytes {
+        uri: styled.uri.into(),
+        bytes: styled.bytes.clone(),
+    })
+    .fit_to_exact_size(Vec2::splat(size))
+    .tint(tint)
+}
+
+/// Paints `icon` centred in `rect`.
+pub fn paint(ui: &Ui, rect: Rect, icon: Icon, size: f32, tint: Color32) {
+    let r = Rect::from_center_size(rect.center(), Vec2::splat(size));
+    image(icon, size, tint).paint_at(ui, r);
+}
+
+/// Rasterizes `icon` at `size` px — used by tests, offscreen rendering and
+/// OS surfaces that need pixel data (status item icon).
+fn rasterize(icon: Icon, size: u32) -> egui::ColorImage {
+    let styled = &styled_icons()[&icon];
+    egui_extras::image::load_svg_bytes_with_size(
+        styled.bytes.as_ref(),
+        egui::load::SizeHint::Size {
+            width: size,
+            height: size,
+            maintain_aspect_ratio: true,
+        },
+        &Default::default(),
+    )
+    // A bundled, compile-time-verified SVG cannot fail; fall back to an
+    // empty image rather than panic if the loader ever disagrees.
+    .unwrap_or_else(|_| egui::ColorImage::filled([size as usize; 2], Color32::TRANSPARENT))
+}
+
+/// Texture handle for `icon` at `size` px (public API for custom painting).
+pub fn texture(ctx: &egui::Context, icon: Icon, size: u32) -> SizedTexture {
+    let styled = &styled_icons()[&icon];
+    let handle = ctx.load_texture(
+        styled.uri,
+        egui_extras::image::load_svg_bytes_with_size(
+            styled.bytes.as_ref(),
+            egui::load::SizeHint::Size {
+                width: size,
+                height: size,
+                maintain_aspect_ratio: true,
+            },
+            &Default::default(),
+        )
+        .unwrap_or_else(|_| egui::ColorImage::filled([size as usize; 2], Color32::TRANSPARENT)),
+        egui::TextureOptions::LINEAR,
+    );
+    SizedTexture::from_handle(&handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_icon_rasterizes() {
+        for &(icon, name, _) in icon_data::DATA {
+            assert!(exists(icon), "{name} missing from map");
+            let img = rasterize(icon, 16);
+            assert_eq!(img.size, [16, 16], "{name} wrong size");
+            assert!(
+                img.pixels.iter().any(|p| p.a() > 0),
+                "{name} rasterized fully transparent"
+            );
+        }
+    }
+}

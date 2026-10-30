@@ -1,0 +1,88 @@
+# PixMe emoji set — Noto Color Emoji PNG 128 px.
+#
+# Source: https://github.com/googlefonts/noto-emoji
+# Pinned commit: 41e31b110b4eb929dffb410264694a06205b7ad7
+# License: Apache License 2.0 (see THIRD_PARTY_NOTICES.md)
+#
+# One Unicode code point per line (hex, lowercase). The PNG file is
+# `emoji_u<codepoint>.png` in this directory. Adding an emoji = one PNG
+# file + one line here. `#` starts a comment; blank lines are ignored.
+# Order is the picker display order; ids are permanent — never remove
+# or rename one (a stored annotation id without an image renders the
+# neutral placeholder).
+
+# validation / alerts
+2705
+274c
+2714
+26a0
+2757
+2753
+1f6ab
+26d4
+1f6d1
+1f534
+1f7e2
+1f7e1
+1f535
+1f7e0
+
+# pointing
+1f449
+1f448
+1f446
+1f447
+27a1
+2b05
+2b06
+2b07
+2197
+2198
+2196
+2199
+
+# markers
+1f4cc
+1f3af
+
+# reactions / gestures
+1f44d
+1f44e
+1f44f
+1f64f
+1f44c
+1f4aa
+270c
+1f91d
+1f440
+1f4ac
+
+# faces
+1f600
+1f602
+1f60d
+1f60e
+1f914
+1f62e
+1f622
+1f621
+1f644
+1f605
+
+# ideas / objects
+1f4a1
+1f525
+2b50
+2764
+2728
+1f389
+1f680
+1f41b
+1f512
+1f511
+2699
+1f50d
+1f4f7
+270f
+1f550
+1f514
