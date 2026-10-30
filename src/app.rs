@@ -159,6 +159,16 @@ pub enum ModalState {
     Saving,
 }
 
+/// Short, privacy-safe description of a dispatched command — `Debug`
+/// alone would dump the full user path of `OpenPath`; everything else
+/// prints as `Variant(field)` (modes, ids — never user data).
+fn command_desc(command: &Command) -> String {
+    match command {
+        Command::OpenPath(path) => format!("OpenPath({})", crate::paths::file_name(path)),
+        other => format!("{other:?}"),
+    }
+}
+
 /// The single source of truth for command availability vs modal state:
 /// menu items (native + tray + egui strip), the dispatch safety net and
 /// every button read this table. The match is exhaustive — adding a
@@ -344,7 +354,14 @@ pub struct Shared {
     /// `modal_state()` never locks the viewer while `viewer.show` holds
     /// it (and would self-deadlock).
     pub viewer_dialog_open: AtomicBool,
+    /// One-shot notice drawn by the first window to appear (the Windows
+    /// data/logs fallback message — set at startup, cleared on OK).
+    pub startup_notice: Mutex<Option<String>>,
 }
+
+/// `capture_id` source — every capture gets one id so its whole life
+/// (start, confirm, store, cancel, failure) greps as a single trail.
+static NEXT_CAPTURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A running background save-all: the moved tabs come back over `rx`,
 /// `done` ticks once per processed tab for the progress veil, and
@@ -437,6 +454,7 @@ impl Shared {
     /// reapplies language side effects if the setting changed. Called at the
     /// top of every viewport pass so any visible window keeps dispatch alive.
     pub fn pump(&self, ctx: &egui::Context) {
+        crate::logging::report_health();
         let commands: Vec<Command> = platform::take_pending_commands()
             .into_iter()
             .chain(std::mem::take(&mut *lock(&self.pending)))
@@ -529,6 +547,9 @@ impl Shared {
             tracing::debug!(?command, ?modal, "command blocked while modal is open");
             return;
         }
+        // Every user action is one Command through this funnel — logging
+        // it here covers the bar, the menus, the tray and the viewer.
+        tracing::info!(command = %command_desc(&command), "command");
         match command {
             Command::Capture(mode) => {
                 let delay = lock(&self.settings).capture_delay_secs;
@@ -682,10 +703,11 @@ impl Shared {
                     .iter()
                     .find(|p| p.id == id)
                     .map(|p| Arc::clone(&p.capture));
-                if let Some(capture) = capture
-                    && let Err(e) = crate::export::clipboard::copy_capture(&capture)
-                {
-                    tracing::warn!("pin copy failed: {e}");
+                if let Some(capture) = capture {
+                    match crate::export::clipboard::copy_capture(&capture) {
+                        Ok(()) => tracing::info!("clipboard_copy"),
+                        Err(e) => tracing::warn!("pin copy failed: {e}"),
+                    }
                 }
             }
             Command::SavePin(id) => {
@@ -711,6 +733,7 @@ impl Shared {
                 // Import opens a NEW tab — it never replaces the current
                 // document (the functional reference's rule).
                 Ok(Some(image)) => {
+                    tracing::info!("clipboard_imported");
                     let title = self.capture_title();
                     lock(&self.viewer)
                         .push_capture_document(Document::new(synthetic_capture(image)), title);
@@ -732,7 +755,7 @@ impl Shared {
                     let mut s = lock(&self.settings);
                     s.remove_recent(&path);
                     s.save();
-                    tracing::warn!(?path, "recent file could not be opened");
+                    tracing::warn!(file = %crate::paths::file_name(&path), "recent file could not be opened");
                 }
             }
             Command::OpenAllRecent => {
@@ -802,10 +825,11 @@ impl Shared {
             }
             Command::RenameActive => lock(&self.viewer).open_rename(),
             Command::CopyActive => {
-                if let Some(img) = lock(&self.viewer).copy_image()
-                    && let Err(e) = crate::export::clipboard::copy_image(&img)
-                {
-                    tracing::warn!("copy failed: {e}");
+                if let Some(img) = lock(&self.viewer).copy_image() {
+                    match crate::export::clipboard::copy_image(&img) {
+                        Ok(()) => tracing::info!("clipboard_copy"),
+                        Err(e) => tracing::warn!("copy failed: {e}"),
+                    }
                 }
             }
             Command::OpenDraw => {
@@ -841,11 +865,14 @@ impl Shared {
                     let viewer = lock(&self.viewer);
                     (viewer.active_image(), viewer.active_title())
                 };
-                if let Some(img) = img
-                    && let Err(e) =
-                        crate::export::file::print_image(&img, title.as_deref().unwrap_or("PixMe"))
-                {
-                    tracing::warn!("print failed: {e}");
+                if let Some(img) = img {
+                    match crate::export::file::print_image(
+                        &img,
+                        title.as_deref().unwrap_or("PixMe"),
+                    ) {
+                        Ok(()) => tracing::info!("printed"),
+                        Err(e) => tracing::warn!("print failed: {e}"),
+                    }
                 }
             }
         }
@@ -891,10 +918,11 @@ impl Shared {
                     doc, title, // From disk = clean until edited.
                     true,
                 );
+                tracing::info!(file = %crate::paths::file_name(path), "document_opened");
                 true
             }
             Err(e) => {
-                tracing::warn!(?path, "cannot open image: {e}");
+                tracing::warn!(file = %crate::paths::file_name(path), "cannot open image: {e}");
                 false
             }
         }
@@ -974,6 +1002,7 @@ impl Shared {
             .filter(|t| !t.saved)
             .any(|t| !seen.insert(crate::config::filename::sanitize_filename(t.title.trim())));
         if clash {
+            tracing::warn!("save-all blocked: duplicate tab titles");
             viewer.dup_names = true;
             ctx.request_repaint_of(viewer_id());
             return false;
@@ -1015,9 +1044,11 @@ impl Shared {
                         tab.doc.meta.source_path = Some(path.clone());
                         tab.doc.meta.saved_at = Some(chrono::Local::now());
                         saved_paths.push(path.clone());
-                        tracing::info!(?path, "tab saved");
+                        tracing::info!(file = %crate::paths::file_name(&path), "tab saved");
                     }
-                    Err(e) => tracing::warn!(?path, "save-all failed: {e}"),
+                    Err(e) => {
+                        tracing::warn!(file = %crate::paths::file_name(&path), "save-all failed: {e}")
+                    }
                 }
                 done.fetch_add(1, Ordering::Relaxed);
                 wake.request_repaint();
@@ -1042,7 +1073,7 @@ impl Shared {
             changed
         };
         if changed {
-            tracing::debug!(?next, "lifecycle state");
+            tracing::info!(state = ?next, "lifecycle");
             // The viewer is a real application window: bring it to the
             // front. The bar is a palette — `always_on_top`, never focus.
             if next == AppState::Viewer {
@@ -1068,6 +1099,7 @@ impl Shared {
         };
         // The session ended deliberately (saved-then-closed or
         // discarded): nothing of it may come back at the next launch.
+        tracing::info!("session_discarded");
         lock(&self.store).clear();
         if quit {
             self.quit_now(ctx);
@@ -1149,8 +1181,11 @@ impl Shared {
                     _ => None,
                 };
                 let mut session = OverlaySession::new(mode, return_to, remembered);
+                session.capture_id = NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed);
                 session.monitor = Some(monitor);
                 session.include_pointer = lock(&self.settings).include_pointer;
+                let _span = session.span().entered();
+                tracing::info!(mode = ?mode, "capture_start");
                 let instant = session.instant;
                 *lock(&self.capture) = Some(session);
                 self.enter(AppState::Capturing, ctx);
@@ -1169,6 +1204,7 @@ impl Shared {
         let Some(mut session) = lock(&self.capture).take() else {
             return;
         };
+        let _span = session.span().entered();
         let capture = if session.instant {
             session.frozen.take().map(|mut c| {
                 // Full screen confirms with no selection: stamp the cursor
@@ -1193,9 +1229,17 @@ impl Shared {
         let return_to = session.return_to;
         let Some(frame) = capture else {
             // Nothing to keep — behave like a cancel.
+            tracing::info!(mode = ?session.mode, "capture_empty");
             self.enter(return_to, ctx);
             return;
         };
+        tracing::info!(
+            mode = ?session.mode,
+            w = frame.image.width(),
+            h = frame.image.height(),
+            ms = session.started_at.elapsed().as_millis() as u64,
+            "capture_finished"
+        );
         // The gear-menu "copy to clipboard" option applies to every
         // confirmed capture — including Pin captures (which never reach
         // the viewer).
@@ -1255,6 +1299,7 @@ impl Shared {
             *n
         };
         lock(&self.pins).push(crate::ui::pin::PinWindow::new(id, frame, origin));
+        tracing::info!(id, "pin_created");
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
@@ -1262,6 +1307,10 @@ impl Shared {
     fn cancel_capture(&self, ctx: &egui::Context) {
         let return_to = {
             let mut slot = lock(&self.capture);
+            if let Some(s) = slot.as_ref() {
+                let _span = s.span().entered();
+                tracing::info!(mode = ?s.mode, "capture_cancelled");
+            }
             let return_to = slot.as_ref().map(|s| s.return_to).unwrap_or(AppState::Idle);
             *slot = None;
             return_to
@@ -1480,6 +1529,38 @@ pub struct PixMeApp {
     shared: Arc<Shared>,
 }
 
+/// The `startup` event — the context every diagnosis needs first:
+/// version, build, OS, screens, language, theme, log level, the dirs in
+/// use and the macOS Screen Recording permission state.
+fn log_banner(settings: &Settings) {
+    let monitors = crate::capture::screen::monitors().unwrap_or_default();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("PIXME_GIT_HASH"),
+        os = %platform::os_version(),
+        arch = std::env::consts::ARCH,
+        screens = monitors.len(),
+        language = ?settings.language,
+        appearance = ?settings.appearance,
+        log_level = %crate::logging::base_directive(),
+        data_dir = %crate::paths::data_dir().display(),
+        logs_dir = %crate::paths::logs_dir().display(),
+        fallback = crate::paths::fallback_from().is_some(),
+        screen_recording = ?platform::current().capture_permission_status(),
+        "startup"
+    );
+    for m in &monitors {
+        tracing::info!(
+            id = m.id,
+            w = m.rect.width,
+            h = m.rect.height,
+            scale = m.scale_factor,
+            primary = m.is_primary,
+            "monitor"
+        );
+    }
+}
+
 impl PixMeApp {
     /// Loads settings, installs fonts, image loaders, the OS UI glue (status
     /// item / tray + menus) and applies language and theme.
@@ -1493,6 +1574,7 @@ impl PixMeApp {
             settings.appearance.kind(cc.egui_ctx.system_theme()),
         );
         platform::install_ui(&cc.egui_ctx);
+        log_banner(&settings);
         // Dev/test hook: `PIXME_CAPTURE=region|fullscreen|fixed` fires that
         // capture at startup without going through the resident menu.
         let debug_capture = std::env::var("PIXME_CAPTURE")
@@ -1533,6 +1615,16 @@ impl PixMeApp {
                 save_all: Mutex::new(None),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
+                // Windows portable fallback: the one translated notice,
+                // shown once the first window exists (i18n already ran).
+                startup_notice: Mutex::new(crate::paths::fallback_from().map(|attempted| {
+                    t!(
+                        "app.fallback_notice",
+                        attempted = attempted.display().to_string(),
+                        used = crate::paths::data_dir().display().to_string()
+                    )
+                    .to_string()
+                })),
             }),
         };
         // Launch lands on the viewer, not resident-idle: it restores
@@ -1641,7 +1733,31 @@ impl eframe::App for PixMeApp {
                     // a closed capture stays closed at the next launch.
                     let closed = lock(&shared.viewer).take_closed_ids();
                     if !closed.is_empty() {
+                        tracing::info!(count = closed.len(), "tabs_closed");
                         lock(&shared.store).delete_documents(&closed);
+                    }
+                    // Deferred startup notice (Windows data/logs fallback):
+                    // the first real window delivers it — non-modal, the
+                    // app stays usable.
+                    if lock(&shared.startup_notice).is_some() {
+                        let mut open = true;
+                        egui::Window::new(t!("app.title").to_string())
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                            .open(&mut open)
+                            .show(&ctx, |ui| {
+                                if let Some(msg) = &*lock(&shared.startup_notice) {
+                                    ui.label(msg);
+                                }
+                                ui.add_space(6.0);
+                                if ui::widgets::primary_button(ui, "OK").clicked() {
+                                    *lock(&shared.startup_notice) = None;
+                                }
+                            });
+                        if !open {
+                            *lock(&shared.startup_notice) = None;
+                        }
                     }
                 });
             }
@@ -1784,9 +1900,11 @@ impl eframe::App for PixMeApp {
                 if let Some(outcome) = outcome
                     && let Some(mut session) = lock(&shared.draw).take()
                 {
+                    tracing::info!("draw_closed");
                     // The modal closed: the viewer gets focus back.
                     ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Focus);
                     if outcome == crate::ui::draw::Outcome::Ok {
+                        tracing::info!("draw_committed");
                         session.finalize_pending();
                         lock(&shared.viewer).commit_draw(
                             session.tab,
@@ -1833,7 +1951,7 @@ impl eframe::App for PixMeApp {
                         match ui::save_dialog::show(ui, dialog) {
                             ui::save_dialog::Outcome::Confirm => match dialog.save(&shared) {
                                 Ok(path) => {
-                                    tracing::info!(?path, "saved");
+                                    tracing::info!(file = %crate::paths::file_name(&path), "saved");
                                     // A viewer document is now on disk:
                                     // the tab flips to clean and records
                                     // where/when it was written.
@@ -2012,46 +2130,10 @@ fn draw_builder(title: &str) -> egui::ViewportBuilder {
         .with_active(true)
 }
 
-/// Writes panics to `data_dir()/panic.log` before the abort — a
-/// `panic = "abort"` release binary otherwise dies with no trace of
-/// the panic site. Installed once at startup.
-fn install_panic_hook() {
-    let log =
-        directories::ProjectDirs::from("", "", "pixme").map(|d| d.data_dir().join("panic.log"));
-    std::panic::set_hook(Box::new(move |info| {
-        let line = format!(
-            "[{}] panic on '{}': {info}",
-            chrono::Local::now().to_rfc3339(),
-            std::thread::current().name().unwrap_or("worker"),
-        );
-        // Write `panic.log` and `stderr` BEFORE calling `tracing::error!`:
-        // a double panic inside the hook aborts immediately without running
-        // the rest of the closure, so the on-disk log must land first.
-        use std::io::Write as _;
-        if let Some(path) = &log {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = f.write_all(line.as_bytes());
-                let _ = f.write_all(b"\n");
-            }
-        }
-        let _ = std::io::stderr().write_all(line.as_bytes());
-        let _ = std::io::stderr().write_all(b"\n");
-        tracing::error!("{line}");
-    }));
-}
-
 /// Runs the app. The root viewport is the permanent 1×1 transparent anchor
 /// window (never in the taskbar); the app first lives in the menu bar /
 /// tray (`Idle`) until the user asks for a capture.
 pub fn run() -> eframe::Result<()> {
-    install_panic_hook();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PixMe")
@@ -2110,6 +2192,7 @@ mod tests {
             last_language: Mutex::new(Language::Auto),
             last_modal: Mutex::new(ModalState::None),
             viewer_dialog_open: AtomicBool::new(false),
+            startup_notice: Mutex::new(None),
         };
         (shared, egui::Context::default())
     }

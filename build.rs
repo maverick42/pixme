@@ -77,7 +77,25 @@ fn main() {
     fs::write(Path::new(&out_dir).join("emoji_table.rs"), out)
         .expect("emoji_table.rs must be writable");
 
+    bake_git_hash(&root);
     embed_exe_icon(&root);
+}
+
+/// Bakes the short commit into `env!("PIXME_GIT_HASH")` for the startup
+/// banner and diagnostics — "unknown" outside a git checkout (a tarball
+/// build must not fail over it).
+fn bake_git_hash(root: &str) {
+    let hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=PIXME_GIT_HASH={hash}");
+    println!("cargo:rerun-if-changed={root}/.git/HEAD");
 }
 
 /// Bakes `assets/app/PixMe.ico` into the Windows executable's resources so

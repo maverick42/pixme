@@ -125,3 +125,44 @@ Windows.
   dialog; under Draw, undo/redo/copy act on the editor only. On
   Windows the same holds for global shortcuts and the tray menu, and
   the egui menu strip / bar buttons show disabled.
+
+## 11. Data locations and logging (2026-10-30)
+
+Security/privacy step — check on every release:
+
+- No secrets in logs: scan `logs/pixme.*.log` — no clipboard text, no
+  annotation text, no window titles above `debug`, no full user-profile
+  paths outside the one-time `startup` banner and the fallback notice.
+- Levels: `ERROR` = user-visible failure, `WARN` = handled degradation,
+  `INFO` = lifecycle/actions, `DEBUG` = timings only. No per-frame lines.
+- `Sensitive<T>` stays `<redacted>` in `Debug`/`Display` (test-gated).
+- Diagnostics copy redacts the home dir (`~`) — verify on both OSes.
+- Locations: nothing writes outside `paths::data_dir()`/
+  `paths::logs_dir()` (source scan `tests/data_paths.rs` gates this).
+
+Manual scenarios:
+
+- MT-29 — Windows read-only install: run `pixme.exe` from a folder the
+  user cannot write (e.g. `C:\Program Files\pixme` or a `chmod 555`
+  dir) — data+logs land in `%LOCALAPPDATA%\PixMe\{data,logs}`, one
+  translated notice shows where, log carries the `attempted`/`used`
+  warning.
+- MT-30 — Path edge cases: exe in `C:\Mon Dossier été\pixme\`, launch
+  via a shortcut whose working dir differs — data+logs still resolve
+  beside the exe; `\\?\`-prefixed and `\\server\share` installs behave
+  identically.
+- MT-31 — Log retention: plant `pixme.<6-days-ago>.log` and a foreign
+  `notes.txt` in `logs\`, relaunch — the dated file is gone, the
+  foreign file stays; >5 daily files → `max_log_files` keeps 5.
+- MT-32 — Diagnostic mode: Settings → General → Diagnostic mode
+  switches the running session to `debug` (uncheck → back to startup
+  level), persists nothing; `RUST_LOG` still wins at launch.
+- MT-33 — Copy diagnostics: Settings → About → button copies banner +
+  log tail with the home dir replaced by `~`; the two folder buttons
+  open Finder/Explorer.
+- MT-34 — Per-install instances (Windows): two PixMe folders run side
+  by side; a second launch from the SAME folder shows the translated
+  warning; kill -9 / End Task then relaunch — no orphan lock blocks it.
+- MT-35 — Settings migration: a `prefs.json` beside an old exe is
+  copied (not moved) into `data\` on first launch when none exists —
+  settings survive, the old file stays.

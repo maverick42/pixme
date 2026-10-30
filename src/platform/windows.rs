@@ -178,6 +178,68 @@ pub fn reveal_in_file_manager(path: &std::path::Path) {
         .status();
 }
 
+/// Opens `dir` in Explorer — the Settings "open folder" buttons.
+pub fn open_folder(dir: &std::path::Path) {
+    let _ = std::process::Command::new("explorer").arg(dir).status();
+}
+
+/// Portable layout: `<exe dir>\data` + `<exe dir>\logs` when the
+/// writability probe passes (creation of both dirs plus a uniquely
+/// named probe file); a read-only install (`C:\Program Files`, a
+/// network share without write rights) falls back to
+/// `%LOCALAPPDATA%\PixMe\{data,logs}` and reports `fallback_from` so
+/// the user gets the deferred notice.
+///
+/// The exe dir comes from `current_exe()` — never the working
+/// directory, which shortcuts freely change — with `\\?\` /
+/// `\\?\UNC\` verbatim prefixes stripped. Note: a network or
+/// removable-drive install keeps working, but SQLite there relies on
+/// its default rollback journal (no WAL — see docs/decisions.md).
+pub fn resolve_base_dirs() -> crate::paths::BaseDirs {
+    let fallback = local_app_data();
+    let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| crate::paths::strip_verbatim(d)))
+    else {
+        // No exe path at all — degraded but survivable.
+        return crate::paths::BaseDirs {
+            data: fallback.join("data"),
+            logs: fallback.join("logs"),
+            fallback_from: None,
+        };
+    };
+    let writable = crate::paths::probe_writable(&exe_dir.join("data"), &exe_dir.join("logs"));
+    crate::paths::pick_dirs(&exe_dir, &fallback, writable)
+}
+
+/// `%LOCALAPPDATA%\PixMe` — the non-portable fallback root.
+fn local_app_data() -> std::path::PathBuf {
+    directories::BaseDirs::new()
+        .map(|b| b.data_local_dir().join("pixme"))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(|v| Path::new(&v).join("pixme")))
+        .unwrap_or_else(|| std::env::temp_dir().join("pixme"))
+}
+
+/// "Windows 10.0.19045" style — `cmd /c ver` output trimmed to the
+/// version field; ~30 ms once at startup, no extra dependency.
+pub fn os_version() -> String {
+    let out = std::process::Command::new("cmd")
+        .args(["/c", "ver"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    // "Microsoft Windows [Version 10.0.19045.4780]" → "Windows 10.0.19045.4780".
+    out.rsplit_once('[')
+        .and_then(|(_, v)| {
+            v.strip_prefix("Version ")
+                .map(|v| v.trim_end_matches(']').to_owned())
+        })
+        .map(|v| format!("Windows {v}"))
+        .unwrap_or_else(|| "Windows ?".to_owned())
+}
+
 /// Shows the native Windows print dialog (`PrintDlgW` — printer picker,
 /// page range, copies) and prints `img` fit to the printable page via
 /// GDI `StretchDIBits` on the chosen printer's DC — no helper process.

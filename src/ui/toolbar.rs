@@ -157,6 +157,7 @@ impl Toolbar {
     /// The chosen delay is session state — it survives between captures
     /// but is never saved to disk.
     fn delay_menu(btn: &egui::Response, settings: &mut Settings) {
+        let before = settings.capture_delay_secs;
         egui::Popup::menu(btn).show(|ui| {
             ui.selectable_value(&mut settings.capture_delay_secs, 0, t!("delay.none"));
             // A quick 5-second pick, then the full 1–9 s range below a
@@ -180,11 +181,20 @@ impl Toolbar {
                 );
             }
         });
+        if before != settings.capture_delay_secs {
+            tracing::info!(
+                setting = "capture_delay_secs",
+                value = settings.capture_delay_secs,
+                "settings_changed"
+            );
+        }
     }
 
     /// Menu on the gear button: capture-related toggles only — application
     /// settings live in the viewer menus / app menu, never in the bar.
     fn options_menu(btn: &egui::Response, settings: &mut Settings) {
+        let before_pointer = settings.include_pointer;
+        let before_clip = settings.copy_to_clipboard;
         let mut changed = false;
         egui::Popup::menu(btn).show(|ui| {
             changed |= ui
@@ -198,6 +208,20 @@ impl Toolbar {
                 .changed();
         });
         if changed {
+            if before_pointer != settings.include_pointer {
+                tracing::info!(
+                    setting = "include_pointer",
+                    value = settings.include_pointer,
+                    "settings_changed"
+                );
+            }
+            if before_clip != settings.copy_to_clipboard {
+                tracing::info!(
+                    setting = "copy_to_clipboard",
+                    value = settings.copy_to_clipboard,
+                    "settings_changed"
+                );
+            }
             settings.save();
         }
     }

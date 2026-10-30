@@ -124,6 +124,11 @@ pub struct OverlaySession {
     loupe: Option<egui::TextureHandle>,
     /// When `C` last copied the colour (drives the "copied" flash).
     copied_at: Option<std::time::Instant>,
+    /// The capture's log correlation id — set by `begin_capture`, every
+    /// event this session emits rides its span (one grep = one life).
+    pub capture_id: u64,
+    /// When the capture started — the `ms` field of `capture_finished`.
+    pub started_at: std::time::Instant,
 }
 
 impl OverlaySession {
@@ -159,7 +164,15 @@ impl OverlaySession {
             texture: None,
             loupe: None,
             copied_at: None,
+            capture_id: 0,
+            started_at: std::time::Instant::now(),
         }
+    }
+
+    /// The `capture` span carrying this session's `capture_id` — every
+    /// event emitted between its `.entered()` markers is correlated.
+    pub fn span(&self) -> tracing::Span {
+        tracing::info_span!("capture", capture_id = self.capture_id)
     }
 
     /// Switches the overlay to the frozen frame of monitor `id` (no-op if
@@ -262,7 +275,8 @@ impl OverlaySession {
                     }
                 }
                 Err(err) => {
-                    tracing::error!("capture failed: {err}");
+                    let _span = self.span().entered();
+                    tracing::error!(mode = ?self.mode, "capture_failed: {err}");
                     self.failed = true;
                 }
             }
@@ -575,6 +589,8 @@ impl OverlaySession {
         {
             let _ = cb.set_text(&hex);
             self.copied_at = Some(std::time::Instant::now());
+            let _span = self.span().entered();
+            tracing::info!("color_copied");
         }
     }
 

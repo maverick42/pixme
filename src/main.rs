@@ -1,7 +1,13 @@
 //! PixMe — a lightweight, standalone screenshot capture and annotation tool.
 //!
-//! Entry point: installs tracing, loads the embedded translations and hands
-//! off to [`app::run`]. All application state lives in [`app::PixMeApp`].
+//! Entry point: resolves the data/log paths, installs file logging, checks
+//! the single-instance guard and hands off to [`app::run`]. All application
+//! state lives in [`app::PixMeApp`].
+//!
+//! Startup order is load-bearing: the local UTC offset is read BEFORE any
+//! thread exists, `paths::init` creates the directories logging needs, and
+//! `logging::init` installs the subscriber — every later event lands in
+//! `logs_dir()/pixme.<date>.log`.
 
 // Phase 1 scaffold: public module APIs (capture, editor, export, widgets) are
 // consumed from phase 2 onward. Remove this allow as real callers land.
@@ -18,6 +24,8 @@ mod devseed;
 mod editor;
 mod export;
 mod i18n;
+mod logging;
+mod paths;
 mod platform;
 mod store;
 mod ui;
@@ -25,13 +33,12 @@ mod ui;
 i18n!("locales", fallback = "en");
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(|| LossyStdout)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // The local offset must be captured before ANY thread spawns —
+    // reading the system zone late can fail or block.
+    let utc_offset = logging::local_utc_offset();
+    paths::init();
+    logging::init(utc_offset);
+    logging::install_panic_hook();
 
     // Dev tool (dev-tools feature only): `pixme --seed-session [N]`
     // writes N large synthetic captures into session.db and exits —
@@ -42,10 +49,13 @@ fn main() -> eframe::Result<()> {
         let instance = instance_guard();
         if instance.as_ref().is_some_and(|i| !i.is_single()) {
             eprintln!("pixme: quit the running instance before seeding the session");
+            logging::shutdown();
             std::process::exit(2);
         }
         let _guard = instance;
-        std::process::exit(devseed::run(count));
+        let code = devseed::run(count);
+        logging::shutdown();
+        std::process::exit(code);
     }
 
     // Single instance: PixMe is a resident app (menu bar / tray) owning
@@ -61,17 +71,26 @@ fn main() -> eframe::Result<()> {
             .set_title(t!("app.title").as_ref())
             .set_description(t!("app.already_running").as_ref())
             .show();
+        logging::shutdown();
         std::process::exit(0);
     }
     platform::drag_out::cleanup_stale_files();
-    app::run()
+    let result = app::run();
+    // Every quit path (menu Quit, quit_now, window close) lands back
+    // here: the writer guard flushes and joins before the process dies.
+    logging::shutdown();
+    result
 }
 
 /// The OS single-instance lock: a named mutex on Windows, an `flock`ed
-/// file on macOS. `None` = the guard itself failed — a resident app
-/// must not be blocked by that, so the failure only logs.
+/// file on macOS — an OS-level lock the kernel releases even on a kill
+/// or crash (no orphan lockfile). Keyed on `data/instance.lock`, i.e.
+/// PER INSTALLATION under the Windows portable layout: two PixMe
+/// folders may run side by side, each owning its own session and logs.
+/// `None` = the guard itself failed — a resident app must not be
+/// blocked by that, so the failure only logs.
 fn instance_guard() -> Option<single_instance::SingleInstance> {
-    let path = store::data_dir().join("instance.lock");
+    let path = paths::instance_lock();
     // The data dir may not exist on a first-ever run — without it the
     // lockfile cannot be created and the guard silently disables.
     if let Some(dir) = path.parent() {
@@ -89,24 +108,35 @@ fn instance_guard() -> Option<single_instance::SingleInstance> {
     }
 }
 
-/// `stdout` writer that swallows write/flush errors (`BrokenPipe`, detached
-/// console). Without this, when the parent shell/terminal that launched
-/// PixMe exits and closes the pipe, `tracing-subscriber`'s default
-/// `io::stdout` writer returns `Err(BrokenPipe)`, which makes
-/// `tracing_subscriber::fmt` call `eprintln!("[tracing-subscriber] Unable
-/// to write an event…")`, which in turn **panics** (`failed printing to
-/// stderr`) because `stderr` points to the same closed pipe — aborting the
-/// resident app on the very next log event.
-struct LossyStdout;
+#[cfg(test)]
+mod tests {
+    /// The per-installation lock: two launches from the SAME folder are
+    /// refused, two DIFFERENT folders may coexist, and a dropped guard
+    /// (kill included — the OS owns the lock, not the file) frees the
+    /// path for the next launch.
+    #[test]
+    fn instance_lock_is_per_directory_and_released() {
+        let base = std::env::temp_dir().join(format!("pixme-lock-{}", std::process::id()));
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let key =
+            |d: &std::path::Path| d.join("instance.lock").to_string_lossy().replace('\\', "/");
 
-impl std::io::Write for LossyStdout {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let _ = std::io::stdout().write_all(buf);
-        Ok(buf.len())
-    }
+        let first = single_instance::SingleInstance::new(&key(&dir_a)).unwrap();
+        assert!(first.is_single());
+        // Same folder → refused.
+        let second = single_instance::SingleInstance::new(&key(&dir_a)).unwrap();
+        assert!(!second.is_single());
+        // Different folder → independent instance allowed.
+        let other = single_instance::SingleInstance::new(&key(&dir_b)).unwrap();
+        assert!(other.is_single());
+        // Guard dropped (crash/kill equivalent) → the folder frees up.
+        drop(first);
+        let relaunch = single_instance::SingleInstance::new(&key(&dir_a)).unwrap();
+        assert!(relaunch.is_single());
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        let _ = std::io::stdout().flush();
-        Ok(())
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

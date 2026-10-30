@@ -65,3 +65,45 @@ $env:PIXME_DATA_DIR="$env:TEMP\pixme-bench"
 $env:PIXME_DEBUG_MOSAIC="1"; $env:RUST_LOG="pixme=debug"
 .\target\release\pixme.exe
 ```
+
+### Data and log locations
+
+All app-data paths are resolved once at startup by `src/paths.rs`.
+
+- **Windows (portable)**: everything lives beside `pixme.exe` —
+  `<exe dir>\data\` (`session.db`, `.bak` backups, `prefs.json`,
+  `instance.lock`) and `<exe dir>\logs\` (`pixme.<date>.log`,
+  `pixme.panic.log`). If the exe dir is not writable the app falls back
+  to `%LOCALAPPDATA%\PixMe\{data,logs}` and tells you once where it went.
+- **macOS**: `~/Library/Application Support/pixme/` and
+  `~/Library/Logs/PixMe/`.
+- `PIXME_DATA_DIR` / `PIXME_LOGS_DIR` overrides exist **in dev-tools
+  builds only** — a distributed binary ignores them, so a test can
+  never touch a real session.
+
+Windows reference install and updates:
+
+```text
+C:\portable\pixme\
+    pixme.exe      ← replace ONLY this file on update
+    data\          ← session.db, prefs.json, instance.lock (untouched)
+    logs\          ← pixme.<date>.log, pixme.panic.log (untouched)
+```
+
+An update = swap the exe; `data\` and `logs\` always survive. Launching
+the exe from a subfolder (e.g. `C:\portable\pixme\old\pixme.exe`) makes
+THAT folder's `data\`/`logs\` the live ones — locations follow the exe,
+never the working directory. Dev builds (`cargo run`,
+`target\release\pixme.exe`) therefore create their data inside
+`target\` — gitignored and wiped by `cargo clean`, never a real
+session.
+
+### Diagnosing a problem
+
+- Logs: `logs_dir()/pixme.<UTC date>.log`, 5 files kept — see
+  `docs/logging.md` for the event catalogue and privacy rules.
+- **Diagnostic mode** (Settings → General): `debug` level for the
+  running session only, never persisted. `RUST_LOG` still overrides the
+  startup level.
+- **Copy diagnostic information** (Settings → About): banner + last 200
+  log lines to the clipboard, home-dir redacted — review before sharing.

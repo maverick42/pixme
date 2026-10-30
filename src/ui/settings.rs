@@ -104,7 +104,8 @@ fn sidebar(ui: &mut egui::Ui, page: &mut SettingsPage) {
     });
 }
 
-/// General page: the three preference rows that existed before.
+/// General page: the persisted preference rows, plus the session-only
+/// diagnostic-mode switch (applied live — it is not part of the draft).
 fn general_page(ui: &mut egui::Ui, draft: &mut Settings) {
     ui.vertical(|ui| {
         ui.add_space(6.0);
@@ -118,6 +119,17 @@ fn general_page(ui: &mut egui::Ui, draft: &mut Settings) {
         widgets::hairline(ui);
         row(ui, &t!("settings.db_retention.label"), |ui| {
             retention_picker(ui, draft);
+        });
+        widgets::hairline(ui);
+        row(ui, &t!("settings.general.diagnostic"), |ui| {
+            let mut on = crate::logging::diagnostic_enabled();
+            if ui
+                .checkbox(&mut on, "")
+                .on_hover_text(t!("settings.general.diagnostic.tooltip").to_string())
+                .changed()
+            {
+                crate::logging::set_diagnostic(on);
+            }
         });
     });
 }
@@ -233,6 +245,31 @@ fn about_page(ui: &mut egui::Ui) {
                 );
             });
         });
+        ui.add_space(10.0);
+        // Data + logs locations — copyable, openable in the OS file
+        // manager, and the one-click diagnostics bundle next to them.
+        folder_row(
+            ui,
+            &t!("settings.about.data_folder"),
+            crate::paths::data_dir(),
+            "settings.about.open_data",
+        );
+        folder_row(
+            ui,
+            &t!("settings.about.logs_folder"),
+            crate::paths::logs_dir(),
+            "settings.about.open_logs",
+        );
+        ui.add_space(4.0);
+        if widgets::secondary_button(ui, &t!("settings.about.copy_diagnostics")).clicked() {
+            ui.ctx().copy_text(crate::logging::diagnostics_text());
+            tracing::info!("diagnostics_copied");
+        }
+        ui.label(
+            egui::RichText::new(t!("settings.about.diagnostics_hint").to_string())
+                .size(10.5)
+                .color(t.text_faint),
+        );
         ui.add_space(12.0);
         ui.label(
             egui::RichText::new(t!("settings.about.notices").to_string())
@@ -253,6 +290,35 @@ fn about_page(ui: &mut egui::Ui) {
                         .color(t.text_dim),
                 );
             });
+    });
+}
+
+/// One About-page location row: label, the path (elided, full path on
+/// hover), a copy button and an open-in-file-manager button.
+fn folder_row(ui: &mut egui::Ui, label: &str, path: &std::path::Path, open_key: &'static str) {
+    let t = theme::tokens(ui.ctx());
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .size(10.5)
+                .color(t.text_dim)
+                .strong(),
+        );
+        widgets::elided_label(ui, path.display().to_string())
+            .on_hover_text(path.display().to_string());
+        if widgets::icon_button(ui, Icon::Copy, false)
+            .on_hover_text(t!("settings.about.copy_path").to_string())
+            .clicked()
+        {
+            ui.ctx().copy_text(path.display().to_string());
+        }
+        if widgets::icon_button(ui, Icon::FolderOpen, false)
+            .on_hover_text(t!(open_key).to_string())
+            .clicked()
+        {
+            tracing::info!(folder = %crate::paths::file_name(path), "folder_opened");
+            crate::platform::open_folder(path);
+        }
     });
 }
 
@@ -277,13 +343,38 @@ fn apply(ctx: &egui::Context, shared: &Shared) {
     write_back(draft, shared);
 }
 
+/// One `settings_changed` event per modified preference — the setting
+/// name and its new value; counters, recents and last-used dirs are
+/// deliberately left out (they churn silently on every save).
+fn log_changes(old: &Settings, new: &Settings) {
+    type Field = (&'static str, fn(&Settings) -> String);
+    let fields: [Field; 9] = [
+        ("language", |s| format!("{:?}", s.language)),
+        ("appearance", |s| format!("{:?}", s.appearance)),
+        ("copy_to_clipboard", |s| s.copy_to_clipboard.to_string()),
+        ("db_retention", |s| format!("{:?}", s.db_retention)),
+        ("tab_sort", |s| format!("{:?}", s.tab_sort)),
+        ("text_color", |s| format!("{:?}", s.text_color)),
+        ("text_font", |s| s.text_font.clone()),
+        ("text_size", |s| s.text_size.to_string()),
+        ("filename_template", |s| s.filename_template.clone()),
+    ];
+    for (name, f) in fields {
+        let (a, b) = (f(old), f(new));
+        if a != b {
+            tracing::info!(setting = name, value = %b, "settings_changed");
+        }
+    }
+}
+
 /// The one write-back path: settings replaced + saved, retention applied
 /// to the store, modal closed.
 fn write_back(draft: Settings, shared: &Shared) {
     let retention = draft.db_retention;
     {
         let mut settings = lock(&shared.settings);
-        *settings = draft;
+        let old = std::mem::replace(&mut *settings, draft);
+        log_changes(&old, &settings);
         settings.save();
     }
     lock(&shared.store).apply_retention(retention);
