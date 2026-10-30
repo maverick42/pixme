@@ -765,8 +765,9 @@ pub fn unhide_cursor() {
 }
 
 /// Ends any active Win32 popup menu once the screen has been frozen so the
-/// selection overlay owns pointer input.
-pub fn dismiss_active_menus() {
+/// selection overlay owns pointer input. Returns `false` — `EndMenu` posts
+/// no key into our own input, nothing to swallow.
+pub fn dismiss_active_menus() -> bool {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn EndMenu() -> i32;
@@ -774,6 +775,7 @@ pub fn dismiss_active_menus() {
     unsafe {
         EndMenu();
     }
+    false
 }
 
 /// No-op on Windows (`with_always_on_top()` already places the overlay at

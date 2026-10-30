@@ -3,7 +3,7 @@
 //!
 //! The status item exposes the same two actions as the Windows tray icon —
 //! "Take a capture" and "Open PixMe". The real application menus (PixMe /
-//! Capture / File / Window) live on the menu bar, and quitting is only
+//! File / Edit / Window) live on the menu bar, and quitting is only
 //! possible from the PixMe menu. `tray_icon::menu` re-exports `muda`, so one
 //! dependency covers both surfaces.
 //!
@@ -219,19 +219,6 @@ pub fn install_ui(ctx: &egui::Context) {
         Some(Accelerator::new(Modifiers::META, Code::KeyQ)),
     );
     append(&app_menu, &app);
-
-    let capture = Submenu::new(t!("menu.capture").as_ref(), true);
-    labels.subs.push((capture.clone(), "menu.capture"));
-    for (id, key) in [
-        ("capture.window", "toolbar.window.tooltip"),
-        ("capture.region", "toolbar.region.tooltip"),
-        ("capture.fullscreen", "toolbar.fullscreen.tooltip"),
-        ("capture.fixed_region", "toolbar.fixed_region.tooltip"),
-        ("capture.pin", "toolbar.pin.tooltip"),
-    ] {
-        item(&mut labels, &capture, id, key, None);
-    }
-    append(&app_menu, &capture);
 
     let file = Submenu::new(t!("menu.file").as_ref(), true);
     labels.subs.push((file.clone(), "menu.file"));
@@ -847,7 +834,10 @@ pub fn unhide_cursor() {
 /// activation and keeps eating mouse events. Sending `Escape` (key code 53)
 /// once the pixels are already captured in `frozen_all` ends that tracking
 /// loop cleanly so the selection overlay owns the pointer.
-pub fn dismiss_active_menus() {
+///
+/// Returns `true` when a synthetic Escape was actually posted — the overlay
+/// uses it to swallow that Esc when it lands on the freshly-keyed window.
+pub fn dismiss_active_menus() -> bool {
     use core_graphics::sys::CGEventRef;
     use std::ffi::c_void;
 
@@ -877,14 +867,18 @@ pub fn dismiss_active_menus() {
     const HID_EVENT_TAP: u32 = 0;
 
     let own_pid = std::process::id();
+    // WindowServer keeps permanent layer ≥ 100 windows (cursor, menubar
+    // backstop) that never run a menu tracking loop — without the exclusion
+    // the Esc below fires on every single capture.
     let mut menu_pids: Vec<u32> = window_list()
         .into_iter()
-        .filter(|w| w.pid != own_pid && w.layer >= POPUP_MENU_LAYER)
+        .filter(|w| w.pid != own_pid && w.layer >= POPUP_MENU_LAYER && w.app_name != "WindowServer")
         .map(|w| w.pid)
         .collect();
     menu_pids.sort_unstable();
     menu_pids.dedup();
 
+    let mut posted = false;
     if !menu_pids.is_empty() {
         unsafe {
             let down = CGEventCreateKeyboardEvent(std::ptr::null(), ESCAPE_KEYCODE, true);
@@ -896,6 +890,8 @@ pub fn dismiss_active_menus() {
                 }
                 CGEventPost(HID_EVENT_TAP, down);
                 CGEventPost(HID_EVENT_TAP, up);
+                posted = true;
+                tracing::info!(?menu_pids, "posted Esc to dismiss foreign popup menus");
             }
             if !down.is_null() {
                 CFRelease(down.cast());
@@ -921,6 +917,7 @@ pub fn dismiss_active_menus() {
             }
         }
     }
+    posted
 }
 
 /// Raises the capture overlay window to `kCGScreenSaverWindowLevel` (1000) —
