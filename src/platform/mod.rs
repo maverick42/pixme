@@ -216,3 +216,35 @@ pub use macos::tick;
 /// The short tick (see above).
 #[cfg(target_os = "windows")]
 pub use windows::tick;
+
+/// Snapshot of the current OS mouse cursor, ready to be composited onto a
+/// captured frame.
+#[derive(Clone, Debug)]
+pub struct CursorSnapshot {
+    /// RGBA bitmap of the cursor at the target monitor's scale factor.
+    pub image: image::RgbaImage,
+    /// Global cursor position in the OS-native display space (the same space
+    /// `MonitorInfo::rect` lives in).
+    pub position: (f32, f32),
+    /// Hotspot offset in physical pixels from the top-left of `image`.
+    pub hotspot_px: (i32, i32),
+}
+
+/// Captures the current OS mouse cursor image, its global position and its
+/// hotspot scaled to `scale_factor`. Returns `None` if the cursor is hidden
+/// or cannot be read from the OS.
+#[cfg(target_os = "macos")]
+pub use macos::cursor_snapshot;
+/// Captures the current OS mouse cursor (see above).
+#[cfg(target_os = "windows")]
+pub use windows::cursor_snapshot;
+
+/// Hides the OS cursor so a screen capture does not bake it into the frame
+/// (the OS composites the cursor on its own). Counter-based — always pair
+/// with `unhide_cursor`.
+#[cfg(target_os = "macos")]
+pub use macos::{dismiss_active_menus, elevate_overlay, hide_cursor, unhide_cursor};
+/// Hides / unhides the OS cursor and dismisses active popup menus around a
+/// capture (see above).
+#[cfg(target_os = "windows")]
+pub use windows::{dismiss_active_menus, elevate_overlay, hide_cursor, unhide_cursor};

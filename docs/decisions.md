@@ -1252,3 +1252,32 @@ Format: date — context — decision — consequences.
   that armed it, on whichever monitor the bar sits, and moves with the bar;
   the chosen delay stays armed for every capture until changed or the app
   quits, with a blue-framed clock icon as the tell. No dependency change.
+
+## 2026-10-29 — Include-mouse-pointer stamps the real OS cursor with zero new dependencies
+
+- **Context**: `Settings::include_pointer` was exposed in the floating bar's
+  gear menu, but nothing in the capture pipeline read it and `xcap` never
+  renders the mouse cursor into captured frames.
+- **Decision**: when `include_pointer` is `true`, `platform::cursor_snapshot`
+  fetches the actual OS cursor image, its global position and its hotspot at
+  capture time — with zero new crate dependencies:
+  - macOS queries `NSCursor.currentSystemCursor` (falling back to
+    `NSCursor.currentCursor`), `hotSpot`, `image.size` and
+    `CGImageForProposedRect:context:hints:` directly via the Objective-C C
+    runtime (`objc_getClass`, `sel_registerName`, `objc_msgSend` from
+    `libobjc`) and rasterizes the `CGImageRef` at the target monitor's
+    `scale_factor` through `core-graphics` (`CGContext`), which is already a
+    direct dependency.
+  - Windows queries `GetCursorInfo` + `GetIconInfo` and renders the cursor via
+    `DrawIconEx` into a 32-bit DIB section (`user32` / `gdi32` FFI).
+  - If the OS cursor is hidden or cannot be retrieved, `cursor_snapshot`
+    returns `None` rather than drawing a synthetic fallback arrow.
+  `screen::capture_all_monitors(include_pointer)` stamps the snapshot once
+  onto the monitor containing the cursor before any cropping (so Region,
+  FixedRegion, FullScreen and Pin all inherit it), and
+  `window::capture_window(id, include_pointer)` stamps it onto standalone
+  window captures when the cursor lies inside the window bounds.
+- **Consequences**: `include_pointer = false` keeps the exact previous
+  behaviour; `include_pointer = true` composites the real system cursor
+  (arrow, I-beam, hand, resize, etc.) at its exact hotspot and Retina scale
+  with no added crate.

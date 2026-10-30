@@ -93,7 +93,10 @@ pub struct Settings {
     pub language: Language,
     /// Theme preference: `auto` follows the OS appearance.
     pub appearance: Appearance,
-    /// Include the mouse pointer in captures.
+    /// Include the mouse pointer in captures. Session-only by user
+    /// decision: it survives between captures but is never written to
+    /// disk — every launch starts without the pointer.
+    #[serde(skip)]
     pub include_pointer: bool,
     /// Also copy every capture to the clipboard.
     pub copy_to_clipboard: bool,

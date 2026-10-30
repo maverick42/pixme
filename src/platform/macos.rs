@@ -482,3 +482,317 @@ pub fn tick() {
     }
     unsafe { NSBeep() }
 }
+
+/// Captures the current OS mouse cursor (`NSCursor.currentSystemCursor`, or
+/// `NSCursor.currentCursor` as fallback) rendered at `scale_factor` into an
+/// RGBA bitmap, along with its global display position and scaled hotspot.
+///
+/// Uses the Objective-C runtime (`objc_getClass` / `sel_registerName` /
+/// `objc_msgSend`, always linked via `libobjc`) and `core-graphics` (already
+/// a direct dependency) so no extra crate is needed.
+pub fn cursor_snapshot(scale_factor: f32) -> Option<super::CursorSnapshot> {
+    use core_graphics::base::kCGImageAlphaPremultipliedLast;
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::CGContext;
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    use core_graphics::sys::CGImageRef;
+    use std::ffi::c_void;
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendPoint = unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGPoint;
+    type MsgSendSize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGSize;
+    type MsgSendCgImage = unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut CGRect,
+        *mut c_void,
+        *mut c_void,
+    ) -> CGImageRef;
+
+    let position = cursor_position()?;
+    let scale = f64::from(scale_factor.max(1.0));
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_pt: MsgSendPoint = std::mem::transmute(objc_msgSend as *const ());
+        let send_sz: MsgSendSize = std::mem::transmute(objc_msgSend as *const ());
+        let send_cg: MsgSendCgImage = std::mem::transmute(objc_msgSend as *const ());
+
+        let cls = objc_getClass(c"NSCursor".as_ptr());
+        if cls.is_null() {
+            return None;
+        }
+        let mut cursor = send_id(cls, sel_registerName(c"currentSystemCursor".as_ptr()));
+        if cursor.is_null() {
+            cursor = send_id(cls, sel_registerName(c"currentCursor".as_ptr()));
+        }
+        // The pointer may sit over another app's window (a delayed capture,
+        // or right after the bar tore down): both "current" cursors are
+        // then NULL — fall back to the standard arrow so the stamp always
+        // has an image when the user asked for the pointer in captures.
+        if cursor.is_null() {
+            cursor = send_id(cls, sel_registerName(c"arrow".as_ptr()));
+        }
+        if cursor.is_null() {
+            return None;
+        }
+
+        let hotspot = send_pt(cursor, sel_registerName(c"hotSpot".as_ptr()));
+        let ns_image = send_id(cursor, sel_registerName(c"image".as_ptr()));
+        if ns_image.is_null() {
+            return None;
+        }
+        let size = send_sz(ns_image, sel_registerName(c"size".as_ptr()));
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return None;
+        }
+
+        let w = (size.width * scale).round().max(1.0) as usize;
+        let h = (size.height * scale).round().max(1.0) as usize;
+        let mut proposed = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(w as f64, h as f64));
+        let cg_img = send_cg(
+            ns_image,
+            sel_registerName(c"CGImageForProposedRect:context:hints:".as_ptr()),
+            &mut proposed,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if cg_img.is_null() {
+            return None;
+        }
+
+        let cs = CGColorSpace::create_device_rgb();
+        let mut ctx = CGContext::create_bitmap_context(
+            None,
+            w,
+            h,
+            8,
+            w * 4,
+            &cs,
+            kCGImageAlphaPremultipliedLast,
+        );
+        let draw_rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(w as f64, h as f64));
+        // `CGImageForProposedRect` returns an autoreleased `CGImageRef`
+        // (get rule) — wrap in `ManuallyDrop<CGImage>` so `draw_image` can
+        // borrow it without releasing on drop.
+        let img = std::mem::ManuallyDrop::new(std::mem::transmute::<
+            CGImageRef,
+            core_graphics::image::CGImage,
+        >(cg_img));
+        ctx.draw_image(draw_rect, &img);
+
+        let mut buf = ctx.data().to_vec();
+        // Un-premultiply RGBA for `image::RgbaImage`.
+        for px in buf.as_chunks_mut::<4>().0 {
+            let a = px[3] as u32;
+            if a > 0 && a < 255 {
+                px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+                px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+                px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+        let image = image::RgbaImage::from_raw(w as u32, h as u32, buf)?;
+        Some(super::CursorSnapshot {
+            image,
+            position,
+            hotspot_px: (
+                (hotspot.x * scale).round() as i32,
+                (hotspot.y * scale).round() as i32,
+            ),
+        })
+    }
+}
+
+/// Hides the OS cursor on every connected display (per-display counter):
+/// `CGWindowListCreateImage` composites the cursor into the frame, and this
+/// is the only way to keep it out of a capture. Works regardless of which
+/// application has focus. Always balance with [`unhide_cursor`].
+pub fn hide_cursor() {
+    unsafe {
+        for m in xcap::Monitor::all().unwrap_or_default() {
+            if let Ok(id) = m.id() {
+                core_graphics::display::CGDisplayHideCursor(id);
+            }
+        }
+    }
+}
+
+/// Balances [`hide_cursor`] (see above).
+pub fn unhide_cursor() {
+    unsafe {
+        for m in xcap::Monitor::all().unwrap_or_default() {
+            if let Ok(id) = m.id() {
+                core_graphics::display::CGDisplayShowCursor(id);
+            }
+        }
+    }
+}
+
+/// Closes any third-party popup menu (`NSMenu`, layer ≥ 100) still tracking
+/// the mouse after the screen frames have been frozen, and activates PixMe.
+///
+/// Status-bar extras (`LSUIElement` daemons like SwitchResX) run a modal menu
+/// tracking loop at `kCGPopUpMenuWindowLevel` (101) that ignores normal app
+/// activation and keeps eating mouse events. Sending `Escape` (key code 53)
+/// once the pixels are already captured in `frozen_all` ends that tracking
+/// loop cleanly so the selection overlay owns the pointer.
+pub fn dismiss_active_menus() {
+    use core_graphics::sys::CGEventRef;
+    use std::ffi::c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: *const c_void,
+            virtual_key: u16,
+            key_down: bool,
+        ) -> CGEventRef;
+        fn CGEventPost(tap: u32, event: CGEventRef);
+        fn CGEventPostToPid(pid: i32, event: CGEventRef);
+        fn CFRelease(cf: *const c_void);
+    }
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
+
+    const ESCAPE_KEYCODE: u16 = 53;
+    const POPUP_MENU_LAYER: i32 = 100;
+    const HID_EVENT_TAP: u32 = 0;
+
+    let own_pid = std::process::id();
+    let mut menu_pids: Vec<u32> = window_list()
+        .into_iter()
+        .filter(|w| w.pid != own_pid && w.layer >= POPUP_MENU_LAYER)
+        .map(|w| w.pid)
+        .collect();
+    menu_pids.sort_unstable();
+    menu_pids.dedup();
+
+    if !menu_pids.is_empty() {
+        unsafe {
+            let down = CGEventCreateKeyboardEvent(std::ptr::null(), ESCAPE_KEYCODE, true);
+            let up = CGEventCreateKeyboardEvent(std::ptr::null(), ESCAPE_KEYCODE, false);
+            if !down.is_null() && !up.is_null() {
+                for pid in &menu_pids {
+                    CGEventPostToPid(*pid as i32, down);
+                    CGEventPostToPid(*pid as i32, up);
+                }
+                CGEventPost(HID_EVENT_TAP, down);
+                CGEventPost(HID_EVENT_TAP, up);
+            }
+            if !down.is_null() {
+                CFRelease(down.cast());
+            }
+            if !up.is_null() {
+                CFRelease(up.cast());
+            }
+        }
+    }
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_bool: MsgSendVoidBool = std::mem::transmute(objc_msgSend as *const ());
+        let cls = objc_getClass(c"NSApplication".as_ptr());
+        if !cls.is_null() {
+            let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
+            if !app.is_null() {
+                send_void_bool(
+                    app,
+                    sel_registerName(c"activateIgnoringOtherApps:".as_ptr()),
+                    true,
+                );
+            }
+        }
+    }
+}
+
+/// Raises the capture overlay window to `kCGScreenSaverWindowLevel` (1000) —
+/// above the system menu bar (25) and popup menus (101) — and makes it key.
+/// `winit`'s `with_always_on_top()` stops at `kCGFloatingWindowLevel` (3),
+/// leaving status-item menus visually and interactively on top of the veil.
+pub fn elevate_overlay() {
+    use std::ffi::c_void;
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendUsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+    type MsgSendIdUsize = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    type MsgSendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+    type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
+    type MsgSendVoidIsize = unsafe extern "C" fn(*mut c_void, *mut c_void, isize);
+    type MsgSendVoidId = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+    type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
+
+    const FLOATING_LEVEL: isize = 3;
+    const SCREEN_SAVER_LEVEL: isize = 1000;
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_usize: MsgSendUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_usize: MsgSendIdUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool: MsgSendBool = std::mem::transmute(objc_msgSend as *const ());
+        let send_isize: MsgSendIsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_isize: MsgSendVoidIsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_id: MsgSendVoidId = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_bool: MsgSendVoidBool = std::mem::transmute(objc_msgSend as *const ());
+
+        let cls = objc_getClass(c"NSApplication".as_ptr());
+        if cls.is_null() {
+            return;
+        }
+        let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
+        if app.is_null() {
+            return;
+        }
+        send_void_bool(
+            app,
+            sel_registerName(c"activateIgnoringOtherApps:".as_ptr()),
+            true,
+        );
+        let windows = send_id(app, sel_registerName(c"windows".as_ptr()));
+        if windows.is_null() {
+            return;
+        }
+        let count = send_usize(windows, sel_registerName(c"count".as_ptr()));
+        let sel_obj = sel_registerName(c"objectAtIndex:".as_ptr());
+        let sel_vis = sel_registerName(c"isVisible".as_ptr());
+        let sel_opaque = sel_registerName(c"isOpaque".as_ptr());
+        let sel_level = sel_registerName(c"level".as_ptr());
+        let sel_set_level = sel_registerName(c"setLevel:".as_ptr());
+        let sel_key_front = sel_registerName(c"makeKeyAndOrderFront:".as_ptr());
+        for i in 0..count {
+            let win = send_id_usize(windows, sel_obj, i);
+            if win.is_null() {
+                continue;
+            }
+            // The capture overlay is the only visible, opaque always-on-top
+            // window (the anchor, bar, countdown and pins are transparent).
+            if send_bool(win, sel_vis)
+                && send_bool(win, sel_opaque)
+                && send_isize(win, sel_level) == FLOATING_LEVEL
+            {
+                send_void_isize(win, sel_set_level, SCREEN_SAVER_LEVEL);
+                send_void_id(win, sel_key_front, std::ptr::null_mut());
+            }
+        }
+    }
+}

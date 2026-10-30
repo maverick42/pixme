@@ -72,6 +72,13 @@ pub struct OverlaySession {
     pub return_to: AppState,
     /// Whole-screen modes freeze and confirm without any selection UI.
     pub instant: bool,
+    /// Whether the OS mouse cursor should be composited onto the captured
+    /// frame (`Settings::include_pointer` at capture start).
+    pub include_pointer: bool,
+    /// Freeze-time snapshot of the OS cursor — taken BEFORE the selection
+    /// crosshair exists, stamped onto the final crop at the click point
+    /// (`None` when `include_pointer` is off or the cursor is hidden).
+    pub(crate) cursor: Option<crate::platform::CursorSnapshot>,
     /// Frames painted before the screenshot is taken — the bar's window must
     /// be torn down first or it would photograph itself.
     warm_frames: u8,
@@ -129,6 +136,8 @@ impl OverlaySession {
             mode,
             return_to,
             instant: matches!(mode, CaptureMode::FullScreen),
+            include_pointer: false,
+            cursor: None,
             warm_frames: 0,
             frozen_all: Vec::new(),
             frozen: None,
@@ -210,8 +219,17 @@ impl OverlaySession {
             return false;
         }
         if self.frozen.is_none() && !self.failed {
-            match screen::capture_all_monitors() {
-                Ok(frames) => {
+            if matches!(self.mode, CaptureMode::WindowOrObject) {
+                // Snapshot the window list BEFORE dismissing active popup
+                // menus so an open menu remains pickable in the frozen frame.
+                self.window_list = window::windows().ok();
+            }
+            match screen::capture_all_monitors(self.include_pointer) {
+                Ok((frames, cursor)) => {
+                    self.cursor = cursor;
+                    if !self.instant {
+                        crate::platform::dismiss_active_menus();
+                    }
                     // Pick the monitor under the cursor right now; fall back
                     // to the pre-selected monitor or the primary/first frame.
                     let cursor_mon = crate::platform::cursor_position()
@@ -330,6 +348,7 @@ impl OverlaySession {
             }
             if !self.nudged {
                 self.nudged = true;
+                crate::platform::elevate_overlay();
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
                     m.rect.x as f32,
                     m.rect.y as f32,
@@ -745,15 +764,12 @@ impl OverlaySession {
     /// Crops the selection (physical px) out of the frozen frame — or, in
     /// pick mode, asks the OS for the window's own image (complete even if
     /// part of it was occluded), falling back to the crop on failure.
+    /// The freeze-time cursor snapshot is stamped at the pointer's CURRENT
+    /// position (the click that confirms the selection) — never at the
+    /// freeze position, and never the selection crosshair itself.
     pub fn take_capture(&self) -> Option<Capture> {
         let frozen = self.frozen.as_ref()?;
         let sel = self.selection?;
-        if matches!(self.mode, CaptureMode::WindowOrObject)
-            && let Some(id) = self.picked_window_id
-            && let Ok(capture) = window::capture_window(id)
-        {
-            return Some(capture);
-        }
         let s = frozen.scale_factor;
         let min = sel.min.to_vec2() + self.screen_offset;
         let rect = PhysicalRect {
@@ -762,7 +778,43 @@ impl OverlaySession {
             width: (sel.width() * s).round().max(1.0) as u32,
             height: (sel.height() * s).round().max(1.0) as u32,
         };
-        Some(screen::crop_region(frozen, rect))
+        // Stamp the freeze-time cursor at the position it had when the
+        // frames were grabbed (`snap.position`) — the point of the photo.
+        // `origin` is the image's top-left in global logical points.
+        let stamp = |img: &mut image::RgbaImage, origin: (f32, f32), sf: f32| {
+            if let Some(snap) = self.cursor.as_ref() {
+                let px = ((snap.position.0 - origin.0) * sf).round() as i64
+                    - i64::from(snap.hotspot_px.0);
+                let py = ((snap.position.1 - origin.1) * sf).round() as i64
+                    - i64::from(snap.hotspot_px.1);
+                image::imageops::overlay(img, &snap.image, px, py);
+            }
+        };
+        let picked = self
+            .picked_window_id
+            .and_then(|id| self.window_list.as_ref()?.iter().find(|w| w.id == id));
+        if matches!(self.mode, CaptureMode::WindowOrObject)
+            && let Some(win) = picked
+            && !win.is_menu
+            && let Ok(mut capture) = window::capture_window(win.id)
+        {
+            // The window's own top-left in global logical points.
+            let origin = (win.rect.x as f32, win.rect.y as f32);
+            stamp(
+                std::sync::Arc::make_mut(&mut capture.image),
+                origin,
+                capture.scale_factor,
+            );
+            return Some(capture);
+        }
+        let mut capture = screen::crop_region(frozen, rect);
+        let mon = &capture.monitor.rect;
+        stamp(
+            std::sync::Arc::make_mut(&mut capture.image),
+            (mon.x as f32 + min.x, mon.y as f32 + min.y),
+            s,
+        );
+        Some(capture)
     }
 }
 

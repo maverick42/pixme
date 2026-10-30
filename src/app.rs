@@ -1072,6 +1072,7 @@ impl Shared {
                 };
                 let mut session = OverlaySession::new(mode, return_to, remembered);
                 session.monitor = Some(monitor);
+                session.include_pointer = lock(&self.settings).include_pointer;
                 let instant = session.instant;
                 *lock(&self.capture) = Some(session);
                 self.enter(AppState::Capturing, ctx);
@@ -1091,7 +1092,23 @@ impl Shared {
             return;
         };
         let capture = if session.instant {
-            session.frozen.take()
+            session.frozen.take().map(|mut c| {
+                // Full screen confirms with no selection: stamp the cursor
+                // at its freeze-time position (`snap.position`).
+                if let Some(snap) = session.cursor.as_ref() {
+                    crate::capture::screen::stamp_cursor(
+                        std::sync::Arc::make_mut(&mut c.image),
+                        &c.monitor.rect,
+                        c.scale_factor,
+                        snap,
+                    );
+                }
+                // Dev hook: PIXME_DUMP_FINAL=/path.png dumps the stamped image.
+                if let Some(path) = std::env::var_os("PIXME_DUMP_FINAL") {
+                    let _ = c.image.save(&path);
+                }
+                c
+            })
         } else {
             session.take_capture()
         };

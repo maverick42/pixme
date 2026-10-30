@@ -14,10 +14,12 @@ use crate::platform;
 const MIN_SIZE: u32 = 24;
 
 /// Capturable window-server layers: 0 = normal window, 3 = floating
-/// palette, 8 = modal panel. Above that lives OS chrome (Dock = 20,
-/// menu bar = 24, status items = 25, notification banners < 0) — never
-/// a pick target. Windows has no layer concept; records there carry 0.
+/// palette, 8 = modal panel, 101 = popup/context menu (`NSMenu`). Other
+/// layers are OS chrome (Dock = 20, menu bar = 24, status items = 25,
+/// notification banners < 0) — never a pick target. Windows has no layer
+/// concept; records there carry 0.
 const MAX_LAYER: i32 = 8;
+const POPUP_MENU_LAYER: i32 = 101;
 
 /// One capturable window, front-to-back order.
 #[derive(Clone, Debug)]
@@ -30,6 +32,10 @@ pub struct WindowInfo {
     pub title: String,
     /// Global logical bounds.
     pub rect: PhysicalRect,
+    /// True when the window is a popup/context menu (`layer == 101`),
+    /// which is dismissed right after freeze and must be cropped from
+    /// the frozen frame rather than re-captured live.
+    pub is_menu: bool,
 }
 
 /// All on-screen pickable windows, front-to-back — minus minimized, tiny,
@@ -39,7 +45,9 @@ pub fn windows() -> Result<Vec<WindowInfo>, CaptureError> {
     let own_pid = std::process::id();
     let mut out = Vec::new();
     for w in platform::window_list() {
-        if w.pid == own_pid || !(0..=MAX_LAYER).contains(&w.layer) {
+        if w.pid == own_pid
+            || (!((0..=MAX_LAYER).contains(&w.layer)) && w.layer != POPUP_MENU_LAYER)
+        {
             continue;
         }
         if w.rect.width < MIN_SIZE || w.rect.height < MIN_SIZE {
@@ -50,13 +58,16 @@ pub fn windows() -> Result<Vec<WindowInfo>, CaptureError> {
             app_name: w.app_name,
             title: w.title,
             rect: w.rect,
+            is_menu: w.layer == POPUP_MENU_LAYER,
         });
     }
     Ok(out)
 }
 
 /// Captures window `id` alone: its frame and content in physical pixels,
-/// on its own monitor's scale factor.
+/// on its own monitor's scale factor. The OS cursor is hidden for the
+/// grab so it can never leak into the frame; when wanted, the caller
+/// stamps the freeze-time snapshot itself (see `OverlaySession::take_capture`).
 pub fn capture_window(id: u32) -> Result<Capture, CaptureError> {
     let w = Window::all()
         .map_err(|e| CaptureError::Failed(e.to_string()))?
@@ -66,12 +77,16 @@ pub fn capture_window(id: u32) -> Result<Capture, CaptureError> {
     let monitor = w
         .current_monitor()
         .map_err(|e| CaptureError::Failed(e.to_string()))?;
-    let image = w
-        .capture_image()
-        .map_err(|e| CaptureError::Failed(e.to_string()))?;
+    let scale_factor = monitor.scale_factor().unwrap_or(1.0);
+    // Same reasoning as `screen::capture_all_monitors`: the OS composites
+    // the cursor into the frame — hide it for the grab.
+    crate::platform::hide_cursor();
+    let image_result = w.capture_image();
+    crate::platform::unhide_cursor();
+    let image = image_result.map_err(|e| CaptureError::Failed(e.to_string()))?;
     Ok(Capture {
         image: std::sync::Arc::new(image),
-        scale_factor: monitor.scale_factor().unwrap_or(1.0),
+        scale_factor,
         monitor: super::screen::monitor_info(&monitor)?,
     })
 }
