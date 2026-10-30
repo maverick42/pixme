@@ -14,6 +14,7 @@ cargo fmt --check    # formatting gate
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 cargo test           # includes the locale completeness test
+cargo audit          # dependency vulnerability check (required on dep changes / release)
 ```
 
 Notes:

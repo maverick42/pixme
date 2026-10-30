@@ -2656,9 +2656,10 @@ impl Viewer {
         let anchor = ui.interact(
             anchor_rect,
             ui.id().with(("pixme-tile-drag", index)),
-            Sense::click(),
+            Sense::drag(),
         );
-        let tile_hovered = resp.hovered() || close.hovered() || anchor.hovered();
+        let tile_hovered =
+            resp.hovered() || close.hovered() || anchor.hovered() || anchor.dragged();
         // Frame: card at rest, accent-soft when selected — the tab
         // chips' selected treatment.
         ui.painter().rect(
@@ -2738,6 +2739,34 @@ impl Viewer {
         }
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // Dragging the top-left grip starts an OS drag-out of the full
+        // rendered capture (base + annotations, never the mosaic thumbnail)
+        // into another application. Both OSes run their own tracking loop
+        // and swallow the mouse-up event, so we release egui's pointer
+        // state right after to prevent a stuck drag on return.
+        if anchor.drag_started_by(egui::PointerButton::Primary) {
+            let full_image = crate::editor::render::render_to_image(&self.tabs[index].doc);
+            let title = &self.tabs[index].title;
+            if let Err(err) = crate::platform::drag_out::start_image_drag(title, &full_image) {
+                tracing::warn!("mosaic drag-out failed: {err}");
+            }
+            let release_pos = ui
+                .ctx()
+                .input(|i| i.pointer.interact_pos())
+                .unwrap_or(anchor_rect.center());
+            ui.ctx().input_mut(|i| {
+                i.events.push(egui::Event::PointerButton {
+                    pos: release_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                i.events.push(egui::Event::PointerGone);
+            });
+            ui.ctx().stop_dragging();
+            ui.ctx().request_repaint();
+            return;
         }
         // The cross closes only this capture — never a warning, like
         // the tabs. Guarded by `tile_hovered` so the invisible cross

@@ -1310,3 +1310,60 @@ Format: date — context — decision — consequences.
   step exists; menubar-template.png (1x) is kept for reference only (the
   status item always loads the 44 px 2x artwork, which the tray
   implementation clamps to 22 pt).
+
+## 2026-10-30 — Mosaic tile OS drag-out via `drag = "=2.1.1"` (`src/platform/drag_out.rs`)
+
+- **Context**: each mosaic tile exposed a top-left `GripVertical` badge with the
+  tooltip "Drag to copy this capture into another app", but the widget was
+  wired with `Sense::click()` and had no drag handler. egui/eframe has no
+  built-in outbound OS drag-and-drop API.
+- **Dependency audit (`drag = "=2.1.1"`, `crabnebula-dev/drag-rs`, audited
+  2026-10-30 — verdict: GO WITH CAVEATS)**:
+  - **Supply chain & licenses**: MIT OR Apache-2.0, maintained by CrabNebula /
+    Tauri team (`lucasfernog-crabnebula`), released 2026-09-24 (~102k recent
+    downloads), `build = false` (no build script), no network/process/filesystem
+    writes in crate source. `cargo audit` reports zero advisories on `drag` or
+    any of the 17 newly locked crates (the 7 warnings in the tree are all
+    pre-existing transitive dependencies).
+  - **Platform hygiene & caveats**:
+    - `raw-window-handle` `^0.6` matches our `eframe 0.36` / `winit 0.30`
+      (`0.6.2` shared, single copy).
+    - macOS: uses `objc2 0.6.5` / `objc2-app-kit 0.3.2` / `objc2-foundation
+      0.3.2` already in our lockfile via `muda` (no legacy `cocoa`/`objc` 0.2).
+      Adds `core-graphics 0.24.0` + `core-foundation 0.10.1` alongside our
+      direct `0.23.2` / `0.9.4`.
+    - Windows: pulls `windows 0.52.0` + `windows-core 0.58.0` alongside the
+      existing `windows 0.62.2` in the lockfile (compile-time / size caveat on
+      Windows builds only).
+  - **Fallback plan**: all `drag` crate usage is isolated inside
+    `src/platform/drag_out.rs`. Replacing the crate with direct
+    `NSDraggingSession` (macOS) + `IDropSource`/`DoDragDrop` (Windows) only
+    touches that single module.
+- **Decision**:
+  - Pin `drag = "=2.1.1"` and `raw-window-handle = "0.6"` in `Cargo.toml`.
+  - **Full-resolution payload, small cursor preview**: dragging a mosaic tile's
+    grip renders the full capture (`editor::render::render_to_image(&tab.doc)`,
+    base + annotations — never the 480 px mosaic thumbnail, and unrestricted on
+    password-locked tabs per the protection spec), writes it atomically to
+    `std::env::temp_dir()/pixme-drag/<sanitized-title>.png`, and passes that
+    absolute file path as `DragItem::Files` (`DragItem::Data` is macOS-only in
+    `drag` 2.1.1). The cursor-following drag icon (`Image::Raw`) is downscaled
+    to ≤ 160 px on its longest side so 5K captures do not cover the screen
+    during the drag (`drag-rs` issue #41).
+  - **Temp file lifecycle**: files are never deleted inside the drop callback
+    (receiving apps read the dropped path asynchronously after the drag returns);
+    `drag_out::cleanup_stale_files()` removes files older than 1 hour at
+    application startup.
+  - **egui pointer state**: both `beginDraggingSessionWithItems` and
+    `DoDragDrop` run their own modal tracking loop and swallow the physical
+    mouse-up event, so the viewer injects a synthetic `PointerButton { pressed:
+    false }` + `PointerGone` and calls `Context::stop_dragging()` immediately
+    after `start_image_drag` returns.
+  - **Scope**: only the mosaic tile grip initiates OS drag-out in this unit.
+    Tab drag-out and pinned-window drag-out remain deferred to a later unit
+    (tab drag will need a gesture rule distinguishing tab reorder from
+    drag-out) and will call the same `platform::drag_out::start_image_drag`
+    helper.
+- **Consequences**: dragging any mosaic tile by its top-left grip drops the
+  full-resolution rendered PNG into Finder/Explorer, browsers, Slack, Discord,
+  Mail, etc. on macOS and Windows.

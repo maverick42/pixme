@@ -62,6 +62,7 @@ fn main() -> eframe::Result<()> {
             .show();
         std::process::exit(0);
     }
+    platform::drag_out::cleanup_stale_files();
     app::run()
 }
 

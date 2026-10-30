@@ -7,6 +7,7 @@
 //! into [`PENDING`] and drained by [`crate::app::Shared::pump`] on the next UI
 //! pass. macOS additionally installs the native application menus.
 
+pub mod drag_out;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
