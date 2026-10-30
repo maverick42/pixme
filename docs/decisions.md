@@ -849,7 +849,6 @@ Format: date — context — decision — consequences.
     outline width + colour, opacity, shadow).
 - **Consequences**: `SCHEMA_VERSION` bumped to 12 in `src/store/mod.rs`.
 
-
 ## 2026-10-27 — Modal windows gate commands via one eligibility table
 
 - **Context**: on macOS the global menu bar stays fully active while a
@@ -1393,6 +1392,37 @@ Format: date — context — decision — consequences.
   OSes with the capture's name as the job title; the image prints fit to
   one page. Cancelling the dialog returns `Err` ("cancelled") — logged
   as a warning like before.
+
+## 2026-10-30 — Lossy stdout writer for `tracing-subscriber` and panic-log-first hook
+
+- **Context**: a macOS crash report (`pixme-2026-10-30-185600.ips`) after the
+  resident app had been running all afternoon with an exited parent shell
+  (`"parentProc": "Exited process"`) showed `SIGABRT` on the main thread when
+  closing/cancelling the print panel (`Command::PrintActive` →
+  `tracing::warn!("print failed: {e}")`), with no `panic.log` written.
+  Disassembling the exact crash offsets revealed the full chain:
+  1. Because the parent shell had exited, `stdout` and `stderr` were broken
+     pipes (`EPIPE`).
+  2. `tracing_subscriber::fmt` wrote the `warn!` event to its default
+     `io::stdout` writer, got `Err(BrokenPipe)`, and executed its internal
+     fallback `eprintln!("[tracing-subscriber] Unable to write an event to the
+     Writer for this Subscriber! Error: …")`.
+  3. Rust's `eprintln!` panics (`failed printing to stderr: Broken pipe`) when
+     `stderr` also returns `Err(BrokenPipe)`.
+  4. `install_panic_hook` caught that panic and called `tracing::error!("{line}")`
+     on its very first line — before writing `panic.log` — which re-entered
+     `tracing_subscriber::fmt`, hit the same `eprintln!` panic on the broken
+     `stderr` pipe, and triggered a double-panic immediate `abort()`.
+- **Decision**:
+  - `main.rs` configures `tracing_subscriber::fmt().with_writer(|| LossyStdout)`
+    where `LossyStdout` forwards to `std::io::stdout()` and swallows any write
+    or flush error (`Ok(buf.len())`), so a closed terminal / broken pipe can
+    never make `tracing-subscriber` call `eprintln!`.
+  - `install_panic_hook` writes `data_dir()/panic.log` and `stderr` (`let _ =
+    write_all`) **before** calling `tracing::error!`.
+- **Consequences**: the resident app survives indefinitely after the launching
+  terminal/shell closes; any future panic is guaranteed to land in `panic.log`
+  first.
 
 ## 2026-10-30 — Five recent files under File → Open
 
