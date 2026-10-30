@@ -1118,6 +1118,14 @@ impl Shared {
             self.enter(return_to, ctx);
             return;
         };
+        // The gear-menu "copy to clipboard" option applies to every
+        // confirmed capture — including Pin captures (which never reach
+        // the viewer).
+        if lock(&self.settings).copy_to_clipboard
+            && let Err(e) = crate::export::clipboard::copy_capture(&frame)
+        {
+            tracing::warn!("auto clipboard copy failed: {e}");
+        }
         // Fixed-region memory: the next fixed capture reopens exactly here
         // (same monitor, same size, same position — monitor-logical space).
         if matches!(session.mode, CaptureMode::FixedRegion) {
