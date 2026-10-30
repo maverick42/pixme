@@ -12,7 +12,7 @@ use rust_i18n::t;
 use crate::app::{Shared, lock};
 use crate::config::{Appearance, DbRetention, Settings};
 use crate::i18n::Language;
-use crate::ui::icons::Icon;
+use crate::ui::icons::{self, Icon};
 use crate::ui::{theme, widgets};
 
 /// Which settings page the sidebar shows.
@@ -194,19 +194,46 @@ fn filename_page(ui: &mut egui::Ui, draft: &mut Settings) {
     });
 }
 
-/// About page: name, version and the third-party notices shipped in
-/// `THIRD_PARTY_NOTICES.md` (embedded — readable offline, in-app).
+/// About page: the app icon, name, version, copyright and license, then
+/// the third-party notices shipped in `THIRD_PARTY_NOTICES.md`
+/// (embedded — readable offline, in-app).
 fn about_page(ui: &mut egui::Ui) {
     let t = theme::tokens(ui.ctx());
     ui.vertical(|ui| {
-        ui.add_space(6.0);
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("PixMe").color(t.text).strong());
-            ui.label(
-                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).color(t.text_dim),
-            );
+            ui.add_space(10.0);
+            ui.image(egui::load::SizedTexture::new(
+                icons::app_icon_texture(ui.ctx()).id,
+                egui::vec2(88.0, 88.0),
+            ));
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new("PixMe")
+                        .font(theme::semibold(17.0))
+                        .color(t.text),
+                );
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(11.0)
+                        .color(t.text_dim),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(t!("settings.about.copyright").to_string())
+                        .size(10.5)
+                        .color(t.text_dim),
+                );
+                ui.label(
+                    egui::RichText::new(t!("settings.about.license").to_string())
+                        .size(10.5)
+                        .color(t.text_faint),
+                );
+            });
         });
-        ui.add_space(6.0);
+        ui.add_space(12.0);
         ui.label(
             egui::RichText::new(t!("settings.about.notices").to_string())
                 .color(t.text)
@@ -216,7 +243,7 @@ fn about_page(ui: &mut egui::Ui) {
         widgets::hairline(ui);
         egui::ScrollArea::vertical()
             .id_salt("settings.about.scroll")
-            .max_height(260.0)
+            .max_height(240.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.label(

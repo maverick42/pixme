@@ -91,10 +91,23 @@ fn embed_exe_icon(root: &str) {
 
 #[cfg(windows)]
 fn embed_exe_icon_impl() {
-    winresource::WindowsResource::new()
-        .set_icon("assets/app/PixMe.ico")
-        .compile()
-        .unwrap_or_else(|e| panic!("cannot embed assets/app/PixMe.ico: {e}"));
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("assets/app/PixMe.ico");
+    // VERSIONINFO strings — what Explorer, taskbar tooltips and antivirus
+    // heuristics read. Copyright/author strings stay ASCII where the file
+    // format allows; these fields are UTF-16 in the PE, so accents are safe.
+    res.set("CompanyName", "Frédérik Benoist (dev.q2ii.fr)");
+    res.set(
+        "FileDescription",
+        "PixMe — Screenshot capture and annotation",
+    );
+    res.set("InternalName", "pixme");
+    res.set("LegalCopyright", "© 2026 Frédérik Benoist (dev.q2ii.fr)");
+    res.set("OriginalFilename", "pixme.exe");
+    res.set("ProductName", "PixMe");
+    res.set("Comments", "Licensed under the MIT License");
+    res.compile()
+        .unwrap_or_else(|e| panic!("cannot embed Windows resources: {e}"));
 }
 
 #[cfg(not(windows))]

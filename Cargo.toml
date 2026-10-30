@@ -2,6 +2,10 @@
 name = "pixme"
 version = "0.1.0"
 edition = "2024"
+authors = ["Frédérik Benoist (dev.q2ii.fr)"]
+description = "Screenshot capture and annotation tool"
+homepage = "https://dev.q2ii.fr"
+license = "MIT"
 
 [features]
 # Benchmark/debug tooling compiled out of every distributed binary:

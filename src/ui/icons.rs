@@ -216,6 +216,26 @@ pub fn app_icon_rgba(size: u32) -> Vec<u8> {
     decode_icon_png(APP_ICON_PNG, size)
 }
 
+/// Texture of the PixMe artwork (`pixme-1024.png`, the master with margins
+/// and shadow) for the Settings About page. Uploaded once per context.
+pub fn app_icon_texture(ctx: &egui::Context) -> SizedTexture {
+    use std::cell::RefCell;
+    thread_local! {
+        static TEX: RefCell<Option<SizedTexture>> = const { RefCell::new(None) };
+    }
+    TEX.with(|tex| {
+        if let Some(t) = *tex.borrow() {
+            return t;
+        }
+        let rgba = decode_icon_png(DOCK_ICON_PNG, 256);
+        let img = egui::ColorImage::from_rgba_unmultiplied([256, 256], &rgba);
+        let handle = ctx.load_texture("pixme://app-icon", img, egui::TextureOptions::LINEAR);
+        let t = SizedTexture::from_handle(&handle);
+        *tex.borrow_mut() = Some(t);
+        t
+    })
+}
+
 /// Raw RGBA of the menu-bar template icon — already 44 px (the 22 pt slot
 /// @2x), passed through unchanged to `tray_icon::Icon::from_rgba`.
 pub fn menubar_icon_rgba() -> Vec<u8> {
