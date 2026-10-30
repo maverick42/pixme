@@ -97,6 +97,12 @@ pub enum Command {
     ImportClipboard,
     /// Open an image file into the viewer.
     OpenFile,
+    /// Reopen one file from the recent-files list (File → Open).
+    OpenPath(std::path::PathBuf),
+    /// Reopen every file in the recent list (at most five).
+    OpenAllRecent,
+    /// Empty the recent-files list (File → Open).
+    ClearRecent,
     /// File picker pre-opened in the last used folder (Ouvrir ▾ menu).
     OpenLastDir,
     /// A blank white document (Ouvrir ▾ → Nouveau).
@@ -204,6 +210,9 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         | Command::ShowBar
         | Command::ImportClipboard
         | Command::OpenFile
+        | Command::OpenPath(_)
+        | Command::OpenAllRecent
+        | Command::ClearRecent
         | Command::OpenLastDir
         | Command::NewDocument
         | Command::SaveActive
@@ -341,7 +350,7 @@ pub struct Shared {
 /// `done` ticks once per processed tab for the progress veil, and
 /// `then_confirm` closes the saved session on completion (ConfirmSave).
 struct SaveAllJob {
-    rx: std::sync::mpsc::Receiver<Vec<crate::ui::viewer::Tab>>,
+    rx: std::sync::mpsc::Receiver<(Vec<crate::ui::viewer::Tab>, Vec<std::path::PathBuf>)>,
     done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     total: usize,
     then_confirm: bool,
@@ -485,8 +494,15 @@ impl Shared {
         let save_done = lock(&self.save_all)
             .as_ref()
             .and_then(|j| j.rx.try_recv().ok());
-        if let Some(tabs) = save_done {
+        if let Some((tabs, saved_paths)) = save_done {
             let job = lock(&self.save_all).take().expect("save-all job");
+            {
+                let mut s = lock(&self.settings);
+                for path in saved_paths {
+                    s.push_recent(path);
+                }
+                s.save();
+            }
             {
                 let mut viewer = lock(&self.viewer);
                 viewer.tabs = tabs;
@@ -704,6 +720,33 @@ impl Shared {
                 Err(e) => tracing::warn!("clipboard import failed: {e}"),
             },
             Command::OpenFile => self.open_files(None, ctx),
+            Command::OpenPath(path) => {
+                if self.open_one(&path) {
+                    let mut s = lock(&self.settings);
+                    s.push_recent(path.clone());
+                    s.save();
+                    self.enter(AppState::Viewer, ctx);
+                } else {
+                    // The recent entry is a dead path — drop it so the
+                    // menu stops offering it.
+                    let mut s = lock(&self.settings);
+                    s.remove_recent(&path);
+                    s.save();
+                    tracing::warn!(?path, "recent file could not be opened");
+                }
+            }
+            Command::OpenAllRecent => {
+                let paths = lock(&self.settings).recent_files.clone();
+                let opened = paths.iter().any(|p| self.open_one(p));
+                if opened {
+                    self.enter(AppState::Viewer, ctx);
+                }
+            }
+            Command::ClearRecent => {
+                let mut s = lock(&self.settings);
+                s.recent_files.clear();
+                s.save();
+            }
             // Same picker, pre-opened in the last used folder.
             Command::OpenLastDir => {
                 let dir = lock(&self.settings)
@@ -811,6 +854,52 @@ impl Shared {
     /// Writes every unsaved tab to the last-used folder (or ~/Pictures) as
     /// timestamped PNGs — the "Save All" / unsaved-confirmation path has no
     /// per-tab dialog, each file is unique via the index suffix.
+    /// Loads one image path as a clean tab titled after the file —
+    /// shared by File → Open's picker loop and the recent-files entries.
+    /// A file already open as a tab is focused, never duplicated.
+    /// Returns `false` when the file cannot be decoded.
+    fn open_one(&self, path: &std::path::Path) -> bool {
+        {
+            let mut viewer = lock(&self.viewer);
+            let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if let Some(i) = viewer.tabs.iter().position(|t| {
+                t.doc.meta.source_path.as_ref().is_some_and(|s| {
+                    std::fs::canonicalize(s).unwrap_or_else(|_| s.clone()) == canon
+                })
+            }) {
+                viewer.set_active(i);
+                return true;
+            }
+        }
+        match crate::export::file::load_image(path) {
+            Ok(image) => {
+                let title = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "image".to_owned());
+                let mut doc = Document::new(synthetic_capture(image));
+                // The file's mtime is the best capture/save date we
+                // have for an opened image.
+                let mtime = std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(chrono::DateTime::<chrono::Local>::from);
+                doc.meta.captured_at = mtime.unwrap_or_else(chrono::Local::now);
+                doc.meta.saved_at = mtime;
+                doc.meta.source_path = Some(path.to_path_buf());
+                lock(&self.viewer).push_named_document(
+                    doc, title, // From disk = clean until edited.
+                    true,
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(?path, "cannot open image: {e}");
+                false
+            }
+        }
+    }
+
     /// The File → Open picker (seeded with `dir` when given) — one tab per
     /// image, and the picked folder is persisted for next time.
     fn open_files(&self, dir: Option<std::path::PathBuf>, ctx: &egui::Context) {
@@ -822,42 +911,24 @@ impl Shared {
         let Some(paths) = dialog.pick_files() else {
             return;
         };
-        let mut opened = false;
+        let mut opened = Vec::new();
         for path in &paths {
-            match crate::export::file::load_image(path) {
-                Ok(image) => {
-                    let title = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "image".to_owned());
-                    let mut doc = Document::new(synthetic_capture(image));
-                    // The file's mtime is the best capture/save date we
-                    // have for an opened image.
-                    let mtime = std::fs::metadata(path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .map(chrono::DateTime::<chrono::Local>::from);
-                    doc.meta.captured_at = mtime.unwrap_or_else(chrono::Local::now);
-                    doc.meta.saved_at = mtime;
-                    doc.meta.source_path = Some(path.clone());
-                    lock(&self.viewer).push_named_document(
-                        doc, title, // From disk = clean until edited.
-                        true,
-                    );
-                    opened = true;
-                }
-                Err(e) => tracing::warn!(?path, "cannot open image: {e}"),
+            if self.open_one(path) {
+                opened.push(path.clone());
             }
         }
-        if opened {
+        if !opened.is_empty() {
+            let mut s = lock(&self.settings);
             if let Some(dir) = paths
                 .first()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             {
-                let mut s = lock(&self.settings);
                 s.last_open_dir = Some(dir);
-                s.save();
             }
+            for path in opened {
+                s.push_recent(path);
+            }
+            s.save();
             self.enter(AppState::Viewer, ctx);
         }
     }
@@ -927,6 +998,7 @@ impl Shared {
         let wake = ctx.clone();
         std::thread::spawn(move || {
             let mut tabs = tabs;
+            let mut saved_paths = Vec::new();
             for tab in tabs.iter_mut().filter(|t| !t.saved) {
                 let stem = crate::config::filename::sanitize_filename(tab.title.trim());
                 let path = unique_png(&folder, &stem);
@@ -942,6 +1014,7 @@ impl Shared {
                         tab.saved = true;
                         tab.doc.meta.source_path = Some(path.clone());
                         tab.doc.meta.saved_at = Some(chrono::Local::now());
+                        saved_paths.push(path.clone());
                         tracing::info!(?path, "tab saved");
                     }
                     Err(e) => tracing::warn!(?path, "save-all failed: {e}"),
@@ -949,7 +1022,7 @@ impl Shared {
                 done.fetch_add(1, Ordering::Relaxed);
                 wake.request_repaint();
             }
-            let _ = tx.send(tabs);
+            let _ = tx.send((tabs, saved_paths));
             wake.request_repaint();
         });
         ctx.request_repaint_of(viewer_id());
@@ -2073,7 +2146,7 @@ mod tests {
         let Some(job) = lock(&shared.save_all).take() else {
             return;
         };
-        if let Ok(tabs) = job.rx.recv() {
+        if let Ok((tabs, _)) = job.rx.recv() {
             let mut viewer = lock(&shared.viewer);
             viewer.tabs = tabs;
             viewer.recompute_dirty();
@@ -2334,6 +2407,9 @@ mod tests {
             Command::Quit,
             Command::ImportClipboard,
             Command::OpenFile,
+            Command::OpenPath(std::path::PathBuf::new()),
+            Command::OpenAllRecent,
+            Command::ClearRecent,
             Command::OpenLastDir,
             Command::NewDocument,
             Command::SaveActive,
@@ -2395,6 +2471,15 @@ mod tests {
             (Command::Quit, true, true, true, true),
             (Command::ImportClipboard, false, false, false, false),
             (Command::OpenFile, false, false, false, false),
+            (
+                Command::OpenPath(std::path::PathBuf::new()),
+                false,
+                false,
+                false,
+                false,
+            ),
+            (Command::OpenAllRecent, false, false, false, false),
+            (Command::ClearRecent, false, false, false, false),
             (Command::OpenLastDir, false, false, false, false),
             (Command::NewDocument, false, false, false, false),
             (Command::SaveActive, false, false, false, false),

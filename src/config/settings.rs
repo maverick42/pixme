@@ -111,6 +111,11 @@ pub struct Settings {
     /// Last folder a file was opened from — seeds File → Open and the
     /// "open last used folder" menu item.
     pub last_open_dir: Option<PathBuf>,
+    /// Most-recently-used files (newest first), at most
+    /// [`RECENT_FILES_MAX`]: every saved or opened file lands here and
+    /// feeds File → Open's recent section.
+    #[serde(default)]
+    pub recent_files: Vec<PathBuf>,
     /// Session-database retention (never / today / always).
     pub db_retention: DbRetention,
     /// Tab ordering — `None` = insertion order.
@@ -188,6 +193,7 @@ impl Default for Settings {
             capture_delay_secs: 0,
             last_save_dir: None,
             last_open_dir: None,
+            recent_files: Vec::new(),
             db_retention: DbRetention::default(),
             tab_sort: None,
             text_color: default_text_color(),
@@ -248,6 +254,21 @@ impl Settings {
         }
     }
 
+    /// Pushes `path` to the front of [`Self::recent_files`] (re-pushing an
+    /// existing entry just moves it back to the top) and trims the list to
+    /// [`RECENT_FILES_MAX`].
+    pub fn push_recent(&mut self, path: PathBuf) {
+        self.recent_files.retain(|p| p != &path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(RECENT_FILES_MAX);
+    }
+
+    /// Drops `path` from [`Self::recent_files`] — used when a recent
+    /// entry turns out to be a dead path.
+    pub fn remove_recent(&mut self, path: &PathBuf) {
+        self.recent_files.retain(|p| p != path);
+    }
+
     /// The pre-`prefs.json` location (`settings.toml` in the OS config
     /// dir), read once for migration. `None` when absent or unreadable.
     fn load_legacy_toml() -> Option<Self> {
@@ -259,6 +280,9 @@ impl Settings {
         Some(settings)
     }
 }
+
+/// Cap on [`Settings::recent_files`] — File → Open shows them all.
+pub const RECENT_FILES_MAX: usize = 5;
 
 /// `prefs.json` beside the executable; a `.app`-bundled binary cannot
 /// write inside its bundle, so it lands in the per-user config dir.
@@ -276,4 +300,47 @@ fn config_path() -> PathBuf {
         }
     }
     PathBuf::from("prefs.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn push_recent_dedups_moves_to_front_and_caps() {
+        let mut s = Settings::default();
+        for i in 0..7 {
+            s.push_recent(PathBuf::from(format!("/tmp/{i}.png")));
+        }
+        assert_eq!(s.recent_files.len(), RECENT_FILES_MAX);
+        assert_eq!(s.recent_files[0], PathBuf::from("/tmp/6.png"));
+        assert_eq!(
+            s.recent_files[RECENT_FILES_MAX - 1],
+            PathBuf::from("/tmp/2.png")
+        );
+
+        s.push_recent(PathBuf::from("/tmp/3.png"));
+        assert_eq!(s.recent_files[0], PathBuf::from("/tmp/3.png"));
+        assert_eq!(
+            s.recent_files
+                .iter()
+                .filter(|p| p.as_path() == Path::new("/tmp/3.png"))
+                .count(),
+            1,
+            "re-pushed entry must not duplicate"
+        );
+        assert_eq!(s.recent_files.len(), RECENT_FILES_MAX);
+    }
+
+    #[test]
+    fn remove_recent_drops_dead_paths() {
+        let mut s = Settings::default();
+        s.push_recent(PathBuf::from("/tmp/a.png"));
+        s.push_recent(PathBuf::from("/tmp/b.png"));
+        s.remove_recent(&PathBuf::from("/tmp/b.png"));
+        assert_eq!(s.recent_files, vec![PathBuf::from("/tmp/a.png")]);
+        s.remove_recent(&PathBuf::from("/tmp/missing.png"));
+        assert_eq!(s.recent_files, vec![PathBuf::from("/tmp/a.png")]);
+    }
 }

@@ -1393,3 +1393,26 @@ Format: date — context — decision — consequences.
   OSes with the capture's name as the job title; the image prints fit to
   one page. Cancelling the dialog returns `Err` ("cancelled") — logged
   as a warning like before.
+
+## 2026-10-30 — Five recent files under File → Open
+
+- **Context**: the functional reference keeps a recent-files section in
+  its File menu; PixMe had none — reopening a just-saved capture meant
+  browsing the file picker again.
+- **Decision**: `Settings::recent_files` persists up to five paths
+  (newest first, dedup on re-push) via `push_recent`/`remove_recent`.
+  The list feeds on every file that lands on disk through PixMe —
+  single save dialog (viewer and pins), each `Save All` write, and
+  every file opened — and on every successful re-open (MRU semantics).
+  `Command::OpenPath(path)` reopens a file directly; an unreadable path
+  is dropped from the list so dead entries clean themselves up. The
+  File menu's Open section and the toolbar's Ouvrir dropdown share the
+  same `recent_menu_items` helper (file names, full path on hover,
+  hidden when empty), followed by an action zone — `OpenAllRecent`
+  (reopens the whole list at once) and `ClearRecent` (empties it).
+  `save_all`'s worker cannot touch `Shared`, so its
+  job channel now carries `(tabs, saved_paths)` and `pump` pushes the
+  recents on the main thread.
+- **Consequences**: File → Open and the Ouvrir dropdown show the five
+  most recent files; clicking one opens it as a clean tab. The macOS
+  native File menu does not list them (egui menus only for now).

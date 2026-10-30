@@ -104,6 +104,7 @@ impl SaveDialog {
         // Persist the folder so the next save (and next session) reopens here.
         let mut s = shared.lock_settings();
         s.last_save_dir = Some(dir);
+        s.push_recent(path.clone());
         s.save();
         Ok(path)
     }

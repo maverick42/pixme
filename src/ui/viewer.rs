@@ -941,7 +941,7 @@ impl Viewer {
     /// protected capture asks for its password on EVERY activation, not
     /// once per session (the spec's rule). Re-locking also drops the
     /// tab's cached thumbnail — a protected tab never keeps pixels.
-    fn set_active(&mut self, index: usize) {
+    pub fn set_active(&mut self, index: usize) {
         self.active = index;
         for tab in &mut self.tabs {
             tab.unlocked = false;
@@ -2109,6 +2109,8 @@ impl Viewer {
                     Command::ImportClipboard,
                     t!("menu.app.import_clipboard").as_ref(),
                 );
+                ui.separator();
+                recent_menu_items(ui, shared);
                 ui.separator();
                 menu_item(
                     ui,
@@ -3644,7 +3646,48 @@ fn open_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_last_dir: bool
                 ui.close();
             }
         });
+        recent_menu_items(ui, shared);
     });
+}
+
+/// The recent-files rows under File → Open / Ouvrir: up to five entries
+/// (newest first) named by file, full path on hover — hidden entirely
+/// when the list is empty.
+fn recent_menu_items(ui: &mut egui::Ui, shared: &Shared) {
+    let recents = shared.lock_settings().recent_files.clone();
+    if recents.is_empty() {
+        return;
+    }
+    ui.separator();
+    for path in recents {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let command = Command::OpenPath(path.clone());
+        let enabled = shared.command_enabled(&command);
+        let resp = ui
+            .add_enabled(enabled, egui::Button::new(name))
+            .on_hover_text(path.display().to_string());
+        if resp.clicked() {
+            shared.push(command);
+            ui.close();
+        }
+    }
+    ui.separator();
+    for (command, key) in [
+        (Command::OpenAllRecent, "menu.file.open_all_recent"),
+        (Command::ClearRecent, "menu.file.clear_recent"),
+    ] {
+        let enabled = shared.command_enabled(&command);
+        if ui
+            .add_enabled(enabled, egui::Button::new(t!(key).as_ref()))
+            .clicked()
+        {
+            shared.push(command);
+            ui.close();
+        }
+    }
 }
 
 /// The zoom menu: actual size, fit window/width, then the 100→500%
