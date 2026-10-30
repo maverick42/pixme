@@ -1,11 +1,11 @@
-//! Persisted settings: `prefs.json`.
+//! Persisted settings: `prefs.json` inside the app `data/` dir
+//! (`crate::paths::settings_file()` — `<exe>\data\prefs.json` on Windows,
+//! `~/Library/Application Support/pixme/prefs.json` on macOS).
 //!
-//! The file lives **next to the executable** on both OSes (portable-mode
-//! behaviour — e.g. `C:\portable\pixme\prefs.json`). The one exception: a
-//! binary running inside a `.app` bundle cannot write beside itself, so
-//! it falls back to `~/Library/Application Support/pixme/prefs.json`.
-//! An older `settings.toml` in the per-OS config dir is migrated once,
-//! silently.
+//! Older locations are migrated ONCE, by copy (the source is never
+//! deleted): a `prefs.json` beside the exe or in the per-user config
+//! dir is validated then copied when no new file exists yet; the even
+//! older `settings.toml` is parsed and re-saved in place.
 
 use std::path::PathBuf;
 
@@ -211,16 +211,23 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Reads `prefs.json`; a missing file falls back to the legacy
-    /// `settings.toml` (migrated once), then to defaults. Any parse error
-    /// yields defaults and a log warning.
+    /// Reads `prefs.json`; a missing file falls back to a legacy
+    /// `prefs.json` copied over once (exe-adjacent or per-user config
+    /// dir), then to `settings.toml` (migrated once), then to defaults.
+    /// Any parse error yields defaults and a log warning.
     pub fn load() -> Self {
         let path = config_path();
+        if !path.exists() {
+            Self::migrate_legacy_prefs(&path);
+        }
         match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str(&text) {
                 Ok(settings) => return settings,
                 Err(err) => {
-                    tracing::warn!("invalid preferences file {}: {err}", path.display())
+                    tracing::warn!(
+                        "invalid preferences file {}: {err}",
+                        crate::paths::file_name(&path)
+                    )
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -229,7 +236,7 @@ impl Settings {
                     return legacy;
                 }
             }
-            Err(err) => tracing::warn!("cannot read {}: {err}", path.display()),
+            Err(err) => tracing::warn!("cannot read {}: {err}", crate::paths::file_name(&path)),
         }
         Self::default()
     }
@@ -241,13 +248,13 @@ impl Settings {
         if let Some(dir) = path.parent()
             && let Err(err) = std::fs::create_dir_all(dir)
         {
-            tracing::warn!("cannot create {}: {err}", dir.display());
+            tracing::warn!("cannot create {}: {err}", crate::paths::file_name(dir));
             return;
         }
         match serde_json::to_string_pretty(self) {
             Ok(text) => {
                 if let Err(err) = std::fs::write(&path, text) {
-                    tracing::warn!("cannot write {}: {err}", path.display());
+                    tracing::warn!("cannot write {}: {err}", crate::paths::file_name(&path));
                 }
             }
             Err(err) => tracing::warn!("cannot serialize settings: {err}"),
@@ -269,14 +276,48 @@ impl Settings {
         self.recent_files.retain(|p| p != path);
     }
 
+    /// One-shot copy of a legacy `prefs.json` into `path` — only when
+    /// `path` does not exist yet, only after the candidate parses as a
+    /// valid `Settings` (a corrupt old file is skipped, never copied),
+    /// and the source is always left intact.
+    fn migrate_legacy_prefs(path: &PathBuf) {
+        for legacy in crate::paths::legacy_settings_files() {
+            if legacy == *path || !legacy.is_file() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&legacy) else {
+                continue;
+            };
+            if serde_json::from_str::<Self>(&text).is_err() {
+                continue;
+            }
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match std::fs::copy(&legacy, path) {
+                Ok(_) => tracing::info!(
+                    "migrated prefs.json from previous location {}",
+                    crate::paths::file_name(&legacy)
+                ),
+                Err(err) => tracing::warn!(
+                    "cannot migrate prefs.json from {}: {err}",
+                    crate::paths::file_name(&legacy)
+                ),
+            }
+            return;
+        }
+    }
+
     /// The pre-`prefs.json` location (`settings.toml` in the OS config
     /// dir), read once for migration. `None` when absent or unreadable.
     fn load_legacy_toml() -> Option<Self> {
-        let path = directories::ProjectDirs::from("", "", "pixme")
-            .map(|dirs| dirs.config_dir().join("settings.toml"))?;
+        let path = crate::paths::legacy_settings_dir()?.join("settings.toml");
         let text = std::fs::read_to_string(&path).ok()?;
         let settings: Self = toml::from_str(&text).ok()?;
-        tracing::info!("migrated settings.toml → {}", config_path().display());
+        tracing::info!(
+            "migrated settings.toml → {}",
+            crate::paths::file_name(&config_path())
+        );
         Some(settings)
     }
 }
@@ -284,22 +325,10 @@ impl Settings {
 /// Cap on [`Settings::recent_files`] — File → Open shows them all.
 pub const RECENT_FILES_MAX: usize = 5;
 
-/// `prefs.json` beside the executable; a `.app`-bundled binary cannot
-/// write inside its bundle, so it lands in the per-user config dir.
-/// The bare `prefs.json` fallback never silently fails to persist.
+/// `data/prefs.json` — resolved by `crate::paths`, the single owner
+/// of data locations.
 fn config_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if exe.to_string_lossy().contains(".app/Contents/MacOS") {
-            return directories::ProjectDirs::from("", "", "pixme").map_or_else(
-                || PathBuf::from("prefs.json"),
-                |dirs| dirs.config_dir().join("prefs.json"),
-            );
-        }
-        if let Some(dir) = exe.parent() {
-            return dir.join("prefs.json");
-        }
-    }
-    PathBuf::from("prefs.json")
+    crate::paths::settings_file()
 }
 
 #[cfg(test)]

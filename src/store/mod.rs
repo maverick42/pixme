@@ -138,7 +138,7 @@ impl Store {
         if let Some(dir) = path.parent()
             && let Err(err) = std::fs::create_dir_all(dir)
         {
-            tracing::warn!("cannot create {}: {err}", dir.display());
+            tracing::warn!("cannot create {}: {err}", crate::paths::file_name(dir));
         }
         match try_open(&path) {
             Ok(conn) => {
@@ -151,13 +151,16 @@ impl Store {
             Err(first) => {
                 let bak = bak_path(&path);
                 if let Err(err) = std::fs::rename(&path, &bak) {
-                    tracing::warn!("cannot park bad session db as {}: {err}", bak.display());
+                    tracing::warn!(
+                        "cannot park bad session db as {}: {err}",
+                        crate::paths::file_name(&bak)
+                    );
                 }
                 match try_open(&path) {
                     Ok(conn) => {
                         tracing::warn!(
                             "session db rebuilt ({first:#}); old file parked at {}",
-                            bak.display()
+                            crate::paths::file_name(&bak)
                         );
                         Self {
                             conn: Some(conn),
@@ -347,23 +350,11 @@ fn local_midnight() -> i64 {
         .unwrap_or(0)
 }
 
-/// Per-user application data directory. `PIXME_DATA_DIR` overrides it
-/// in dev-tools builds ONLY, so `--seed-session` and benchmarks can
-/// never touch a real session — distributed binaries ignore the
-/// variable entirely.
-pub(crate) fn data_dir() -> PathBuf {
-    #[cfg(feature = "dev-tools")]
-    if let Some(dir) = std::env::var_os("PIXME_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    directories::ProjectDirs::from("", "", "pixme")
-        .map_or_else(|| PathBuf::from("."), |dirs| dirs.data_dir().to_path_buf())
-}
-
-/// `data_dir()/session.db` (per-user application data); the bare
-/// fallback never silently fails to persist.
+/// `data_dir()/session.db` — the location comes from `crate::paths`,
+/// the single resolver (portable exe-adjacent dir on Windows,
+/// Application Support on macOS, `PIXME_DATA_DIR` in dev-tools only).
 pub(crate) fn db_path() -> PathBuf {
-    data_dir().join("session.db")
+    crate::paths::db_path()
 }
 
 /// `<db>.bak` — where a corrupt or foreign-version file is parked.
@@ -388,8 +379,11 @@ fn prune_old_backup(path: &Path) {
         .is_some_and(|a| a > std::time::Duration::from_secs(BAK_KEEP_DAYS * 86_400));
     if aged {
         match std::fs::remove_file(&bak) {
-            Ok(()) => tracing::info!("aged session backup removed: {}", bak.display()),
-            Err(err) => tracing::warn!("cannot remove {}: {err}", bak.display()),
+            Ok(()) => tracing::info!(
+                "aged session backup removed: {}",
+                crate::paths::file_name(&bak)
+            ),
+            Err(err) => tracing::warn!("cannot remove {}: {err}", crate::paths::file_name(&bak)),
         }
     }
 }

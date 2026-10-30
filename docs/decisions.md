@@ -1446,3 +1446,157 @@ Format: date — context — decision — consequences.
 - **Consequences**: File → Open and the Ouvrir dropdown show the five
   most recent files; clicking one opens it as a clean tab. The macOS
   native File menu does not list them (egui menus only for now).
+
+## 2026-10-30 — Centralised data paths (`src/paths.rs`) + file logging (`src/logging.rs`)
+
+- **Context**: data locations were scattered — `session.db` under
+  `ProjectDirs::data_dir()`, `prefs.json` beside the exe, `panic.log` in
+  yet another computed dir, and logging went to stdout only. The spec
+  asked for one resolver, a Windows portable layout, daily file logging
+  and hard privacy rules.
+- **Decisions**:
+  - `src/paths.rs` is the ONLY module building app-data paths
+    (`data_dir`, `logs_dir`, `settings_file`, `db_path`, `instance_lock`,
+    `panic_log`), frozen in a `OnceLock` around pure `pick_dirs`/
+    `strip_verbatim`/`probe_writable` helpers; `tests/data_paths.rs`
+    fails the build if `ProjectDirs`/`current_exe`/`LOCALAPPDATA`/
+    `config_dir`/`data_local_dir`/`home_dir`/`Library/Logs` appears
+    outside `src/paths.rs` and `src/platform/`.
+  - Windows = portable: `<exe>\data\` and `<exe>\logs\` from
+    `current_exe()` (never the cwd — shortcuts change it), `\\?\` and
+    `\\?\UNC\` prefixes stripped without canonicalization. A startup
+    writability probe (create `data`+`logs`, write/remove a
+    `.<pid>.tmp` file) falls back to `%LOCALAPPDATA%\PixMe\{data,logs}`
+    when the exe dir is read-only; the user gets ONE deferred
+    translated notice once the first window exists, plus a log warning.
+  - macOS = system locations: `~/Library/Application Support/pixme`
+    (data) and `~/Library/Logs/PixMe` (logs) — a `.app` bundle is never
+    written into.
+  - No session/log migration: a previous per-user `ProjectDirs` data
+    dir is warned about in the log and left intact — captures and logs
+    are user data, never moved silently.
+  - `prefs.json` IS migrated once: copied (not moved) from the
+    exe-adjacent or per-user-config location, only when the new file
+    does not exist and the candidate parses as a valid `Settings`.
+    User decision: losing settings on update would silently reset the
+    app; settings carry no sensitive data, unlike captures.
+  - Single instance is per-installation on Windows: `instance.lock`
+    lives in `data\`, so two portable installs may run side by side
+    (each owns its session + logs); a second launch from the SAME
+    folder shows the existing translated `app.already_running` dialog.
+    Bringing the first instance's window forward was skipped — no
+    cross-process window handle exists without fragile Win32/AppleScript
+    code. Global-hotkey conflict handling is moot (feature not
+    implemented yet); when it lands, registration failure must run
+    hotkey-less with one translated notice, not crash.
+  - Logging: `tracing-appender` daily files `pixme.<UTC date>.log`
+    (rotation is UTC — the crate's clock is `OffsetDateTime::now_utc`
+    with no local-time option), `max_log_files(5)` plus a startup purge
+    of dated files older than 5 days and an mtime-aged `pixme.panic.log`
+    (foreign files never touched). Non-blocking lossy writer (8192-line
+    queue) — under saturation lines are dropped, counted via
+    `error_counter()` and reported once; chosen over backpressure
+    because a resident UI app must never stall on logging. Size caps on
+    the single daily file: >64 MiB keeps `warn`/`error` only (soft cap,
+    announced once), >256 MiB stops all file output (hard cap); the
+    panic hook writes `pixme.panic.log` synchronously and is NEVER
+    capped. The `WorkerGuard` lives in `main` and is released in
+    `logging::shutdown()` on every exit path (eframe return covers
+    `quit_now`/menu quit; `process::exit` calls are pre-shutdown).
+  - Timestamps: local time with explicit offset, the zone captured on
+    the FIRST line of `main` before any thread exists (late reads of
+    the local zone can fail), UTC on failure.
+  - Privacy: `Sensitive<T>` redacts `Debug`/`Display`; paths are
+    reduced (`file_name`/`tail_path`) at `info`, full user paths only
+    in the one-time banner and the deferred notice; window titles stay
+    `debug`-only; the diagnostics copy re-redacts the home dir (`~`).
+  - Diagnostic mode is a session-only `debug` switch (Settings →
+    General) implemented as a `reload` handle on the `EnvFilter`;
+    `RUST_LOG` keeps precedence at startup. Stdout echo exists only in
+    debug/dev-tools builds — release writes the file and stays silent
+    (a dead console pipe must never kill a resident app).
+- **Consequences**: replacing `pixme.exe` in `C:\portable\pixme\` never
+  touches `data\`/`logs\`; an update of the portable folder's exe is a
+  pure file swap. Dev builds writing beside `target\release\pixme`
+  create `target/release/{data,logs}` — covered by the `target/`
+  gitignore entry and by `cargo clean`; real sessions never live in
+  `target/` because release-run data follows the exe inside `target/`
+  only when the exe itself is there (dev runs), and `PIXME_DATA_DIR`
+  overrides are dev-tools-only.
+
+## 2026-10-30 — Centralised data paths (`src/paths.rs`) + file logging (`src/logging.rs`)
+
+- **Context**: data locations were scattered — `session.db` under
+  `ProjectDirs::data_dir()`, `prefs.json` beside the exe, `panic.log` in
+  yet another computed dir, and logging went to stdout only. The spec
+  asked for one resolver, a Windows portable layout, daily file logging
+  and hard privacy rules.
+- **Decisions**:
+  - `src/paths.rs` is the ONLY module building app-data paths
+    (`data_dir`, `logs_dir`, `settings_file`, `db_path`, `instance_lock`,
+    `panic_log`), frozen in a `OnceLock` around pure `pick_dirs`/
+    `strip_verbatim`/`probe_writable` helpers; `tests/data_paths.rs`
+    fails the build if `ProjectDirs`/`current_exe`/`LOCALAPPDATA`/
+    `config_dir`/`data_local_dir`/`home_dir`/`Library/Logs` appears
+    outside `src/paths.rs` and `src/platform/`.
+  - Windows = portable: `<exe>\data\` and `<exe>\logs\` from
+    `current_exe()` (never the cwd — shortcuts change it), `\\?\` and
+    `\\?\UNC\` prefixes stripped without canonicalization. A startup
+    writability probe (create `data`+`logs`, write/remove a
+    `.<pid>.tmp` file) falls back to `%LOCALAPPDATA%\PixMe\{data,logs}`
+    when the exe dir is read-only; the user gets ONE deferred
+    translated notice once the first window exists, plus a log warning.
+  - macOS = system locations: `~/Library/Application Support/pixme`
+    (data) and `~/Library/Logs/PixMe` (logs) — a `.app` bundle is never
+    written into.
+  - No session/log migration: a previous per-user `ProjectDirs` data
+    dir is warned about in the log and left intact — captures and logs
+    are user data, never moved silently.
+  - `prefs.json` IS migrated once: copied (not moved) from the
+    exe-adjacent or per-user-config location, only when the new file
+    does not exist and the candidate parses as a valid `Settings`.
+    User decision: losing settings on update would silently reset the
+    app; settings carry no sensitive data, unlike captures.
+  - Single instance is per-installation on Windows: `instance.lock`
+    lives in `data\`, so two portable installs may run side by side
+    (each owns its session + logs); a second launch from the SAME
+    folder shows the existing translated `app.already_running` dialog.
+    Bringing the first instance's window forward was skipped — no
+    cross-process window handle exists without fragile Win32/AppleScript
+    code. Global-hotkey conflict handling is moot (feature not
+    implemented yet); when it lands, registration failure must run
+    hotkey-less with one translated notice, not crash.
+  - Logging: `tracing-appender` daily files `pixme.<UTC date>.log`
+    (rotation is UTC — the crate's clock is `OffsetDateTime::now_utc`
+    with no local-time option), `max_log_files(5)` plus a startup purge
+    of dated files older than 5 days and an mtime-aged `pixme.panic.log`
+    (foreign files never touched). Non-blocking lossy writer (8192-line
+    queue) — under saturation lines are dropped, counted via
+    `error_counter()` and reported once; chosen over backpressure
+    because a resident UI app must never stall on logging. Size caps on
+    the single daily file: >64 MiB keeps `warn`/`error` only (soft cap,
+    announced once), >256 MiB stops all file output (hard cap); the
+    panic hook writes `pixme.panic.log` synchronously and is NEVER
+    capped. The `WorkerGuard` lives in `main` and is released in
+    `logging::shutdown()` on every exit path (eframe return covers
+    `quit_now`/menu quit; `process::exit` calls are pre-shutdown).
+  - Timestamps: local time with explicit offset, the zone captured on
+    the FIRST line of `main` before any thread exists (late reads of
+    the local zone can fail), UTC on failure.
+  - Privacy: `Sensitive<T>` redacts `Debug`/`Display`; paths are
+    reduced (`file_name`/`tail_path`) at `info`, full user paths only
+    in the one-time banner and the deferred notice; window titles stay
+    `debug`-only; the diagnostics copy re-redacts the home dir (`~`).
+  - Diagnostic mode is a session-only `debug` switch (Settings →
+    General) implemented as a `reload` handle on the `EnvFilter`;
+    `RUST_LOG` keeps precedence at startup. Stdout echo exists only in
+    debug/dev-tools builds — release writes the file and stays silent
+    (a dead console pipe must never kill a resident app).
+- **Consequences**: replacing `pixme.exe` in `C:\portable\pixme\` never
+  touches `data\`/`logs\`; an update of the portable folder's exe is a
+  pure file swap. Dev builds writing beside `target\release\pixme`
+  create `target/release/{data,logs}` — covered by the `target/`
+  gitignore entry and by `cargo clean`; real sessions never live in
+  `target/` because release-run data follows the exe inside `target/`
+  only when the exe itself is there (dev runs), and `PIXME_DATA_DIR`
+  overrides are dev-tools-only.

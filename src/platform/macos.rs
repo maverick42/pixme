@@ -38,6 +38,11 @@ impl PlatformServices for MacOs {
         // The PixMe/Capture/File/Window menus live on the system menu bar.
         true
     }
+
+    fn capture_permission_status(&self) -> Option<bool> {
+        // Read-only TCC preflight — never prompts.
+        Some(core_graphics::access::ScreenCaptureAccess.preflight())
+    }
 }
 
 /// The app keeps the default `regular` activation policy: a permanent Dock
@@ -449,6 +454,41 @@ pub fn window_list() -> Vec<super::WindowRecord> {
         });
     }
     out
+}
+
+/// System layout: `~/Library/Application Support/pixme` for data,
+/// `~/Library/Logs/PixMe` for logs — an `.app` bundle is never written
+/// into (it may be read-only), and both locations survive an update of
+/// the app itself.
+pub fn resolve_base_dirs() -> crate::paths::BaseDirs {
+    let data = directories::ProjectDirs::from("", "", "pixme")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("pixme"));
+    let logs = directories::UserDirs::new()
+        .map(|u| u.home_dir().join("Library/Logs/PixMe"))
+        .unwrap_or_else(|| data.join("logs"));
+    crate::paths::BaseDirs {
+        data,
+        logs,
+        fallback_from: None,
+    }
+}
+
+/// "macOS 15.x" — `sw_vers` ships with the OS; ~20 ms once at startup.
+pub fn os_version() -> String {
+    std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| "macOS ?".to_owned(), |v| format!("macOS {v}"))
+}
+
+/// Opens `dir` in Finder — the Settings "open folder" buttons.
+pub fn open_folder(dir: &std::path::Path) {
+    let _ = std::process::Command::new("open").arg(dir).status();
 }
 
 /// Reveals `path` in Finder (`open -R` selects the file); falls back to

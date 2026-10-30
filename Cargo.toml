@@ -38,6 +38,7 @@ sys-locale = "0.3.2"
 thiserror = "2.0.21"
 toml = "1.1.8"
 tracing = "0.1.44"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.26.1"
 xcap = "0.9.8"

@@ -569,7 +569,7 @@ impl Viewer {
         // open shows the capture right away, the same move a new tab
         // makes in Tabs mode (tile double-click takes this path too).
         if self.view_mode == ViewMode::Mosaic {
-            self.view_mode = ViewMode::Tabs;
+            self.set_view_mode(ViewMode::Tabs);
             self.mos_since = None;
         }
         self.recompute_dirty();
@@ -602,7 +602,7 @@ impl Viewer {
         // Same rule as `push_named_document`: a capture landing while
         // the mosaic is open switches the viewer onto it.
         if self.view_mode == ViewMode::Mosaic {
-            self.view_mode = ViewMode::Tabs;
+            self.set_view_mode(ViewMode::Tabs);
             self.mos_since = None;
         }
         self.recompute_dirty();
@@ -834,6 +834,7 @@ impl Viewer {
         let Some(ai) = self.active_index() else {
             return;
         };
+        tracing::info!("tab_renamed");
         let ids: Vec<_> = self.tabs[ai + 1..]
             .iter()
             .take(follow)
@@ -915,6 +916,12 @@ impl Viewer {
         let tab = &mut self.tabs[i];
         tab.flatten();
         let before = tab.doc.base.image.as_ref().clone();
+        tracing::info!(
+            from = %format!("{}x{}", before.width(), before.height()),
+            to = %format!("{w}x{h}"),
+            antialias,
+            "resized"
+        );
         tab.doc.base.image = std::sync::Arc::new(image::imageops::resize(
             &*tab.doc.base.image,
             w,
@@ -948,6 +955,7 @@ impl Viewer {
     /// Resets the per-view transient state (tab switch / doc mutation).
     fn reset_view(&mut self) {
         self.zoom = ZoomMode::Fit;
+        tracing::info!(zoom = ?self.zoom, "zoom");
     }
 
     /// Makes `index` the visible tab. Leaving a tab re-locks it: a
@@ -1125,7 +1133,7 @@ impl Viewer {
         // hand. Compiled out of distributed binaries.
         #[cfg(feature = "dev-tools")]
         if std::env::var_os("PIXME_DEBUG_MOSAIC").is_some() {
-            self.view_mode = ViewMode::Mosaic;
+            self.set_view_mode(ViewMode::Mosaic);
             self.mos_since = Some(std::time::Instant::now());
             self.mos_built_total = 0;
             self.mos_ms_total = std::time::Duration::ZERO;
@@ -1214,6 +1222,7 @@ impl Viewer {
         self.next_insertion += 1;
         let new = self.tabs.len() - 1;
         self.set_active(new);
+        tracing::info!("tab_duplicated");
         self.dirty = true;
     }
 
@@ -1228,6 +1237,7 @@ impl Viewer {
             return Ok(());
         };
         std::fs::remove_file(&path)?;
+        tracing::info!(file = %crate::paths::file_name(&path), "file_deleted");
         let t = &mut self.tabs[tab];
         t.doc.meta.source_path = None;
         t.doc.meta.saved_at = None;
@@ -1241,31 +1251,42 @@ impl Viewer {
     fn toggle_view_mode(&mut self) {
         match self.view_mode {
             ViewMode::Tabs => {
-                self.view_mode = ViewMode::Mosaic;
+                self.set_view_mode(ViewMode::Mosaic);
                 self.mos_since = Some(std::time::Instant::now());
                 self.mos_built_total = 0;
                 self.mos_ms_total = std::time::Duration::ZERO;
             }
             ViewMode::Mosaic => {
-                self.view_mode = ViewMode::Tabs;
+                self.set_view_mode(ViewMode::Tabs);
                 self.mos_since = None;
             }
+        }
+    }
+
+    /// Every view-mode switch funnels here so the change is logged.
+    fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode != mode {
+            self.view_mode = mode;
+            tracing::info!(mode = ?mode, "view_mode");
         }
     }
 
     /// Mosaic zoom in: ×1.25, clamped to 200%.
     fn mosaic_zoom_in(&mut self) {
         self.mosaic_scale = (self.mosaic_scale * 1.25).min(2.0);
+        tracing::info!(scale = %self.mosaic_scale, "mosaic_zoom");
     }
 
     /// Mosaic zoom out: ÷1.25, clamped to 50%.
     fn mosaic_zoom_out(&mut self) {
         self.mosaic_scale = (self.mosaic_scale / 1.25).max(0.5);
+        tracing::info!(scale = %self.mosaic_scale, "mosaic_zoom");
     }
 
     /// Mosaic zoom back to 100% (the percent button's main click).
     fn mosaic_zoom_reset(&mut self) {
         self.mosaic_scale = 1.0;
+        tracing::info!(scale = %self.mosaic_scale, "mosaic_zoom");
     }
 
     /// The mosaic's double-click/Enter action: make `index` the active
@@ -1276,7 +1297,7 @@ impl Viewer {
         if index != self.active {
             self.set_active(index);
         }
-        self.view_mode = ViewMode::Tabs;
+        self.set_view_mode(ViewMode::Tabs);
         self.mos_since = None;
     }
 
@@ -1958,6 +1979,7 @@ impl Viewer {
                                     self.mosaic_zoom_reset();
                                 } else {
                                     self.zoom = ZoomMode::Factor(1.0);
+                                    tracing::info!(zoom = ?self.zoom, "zoom");
                                 }
                             }
                             if self.view_mode == ViewMode::Mosaic {
@@ -2459,6 +2481,7 @@ impl Viewer {
             let selected = self.sort_mode == Some(mode);
             if ui.selectable_label(selected, t!(key).to_string()).clicked() {
                 self.sort_mode = if selected { None } else { Some(mode) };
+                tracing::info!(sort = ?self.sort_mode, "tab_sort");
                 self.sort_tabs();
                 let mut settings = shared.lock_settings();
                 settings.tab_sort = self.sort_mode;
@@ -2763,8 +2786,9 @@ impl Viewer {
         if anchor.drag_started_by(egui::PointerButton::Primary) {
             let full_image = crate::editor::render::render_to_image(&self.tabs[index].doc);
             let title = &self.tabs[index].title;
-            if let Err(err) = crate::platform::drag_out::start_image_drag(title, &full_image) {
-                tracing::warn!("mosaic drag-out failed: {err}");
+            match crate::platform::drag_out::start_image_drag(title, &full_image) {
+                Ok(()) => tracing::info!("drag_out"),
+                Err(err) => tracing::warn!("mosaic drag-out failed: {err}"),
             }
             let release_pos = ui
                 .ctx()
@@ -2955,11 +2979,13 @@ impl Viewer {
         if submit {
             if self.tabs[index].doc.meta.check_password(&self.unlock_draft) {
                 self.tabs[index].unlocked = true;
+                tracing::info!("tab_unlocked");
                 self.unlock_draft.clear();
                 self.unlock_error = false;
             } else {
                 self.unlock_draft.clear();
                 self.unlock_error = true;
+                tracing::warn!("tab_unlock_failed");
             }
         }
     }
@@ -3372,6 +3398,7 @@ impl Viewer {
             } else {
                 let tab = &mut self.tabs[state.tab];
                 tab.doc.meta.set_password(state.new.trim());
+                tracing::info!("protection_changed");
                 // Arming (or changing) the password locks the tab
                 // immediately — same instant-padlock rule as the mosaic
                 // tiles. Only DISARMING (an empty new password) leaves
@@ -3714,6 +3741,7 @@ fn zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) {
         ] {
             if ui.selectable_label(v.zoom == mode, t!(key)).clicked() {
                 v.zoom = mode;
+                tracing::info!(zoom = ?mode, "zoom");
                 ui.close();
             }
         }
@@ -3725,6 +3753,7 @@ fn zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) {
                 .clicked()
             {
                 v.zoom = mode;
+                tracing::info!(zoom = ?mode, "zoom");
                 ui.close();
             }
         }

@@ -26,3 +26,10 @@ rustc-ice-*.txt
 # Session data and benchmark captures — never version real or test captures
 session.db*
 *.preseed
+
+# Runtime data + logs: the Windows portable layout writes <exe>\data\
+# and <exe>\logs\; dev builds land them under target/ (already ignored)
+data/
+logs/
+prefs.json
+*.log

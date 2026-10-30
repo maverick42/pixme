@@ -28,6 +28,13 @@ pub trait PlatformServices: Send + Sync {
     /// when the OS supports that (macOS does).
     fn open_permission_settings(&self) {}
 
+    /// The current state of the OS capture permission for the startup
+    /// banner — `Some(granted)` on macOS (Screen Recording preflight),
+    /// `None` on Windows (no such permission).
+    fn capture_permission_status(&self) -> Option<bool> {
+        None
+    }
+
     /// Whether the OS provides a native application menu bar (macOS: yes —
     /// menus live at the top of the screen; Windows: no — the viewer renders
     /// its own egui menu strip inside the window instead).
@@ -159,6 +166,30 @@ pub use macos::reveal_in_file_manager;
 /// Reveals a file selected in the OS file manager (see above).
 #[cfg(target_os = "windows")]
 pub use windows::reveal_in_file_manager;
+
+/// The OS choice of base directories for app data and logs
+/// (`crate::paths::BaseDirs`) — exe-adjacent + LOCALAPPDATA fallback on
+/// Windows, Application Support + ~/Library/Logs on macOS.
+#[cfg(target_os = "macos")]
+pub use macos::resolve_base_dirs;
+/// The OS choice of base directories (see above).
+#[cfg(target_os = "windows")]
+pub use windows::resolve_base_dirs;
+
+/// The OS version string for the startup banner / diagnostics
+/// ("macOS 15.x", "Windows 10.0.x").
+#[cfg(target_os = "macos")]
+pub use macos::os_version;
+/// The OS version string (see above).
+#[cfg(target_os = "windows")]
+pub use windows::os_version;
+
+/// Opens `dir` in the OS file manager (Finder / Explorer).
+#[cfg(target_os = "macos")]
+pub use macos::open_folder;
+/// Opens `dir` in the OS file manager (see above).
+#[cfg(target_os = "windows")]
+pub use windows::open_folder;
 
 /// egui window "ui points" (`ViewportInfo::outer_rect`) → OS-native global
 /// units, the space `MonitorInfo::rect` lives in (CGDisplay bounds on

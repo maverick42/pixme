@@ -91,7 +91,7 @@ pub fn run(count: usize) -> i32 {
         count,
         gen_ms,
         save_ms = t1.elapsed().as_millis(),
-        path = %path.display(),
+        path = %crate::paths::file_name(&path),
         "session seeded"
     );
     0
@@ -108,7 +108,11 @@ fn backup_existing(path: &Path) -> std::io::Result<()> {
         if file.exists() {
             let to = suffixed(&file, ".preseed");
             std::fs::copy(&file, &to)?;
-            tracing::info!("existing {} parked as {}", file.display(), to.display());
+            tracing::info!(
+                "existing {} parked as {}",
+                crate::paths::file_name(&file),
+                crate::paths::file_name(&to)
+            );
         }
     }
     Ok(())
