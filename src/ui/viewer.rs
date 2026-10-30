@@ -565,6 +565,13 @@ impl Viewer {
         // Sorting may move the new tab; set_active ran first so
         // sort_tabs remaps `active` by document id.
         self.sort_tabs();
+        // The mosaic is a browser: a document landing while it is
+        // open shows the capture right away, the same move a new tab
+        // makes in Tabs mode (tile double-click takes this path too).
+        if self.view_mode == ViewMode::Mosaic {
+            self.view_mode = ViewMode::Tabs;
+            self.mos_since = None;
+        }
         self.recompute_dirty();
     }
 
@@ -592,6 +599,12 @@ impl Viewer {
         let new = self.tabs.len() - 1;
         self.set_active(new);
         self.sort_tabs();
+        // Same rule as `push_named_document`: a capture landing while
+        // the mosaic is open switches the viewer onto it.
+        if self.view_mode == ViewMode::Mosaic {
+            self.view_mode = ViewMode::Tabs;
+            self.mos_since = None;
+        }
         self.recompute_dirty();
     }
 
