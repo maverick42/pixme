@@ -261,6 +261,17 @@ fn draw_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.draw")
 }
 
+/// Wakes every command-pumping viewport from outside a pass (OS menu
+/// callbacks, worker threads): `Context::request_repaint()` alone only
+/// targets `ViewportId::ROOT`, which macOS throttles when the 1×1 anchor
+/// sits behind a visible window.
+pub fn wake_viewports(ctx: &egui::Context) {
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    ctx.request_repaint_of(viewer_id());
+    ctx.request_repaint_of(bar_id());
+    ctx.request_repaint_of(draw_id());
+}
+
 /// Lock helper: recover a poisoned mutex rather than crash the UI thread.
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -823,7 +834,12 @@ impl Shared {
             Command::SaveAll => {
                 self.save_all(ctx, false);
             }
-            Command::RenameActive => lock(&self.viewer).open_rename(),
+            Command::RenameActive => {
+                lock(&self.viewer).open_rename();
+                // The dialog is painted by the viewer pass — menu-driven
+                // opens must wake it or it waits for the next OS event.
+                ctx.request_repaint_of(viewer_id());
+            }
             Command::CopyActive => {
                 if let Some(img) = lock(&self.viewer).copy_image() {
                     match crate::export::clipboard::copy_image(&img) {
@@ -850,6 +866,7 @@ impl Shared {
                     ctx.request_repaint_of(draw_id());
                 } else {
                     lock(&self.viewer).undo_active();
+                    ctx.request_repaint_of(viewer_id());
                 }
             }
             Command::RedoActive => {
@@ -858,6 +875,7 @@ impl Shared {
                     ctx.request_repaint_of(draw_id());
                 } else {
                     lock(&self.viewer).redo_active();
+                    ctx.request_repaint_of(viewer_id());
                 }
             }
             Command::PrintActive => {

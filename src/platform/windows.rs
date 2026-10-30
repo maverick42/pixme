@@ -68,7 +68,7 @@ pub fn install_ui(ctx: &egui::Context) {
     MenuEvent::set_event_handler(Some(move |event| {
         if let Some(command) = super::command_from_menu_id(event.id().0.as_str()) {
             super::queue_menu_command(command);
-            repaint_ctx.request_repaint();
+            crate::app::wake_viewports(&repaint_ctx);
         }
     }));
 

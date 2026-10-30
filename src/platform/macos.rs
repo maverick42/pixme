@@ -157,8 +157,9 @@ pub fn install_ui(ctx: &egui::Context) {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if let Some(command) = super::command_from_menu_id(event.id().0.as_str()) {
             super::queue_menu_command(command);
-            // The egui windows may be hidden: wake the loop so pump() runs.
-            repaint_ctx.request_repaint();
+            // Wake every live viewport so pump() runs without waiting
+            // for an occluded root anchor or the next mouse event.
+            crate::app::wake_viewports(&repaint_ctx);
         }
     }));
 
