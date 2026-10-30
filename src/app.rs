@@ -1785,6 +1785,7 @@ impl eframe::App for PixMeApp {
 fn bar_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
         .with_title("PixMe")
+        .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(false)
@@ -1804,6 +1805,7 @@ fn bar_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
 fn viewer_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
         .with_title(t!("app.title"))
+        .with_icon(ui::icons::app_icon_data())
         .with_app_id("pixme")
         .with_inner_size([860.0, 560.0])
         .with_min_inner_size([420.0, 280.0])
@@ -1860,6 +1862,7 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
         .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
     egui::ViewportBuilder::default()
         .with_title("PixMe")
+        .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_resizable(false)
         .with_always_on_top()
@@ -1877,6 +1880,7 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
 fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
         .with_title("PixMe")
+        .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(false)
@@ -1894,6 +1898,7 @@ fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
 fn countdown_builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
         .with_title("PixMe")
+        .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(false)
@@ -1909,6 +1914,7 @@ fn countdown_builder() -> egui::ViewportBuilder {
 fn save_dialog_builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
         .with_title(t!("save.title"))
+        .with_icon(ui::icons::app_icon_data())
         .with_inner_size([560.0, 205.0])
         .with_resizable(false)
         .with_always_on_top()
@@ -1921,6 +1927,7 @@ fn save_dialog_builder() -> egui::ViewportBuilder {
 fn draw_builder(title: &str) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
         .with_title(title)
+        .with_icon(ui::icons::app_icon_data())
         .with_app_id("pixme")
         .with_inner_size([1100.0, 700.0])
         .with_min_inner_size([640.0, 420.0])

@@ -162,6 +162,66 @@ pub fn exists(icon: Icon) -> bool {
     styled_icons().contains_key(&icon)
 }
 
+/// Embedded application icons (original artwork — see
+/// `assets/app/README.md`). The window/taskbar icon is the Windows variant
+/// (`pixme-window-256.png`, full-bleed); the macOS Dock icon uses
+/// `pixme-1024.png` (Apple icon grid with margins and shadow); the status
+/// item uses the black-on-transparent template the menu bar recolours.
+const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/app/pixme-window-256.png");
+const DOCK_ICON_PNG: &[u8] = include_bytes!("../../assets/app/pixme-1024.png");
+const MENUBAR_ICON_PNG: &[u8] = include_bytes!("../../assets/app/menubar-template@2x.png");
+
+/// Decodes `png` to straight-alpha RGBA resized to `size`×`size` — every OS
+/// icon surface (`winit` window icon, tray icon, status item) takes pixels.
+fn decode_icon_png(png: &[u8], size: u32) -> Vec<u8> {
+    image::load_from_memory(png)
+        .map(|img| {
+            img.resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+                .to_rgba8()
+                .into_raw()
+        })
+        .unwrap_or_default()
+}
+
+/// The application icon as [`egui::IconData`] for
+/// `ViewportBuilder::with_icon` — Windows title bar and taskbar. Decoded once.
+pub fn app_icon_data() -> std::sync::Arc<egui::IconData> {
+    static ICON: OnceLock<std::sync::Arc<egui::IconData>> = OnceLock::new();
+    std::sync::Arc::clone(ICON.get_or_init(|| {
+        std::sync::Arc::new(egui::IconData {
+            rgba: decode_icon_png(APP_ICON_PNG, 256),
+            width: 256,
+            height: 256,
+        })
+    }))
+}
+
+/// The macOS Dock icon as [`egui::IconData`] for `eframe::NativeOptions`
+/// (`pixme-1024.png`, which carries the Apple icon-grid margins and shadow
+/// so the Dock tile matches native apps in size). Decoded once at 512 px.
+pub fn dock_icon_data() -> std::sync::Arc<egui::IconData> {
+    static ICON: OnceLock<std::sync::Arc<egui::IconData>> = OnceLock::new();
+    std::sync::Arc::clone(ICON.get_or_init(|| {
+        std::sync::Arc::new(egui::IconData {
+            rgba: decode_icon_png(DOCK_ICON_PNG, 512),
+            width: 512,
+            height: 512,
+        })
+    }))
+}
+
+/// Raw RGBA of the app icon at `size` px — the Windows tray icon has no
+/// template mode, so it uses the full-colour artwork.
+pub fn app_icon_rgba(size: u32) -> Vec<u8> {
+    decode_icon_png(APP_ICON_PNG, size)
+}
+
+/// Raw RGBA of the menu-bar template icon — already 44 px (the 22 pt slot
+/// @2x), passed through unchanged to `tray_icon::Icon::from_rgba`.
+pub fn menubar_icon_rgba() -> Vec<u8> {
+    decode_icon_png(MENUBAR_ICON_PNG, 44)
+}
+
 /// An egui image for `icon`, tinted. Relies on
 /// `egui_extras::install_image_loaders` (done in `ui::install`).
 pub fn image(icon: Icon, size: f32, tint: Color32) -> egui::Image<'static> {
@@ -178,34 +238,6 @@ pub fn image(icon: Icon, size: f32, tint: Color32) -> egui::Image<'static> {
 pub fn paint(ui: &Ui, rect: Rect, icon: Icon, size: f32, tint: Color32) {
     let r = Rect::from_center_size(rect.center(), Vec2::splat(size));
     image(icon, size, tint).paint_at(ui, r);
-}
-
-/// Rasterizes `icon` to raw RGBA8 bytes at `size` px — used for OS surfaces
-/// that need pixel data instead of an egui image (macOS status item icon,
-/// white strokes work fine for a template icon).
-pub fn rgba(icon: Icon, size: u32) -> Vec<u8> {
-    rasterize(icon, size).as_raw().to_vec()
-}
-
-/// Rasterizes `icon` recoloured to `color` (a `#rrggbb` hex string) — for OS
-/// surfaces without a template mode (the Windows tray, where pure-white
-/// strokes would vanish on a light taskbar).
-pub fn rgba_with(icon: Icon, size: u32, color: &str) -> Vec<u8> {
-    let Some(&(_, _, raw)) = icon_data::DATA.iter().find(|&&(i, _, _)| i == icon) else {
-        return Vec::new();
-    };
-    let svg = String::from_utf8_lossy(raw).replace("currentColor", color);
-    egui_extras::image::load_svg_bytes_with_size(
-        svg.as_bytes(),
-        egui::load::SizeHint::Size {
-            width: size,
-            height: size,
-            maintain_aspect_ratio: true,
-        },
-        &Default::default(),
-    )
-    .map(|img| img.as_raw().to_vec())
-    .unwrap_or_default()
 }
 
 /// Rasterizes `icon` at `size` px — used by tests, offscreen rendering and

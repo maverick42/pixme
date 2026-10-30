@@ -23,7 +23,7 @@ use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem,
 
 use super::PlatformServices;
 use crate::capture::CaptureError;
-use crate::ui::icons::{self, Icon};
+use crate::ui::icons;
 
 /// macOS services.
 pub struct MacOs;
@@ -42,11 +42,16 @@ impl PlatformServices for MacOs {
 
 /// The app keeps the default `regular` activation policy: a permanent Dock
 /// icon (launcher-style) so PixMe owns the system menu bar whenever one of
-/// its windows is focused — accessory apps can never own it. Nothing to
-/// tweak at event-loop creation.
-pub fn apply_native_options(_options: &mut eframe::NativeOptions) {}
+/// its windows is focused — accessory apps can never own it. Passes the
+/// macOS artwork (`pixme-1024.png`, with Apple icon-grid margins) to
+/// `eframe`'s `AppTitleIconSetter`, which installs it via `NSBitmapImageRep`
+/// + `setApplicationIconImage:`.
+pub fn apply_native_options(options: &mut eframe::NativeOptions) {
+    options.viewport = options.viewport.clone().with_icon(icons::dock_icon_data());
+}
 
-/// Status-item icon edge in pixels (22 pt menu-bar slot × 2 for Retina).
+/// Status-item icon edge in pixels (22 pt menu-bar slot × 2 for Retina —
+/// `menubar-template@2x.png` is exactly this size).
 const STATUS_ICON_PX: u32 = 44;
 
 /// Menu handles kept alive for the app lifetime, plus the i18n keys needed
@@ -327,11 +332,7 @@ fn install_status_item(menu: Menu) -> Option<TrayIcon> {
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(true)
         .with_tooltip("PixMe");
-    match tray_icon::Icon::from_rgba(
-        icons::rgba(Icon::Scan, STATUS_ICON_PX),
-        STATUS_ICON_PX,
-        STATUS_ICON_PX,
-    ) {
+    match tray_icon::Icon::from_rgba(icons::menubar_icon_rgba(), STATUS_ICON_PX, STATUS_ICON_PX) {
         Ok(icon) => builder = builder.with_icon_templated(icon),
         Err(err) => tracing::warn!("status item icon unavailable: {err}"),
     }

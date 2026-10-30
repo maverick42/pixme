@@ -1281,3 +1281,32 @@ Format: date — context — decision — consequences.
   behaviour; `include_pointer = true` composites the real system cursor
   (arrow, I-beam, hand, resize, etc.) at its exact hotspot and Retina scale
   with no added crate.
+
+## 2026-10-30 — Original PixMe icon set wired to every OS surface
+
+- **Context**: all OS-facing icons were drawn from the Lucide "Scan" glyph
+  (macOS status item, Windows tray) or left to the OS default (window
+  icons, Dock icon, executable icon). The user supplied an original PixMe
+  icon set (`assets/app/`, see its README — no third-party assets).
+- **Decision**:
+  - macOS status item → `menubar-template@2x.png` (44 px, black on
+    transparent, loaded templated so the menu bar recolours it).
+  - macOS Dock → `macos::apply_native_options` attaches `dock_icon_data()`
+    (`pixme-1024.png`, which carries the Apple icon-grid margins and
+    baked shadow) to `eframe::NativeOptions`, and `eframe`'s
+    `AppTitleIconSetter` installs it via `NSBitmapImageRep` +
+    `setApplicationIconImage:`. `PixMe.icns` is kept in `assets/app/` for
+    a future bundle.
+  - Windows tray → `pixme-window-256.png` RGBA (full colour — the Windows
+    tray has no template mode).
+  - Window icons → `ViewportBuilder::with_icon` on every window builder
+    with the same PNG decoded once (`egui::IconData`); Windows shows it
+    in the taskbar/title bar, macOS ignores it.
+  - Windows executable → `winresource` (target-gated build-dependency,
+    `#[cfg(windows)]` in `build.rs`) embeds `PixMe.ico` into the PE.
+  - The now-unused `icons::rgba` / `rgba_with` helpers were removed.
+- **Consequences**: one new build-only dependency (`winresource`, no
+  runtime code); the `.icns` has no consumer until an `.app` packaging
+  step exists; menubar-template.png (1x) is kept for reference only (the
+  status item always loads the 44 px 2x artwork, which the tray
+  implementation clamps to 22 pt).

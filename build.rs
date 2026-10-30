@@ -76,4 +76,26 @@ fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR is always set");
     fs::write(Path::new(&out_dir).join("emoji_table.rs"), out)
         .expect("emoji_table.rs must be writable");
+
+    embed_exe_icon(&root);
 }
+
+/// Bakes `assets/app/PixMe.ico` into the Windows executable's resources so
+/// the taskbar / Explorer show the PixMe icon. `winresource` is a
+/// target-gated build-dependency: it only exists when the build host is
+/// Windows, so the real work lives behind `#[cfg(windows)]`.
+fn embed_exe_icon(root: &str) {
+    println!("cargo:rerun-if-changed={root}/assets/app/PixMe.ico");
+    embed_exe_icon_impl();
+}
+
+#[cfg(windows)]
+fn embed_exe_icon_impl() {
+    winresource::WindowsResource::new()
+        .set_icon("assets/app/PixMe.ico")
+        .compile()
+        .unwrap_or_else(|e| panic!("cannot embed assets/app/PixMe.ico: {e}"));
+}
+
+#[cfg(not(windows))]
+fn embed_exe_icon_impl() {}

@@ -17,7 +17,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 
 use super::PlatformServices;
 use crate::capture::CaptureError;
-use crate::ui::icons::{self, Icon};
+use crate::ui::icons;
 
 /// Windows services.
 pub struct Windows;
@@ -39,7 +39,11 @@ impl PlatformServices for Windows {
 /// nothing — same dead behaviour as the launcher's Dock icon). The viewer
 /// still gets its own taskbar button while open.
 pub fn apply_native_options(options: &mut eframe::NativeOptions) {
-    options.viewport = options.viewport.clone().with_taskbar(true);
+    options.viewport = options
+        .viewport
+        .clone()
+        .with_taskbar(true)
+        .with_icon(icons::app_icon_data());
 }
 
 /// Tray icon edge in pixels (16 px slot × ~2 for high-DPI trays).
@@ -85,10 +89,10 @@ pub fn install_ui(ctx: &egui::Context) {
         .with_menu(Box::new(menu.clone()))
         .with_menu_on_left_click(true)
         .with_tooltip("PixMe");
-    // The Windows tray has no template mode: draw the glyph in the accent
-    // colour so it stays visible on light and dark taskbars.
+    // The Windows tray has no template mode: use the full-colour artwork
+    // (readable on light and dark taskbars alike).
     match tray_icon::Icon::from_rgba(
-        icons::rgba_with(Icon::Scan, TRAY_ICON_PX, "#378EF0"),
+        icons::app_icon_rgba(TRAY_ICON_PX),
         TRAY_ICON_PX,
         TRAY_ICON_PX,
     ) {
