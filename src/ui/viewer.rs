@@ -1612,6 +1612,41 @@ impl Viewer {
                 // Ctrl+Y — the Windows redo convention.
                 shared.push(Command::RedoActive);
                 ctx.request_repaint();
+            } else if ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::S,
+                )
+            }) {
+                // ⇧⌘S / Ctrl+Shift+S before ⌘S — same ordering rule as undo.
+                shared.push(Command::SaveAll);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+                shared.push(Command::SaveActive);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+                shared.push(Command::OpenFile);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+                shared.push(Command::PrintActive);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                    egui::Key::V,
+                )
+            }) {
+                // The native menus' import shortcut (⌘⌥V / Ctrl+Alt+V).
+                shared.push(Command::ImportClipboard);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)
+            }) {
+                shared.push(Command::OpenSettings);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
+                shared.push(Command::Quit);
+                ctx.request_repaint();
             }
         }
         // Explicit fill: the app-wide clear color is transparent (the anchor
@@ -2134,7 +2169,16 @@ impl Viewer {
     /// commands as the native menus — the only difference is where they
     /// render.
     fn menu_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
-        ui.horizontal(|ui| {
+        egui::Frame::default()
+            .inner_margin(Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+            ui.horizontal(|ui| {
+            // Menu titles, not buttons: no fill, no border — the hover
+            // highlight alone signals them (PhotoCraft's egui menu bar
+            // reads the same way on Windows).
+            let v = &mut ui.style_mut().visuals;
+            v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+            v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
             ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
             menu_button(ui, t!("menu.file").as_ref(), |ui| {
                 menu_item(ui, shared, Command::OpenFile, t!("menu.file.open").as_ref());
@@ -2215,7 +2259,8 @@ impl Viewer {
                     t!("menu.app.preferences").as_ref(),
                 );
             });
-        });
+            });
+            });
     }
 
     /// The capture tab strip: one selectable label per capture — red
@@ -3780,7 +3825,12 @@ fn mosaic_zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) 
 
 /// One top-level menu label opening a popup (egui menu strip style).
 fn menu_button(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-    let resp = ui.button(label);
+    let mut resp = ui.button(label);
+    // Anchor the dropdown to the title's text edge, not the padded button
+    // edge — the flat titles carry no visible frame, so aligning the popup
+    // on the text is what reads like a real menu bar (egui's own SubMenu
+    // does the same trick in the vertical axis).
+    resp.interact_rect.min.x += ui.spacing().button_padding.x;
     egui::Popup::menu(&resp).show(|ui| {
         ui.set_min_width(180.0);
         add(ui);
