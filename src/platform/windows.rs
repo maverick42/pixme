@@ -14,7 +14,7 @@ use std::path::Path;
 
 use rust_i18n::t;
 use tray_icon::TrayIcon;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
 use super::PlatformServices;
 use crate::capture::CaptureError;
@@ -73,18 +73,27 @@ pub fn install_ui(ctx: &egui::Context) {
         }
     }));
 
-    let menu = Menu::new();
-    let mut items = Vec::new();
-    for (id, key) in [
-        ("take_capture", "menubar.take_capture"),
-        ("open_viewer", "menubar.open_viewer"),
-    ] {
+    fn add(
+        menu: &Menu,
+        items: &mut Vec<(MenuItem, &'static str, &'static str)>,
+        id: &'static str,
+        key: &'static str,
+    ) {
         let item = MenuItem::with_id(id, t!(key).as_ref(), true, None);
         if let Err(err) = menu.append(&item) {
             tracing::warn!("cannot append tray menu item: {err}");
         }
         items.push((item, key, id));
     }
+
+    let menu = Menu::new();
+    let mut items = Vec::new();
+    add(&menu, &mut items, "take_capture", "menubar.take_capture");
+    add(&menu, &mut items, "open_viewer", "menubar.open_viewer");
+    if let Err(err) = menu.append(&PredefinedMenuItem::separator()) {
+        tracing::warn!("cannot append tray menu separator: {err}");
+    }
+    add(&menu, &mut items, "quit", "menubar.quit");
 
     let mut builder = TrayIcon::builder()
         .with_menu(Box::new(menu.clone()))
