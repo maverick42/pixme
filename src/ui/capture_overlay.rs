@@ -37,6 +37,10 @@ const LOUPE_GAP: f32 = 24.0;
 const FIXED_SIZE: Vec2 = Vec2::new(640.0, 480.0);
 /// "Copied" feedback duration.
 const COPIED_SECS: f32 = 1.2;
+/// How long after the freeze a consumed Esc is treated as the synthetic
+/// one `dismiss_active_menus` posted — covers the overlay's whole
+/// create-window-and-become-key path (~100-300 ms observed).
+const SYNTHETIC_ESC_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
 
 /// One of the eight resize handles.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,6 +128,11 @@ pub struct OverlaySession {
     loupe: Option<egui::TextureHandle>,
     /// When `C` last copied the colour (drives the "copied" flash).
     copied_at: Option<std::time::Instant>,
+    /// macOS posts a synthetic Escape to dismiss foreign popup menus right
+    /// after the freeze; it can be delivered to this window once it becomes
+    /// key. Until this instant the first consumed Esc is ours, not the
+    /// user's — swallow it rather than cancelling the fresh capture.
+    swallow_esc_until: Option<std::time::Instant>,
     /// The capture's log correlation id — set by `begin_capture`, every
     /// event this session emits rides its span (one grep = one life).
     pub capture_id: u64,
@@ -164,6 +173,7 @@ impl OverlaySession {
             texture: None,
             loupe: None,
             copied_at: None,
+            swallow_esc_until: None,
             capture_id: 0,
             started_at: std::time::Instant::now(),
         }
@@ -240,8 +250,12 @@ impl OverlaySession {
             match screen::capture_all_monitors(self.include_pointer) {
                 Ok((frames, cursor)) => {
                     self.cursor = cursor;
-                    if !self.instant {
-                        crate::platform::dismiss_active_menus();
+                    if !self.instant && crate::platform::dismiss_active_menus() {
+                        // The synthetic Esc rides the HID queue and lands on
+                        // whatever is key — possibly this overlay once it
+                        // exists. Arm the swallow window (see `keys()`).
+                        self.swallow_esc_until =
+                            Some(std::time::Instant::now() + SYNTHETIC_ESC_GRACE);
                     }
                     // Pick the monitor under the cursor right now; fall back
                     // to the pre-selected monitor or the primary/first frame.
@@ -288,6 +302,10 @@ impl OverlaySession {
     pub fn show(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) {
+            tracing::info!(
+                capture_id = self.capture_id,
+                "overlay close_requested -> cancel"
+            );
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             shared.push(Command::CancelCapture);
             return;
@@ -572,6 +590,18 @@ impl OverlaySession {
     /// Esc cancels, Enter confirms, C copies the cursor colour.
     fn keys(&mut self, ctx: &egui::Context, shared: &Shared) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            // A synthetic Esc posted by `dismiss_active_menus` can be
+            // delivered to this window — swallow it once instead of
+            // cancelling the capture it was meant to enable.
+            let swallow = self
+                .swallow_esc_until
+                .take()
+                .is_some_and(|t| std::time::Instant::now() < t);
+            if swallow {
+                tracing::info!(capture_id = self.capture_id, "synthetic Esc swallowed");
+                return;
+            }
+            tracing::info!(capture_id = self.capture_id, "overlay Esc -> cancel");
             shared.push(Command::CancelCapture);
             return;
         }

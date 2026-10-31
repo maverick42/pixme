@@ -1600,3 +1600,18 @@ Format: date — context — decision — consequences.
   `target/` because release-run data follows the exe inside `target/`
   only when the exe itself is there (dev runs), and `PIXME_DATA_DIR`
   overrides are dev-tools-only.
+
+## 2026-10-30 — macOS app menus: the Capture submenu is removed
+
+- **Context**: the native menu bar carried PixMe / Capture / File / Edit /
+  Window. The Capture submenu duplicated the floating bar's modes and was a
+  live path to launching a second capture while the overlay owned the
+  screen — the user judged it added little.
+- **Decision**: the Capture submenu (and its `menu.capture` locale key plus
+  the `capture.*` id → `Command::Capture` mappings) is removed; the
+  remaining menus are PixMe / File / Edit / Window, and captures start from
+  the floating bar or the status item only.
+- **Consequences**: no native-menu path can start a capture mid-capture;
+  other commands (status item, File/Edit items) remain gated only by
+  `ModalState`, which has no capture-in-progress variant — greying during
+  an active capture is still unimplemented if wanted later.

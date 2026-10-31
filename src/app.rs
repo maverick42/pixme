@@ -154,6 +154,9 @@ pub enum ModalState {
     /// A dialog living inside the viewer window (rename, resize,
     /// protection, delete-file, unsaved confirmation, dup names).
     ViewerDialog,
+    /// A capture session is live: the overlay owns the screen, so menus
+    /// and commands grey out — a second capture can never start under it.
+    Capturing,
     /// The quit-time session save is writing on a worker — the UI is
     /// frozen behind the saving veil until the app actually closes.
     Saving,
@@ -259,6 +262,17 @@ fn countdown_id() -> egui::ViewportId {
 /// The Draw (Dessiner) editor window.
 fn draw_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.draw")
+}
+
+/// Wakes every command-pumping viewport from outside a pass (OS menu
+/// callbacks, worker threads): `Context::request_repaint()` alone only
+/// targets `ViewportId::ROOT`, which macOS throttles when the 1×1 anchor
+/// sits behind a visible window.
+pub fn wake_viewports(ctx: &egui::Context) {
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    ctx.request_repaint_of(viewer_id());
+    ctx.request_repaint_of(bar_id());
+    ctx.request_repaint_of(draw_id());
 }
 
 /// Lock helper: recover a poisoned mutex rather than crash the UI thread.
@@ -419,6 +433,8 @@ impl Shared {
             ModalState::Settings
         } else if self.viewer_dialog_open.load(Ordering::Relaxed) {
             ModalState::ViewerDialog
+        } else if *lock(&self.state) == AppState::Capturing {
+            ModalState::Capturing
         } else {
             ModalState::None
         }
@@ -823,7 +839,12 @@ impl Shared {
             Command::SaveAll => {
                 self.save_all(ctx, false);
             }
-            Command::RenameActive => lock(&self.viewer).open_rename(),
+            Command::RenameActive => {
+                lock(&self.viewer).open_rename();
+                // The dialog is painted by the viewer pass — menu-driven
+                // opens must wake it or it waits for the next OS event.
+                ctx.request_repaint_of(viewer_id());
+            }
             Command::CopyActive => {
                 if let Some(img) = lock(&self.viewer).copy_image() {
                     match crate::export::clipboard::copy_image(&img) {
@@ -850,6 +871,7 @@ impl Shared {
                     ctx.request_repaint_of(draw_id());
                 } else {
                     lock(&self.viewer).undo_active();
+                    ctx.request_repaint_of(viewer_id());
                 }
             }
             Command::RedoActive => {
@@ -858,6 +880,7 @@ impl Shared {
                     ctx.request_repaint_of(draw_id());
                 } else {
                     lock(&self.viewer).redo_active();
+                    ctx.request_repaint_of(viewer_id());
                 }
             }
             Command::PrintActive => {
@@ -2611,6 +2634,38 @@ mod tests {
                 "Saving: {command:?}"
             );
         }
+        // While a capture owns the screen, only the always-live commands
+        // pass — in particular a second Capture can never start.
+        for command in all_commands() {
+            let expected = matches!(
+                command,
+                Command::Quit
+                    | Command::CloseSettings
+                    | Command::ConfirmSave
+                    | Command::ConfirmDiscard
+                    | Command::ConfirmCancel
+                    | Command::ConfirmCapture
+                    | Command::CancelCapture
+                    | Command::ClosePin(_)
+                    | Command::CopyPin(_)
+                    | Command::ViewerClosed
+                    | Command::CloseBar
+            );
+            assert_eq!(
+                is_command_enabled(&command, ModalState::Capturing),
+                expected,
+                "Capturing: {command:?}"
+            );
+        }
+    }
+
+    /// `modal_state()` reports the capture session as modal so menus grey
+    /// out while the overlay owns the screen.
+    #[test]
+    fn capturing_reports_a_modal_state() {
+        let (shared, _ctx) = harness();
+        *lock(&shared.state) = AppState::Capturing;
+        assert_eq!(shared.modal_state(), ModalState::Capturing);
     }
 
     /// A blocked command is dropped by dispatch, not executed: SaveAll

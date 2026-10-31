@@ -15,7 +15,7 @@ mod windows;
 
 use std::sync::{Mutex, MutexGuard};
 
-use crate::app::{CaptureMode, Command};
+use crate::app::Command;
 use eframe::egui;
 
 /// What the OS needs PixMe to handle.
@@ -130,11 +130,6 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
     Some(match id {
         "take_capture" => Command::ShowBar,
         "open_viewer" => Command::OpenViewer,
-        "capture.window" => Command::Capture(CaptureMode::WindowOrObject),
-        "capture.region" => Command::Capture(CaptureMode::Region),
-        "capture.fullscreen" => Command::Capture(CaptureMode::FullScreen),
-        "capture.fixed_region" => Command::Capture(CaptureMode::FixedRegion),
-        "capture.pin" => Command::Capture(CaptureMode::Pin),
         "settings" => Command::OpenSettings,
         "import_clipboard" => Command::ImportClipboard,
         "edit.undo" => Command::UndoActive,
