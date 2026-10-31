@@ -1393,6 +1393,35 @@ Format: date — context — decision — consequences.
   one page. Cancelling the dialog returns `Err` ("cancelled") — logged
   as a warning like before.
 
+## 2026-10-31 — Pin windows: remove corner drag-resize and claim drag hits on chrome controls
+
+- **Context**: clicking the top-left close dot on a pinned capture caused the
+  window to jump downward or enter an OS window drag instead of closing on the
+  first click. In `egui` 0.36, a `Sense::click()` widget stacked on top of a
+  `Sense::drag()` widget (`pin-body` or the 20×20 corner resize grips) only
+  claims the click hit — `hit_test_on_close` still returns the underlying
+  drag-only widget as the drag hit, which becomes `dragged` on the press frame
+   itself. Pressing inside `[7..20]²` latched a corner resize anchored at the
+  bottom-right corner (shrinking the window downward on any pointer drift);
+  pressing inside `[20..25]²` fired `ViewportCommand::StartDrag` on the body.
+- **Decision** (supersedes the corner-resize part of 2026-10-24 "Pin resize,
+  white chrome, and a real save-as window"):
+  - **No user drag-resize on pins**: `resize_grips`, `GRIP`, `corner_zone`,
+    `PinAnchor` and `resize_start` are removed. The zoom preset menu (`50%`,
+    `100%`, `200%`) remains the sole way to scale a pin (`apply_zoom` anchored
+    at the top-left corner).
+  - **Chrome buttons use `Sense::click_and_drag()`**: the close dot, zoom pill,
+    copy and save buttons register with `Sense::click_and_drag()` after
+    `pin-body` so `egui`'s hit-tester assigns both `click` and `drag` to the
+    button and never leaks `StartDrag` to the body behind it. Releasing while
+    still over the button also fires when pointer drift exceeded
+    `max_click_dist` (`drag_stopped() && contains_pointer()`).
+- **Consequences**: clicking the close dot (or any bottom-strip button) closes
+  or activates reliably on the first click without moving or resizing the pin,
+  even with slight trackpad drift; dragging the image body or the centre grip
+  pill still moves the window.
+
+
 ## 2026-10-30 — Lossy stdout writer for `tracing-subscriber` and panic-log-first hook
 
 - **Context**: a macOS crash report (`pixme-2026-10-30-185600.ips`) after the
