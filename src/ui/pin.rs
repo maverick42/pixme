@@ -27,8 +27,6 @@ const ZOOMS: [f32; 3] = [0.5, 1.0, 2.0];
 const ROUNDING: f32 = 10.0;
 /// Dark scoop hugging the top-left corner behind the close dot.
 const HALO: f32 = 34.0;
-/// Corner-resize hit zones (squares at each window corner).
-const GRIP: f32 = 20.0;
 /// Below this width/height only the close dot is shown — there is no
 /// room left for the strip icons.
 const MIN_STRIP_W: f32 = 210.0;
@@ -38,67 +36,10 @@ const MIN_STRIP_H: f32 = 90.0;
 const MIN_ZOOM_W: f32 = 280.0;
 /// The centre grip pill needs more room than the round buttons.
 const MIN_PILL_W: f32 = 300.0;
-/// Smallest on-screen side a pin can be resized to (logical px).
+/// Smallest on-screen side a pin can be zoomed to (logical px).
 pub const MIN_SIDE: f32 = 64.0;
 /// Largest zoom (logical units per image point).
 pub const MAX_ZOOM: f32 = 6.0;
-
-/// Which window corner is being dragged while resizing: it follows the
-/// pointer, the opposite corner stays put.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PinAnchor {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
-
-impl PinAnchor {
-    /// Sign applied to the pointer delta per axis: for `TopLeft`, moving
-    /// the pointer left/up grows the window.
-    fn signs(self) -> (f32, f32) {
-        match self {
-            Self::TopLeft => (-1.0, -1.0),
-            Self::TopRight => (1.0, -1.0),
-            Self::BottomLeft => (-1.0, 1.0),
-            Self::BottomRight => (1.0, 1.0),
-        }
-    }
-
-    /// The resize cursor shown on that corner.
-    fn cursor(self) -> egui::CursorIcon {
-        match self {
-            Self::TopLeft | Self::BottomRight => egui::CursorIcon::ResizeNwSe,
-            Self::TopRight | Self::BottomLeft => egui::CursorIcon::ResizeNeSw,
-        }
-    }
-
-    /// The corner that stays put while this one is dragged.
-    fn opposite(self) -> Self {
-        match self {
-            Self::TopLeft => Self::BottomRight,
-            Self::TopRight => Self::BottomLeft,
-            Self::BottomLeft => Self::TopRight,
-            Self::BottomRight => Self::TopLeft,
-        }
-    }
-}
-
-/// The resize hit zone at `anchor`'s corner of `rect`.
-fn corner_zone(anchor: PinAnchor, rect: Rect) -> Rect {
-    match anchor {
-        PinAnchor::TopLeft => Rect::from_min_size(rect.min, Vec2::splat(GRIP)),
-        PinAnchor::TopRight => {
-            Rect::from_min_size(Pos2::new(rect.max.x - GRIP, rect.min.y), Vec2::splat(GRIP))
-        }
-        PinAnchor::BottomLeft => {
-            Rect::from_min_size(Pos2::new(rect.min.x, rect.max.y - GRIP), Vec2::splat(GRIP))
-        }
-        PinAnchor::BottomRight => {
-            Rect::from_min_size(rect.max - Vec2::splat(GRIP), Vec2::splat(GRIP))
-        }
-    }
-}
 
 /// One pinned capture — an autonomous floating window.
 pub struct PinWindow {
@@ -110,14 +51,10 @@ pub struct PinWindow {
     /// region sat on screen.
     pub origin: Pos2,
     /// Display zoom (logical units per image point at scale 1). Updated
-    /// by the % menu and by the corner-resize grips.
+    /// by the % menu.
     pub zoom: f32,
     /// GPU texture, built once.
     texture: Option<egui::TextureHandle>,
-    /// (zoom, size, press origin, corner) latched when a resize begins —
-    /// the delta is measured from the press point while the button stays
-    /// down.
-    resize_start: Option<(f32, Vec2, Pos2, PinAnchor)>,
 }
 
 impl PinWindow {
@@ -128,26 +65,19 @@ impl PinWindow {
             origin,
             zoom: 1.0,
             texture: None,
-            resize_start: None,
         }
     }
 
-    /// Resize the window to `zoom`, keeping `anchor`'s corner fixed —
+    /// Resize the window to `zoom`, keeping the top-left corner fixed —
     /// sent to THIS viewport directly (the pin is autonomous; no command
     /// round-trip through the shared queue).
-    fn apply_zoom(&mut self, ctx: &egui::Context, z: f32, anchor: PinAnchor) {
+    fn apply_zoom(&mut self, ctx: &egui::Context, z: f32) {
         let nat = self.logical_size() / self.zoom;
         let z_min = (MIN_SIDE / nat.x).max(MIN_SIDE / nat.y);
         self.zoom = z.clamp(z_min, MAX_ZOOM);
         let size = self.logical_size();
         if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-            let pos = match anchor {
-                PinAnchor::TopLeft => outer.min,
-                PinAnchor::TopRight => Pos2::new(outer.max.x - size.x, outer.min.y),
-                PinAnchor::BottomLeft => Pos2::new(outer.min.x, outer.max.y - size.y),
-                PinAnchor::BottomRight => Pos2::new(outer.max.x - size.x, outer.max.y - size.y),
-            };
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer.min));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
     }
@@ -188,13 +118,12 @@ impl PinWindow {
             egui::StrokeKind::Inside,
         );
 
-        // The image body moves the window.
+        // The image body moves the window. Controls registered above it
+        // use `Sense::click_and_drag()` so egui's hit-tester claims both
+        // the click and the drag hit — a pure `Sense::click()` on top of
+        // a `Sense::drag()` background lets the drag hit fall through to
+        // the background and starts a window drag on press.
         let body = ui.interact(rect, ui.id().with("pin-body"), Sense::drag());
-        if body.drag_started() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-
-        self.resize_grips(ui, &ctx, rect);
 
         let hovered = ctx
             .input(|i| i.pointer.latest_pos())
@@ -202,64 +131,9 @@ impl PinWindow {
         if hovered {
             self.chrome(ui, &ctx, rect, &t, shared);
         }
-    }
 
-    /// Aspect-locked resize at all four corners: the dragged corner
-    /// follows the pointer, the opposite one stays put. A press *on the
-    /// grip widget* latches the resize (`is_pointer_button_down_on`, no
-    /// drag threshold needed) — presses claimed by higher widgets (the
-    /// close dot sits inside the TL zone) never start one.
-    fn resize_grips(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect) {
-        let pointer_down = ctx.input(|i| i.pointer.primary_down());
-        let press_origin = ctx.input(|i| i.pointer.press_origin());
-        let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
-        let anchors = [
-            PinAnchor::TopLeft,
-            PinAnchor::TopRight,
-            PinAnchor::BottomLeft,
-            PinAnchor::BottomRight,
-        ];
-
-        for anchor in anchors {
-            let r = ui.interact(
-                corner_zone(anchor, rect),
-                ui.id().with(("pin-resize", anchor as u8)),
-                Sense::drag(),
-            );
-            if r.is_pointer_button_down_on()
-                && self.resize_start.is_none()
-                && let Some(origin) = press_origin
-            {
-                self.resize_start = Some((self.zoom, self.logical_size(), origin, anchor));
-            }
-        }
-
-        // While the button stays down the latched corner follows the
-        // pointer; release clears the latch.
-        let mut live_anchor = None;
-        if pointer_down {
-            if let Some((z0, s0, origin, anchor)) = self.resize_start
-                && let Some(now) = pointer_pos
-            {
-                let (sx, sy) = anchor.signs();
-                let d = now - origin;
-                // Grow along whichever axis the drag extends the most —
-                // the aspect ratio is locked to the image, and the
-                // OPPOSITE corner stays bolted in place.
-                let kx = (s0.x + sx * d.x) / s0.x;
-                let ky = (s0.y + sy * d.y) / s0.y;
-                self.apply_zoom(ctx, z0 * kx.max(ky), anchor.opposite());
-                live_anchor = Some(anchor);
-            }
-        } else {
-            self.resize_start = None;
-        }
-
-        for anchor in anchors {
-            let zone = corner_zone(anchor, rect);
-            if zone.contains(pointer_pos.unwrap_or_default()) || live_anchor == Some(anchor) {
-                ctx.set_cursor_icon(anchor.cursor());
-            }
+        if body.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
     }
 
@@ -290,7 +164,7 @@ impl PinWindow {
         // -- red close dot -------------------------------------------------
         let c = rect.min + Vec2::splat(16.0);
         let dot = Rect::from_center_size(c, Vec2::splat(18.0));
-        let dot_resp = ui.interact(dot, ui.id().with("pin-close"), Sense::click());
+        let dot_resp = ui.interact(dot, ui.id().with("pin-close"), Sense::click_and_drag());
         let fill = if dot_resp.hovered() {
             t.danger
         } else {
@@ -307,7 +181,7 @@ impl PinWindow {
             );
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        if dot_resp.clicked() {
+        if dot_resp.clicked() || (dot_resp.drag_stopped() && dot_resp.contains_pointer()) {
             shared.push(Command::ClosePin(self.id));
             return;
         }
@@ -324,7 +198,8 @@ impl PinWindow {
                 Pos2::new(rect.min.x + STRIP_PAD, strip_y),
                 Vec2::new(56.0, STRIP_H),
             );
-            let zoom_resp = ui.interact(zoom_rect, ui.id().with("pin-zoom"), Sense::click());
+            let zoom_resp =
+                ui.interact(zoom_rect, ui.id().with("pin-zoom"), Sense::click_and_drag());
             ui.painter().rect_filled(
                 zoom_rect,
                 STRIP_H / 2.0,
@@ -350,7 +225,7 @@ impl PinWindow {
                         .selectable_label((self.zoom - z).abs() < f32::EPSILON, label)
                         .clicked()
                     {
-                        self.apply_zoom(ctx, z, PinAnchor::TopLeft);
+                        self.apply_zoom(ctx, z);
                         ui.close();
                     }
                 }
@@ -415,7 +290,7 @@ impl PinWindow {
                 strip_y + STRIP_H / 2.0,
             );
             let cr = Rect::from_center_size(c, Vec2::splat(STRIP_H));
-            let r = ui.interact(cr, ui.id().with(("pin-act", n)), Sense::click());
+            let r = ui.interact(cr, ui.id().with(("pin-act", n)), Sense::click_and_drag());
             ui.painter().circle_filled(
                 c,
                 STRIP_H / 2.0,
@@ -435,7 +310,7 @@ impl PinWindow {
                 0 => t!("pin.copy"),
                 _ => t!("pin.save"),
             };
-            let clicked = r.clicked();
+            let clicked = r.clicked() || (r.drag_stopped() && r.contains_pointer());
             r.on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(tip);
             if clicked {

@@ -2791,4 +2791,86 @@ mod tests {
         assert_eq!(dialog.filename, "new_name");
         assert_eq!(dialog.existing_ok, Some(path));
     }
+
+    /// Clicking the pin close dot (even with slight pointer drift or near
+    /// its bottom-right edge) closes the pin on the first click without
+    /// emitting `StartDrag`, `OuterPosition` or `InnerSize`.
+    #[test]
+    fn pin_close_dot_closes_without_moving_or_resizing() {
+        for press_pos in [egui::pos2(16.0, 16.0), egui::pos2(22.0, 22.0)] {
+            let (shared, ctx) = harness();
+            crate::ui::theme::install_fonts(&ctx);
+            let img = image::RgbaImage::from_pixel(320, 200, image::Rgba([40, 40, 40, 255]));
+            let mut pin =
+                crate::ui::pin::PinWindow::new(7, synthetic_capture(img), egui::pos2(100.0, 100.0));
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 200.0));
+
+            let mut run_frame = |events: Vec<egui::Event>| -> Vec<egui::ViewportCommand> {
+                let raw = egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| pin.show(ui, &shared));
+                });
+                out.textures_delta.clear();
+                out.viewport_output
+                    .get(&egui::ViewportId::ROOT)
+                    .map(|v| v.commands.clone())
+                    .unwrap_or_default()
+            };
+
+            let moved_or_resized = |cmds: &[egui::ViewportCommand]| {
+                cmds.iter().any(|c| {
+                    matches!(
+                        c,
+                        egui::ViewportCommand::StartDrag
+                            | egui::ViewportCommand::OuterPosition(_)
+                            | egui::ViewportCommand::InnerSize(_)
+                    )
+                })
+            };
+
+            // Frame 1: hover over the pin so chrome widgets are registered.
+            let cmds = run_frame(vec![egui::Event::PointerMoved(press_pos)]);
+            assert!(!moved_or_resized(&cmds), "hover emitted {cmds:?}");
+
+            // Frame 2: press on the close dot.
+            let cmds = run_frame(vec![egui::Event::PointerButton {
+                pos: press_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            assert!(
+                !moved_or_resized(&cmds),
+                "press at {press_pos:?} leaked viewport command: {cmds:?}"
+            );
+
+            // Frame 3: slight trackpad drift while held, then release.
+            let release_pos = press_pos + egui::vec2(2.0, 2.0);
+            let cmds = run_frame(vec![
+                egui::Event::PointerMoved(release_pos),
+                egui::Event::PointerButton {
+                    pos: release_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            assert!(
+                !moved_or_resized(&cmds),
+                "drift+release at {press_pos:?} leaked viewport command: {cmds:?}"
+            );
+            assert!(
+                lock(&shared.pending)
+                    .iter()
+                    .any(|c| matches!(c, Command::ClosePin(7))),
+                "ClosePin(7) was not queued after clicking at {press_pos:?}"
+            );
+        }
+    }
 }
