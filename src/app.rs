@@ -471,6 +471,7 @@ impl Shared {
     /// top of every viewport pass so any visible window keeps dispatch alive.
     pub fn pump(&self, ctx: &egui::Context) {
         crate::logging::report_health();
+        platform::strip_undecorated_frame();
         let commands: Vec<Command> = platform::take_pending_commands()
             .into_iter()
             .chain(std::mem::take(&mut *lock(&self.pending)))
@@ -1715,6 +1716,10 @@ impl eframe::App for PixMeApp {
                     if let Some(pos) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
                         *lock(&shared.bar_pos) = Some(pos);
                     }
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && lock(&shared.countdown).is_some() {
+                        *lock(&shared.countdown) = None;
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
                     let mut toolbar = lock(&shared.toolbar);
                     let mut settings = lock(&shared.settings);
                     toolbar.show(ui, &mut settings, &shared);
@@ -2003,7 +2008,7 @@ impl eframe::App for PixMeApp {
 /// content; position restored across hide/show cycles.
 fn bar_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
-        .with_title("PixMe")
+        .with_title("PixMe Bar")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
@@ -2098,7 +2103,7 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
 /// at creation: user drags and zoom resizes use viewport commands.
 fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_title("PixMe")
+        .with_title("PixMe Pin")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
@@ -2116,7 +2121,7 @@ fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
 /// the card then tracks the monitor under the cursor.
 fn countdown_builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_title("PixMe")
+        .with_title("PixMe Countdown")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
@@ -2124,7 +2129,7 @@ fn countdown_builder() -> egui::ViewportBuilder {
         .with_always_on_top()
         .with_has_shadow(false)
         .with_taskbar(false)
-        .with_active(true)
+        .with_active(false)
         .with_inner_size([140.0, 140.0])
 }
 

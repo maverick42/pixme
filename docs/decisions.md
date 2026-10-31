@@ -1644,3 +1644,43 @@ Format: date — context — decision — consequences.
   other commands (status item, File/Edit items) remain gated only by
   `ModalState`, which has no capture-in-progress variant — greying during
   an active capture is still unimplemented if wanted later.
+
+## 2026-10-31 — Windows undecorated floating windows: `WS_CAPTION` stripping and native window regions (`SetWindowRgn`)
+
+- **Context**:
+  1. On Windows with Intel drivers or OpenGL (`glow`), `winit` 0.30 forces
+     `WS_CAPTION | WS_BORDER` styles on all windows even when
+     `decorations: false` is configured, relying on `WM_NCCALCSIZE` to hide
+     them. The desktop compositor still reserves space for the caption,
+     shifting content ~31 px down and clipping it at the window bottom
+     (`emilk/egui#2770`, `libsdl/SDL#12105`, and PhotoCraft issue `#2246`).
+  2. On Windows 11, DWM draws an accent line at y=0 on borderless windows
+     (documented in `winit::platform::windows::WindowExtWindows::set_undecorated_shadow`:
+     *"Enabling the shadow causes a thin 1px line to appear on the top of the window"*).
+- **Decision**:
+  - Adopt PhotoCraft's exact `#2246` fix in `src/platform/windows.rs`: strip
+    `WS_CHROME` (`WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX`)
+    on undecorated topmost floating windows via `SetWindowLongPtrW` +
+    `SWP_FRAMECHANGED | SWP_NOCOPYBITS`.
+  - Assign distinct internal titles to floating builders (`"PixMe Bar"`,
+    `"PixMe Pin"`, `"PixMe Countdown"`). Because all three are undecorated and
+    omitted from the taskbar, these titles are never visible to the user on
+    either OS.
+  - Apply native Win32 GDI window regions (`SetWindowRgn`) to tell DWM the true
+    geometry of each window:
+    - For `"PixMe Bar"` and `"PixMe Countdown"`: both carry a 14 pt transparent
+      `SHADOW_MARGIN`, so clipping y=0..2 (`CreateRectRgn(0, 2, w + 1, h + 1)`)
+      eliminates the DWM top accent line without touching the card or its soft shadow.
+    - For `"PixMe Pin"`: apply a rounded-rectangle region (`CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16)`)
+      matching the card's 8 pt rounded corners (16 px diameter), cleanly
+      eliminating the straight DWM line while preserving the 1 px border stroke
+      on all four sides.
+  - Reapply `SetWindowRgn` dynamically whenever styles are stripped or window
+    dimensions change (winit triggers `SWP_FRAMECHANGED` on focus / child window
+    transitions, which resets the non-client frame).
+- **Consequences**:
+  - Floating bar, countdown and pinned windows render crisply and completely on
+    Windows with zero visual artifacts.
+  - macOS version is 100% unaffected (`strip_undecorated_frame` is an inlined
+    no-op on macOS in `src/platform/mod.rs`).
+

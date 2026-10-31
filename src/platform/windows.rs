@@ -10,6 +10,7 @@
 //! Phase 3: per-monitor DPI awareness (`PROCESS_PER_MONITOR_DPI_AWARE`).
 
 use std::cell::RefCell;
+use std::path::Path;
 
 use rust_i18n::t;
 use tray_icon::TrayIcon;
@@ -65,7 +66,7 @@ thread_local! {
 /// [`crate::app::Command`]s.
 pub fn install_ui(ctx: &egui::Context) {
     let repaint_ctx = ctx.clone();
-    MenuEvent::set_event_handler(Some(move |event| {
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if let Some(command) = super::command_from_menu_id(event.id().0.as_str()) {
             super::queue_menu_command(command);
             crate::app::wake_viewports(&repaint_ctx);
@@ -169,6 +170,189 @@ pub fn sync_menu_enabled(modal: crate::app::ModalState) {
             }
         }
     });
+}
+
+/// Strips `WS_CAPTION` and shapes undecorated floating windows (#2246).
+///
+/// ## Known Upstream Bugs (winit / DWM)
+///
+/// 1. **Content offset (31 px down)**: `winit` 0.30 forces `WS_CAPTION | WS_BORDER`
+///    on all windows, even with `decorations: false`, and relies on `WM_NCCALCSIZE`
+///    to hide them. On Windows with Intel graphics drivers or OpenGL, the desktop
+///    compositor still reserves space for the caption, shifting content ~31 px
+///    down and clipping it at the window bottom (emilk/egui#2770, libsdl#12105).
+///    This reproduces the fix from PhotoCraft (`window_frame.rs`, issue #2246):
+///    stripping `WS_CHROME` removes the non-client area so no offset occurs.
+///
+/// 2. **DWM 1 px top line**: on Windows 11, DWM draws an accent line at y=0 on
+///    borderless windows (documented in `winit::platform::windows::WindowExtWindows::set_undecorated_shadow`:
+///    *"Enabling the shadow causes a thin 1px line to appear on the top of the window"*).
+///    Applying a native Win32 window region (`SetWindowRgn`) tells DWM the true
+///    geometry of the window so nothing is drawn outside it:
+///    - For the floating bar and countdown (`"PixMe Bar"`, `"PixMe Countdown"`):
+///      both carry a 14 pt transparent `SHADOW_MARGIN`, so clipping y=0..2
+///      removes the DWM line without touching the card or its soft shadow.
+///    - For pinned captures (`"PixMe Pin"`): sets a rounded-rect region (`16 px`),
+///      matching the card's rounded corners and preserving the full border stroke.
+///
+/// Note: whenever winit touches window flags (focus change, new child window),
+/// it triggers `SWP_FRAMECHANGED` which resets the window region. The guard
+/// reapplies `SetWindowRgn` whenever styles are stripped or dimensions change.
+pub fn strip_undecorated_frame() {
+    use std::collections::HashMap;
+
+    const GWL_STYLE: i32 = -16;
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_TOPMOST: isize = 0x8;
+    const WS_CAPTION: isize = 0x00C0_0000;
+    const WS_CHROME: isize = WS_CAPTION | 0x0008_0000 | 0x0002_0000 | 0x0001_0000; // caption, sysmenu, min, max
+    const WS_EX_WINDOWEDGE: isize = 0x0000_0400;
+    // SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOCOPYBITS
+    const SWP_FLAGS: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020 | 0x0100;
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumThreadWindows(
+            tid: u32,
+            f: unsafe extern "system" fn(isize, isize) -> i32,
+            p: isize,
+        ) -> i32;
+        fn GetWindowLongPtrW(hwnd: isize, idx: i32) -> isize;
+        fn SetWindowLongPtrW(hwnd: isize, idx: i32, v: isize) -> isize;
+        fn SetWindowPos(
+            hwnd: isize,
+            after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+        fn GetWindowTextW(hwnd: isize, s: *mut u16, n: i32) -> i32;
+        fn SetWindowTextW(hwnd: isize, s: *const u16) -> i32;
+        fn GetWindowRect(hwnd: isize, r: *mut WinRect) -> i32;
+        fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateRectRgn(x1: i32, y1: i32, x2: i32, y2: i32) -> isize;
+        fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, cx: i32, cy: i32) -> isize;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        CardWithMargin,
+        Pin,
+    }
+
+    thread_local! {
+        static REGIONS: RefCell<HashMap<isize, (i32, i32)>> = RefCell::new(HashMap::new());
+        static ROLES: RefCell<HashMap<isize, Role>> = RefCell::new(HashMap::new());
+    }
+
+    unsafe extern "system" fn visit(hwnd: isize, _lp: isize) -> i32 {
+        let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        if (exstyle & WS_EX_TOPMOST) == 0 {
+            return 1;
+        }
+
+        let mut title_buf = [0u16; 64];
+        let n = unsafe { GetWindowTextW(hwnd, title_buf.as_mut_ptr(), 64) as usize };
+        let title = String::from_utf16_lossy(&title_buf[..n]);
+
+        let role = ROLES.with(|roles| {
+            let mut m = roles.borrow_mut();
+            if let Some(&r) = m.get(&hwnd) {
+                Some(r)
+            } else if title == "PixMe Bar" || title == "PixMe Countdown" {
+                m.insert(hwnd, Role::CardWithMargin);
+                // Clear the window title text in Win32 so DefWindowProc on WM_NCACTIVATE
+                // (fired when focus shifts to countdown) never draws title text.
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                Some(Role::CardWithMargin)
+            } else if title == "PixMe Pin" {
+                m.insert(hwnd, Role::Pin);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                Some(Role::Pin)
+            } else {
+                None
+            }
+        });
+
+        let Some(role) = role else {
+            return 1;
+        };
+
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+        let mut need_reapply_region = false;
+        if (style & WS_CHROME) != 0 {
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !WS_CHROME);
+                if (exstyle & WS_EX_WINDOWEDGE) != 0 {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle & !WS_EX_WINDOWEDGE);
+                }
+                SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FLAGS);
+            }
+            need_reapply_region = true;
+        }
+
+        let mut r = WinRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut r) } != 0 {
+            let w = r.right - r.left;
+            let h = r.bottom - r.top;
+            if w > 0 && h > 0 {
+                let size_changed = REGIONS.with(|regs| {
+                    let mut m = regs.borrow_mut();
+                    if m.get(&hwnd).copied() != Some((w, h)) {
+                        m.insert(hwnd, (w, h));
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+                if need_reapply_region || size_changed {
+                    let rgn = match role {
+                        Role::CardWithMargin => {
+                            // Clip the top 2 pixels of empty transparent margin to eliminate
+                            // the DWM top accent line.
+                            unsafe { CreateRectRgn(0, 2, w + 1, h + 1) }
+                        }
+                        Role::Pin => {
+                            // Shape the window to the exact rounded-corner bounds of the pin image.
+                            unsafe { CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16) }
+                        }
+                    };
+                    if rgn != 0 {
+                        unsafe {
+                            SetWindowRgn(hwnd, rgn, 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        1
+    }
+
+    unsafe {
+        EnumThreadWindows(GetCurrentThreadId(), visit, 0);
+    }
 }
 
 /// Reveals `path` selected in Explorer (`explorer /select,<path>`).
