@@ -270,9 +270,37 @@ fn draw_id() -> egui::ViewportId {
 /// sits behind a visible window.
 pub fn wake_viewports(ctx: &egui::Context) {
     ctx.request_repaint_of(egui::ViewportId::ROOT);
-    ctx.request_repaint_of(viewer_id());
-    ctx.request_repaint_of(bar_id());
-    ctx.request_repaint_of(draw_id());
+    ctx.repaint_if_live(viewer_id());
+    ctx.repaint_if_live(bar_id());
+    ctx.repaint_if_live(draw_id());
+}
+
+/// `Context::request_repaint_of` and `Context::send_viewport_cmd_to` on a
+/// viewport id whose window does not exist insert a *default-built*
+/// `ViewportState` (decorated, titled "egui window") into `ctx.viewports`.
+/// When a later non-root pass emits it in `viewport_output`, eframe
+/// materializes it as a real window for a frame — the "egui window" flash
+/// seen between the capture click and the crosshair. These helpers no-op
+/// unless the window exists.
+trait ViewportWake {
+    /// `request_repaint_of(id)` only when `id`'s window exists.
+    fn repaint_if_live(&self, id: egui::ViewportId);
+    /// `send_viewport_cmd_to(id, cmd)` only when `id`'s window exists.
+    fn cmd_if_live(&self, id: egui::ViewportId, cmd: egui::ViewportCommand);
+}
+
+impl ViewportWake for egui::Context {
+    fn repaint_if_live(&self, id: egui::ViewportId) {
+        if self.input(|i| i.raw.viewports.contains_key(&id)) {
+            self.request_repaint_of(id);
+        }
+    }
+
+    fn cmd_if_live(&self, id: egui::ViewportId, cmd: egui::ViewportCommand) {
+        if self.input(|i| i.raw.viewports.contains_key(&id)) {
+            self.send_viewport_cmd_to(id, cmd);
+        }
+    }
 }
 
 /// Lock helper: recover a poisoned mutex rather than crash the UI thread.
@@ -502,8 +530,8 @@ impl Shared {
             *last_modal = modal;
             platform::sync_menu_enabled(modal);
             ctx.request_repaint_of(egui::ViewportId::ROOT);
-            ctx.request_repaint_of(viewer_id());
-            ctx.request_repaint_of(bar_id());
+            ctx.repaint_if_live(viewer_id());
+            ctx.repaint_if_live(bar_id());
         }
         // A background session restore lands here — swap the empty
         // session for the loaded tabs and drop the spinner.
@@ -513,7 +541,7 @@ impl Shared {
         if let Some((session, store)) = done {
             *lock(&self.restore_rx) = None;
             self.finish_restore(session, store);
-            ctx.request_repaint_of(viewer_id());
+            ctx.repaint_if_live(viewer_id());
         }
         // The quit-time save finished on its thread: the store comes
         // back and the app closes for real.
@@ -550,7 +578,7 @@ impl Shared {
                     self.finish_confirmation(ctx);
                 }
             }
-            ctx.request_repaint_of(viewer_id());
+            ctx.repaint_if_live(viewer_id());
         }
     }
 
@@ -638,15 +666,15 @@ impl Shared {
                 // other apps, or minimized in the Dock) must still bring
                 // it forward: `enter` only requests focus on a state
                 // CHANGE, so de-minimize and focus explicitly here.
-                ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Minimized(false));
+                ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
                 // The direct Focus command both wakes the (possibly
                 // sleeping) viewport and, on macOS, activates the app
                 // (`activateIgnoringOtherApps` + `makeKeyAndOrderFront`)
                 // — a mere in-app focus request would do nothing while
                 // another application is frontmost.
-                ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Focus);
+                ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
                 self.request_focus(viewer_id());
-                ctx.request_repaint_of(viewer_id());
+                ctx.repaint_if_live(viewer_id());
             }
             Command::CloseBar => {
                 // Back where the user came from: the viewer when the session
@@ -670,9 +698,9 @@ impl Shared {
                 if self.settings_open.load(Ordering::Relaxed) {
                     // Already open: re-invocation brings the existing
                     // modal to the front rather than re-opening it.
-                    ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Minimized(false));
+                    ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
                     self.request_focus(viewer_id());
-                    ctx.request_repaint_of(viewer_id());
+                    ctx.repaint_if_live(viewer_id());
                     return;
                 }
                 self.settings_open.store(true, Ordering::Relaxed);
@@ -684,12 +712,12 @@ impl Shared {
                 // The modal lives in the VIEWER's pass — repainting the
                 // anchor alone would leave an idle viewer asleep and the
                 // modal would wait for the next input event.
-                ctx.request_repaint_of(viewer_id());
+                ctx.repaint_if_live(viewer_id());
             }
             Command::CloseSettings => {
                 self.settings_open.store(false, Ordering::Relaxed);
                 *lock(&self.settings_draft) = None;
-                ctx.request_repaint_of(viewer_id());
+                ctx.repaint_if_live(viewer_id());
             }
             Command::Quit => {
                 // Quit is always live: close the non-Draw modals first so
@@ -868,7 +896,7 @@ impl Shared {
                 lock(&self.viewer).open_rename();
                 // The dialog is painted by the viewer pass — menu-driven
                 // opens must wake it or it waits for the next OS event.
-                ctx.request_repaint_of(viewer_id());
+                ctx.repaint_if_live(viewer_id());
             }
             Command::CopyActive => {
                 if let Some(img) = lock(&self.viewer).copy_image() {
@@ -893,19 +921,19 @@ impl Shared {
             Command::UndoActive => {
                 if let Some(draw) = lock(&self.draw).as_mut() {
                     draw.undo_once();
-                    ctx.request_repaint_of(draw_id());
+                    ctx.repaint_if_live(draw_id());
                 } else {
                     lock(&self.viewer).undo_active();
-                    ctx.request_repaint_of(viewer_id());
+                    ctx.repaint_if_live(viewer_id());
                 }
             }
             Command::RedoActive => {
                 if let Some(draw) = lock(&self.draw).as_mut() {
                     draw.redo_once();
-                    ctx.request_repaint_of(draw_id());
+                    ctx.repaint_if_live(draw_id());
                 } else {
                     lock(&self.viewer).redo_active();
-                    ctx.request_repaint_of(viewer_id());
+                    ctx.repaint_if_live(viewer_id());
                 }
             }
             Command::PrintActive => {
@@ -1052,7 +1080,7 @@ impl Shared {
         if clash {
             tracing::warn!("save-all blocked: duplicate tab titles");
             viewer.dup_names = true;
-            ctx.request_repaint_of(viewer_id());
+            ctx.repaint_if_live(viewer_id());
             return false;
         }
         if viewer.tabs.iter().all(|t| t.saved) {
@@ -1104,7 +1132,7 @@ impl Shared {
             let _ = tx.send((tabs, saved_paths));
             wake.request_repaint();
         });
-        ctx.request_repaint_of(viewer_id());
+        ctx.repaint_if_live(viewer_id());
         false
     }
 
@@ -1483,7 +1511,7 @@ impl Shared {
             let _ = tx.send(store);
             wake.request_repaint();
         });
-        ctx.request_repaint_of(viewer_id());
+        ctx.repaint_if_live(viewer_id());
     }
 }
 
@@ -1681,7 +1709,7 @@ impl PixMeApp {
         // capture bar showing at a previous quit) is closed explicitly.
         app.shared.enter(AppState::Viewer, &cc.egui_ctx);
         cc.egui_ctx
-            .send_viewport_cmd_to(bar_id(), egui::ViewportCommand::Close);
+            .cmd_if_live(bar_id(), egui::ViewportCommand::Close);
         app.tap_debug_capture(&cc.egui_ctx, debug_capture)
     }
 
@@ -1777,7 +1805,7 @@ impl eframe::App for PixMeApp {
                     // eats it) brings the editor back in front — one
                     // command per click, no per-frame focus fight.
                     if lock(&shared.draw).is_some() && ctx.input(|i| i.pointer.any_pressed()) {
-                        ctx.send_viewport_cmd_to(draw_id(), egui::ViewportCommand::Focus);
+                        ctx.cmd_if_live(draw_id(), egui::ViewportCommand::Focus);
                     }
                     ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
                     lock(&shared.viewer).show(ui, &shared);
@@ -1954,7 +1982,7 @@ impl eframe::App for PixMeApp {
                 {
                     tracing::info!("draw_closed");
                     // The modal closed: the viewer gets focus back.
-                    ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Focus);
+                    ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
                     if outcome == crate::ui::draw::Outcome::Ok {
                         tracing::info!("draw_committed");
                         session.finalize_pending();
@@ -2109,7 +2137,10 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
         })
         .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
     egui::ViewportBuilder::default()
-        .with_title("PixMe")
+        // Unique title: Windows' strip_undecorated_frame keys its chrome
+        // strip on it ("PixMe" is already the invisible anchor's title —
+        // and clearing a taskbar-bearing title would blank its button).
+        .with_title("PixMe Overlay")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_resizable(false)

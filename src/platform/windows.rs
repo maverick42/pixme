@@ -262,6 +262,11 @@ pub fn strip_undecorated_frame() {
     enum Role {
         CardWithMargin,
         Pin,
+        /// Fullscreen capture overlay (`"PixMe Overlay"`): strip chrome
+        /// only — no window region. The card's 2 px top clip exists for
+        /// its empty transparent margin; on the overlay it would eat real
+        /// pixels of the frozen frame.
+        Overlay,
     }
 
     thread_local! {
@@ -293,6 +298,10 @@ pub fn strip_undecorated_frame() {
                 m.insert(hwnd, Role::Pin);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
                 Some(Role::Pin)
+            } else if title == "PixMe Overlay" {
+                m.insert(hwnd, Role::Overlay);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                Some(Role::Overlay)
             } else {
                 None
             }
@@ -346,6 +355,7 @@ pub fn strip_undecorated_frame() {
                             // Shape the window to the exact rounded-corner bounds of the pin image.
                             unsafe { CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16) }
                         }
+                        Role::Overlay => 0,
                     };
                     if rgn != 0 {
                         unsafe {
