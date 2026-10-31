@@ -1782,9 +1782,8 @@ impl eframe::App for PixMeApp {
                 // If a capture just landed on a specific monitor, make sure
                 // the viewer opens on that monitor (preserving its relative
                 // placement / size when already known, or centring it there).
-                let target_mon = lock(&shared.viewer_target_monitor).take();
-                if let Some(ref m) = target_mon {
-                    let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), m);
+                if let Some(m) = lock(&shared.viewer_target_monitor).clone() {
+                    let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), &m);
                     *lock(&shared.viewer_rect) = Some(next);
                 }
                 let builder = viewer_builder(lock(&shared.viewer_rect).map(|r| r.min));
@@ -1792,8 +1791,9 @@ impl eframe::App for PixMeApp {
                     let ctx = ui.ctx().clone();
                     shared.pump(&ctx);
                     shared.maybe_focus(&ctx, viewer_id());
-                    if let Some(ref m) = target_mon {
-                        let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), m);
+                    let target = lock(&shared.viewer_target_monitor).take();
+                    if let Some(m) = target {
+                        let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), &m);
                         *lock(&shared.viewer_rect) = Some(next);
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(next.min));
                     } else if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
@@ -2136,7 +2136,7 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
             )
         })
         .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
-    egui::ViewportBuilder::default()
+    let builder = egui::ViewportBuilder::default()
         // Unique title: Windows' strip_undecorated_frame keys its chrome
         // strip on it ("PixMe" is already the invisible anchor's title —
         // and clearing a taskbar-bearing title would blank its button).
@@ -2149,7 +2149,10 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
         .with_taskbar(false)
         .with_active(true)
         .with_inner_size(size)
-        .with_position(pos)
+        .with_position(pos);
+    #[cfg(target_os = "windows")]
+    let builder = builder.with_visible(false);
+    builder
 }
 
 /// A pinned capture: borderless, transparent, always on top, not a

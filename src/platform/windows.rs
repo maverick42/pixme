@@ -262,10 +262,6 @@ pub fn strip_undecorated_frame() {
     enum Role {
         CardWithMargin,
         Pin,
-        /// Fullscreen capture overlay (`"PixMe Overlay"`): strip chrome
-        /// only — no window region. The card's 2 px top clip exists for
-        /// its empty transparent margin; on the overlay it would eat real
-        /// pixels of the frozen frame.
         Overlay,
     }
 
