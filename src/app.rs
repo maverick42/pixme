@@ -585,26 +585,50 @@ impl Shared {
             Command::ConfirmCapture => self.confirm_capture(ctx),
             Command::CancelCapture => self.cancel_capture(ctx),
             Command::ShowBar => {
-                // Always open the floating bar top-centred on the monitor
-                // where the mouse currently is.
-                if let Some(m) = platform::cursor_position()
-                    .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
-                    .or_else(|| monitor_under(ctx))
-                    .or_else(|| crate::capture::screen::primary_monitor().ok())
-                {
-                    let scale = m.scale_factor.max(1.0);
-                    let origin =
-                        platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
-                    let size = platform::native_to_ui(
-                        egui::pos2(m.rect.width as f32, m.rect.height as f32),
-                        scale,
-                    )
-                    .to_vec2();
-                    *lock(&self.bar_pos) = Some(egui::pos2(
-                        origin.x + (size.x - 340.0) / 2.0,
-                        origin.y + size.y * 0.12,
-                    ));
-                    lock(&self.toolbar).place_on_monitor(m);
+                // The bar reopens where the user last dragged it — and on
+                // that monitor. A stale spot (display unplugged since, or a
+                // first-ever show) falls back to top-centre on the monitor
+                // under the mouse.
+                let remembered_monitor = (*lock(&self.bar_pos)).and_then(|pos| {
+                    crate::capture::screen::monitors()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|m| {
+                            let scale = m.scale_factor.max(1.0);
+                            let native = platform::ui_to_native(pos, scale);
+                            let r = &m.rect;
+                            native.x >= r.x as f32
+                                && native.x < r.x as f32 + r.width as f32
+                                && native.y >= r.y as f32
+                                && native.y < r.y as f32 + r.height as f32
+                        })
+                });
+                // `place_on_monitor` asks `sync_viewport` to re-centre the
+                // bar on that monitor next frame — only wanted on the
+                // fallback path, never over a remembered spot.
+                if remembered_monitor.is_none() {
+                    *lock(&self.bar_pos) = None;
+                    if let Some(m) = platform::cursor_position()
+                        .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
+                        .or_else(|| monitor_under(ctx))
+                        .or_else(|| crate::capture::screen::primary_monitor().ok())
+                    {
+                        let scale = m.scale_factor.max(1.0);
+                        let origin = platform::native_to_ui(
+                            egui::pos2(m.rect.x as f32, m.rect.y as f32),
+                            scale,
+                        );
+                        let size = platform::native_to_ui(
+                            egui::pos2(m.rect.width as f32, m.rect.height as f32),
+                            scale,
+                        )
+                        .to_vec2();
+                        *lock(&self.bar_pos) = Some(egui::pos2(
+                            origin.x + (size.x - 340.0) / 2.0,
+                            origin.y + size.y * 0.12,
+                        ));
+                        lock(&self.toolbar).place_on_monitor(m);
+                    }
                 }
                 self.enter(AppState::Bar, ctx);
             }
