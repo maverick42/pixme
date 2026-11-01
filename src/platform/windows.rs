@@ -165,7 +165,12 @@ pub fn relabel_menus() {
 /// Greys out tray menu items whose command is forbidden under `modal`
 /// (same [`crate::app::is_command_enabled`] table as the macOS menus).
 /// Called from `Shared::pump`, always on the main thread.
-pub fn sync_menu_enabled(modal: crate::app::ModalState) {
+pub fn sync_menu_enabled(
+    modal: crate::app::ModalState,
+    _has_doc: bool,
+    _has_file: bool,
+    _has_last_dir: bool,
+) {
     INSTALLED.with(|cell| {
         if let Some(installed) = &*cell.borrow() {
             for (item, _key, id) in &installed.items {

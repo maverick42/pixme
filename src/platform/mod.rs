@@ -139,8 +139,14 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
         "file.save" => Command::SaveActive,
         "file.save_all" => Command::SaveAll,
         "file.rename" => Command::RenameActive,
+        "file.delete" => Command::DeleteFileActive,
+        "file.open_last_dir" => Command::OpenLastDir,
         "file.print" => Command::PrintActive,
+        "capture.launch" => Command::ShowBar,
         "quit" => Command::Quit,
+        id if id.starts_with("recent:") => {
+            Command::OpenPath(std::path::PathBuf::from(&id["recent:".len()..]))
+        }
         _ => return None,
     })
 }
@@ -154,6 +160,14 @@ pub use macos::sync_menu_enabled;
 /// Greys out menu items (see above).
 #[cfg(target_os = "windows")]
 pub use windows::sync_menu_enabled;
+
+/// Rebuilds the File ▸ Recents submenu when the list changed (see above).
+#[cfg(target_os = "macos")]
+pub use macos::sync_recent_menu;
+/// No-op on Windows: its menus are egui-drawn every frame.
+#[cfg(target_os = "windows")]
+#[inline]
+pub fn sync_recent_menu(_recents: &[std::path::PathBuf]) {}
 
 /// Strips `WS_CAPTION` from undecorated floating windows to prevent
 /// the compositor offset (PhotoCraft #2246 fix; no-op on macOS).

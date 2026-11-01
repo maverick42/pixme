@@ -1228,6 +1228,27 @@ impl Viewer {
 
     /// Deletes `tab`'s file on disk — the tab itself stays open, now
     /// unsaved again (the file it pointed at is gone).
+    /// The active tab has a file on disk (`File ▸ Supprimer le fichier`
+    /// and the tab menu's entry both gate on this).
+    pub fn active_has_file(&self) -> bool {
+        self.active_index()
+            .and_then(|i| self.tabs.get(i))
+            .is_some_and(|t| t.doc.meta.source_path.is_some())
+    }
+
+    /// Opens the "Supprimer le fichier" confirmation on the active tab —
+    /// same entry point as the tab context menu's item.
+    pub fn open_delete_file_dialog(&mut self) {
+        if let Some(tab) = self.active_index()
+            && self
+                .tabs
+                .get(tab)
+                .is_some_and(|t| t.doc.meta.source_path.is_some())
+        {
+            self.confirm_delete = Some(DeleteFileDialog { tab, error: None });
+        }
+    }
+
     fn delete_tab_file(&mut self, tab: usize) -> Result<(), std::io::Error> {
         let Some(path) = self
             .tabs
@@ -2233,10 +2254,11 @@ impl Viewer {
                         menu_item_icon(
                             ui,
                             shared,
-                            Command::DeleteActive,
+                            Command::DeleteFileActive,
                             t!("menu.file.delete").as_ref(),
                             Some(Icon::X),
-                            has_doc && shared.command_enabled(&Command::DeleteActive),
+                            self.active_has_file()
+                                && shared.command_enabled(&Command::DeleteFileActive),
                         );
                         ui.separator();
                         recent_submenu(ui, shared);

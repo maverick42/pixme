@@ -120,6 +120,9 @@ pub enum Command {
     CopyActive,
     /// Delete the active document from the session.
     DeleteActive,
+    /// Delete the active document's file on disk (the tab's "Supprimer
+    /// le fichier" — confirmation dialog, greyed unless it has one).
+    DeleteFileActive,
     /// Open the Draw (Dessiner) editor on the active document.
     OpenDraw,
     /// Revert the newest pixel mutation of the active document.
@@ -224,6 +227,7 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         Command::OpenViewer => modal == ModalState::Settings,
         // Everything else is blocked while a modal owns the UI.
         Command::DeleteActive
+        | Command::DeleteFileActive
         | Command::Capture(_)
         | Command::CaptureNow(_)
         | Command::ShowBar
@@ -398,7 +402,7 @@ pub struct Shared {
     last_language: Mutex<Language>,
     /// Last modal state pushed to the OS menus — diffs drive the
     /// enable/disable sync so menu greying tracks every transition.
-    last_modal: Mutex<ModalState>,
+    last_menu_sync: Mutex<(ModalState, bool, bool, bool)>,
     /// An in-viewer dialog (rename, resize, protection, delete-file,
     /// unsaved confirm, dup names) is up — synced every viewer pass so
     /// `modal_state()` never locks the viewer while `viewer.show` holds
@@ -532,20 +536,35 @@ impl Shared {
             i18n::apply(language);
             platform::relabel_menus();
         }
-        // Menu enable state follows every modal transition — opened via
-        // commands, closed via window chrome, Escape or programmatic
-        // clears all funnel into `modal_state()` read here. `pump` only
-        // runs on viewport passes, i.e. the main thread, which is where
-        // the thread_local muda handles live.
+        // Menu enable state follows every modal transition AND the
+        // document/last-dir gates the doc-bound entries depend on (a tab
+        // opening or closing changes neither modal): the sync input is
+        // the whole tuple, compared each pass. `pump` only runs on
+        // viewport passes, i.e. the main thread, where the thread_local
+        // muda handles live.
         let modal = self.modal_state();
-        let mut last_modal = lock(&self.last_modal);
-        if *last_modal != modal {
-            *last_modal = modal;
-            platform::sync_menu_enabled(modal);
+        let (has_doc, has_file) = {
+            let viewer = lock(&self.viewer);
+            (viewer.active_index().is_some(), viewer.active_has_file())
+        };
+        let has_last_dir = {
+            let s = lock(&self.settings);
+            s.last_open_dir.is_some() || s.last_save_dir.is_some()
+        };
+        let sync = (modal, has_doc, has_file, has_last_dir);
+        let mut last_menu_sync = lock(&self.last_menu_sync);
+        if *last_menu_sync != sync {
+            *last_menu_sync = sync;
+            platform::sync_menu_enabled(modal, has_doc, has_file, has_last_dir);
             ctx.request_repaint_of(egui::ViewportId::ROOT);
             ctx.repaint_if_live(viewer_id());
             ctx.repaint_if_live(bar_id());
         }
+        // Recent files change without a modal transition (open/save
+        // succeeds, history cleared): the macOS File menu is native and
+        // must be re-synced explicitly — a no-op on Windows, whose menus
+        // are egui-drawn every frame.
+        platform::sync_recent_menu(&lock(&self.settings).recent_files);
         // A background session restore lands here — swap the empty
         // session for the loaded tabs and drop the spinner.
         let done = lock(&self.restore_rx)
@@ -691,8 +710,11 @@ impl Shared {
             }
             Command::CloseBar => {
                 // Back where the user came from: the viewer when the session
-                // has captures, the resident icon otherwise.
-                if lock(&self.viewer).tabs.is_empty() {
+                // has captures, the resident icon otherwise. The guard is
+                // bound out of the `if` scrutinee: `enter(Viewer)` re-locks
+                // `viewer` and a live scrutinee guard would deadlock.
+                let empty = lock(&self.viewer).tabs.is_empty();
+                if empty {
                     self.enter(AppState::Idle, ctx);
                 } else {
                     self.enter(AppState::Viewer, ctx);
@@ -934,10 +956,18 @@ impl Shared {
                 }
             }
             Command::DeleteActive => {
-                if let Some(i) = lock(&self.viewer).active_index() {
+                // Bind first: the scrutinee's MutexGuard would otherwise
+                // live for the whole `if let` body and the second lock
+                // would deadlock on the same thread.
+                let active = lock(&self.viewer).active_index();
+                if let Some(i) = active {
                     lock(&self.viewer).close_tabs(&[i]);
                     tracing::info!("tab deleted");
                 }
+            }
+            Command::DeleteFileActive => {
+                lock(&self.viewer).open_delete_file_dialog();
+                ctx.repaint_if_live(viewer_id());
             }
             Command::OpenDraw => {
                 if lock(&self.draw).is_none()
@@ -1694,7 +1724,7 @@ impl PixMeApp {
             shared: Arc::new(Shared {
                 state: Mutex::new(AppState::Idle),
                 last_language: Mutex::new(settings.language),
-                last_modal: Mutex::new(ModalState::None),
+                last_menu_sync: Mutex::new((ModalState::None, false, false, false)),
                 viewer_dialog_open: AtomicBool::new(false),
                 settings: Mutex::new(settings),
                 viewer: Mutex::new(Viewer::default()),
@@ -2471,7 +2501,7 @@ mod tests {
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
-            last_modal: Mutex::new(ModalState::None),
+            last_menu_sync: Mutex::new((ModalState::None, false, false, false)),
             viewer_dialog_open: AtomicBool::new(false),
             startup_notice: Mutex::new(None),
         };
