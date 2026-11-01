@@ -340,6 +340,8 @@ pub struct Shared {
     pub bar_rect: Mutex<Option<egui::Rect>>,
     /// Whether the settings window is open.
     pub settings_open: AtomicBool,
+    /// The Windows About modal is open (egui twin of the native panel).
+    pub about_open: AtomicBool,
     /// The editable copy shown by the settings window — written back to
     /// `settings` only on OK; Annuler/close drops it untouched.
     pub settings_draft: Mutex<Option<Settings>>,
@@ -463,7 +465,9 @@ impl Shared {
             ModalState::Draw
         } else if lock(&self.save_dialog).is_some() {
             ModalState::SaveDialog
-        } else if self.settings_open.load(Ordering::Relaxed) {
+        } else if self.settings_open.load(Ordering::Relaxed) || self.about_open.load(Ordering::Relaxed) {
+            // The About modal is modal to the viewer too: the dimmed veil
+            // + click-eater cover the panel until OK / cross / Esc.
             ModalState::Settings
         } else if self.viewer_dialog_open.load(Ordering::Relaxed) {
             ModalState::ViewerDialog
@@ -702,8 +706,13 @@ impl Shared {
                 self.enter(AppState::Idle, ctx);
             }
             Command::OpenAbout => {
-                ui::settings::open_about(ctx);
-                self.dispatch(Command::OpenSettings, ctx);
+                // macOS keeps its native About panel in the PixMe menu;
+                // Windows opens the egui twin of that panel.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.about_open.store(true, Ordering::Relaxed);
+                    ctx.repaint_if_live(viewer_id());
+                }
             }
             Command::OpenSettings => {
                 if self.settings_open.load(Ordering::Relaxed) {
@@ -1695,6 +1704,7 @@ impl PixMeApp {
                 bar_pos: Mutex::new(None),
                 bar_rect: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
+            about_open: AtomicBool::new(false),
                 settings_draft: Mutex::new(None),
                 capture: Mutex::new(None),
                 countdown: Mutex::new(None),
@@ -1862,6 +1872,161 @@ impl eframe::App for PixMeApp {
                             });
                         if !open {
                             *lock(&shared.startup_notice) = None;
+                        }
+                    }
+                    // Windows About modal — the egui twin of the macOS
+                    // native About panel, framed like the settings modal:
+                    // title band with a painted close cross, compact body.
+                    if shared.about_open.load(Ordering::Relaxed) {
+                        let mut open = true;
+                        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            open = false;
+                        }
+                        egui::Area::new(egui::Id::new("pixme.about_modal"))
+                            .order(egui::Order::Foreground)
+                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                            .show(&ctx, |ui| {
+                                let t = crate::ui::theme::tokens(&ctx);
+                                egui::Frame::default()
+                                    .fill(t.dock)
+                                    .stroke(egui::Stroke::new(1.0, t.card_border))
+                                    .corner_radius(egui::CornerRadius::same(t.radius_lg))
+                                    .show(ui, |ui| {
+                                        ui.set_width(300.0);
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        // Title band: "À propos" + close cross.
+                                        egui::Frame::default()
+                                            .inner_margin(egui::Margin::symmetric(10, 6))
+                                            .fill(t.card)
+                                            .corner_radius(egui::CornerRadius {
+                                                nw: t.radius_lg,
+                                                ne: t.radius_lg,
+                                                sw: 0,
+                                                se: 0,
+                                            })
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            t!("menu.help.about").to_string(),
+                                                        )
+                                                        .color(t.text)
+                                                        .strong(),
+                                                    );
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            let (rect, resp) = ui
+                                                                .allocate_exact_size(
+                                                                    egui::Vec2::splat(20.0),
+                                                                    egui::Sense::click(),
+                                                                );
+                                                            if ui.is_rect_visible(rect) {
+                                                                let hovered = resp.hovered();
+                                                                if hovered {
+                                                                    let fill = egui::Color32::from_rgba_unmultiplied(
+                                                                        t.danger.r(),
+                                                                        t.danger.g(),
+                                                                        t.danger.b(),
+                                                                        34,
+                                                                    );
+                                                                    ui.painter().rect_filled(
+                                                                        rect,
+                                                                        egui::CornerRadius::same(t.radius_sm),
+                                                                        fill,
+                                                                    );
+                                                                }
+                                                                crate::ui::icons::paint(
+                                                                    ui,
+                                                                    rect,
+                                                                    crate::ui::icons::Icon::X,
+                                                                    if hovered { 14.0 } else { 12.0 },
+                                                                    if hovered { t.danger } else { t.icon },
+                                                                );
+                                                            }
+                                                            if resp.clicked() {
+                                                                open = false;
+                                                            }
+                                                        },
+                                                    );
+                                                });
+                                            });
+                                        egui::Frame::default()
+                                            .inner_margin(egui::Margin::same(16))
+                                            .show(ui, |ui| {
+                                                ui.vertical_centered(|ui| {
+                                                    // Full-bleed 256 artwork
+                                                    // (the window icon) — the
+                                                    // 1024 dock master carries
+                                                    // margins + shadow and reads
+                                                    // as "no icon" at 64 px.
+                                                    let icon_rgba =
+                                                        crate::ui::icons::app_icon_rgba(128);
+                                                    let icon_img =
+                                                        egui::ColorImage::from_rgba_unmultiplied(
+                                                            [128, 128],
+                                                            &icon_rgba,
+                                                        );
+                                                    let icon_tex = ctx.load_texture(
+                                                        "pixme://about-icon",
+                                                        icon_img,
+                                                        egui::TextureOptions::LINEAR,
+                                                    );
+                                                    ui.image(egui::load::SizedTexture::new(
+                                                        icon_tex.id(),
+                                                        egui::vec2(64.0, 64.0),
+                                                    ));
+                                                    ui.add_space(6.0);
+                                                    ui.label(
+                                                        egui::RichText::new("PixMe").font(
+                                                            crate::ui::theme::semibold(17.0),
+                                                        ),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "v{}",
+                                                            env!("CARGO_PKG_VERSION")
+                                                        ))
+                                                        .size(11.0),
+                                                    );
+                                                    ui.add_space(8.0);
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            t!("settings.about.copyright")
+                                                                .to_string(),
+                                                        )
+                                                        .size(10.5),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            t!("settings.about.license").to_string(),
+                                                        )
+                                                        .size(10.5),
+                                                    );
+                                                });
+                                                ui.add_space(10.0);
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if crate::ui::widgets::primary_button(
+                                                            ui,
+                                                            "OK",
+                                                        )
+                                                        .clicked()
+                                                        {
+                                                            open = false;
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                    });
+                            });
+                        if !open {
+                            shared.about_open.store(false, Ordering::Relaxed);
                         }
                     }
                 });
@@ -2287,6 +2452,7 @@ mod tests {
             bar_pos: Mutex::new(None),
             bar_rect: Mutex::new(None),
             settings_open: AtomicBool::new(false),
+            about_open: AtomicBool::new(false),
             settings_draft: Mutex::new(None),
             capture: Mutex::new(None),
             countdown: Mutex::new(None),

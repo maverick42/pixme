@@ -502,8 +502,12 @@ mod tests {
         ] {
             std::fs::write(dir.join(&name), b"x").unwrap();
         }
-        // panic.log has no date in its name: age it via mtime.
-        std::fs::File::open(dir.join("pixme.panic.log"))
+        // panic.log has no date in its name: age it via mtime. On
+        // Windows `SetFileTime` needs a write-attributes handle, so open
+        // with write access (a read-only `File::open` denies).
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("pixme.panic.log"))
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(6 * 86_400))
             .unwrap();

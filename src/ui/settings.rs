@@ -12,7 +12,7 @@ use rust_i18n::t;
 use crate::app::{Shared, lock};
 use crate::config::{Appearance, DbRetention, Settings};
 use crate::i18n::Language;
-use crate::ui::icons::{self, Icon};
+use crate::ui::icons::Icon;
 use crate::ui::{theme, widgets};
 
 /// Which settings page the sidebar shows.
@@ -23,19 +23,13 @@ pub enum SettingsPage {
     General,
     /// The saved-file filename template and its editable presets.
     Filename,
-    /// App version and bundled third-party notices.
-    About,
+    /// Data and log folder locations, diagnostics bundle.
+    Folders,
 }
 
 /// egui-temp keys: the active page, and a draft parked behind the
 /// "captures will be lost" confirmation.
 const PAGE_KEY: &str = "pixme.settings_page";
-
-/// Opens the settings modal landing on the About page — the egui twin of
-/// the macOS native About panel. Called right before `OpenSettings`.
-pub fn open_about(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new(PAGE_KEY), SettingsPage::About));
-}
 const PENDING_DRAFT: &str = "pixme.pending_settings_draft";
 
 /// Draws the settings pages inside the viewer's modal settings window.
@@ -58,11 +52,18 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
             sidebar(ui, &mut page);
             widgets::vline(ui, 140.0);
             ui.add_space(8.0);
-            match page {
-                SettingsPage::General => general_page(ui, draft),
-                SettingsPage::Filename => filename_page(ui, draft),
-                SettingsPage::About => about_page(ui),
-            }
+            // Constant 140 px content box: keeps the Annuler/OK row at the
+            // exact same vertical position across all three pages without
+            // layout feedback loops.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 140.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| match page {
+                    SettingsPage::General => general_page(ui, draft),
+                    SettingsPage::Filename => filename_page(ui, draft),
+                    SettingsPage::Folders => folders_page(ui),
+                },
+            );
         });
     }
     ui.ctx()
@@ -95,10 +96,12 @@ fn sidebar(ui: &mut egui::Ui, page: &mut SettingsPage) {
     ui.vertical(|ui| {
         ui.set_width(110.0);
         ui.add_space(4.0);
+        // A few pixels of air between the page options.
+        ui.spacing_mut().item_spacing.y = 4.0;
         for (value, key) in [
             (SettingsPage::General, "settings.page.general"),
             (SettingsPage::Filename, "settings.page.filename"),
-            (SettingsPage::About, "settings.page.about"),
+            (SettingsPage::Folders, "settings.page.folders"),
         ] {
             if ui
                 .selectable_label(*page == value, t!(key).to_string())
@@ -212,48 +215,12 @@ fn filename_page(ui: &mut egui::Ui, draft: &mut Settings) {
     });
 }
 
-/// About page: the app icon, name, version, copyright and license, then
-/// the third-party notices shipped in `THIRD_PARTY_NOTICES.md`
-/// (embedded — readable offline, in-app).
-fn about_page(ui: &mut egui::Ui) {
+/// "Dossiers" page: the data and log folder locations — copyable,
+/// openable in the OS file manager — plus the diagnostics bundle.
+fn folders_page(ui: &mut egui::Ui) {
     let t = theme::tokens(ui.ctx());
     ui.vertical(|ui| {
         ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.add_space(10.0);
-            ui.image(egui::load::SizedTexture::new(
-                icons::app_icon_texture(ui.ctx()).id,
-                egui::vec2(88.0, 88.0),
-            ));
-            ui.add_space(12.0);
-            ui.vertical(|ui| {
-                ui.add_space(16.0);
-                ui.label(
-                    egui::RichText::new("PixMe")
-                        .font(theme::semibold(17.0))
-                        .color(t.text),
-                );
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .size(11.0)
-                        .color(t.text_dim),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(t!("settings.about.copyright").to_string())
-                        .size(10.5)
-                        .color(t.text_dim),
-                );
-                ui.label(
-                    egui::RichText::new(t!("settings.about.license").to_string())
-                        .size(10.5)
-                        .color(t.text_faint),
-                );
-            });
-        });
-        ui.add_space(10.0);
-        // Data + logs locations — copyable, openable in the OS file
-        // manager, and the one-click diagnostics bundle next to them.
         folder_row(
             ui,
             &t!("settings.about.data_folder"),
@@ -276,26 +243,6 @@ fn about_page(ui: &mut egui::Ui) {
                 .size(10.5)
                 .color(t.text_faint),
         );
-        ui.add_space(12.0);
-        ui.label(
-            egui::RichText::new(t!("settings.about.notices").to_string())
-                .color(t.text)
-                .strong(),
-        );
-        ui.add_space(4.0);
-        widgets::hairline(ui);
-        egui::ScrollArea::vertical()
-            .id_salt("settings.about.scroll")
-            .max_height(240.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(THIRD_PARTY_NOTICES)
-                        .monospace()
-                        .size(10.5)
-                        .color(t.text_dim),
-                );
-            });
     });
 }
 
@@ -328,9 +275,6 @@ fn folder_row(ui: &mut egui::Ui, label: &str, path: &std::path::Path, open_key: 
     });
 }
 
-/// `THIRD_PARTY_NOTICES.md`, embedded so the About page works offline
-/// and the file ships inside the binary.
-const THIRD_PARTY_NOTICES: &str = include_str!("../../THIRD_PARTY_NOTICES.md");
 
 /// Writes the draft back and persists it — unless the new retention
 /// would lose stored captures, which parks the draft behind the confirm

@@ -1829,7 +1829,7 @@ impl Viewer {
                                 });
                             });
                         egui::Frame::default()
-                            .inner_margin(Margin::symmetric(14, 0))
+                            .inner_margin(Margin { left: 14, right: 14, top: 4, bottom: 12 })
                             .show(ui, |ui| crate::ui::settings::show(ui, shared));
                     });
             });
@@ -2228,9 +2228,7 @@ impl Viewer {
                 );
             });
             menu_button(ui, t!("menu.help").as_ref(), |ui| {
-                // Aide currently lands on the About page (no online docs
-                // yet) — the website entry stays greyed until it exists.
-                menu_item_icon(ui, shared, Command::OpenAbout, t!("menu.help.help").as_ref(), None, shared.command_enabled(&Command::OpenAbout));
+                // The website entry stays greyed until it exists.
                 menu_item_icon(ui, shared, Command::OpenViewer, t!("menu.help.visit_site").as_ref(), None, false);
                 ui.separator();
                 menu_item_icon(ui, shared, Command::OpenAbout, t!("menu.help.about").as_ref(), None, shared.command_enabled(&Command::OpenAbout));
