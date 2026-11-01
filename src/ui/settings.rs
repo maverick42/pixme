@@ -250,28 +250,45 @@ fn folders_page(ui: &mut egui::Ui) {
 /// hover), a copy button and an open-in-file-manager button.
 fn folder_row(ui: &mut egui::Ui, label: &str, path: &std::path::Path, open_key: &'static str) {
     let t = theme::tokens(ui.ctx());
+    let path_text = path.display().to_string();
     ui.horizontal(|ui| {
+        // Natural label — the value starts right after it, same gap as
+        // the "Modèle :" row of the Filename page.
         ui.label(
             egui::RichText::new(label)
                 .size(10.5)
                 .color(t.text_dim)
                 .strong(),
         );
-        widgets::elided_label(ui, path.display().to_string())
-            .on_hover_text(path.display().to_string());
-        if widgets::icon_button(ui, Icon::Copy, false)
-            .on_hover_text(t!("settings.about.copy_path").to_string())
-            .clicked()
-        {
-            ui.ctx().copy_text(path.display().to_string());
-        }
-        if widgets::icon_button(ui, Icon::FolderOpen, false)
-            .on_hover_text(t!(open_key).to_string())
-            .clicked()
-        {
-            tracing::info!(folder = %crate::paths::file_name(path), "folder_opened");
-            crate::platform::open_folder(path);
-        }
+        ui.add_space(2.0);
+        // Fixed-width truncating path (full path on hover): the icons
+        // stay at a fixed right position on both rows and long paths
+        // never stretch the window.
+        ui.add_sized(
+            [220.0, 16.0],
+            egui::Label::new(
+                egui::RichText::new(&path_text)
+                    .size(10.5)
+                    .color(t.text),
+            )
+            .truncate(),
+        )
+        .on_hover_text(&path_text);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::icon_button(ui, Icon::FolderOpen, false)
+                .on_hover_text(t!(open_key).to_string())
+                .clicked()
+            {
+                tracing::info!(folder = %crate::paths::file_name(path), "folder_opened");
+                crate::platform::open_folder(path);
+            }
+            if widgets::icon_button(ui, Icon::Copy, false)
+                .on_hover_text(t!("settings.about.copy_path").to_string())
+                .clicked()
+            {
+                ui.ctx().copy_text(path_text.clone());
+            }
+        });
     });
 }
 
