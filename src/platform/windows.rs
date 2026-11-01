@@ -35,15 +35,14 @@ impl PlatformServices for Windows {
     }
 }
 
-/// Windows parity with the permanent macOS Dock icon: the invisible anchor
-/// viewport keeps a taskbar button (clicking it focuses the app, shows
-/// nothing — same dead behaviour as the launcher's Dock icon). The viewer
-/// still gets its own taskbar button while open.
+/// The 1×1 invisible anchor viewport gets NO taskbar button: on Windows a
+/// resident app lives in the notification area (the tray icon), and an
+/// extra taskbar entry would surface an empty ghost window in the taskbar
+/// and Alt+Tab. The viewer still gets its own taskbar button while open.
 pub fn apply_native_options(options: &mut eframe::NativeOptions) {
     options.viewport = options
         .viewport
         .clone()
-        .with_taskbar(true)
         .with_icon(icons::app_icon_data());
 }
 
