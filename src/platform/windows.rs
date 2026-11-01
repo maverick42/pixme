@@ -710,17 +710,64 @@ pub fn cursor_position() -> Option<(f32, f32)> {
     }
 }
 
-/// One short tick — the system "Asterisk" sound via `MessageBeep`
-/// (respects the sound scheme and volume).
+/// One short tick — a soft click synthesized once in memory and played
+/// through `PlaySoundW` (`SND_MEMORY` keeps it file-free and independent
+/// of the user's sound scheme). `MessageBeep` falls back if playback
+/// fails.
 pub fn tick() {
-    const MB_ICONASTERISK: u32 = 0x40;
+    use std::sync::OnceLock;
+
+    const SND_ASYNC: u32 = 0x0001;
+    const SND_NODEFAULT: u32 = 0x0002;
+    const SND_MEMORY: u32 = 0x0004;
+    const MB_OK: u32 = 0x0;
+
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn PlaySoundW(sound: *const u8, hmod: isize, flags: u32) -> i32;
+    }
     #[link(name = "user32")]
     unsafe extern "system" {
         fn MessageBeep(u_type: u32) -> i32;
     }
-    unsafe {
-        MessageBeep(MB_ICONASTERISK);
+
+    static WAV: OnceLock<Vec<u8>> = OnceLock::new();
+    let wav = WAV.get_or_init(tick_wav);
+    if unsafe { PlaySoundW(wav.as_ptr(), 0, SND_MEMORY | SND_ASYNC | SND_NODEFAULT) } == 0 {
+        unsafe { MessageBeep(MB_OK) };
     }
+}
+
+/// Builds the tick sample: a 2.2 kHz sine burst under an exponential
+/// decay (~250 ms) — a soft metronome-like click, 22.05 kHz 16-bit mono
+/// PCM in a standard RIFF/WAVE wrapper. NOTE: anything under ~100 ms is
+/// swallowed silently by RDP audio redirection on some setups, hence the
+/// generous decay tail.
+fn tick_wav() -> Vec<u8> {
+    const RATE: u32 = 22_050;
+    const MS: usize = 300;
+    let frames = RATE as usize * MS / 1000;
+    let data_bytes = (frames * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for i in 0..frames {
+        let t = i as f32 / RATE as f32;
+        let env = (-25.0 * t).exp();
+        let s = (t * 2.0 * std::f32::consts::PI * 2200.0).sin() * env * 0.8;
+        wav.extend_from_slice(&((s * i16::MAX as f32) as i16).to_le_bytes());
+    }
+    wav
 }
 
 /// Captures the current OS mouse cursor via `GetCursorInfo` + `GetIconInfo`
