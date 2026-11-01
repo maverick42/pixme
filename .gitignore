@@ -33,3 +33,6 @@ data/
 logs/
 prefs.json
 *.log
+
+# Local per-machine notes (build env, personal TODOs) — never committed
+*.local.md

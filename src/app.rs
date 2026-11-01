@@ -89,6 +89,9 @@ pub enum Command {
     ViewerClosed,
     /// Open the settings window.
     OpenSettings,
+    /// Open the settings window on the About page (egui twin of the
+    /// macOS native About panel).
+    OpenAbout,
     /// The settings window was closed.
     CloseSettings,
     /// Application quit (menu only — never a window-close side effect).
@@ -115,6 +118,8 @@ pub enum Command {
     RenameActive,
     /// Copy the active document to the clipboard.
     CopyActive,
+    /// Delete the active document from the session.
+    DeleteActive,
     /// Open the Draw (Dessiner) editor on the active document.
     OpenDraw,
     /// Revert the newest pixel mutation of the active document.
@@ -215,10 +220,11 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         // Re-invoking the open modal's entry re-focuses it instead of
         // re-opening. When the SETTINGS modal is up the same menu click
         // brings it forward.
-        Command::OpenSettings => modal == ModalState::Settings,
+        Command::OpenSettings | Command::OpenAbout => modal == ModalState::Settings,
         Command::OpenViewer => modal == ModalState::Settings,
         // Everything else is blocked while a modal owns the UI.
-        Command::Capture(_)
+        Command::DeleteActive
+        | Command::Capture(_)
         | Command::CaptureNow(_)
         | Command::ShowBar
         | Command::ImportClipboard
@@ -270,9 +276,37 @@ fn draw_id() -> egui::ViewportId {
 /// sits behind a visible window.
 pub fn wake_viewports(ctx: &egui::Context) {
     ctx.request_repaint_of(egui::ViewportId::ROOT);
-    ctx.request_repaint_of(viewer_id());
-    ctx.request_repaint_of(bar_id());
-    ctx.request_repaint_of(draw_id());
+    ctx.repaint_if_live(viewer_id());
+    ctx.repaint_if_live(bar_id());
+    ctx.repaint_if_live(draw_id());
+}
+
+/// `Context::request_repaint_of` and `Context::send_viewport_cmd_to` on a
+/// viewport id whose window does not exist insert a *default-built*
+/// `ViewportState` (decorated, titled "egui window") into `ctx.viewports`.
+/// When a later non-root pass emits it in `viewport_output`, eframe
+/// materializes it as a real window for a frame — the "egui window" flash
+/// seen between the capture click and the crosshair. These helpers no-op
+/// unless the window exists.
+trait ViewportWake {
+    /// `request_repaint_of(id)` only when `id`'s window exists.
+    fn repaint_if_live(&self, id: egui::ViewportId);
+    /// `send_viewport_cmd_to(id, cmd)` only when `id`'s window exists.
+    fn cmd_if_live(&self, id: egui::ViewportId, cmd: egui::ViewportCommand);
+}
+
+impl ViewportWake for egui::Context {
+    fn repaint_if_live(&self, id: egui::ViewportId) {
+        if self.input(|i| i.raw.viewports.contains_key(&id)) {
+            self.request_repaint_of(id);
+        }
+    }
+
+    fn cmd_if_live(&self, id: egui::ViewportId, cmd: egui::ViewportCommand) {
+        if self.input(|i| i.raw.viewports.contains_key(&id)) {
+            self.send_viewport_cmd_to(id, cmd);
+        }
+    }
 }
 
 /// Lock helper: recover a poisoned mutex rather than crash the UI thread.
@@ -306,6 +340,8 @@ pub struct Shared {
     pub bar_rect: Mutex<Option<egui::Rect>>,
     /// Whether the settings window is open.
     pub settings_open: AtomicBool,
+    /// The Windows About modal is open (egui twin of the native panel).
+    pub about_open: AtomicBool,
     /// The editable copy shown by the settings window — written back to
     /// `settings` only on OK; Annuler/close drops it untouched.
     pub settings_draft: Mutex<Option<Settings>>,
@@ -429,7 +465,9 @@ impl Shared {
             ModalState::Draw
         } else if lock(&self.save_dialog).is_some() {
             ModalState::SaveDialog
-        } else if self.settings_open.load(Ordering::Relaxed) {
+        } else if self.settings_open.load(Ordering::Relaxed) || self.about_open.load(Ordering::Relaxed) {
+            // The About modal is modal to the viewer too: the dimmed veil
+            // + click-eater cover the panel until OK / cross / Esc.
             ModalState::Settings
         } else if self.viewer_dialog_open.load(Ordering::Relaxed) {
             ModalState::ViewerDialog
@@ -471,6 +509,7 @@ impl Shared {
     /// top of every viewport pass so any visible window keeps dispatch alive.
     pub fn pump(&self, ctx: &egui::Context) {
         crate::logging::report_health();
+        platform::strip_undecorated_frame();
         let commands: Vec<Command> = platform::take_pending_commands()
             .into_iter()
             .chain(std::mem::take(&mut *lock(&self.pending)))
@@ -478,6 +517,7 @@ impl Shared {
         for command in &commands {
             self.dispatch(command.clone(), ctx);
         }
+
         if !commands.is_empty() {
             // Wake the anchor so it (de)registers the child viewports whose
             // state just changed.
@@ -501,8 +541,8 @@ impl Shared {
             *last_modal = modal;
             platform::sync_menu_enabled(modal);
             ctx.request_repaint_of(egui::ViewportId::ROOT);
-            ctx.request_repaint_of(viewer_id());
-            ctx.request_repaint_of(bar_id());
+            ctx.repaint_if_live(viewer_id());
+            ctx.repaint_if_live(bar_id());
         }
         // A background session restore lands here — swap the empty
         // session for the loaded tabs and drop the spinner.
@@ -512,7 +552,7 @@ impl Shared {
         if let Some((session, store)) = done {
             *lock(&self.restore_rx) = None;
             self.finish_restore(session, store);
-            ctx.request_repaint_of(viewer_id());
+            ctx.repaint_if_live(viewer_id());
         }
         // The quit-time save finished on its thread: the store comes
         // back and the app closes for real.
@@ -549,7 +589,7 @@ impl Shared {
                     self.finish_confirmation(ctx);
                 }
             }
-            ctx.request_repaint_of(viewer_id());
+            ctx.repaint_if_live(viewer_id());
         }
     }
 
@@ -584,26 +624,50 @@ impl Shared {
             Command::ConfirmCapture => self.confirm_capture(ctx),
             Command::CancelCapture => self.cancel_capture(ctx),
             Command::ShowBar => {
-                // Always open the floating bar top-centred on the monitor
-                // where the mouse currently is.
-                if let Some(m) = platform::cursor_position()
-                    .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
-                    .or_else(|| monitor_under(ctx))
-                    .or_else(|| crate::capture::screen::primary_monitor().ok())
-                {
-                    let scale = m.scale_factor.max(1.0);
-                    let origin =
-                        platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
-                    let size = platform::native_to_ui(
-                        egui::pos2(m.rect.width as f32, m.rect.height as f32),
-                        scale,
-                    )
-                    .to_vec2();
-                    *lock(&self.bar_pos) = Some(egui::pos2(
-                        origin.x + (size.x - 340.0) / 2.0,
-                        origin.y + size.y * 0.12,
-                    ));
-                    lock(&self.toolbar).place_on_monitor(m);
+                // The bar reopens where the user last dragged it — and on
+                // that monitor. A stale spot (display unplugged since, or a
+                // first-ever show) falls back to top-centre on the monitor
+                // under the mouse.
+                let remembered_monitor = (*lock(&self.bar_pos)).and_then(|pos| {
+                    crate::capture::screen::monitors()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|m| {
+                            let scale = m.scale_factor.max(1.0);
+                            let native = platform::ui_to_native(pos, scale);
+                            let r = &m.rect;
+                            native.x >= r.x as f32
+                                && native.x < r.x as f32 + r.width as f32
+                                && native.y >= r.y as f32
+                                && native.y < r.y as f32 + r.height as f32
+                        })
+                });
+                // `place_on_monitor` asks `sync_viewport` to re-centre the
+                // bar on that monitor next frame — only wanted on the
+                // fallback path, never over a remembered spot.
+                if remembered_monitor.is_none() {
+                    *lock(&self.bar_pos) = None;
+                    if let Some(m) = platform::cursor_position()
+                        .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
+                        .or_else(|| monitor_under(ctx))
+                        .or_else(|| crate::capture::screen::primary_monitor().ok())
+                    {
+                        let scale = m.scale_factor.max(1.0);
+                        let origin = platform::native_to_ui(
+                            egui::pos2(m.rect.x as f32, m.rect.y as f32),
+                            scale,
+                        );
+                        let size = platform::native_to_ui(
+                            egui::pos2(m.rect.width as f32, m.rect.height as f32),
+                            scale,
+                        )
+                        .to_vec2();
+                        *lock(&self.bar_pos) = Some(egui::pos2(
+                            origin.x + (size.x - 340.0) / 2.0,
+                            origin.y + size.y * 0.12,
+                        ));
+                        lock(&self.toolbar).place_on_monitor(m);
+                    }
                 }
                 self.enter(AppState::Bar, ctx);
             }
@@ -613,15 +677,15 @@ impl Shared {
                 // other apps, or minimized in the Dock) must still bring
                 // it forward: `enter` only requests focus on a state
                 // CHANGE, so de-minimize and focus explicitly here.
-                ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Minimized(false));
+                ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
                 // The direct Focus command both wakes the (possibly
                 // sleeping) viewport and, on macOS, activates the app
                 // (`activateIgnoringOtherApps` + `makeKeyAndOrderFront`)
                 // — a mere in-app focus request would do nothing while
                 // another application is frontmost.
-                ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Focus);
+                ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
                 self.request_focus(viewer_id());
-                ctx.request_repaint_of(viewer_id());
+                ctx.repaint_if_live(viewer_id());
             }
             Command::CloseBar => {
                 // Back where the user came from: the viewer when the session
@@ -641,13 +705,22 @@ impl Shared {
                 // lost, so the dirty warning is Quit-only.
                 self.enter(AppState::Idle, ctx);
             }
+            Command::OpenAbout => {
+                // macOS keeps its native About panel in the PixMe menu;
+                // Windows opens the egui twin of that panel.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.about_open.store(true, Ordering::Relaxed);
+                    ctx.repaint_if_live(viewer_id());
+                }
+            }
             Command::OpenSettings => {
                 if self.settings_open.load(Ordering::Relaxed) {
                     // Already open: re-invocation brings the existing
                     // modal to the front rather than re-opening it.
-                    ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Minimized(false));
+                    ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
                     self.request_focus(viewer_id());
-                    ctx.request_repaint_of(viewer_id());
+                    ctx.repaint_if_live(viewer_id());
                     return;
                 }
                 self.settings_open.store(true, Ordering::Relaxed);
@@ -659,12 +732,12 @@ impl Shared {
                 // The modal lives in the VIEWER's pass — repainting the
                 // anchor alone would leave an idle viewer asleep and the
                 // modal would wait for the next input event.
-                ctx.request_repaint_of(viewer_id());
+                ctx.repaint_if_live(viewer_id());
             }
             Command::CloseSettings => {
                 self.settings_open.store(false, Ordering::Relaxed);
                 *lock(&self.settings_draft) = None;
-                ctx.request_repaint_of(viewer_id());
+                ctx.repaint_if_live(viewer_id());
             }
             Command::Quit => {
                 // Quit is always live: close the non-Draw modals first so
@@ -788,11 +861,18 @@ impl Shared {
             }
             // Same picker, pre-opened in the last used folder.
             Command::OpenLastDir => {
-                let dir = lock(&self.settings)
-                    .last_open_dir
-                    .clone()
-                    .or_else(|| lock(&self.settings).last_save_dir.clone());
-                self.open_files(dir, ctx);
+                // Single settings lock — a second `lock()` inside
+                // `or_else` would deadlock on the same thread (the first
+                // guard lives until the end of the statement).
+                let dir = {
+                    let s = lock(&self.settings);
+                    s.last_open_dir
+                        .clone()
+                        .or_else(|| s.last_save_dir.clone())
+                };
+                if let Some(dir) = dir {
+                    platform::open_folder(&dir);
+                }
             }
             Command::NewDocument => {
                 // Blank white canvas — the functional reference's "New".
@@ -843,7 +923,7 @@ impl Shared {
                 lock(&self.viewer).open_rename();
                 // The dialog is painted by the viewer pass — menu-driven
                 // opens must wake it or it waits for the next OS event.
-                ctx.request_repaint_of(viewer_id());
+                ctx.repaint_if_live(viewer_id());
             }
             Command::CopyActive => {
                 if let Some(img) = lock(&self.viewer).copy_image() {
@@ -851,6 +931,12 @@ impl Shared {
                         Ok(()) => tracing::info!("clipboard_copy"),
                         Err(e) => tracing::warn!("copy failed: {e}"),
                     }
+                }
+            }
+            Command::DeleteActive => {
+                if let Some(i) = lock(&self.viewer).active_index() {
+                    lock(&self.viewer).close_tabs(&[i]);
+                    tracing::info!("tab deleted");
                 }
             }
             Command::OpenDraw => {
@@ -868,19 +954,19 @@ impl Shared {
             Command::UndoActive => {
                 if let Some(draw) = lock(&self.draw).as_mut() {
                     draw.undo_once();
-                    ctx.request_repaint_of(draw_id());
+                    ctx.repaint_if_live(draw_id());
                 } else {
                     lock(&self.viewer).undo_active();
-                    ctx.request_repaint_of(viewer_id());
+                    ctx.repaint_if_live(viewer_id());
                 }
             }
             Command::RedoActive => {
                 if let Some(draw) = lock(&self.draw).as_mut() {
                     draw.redo_once();
-                    ctx.request_repaint_of(draw_id());
+                    ctx.repaint_if_live(draw_id());
                 } else {
                     lock(&self.viewer).redo_active();
-                    ctx.request_repaint_of(viewer_id());
+                    ctx.repaint_if_live(viewer_id());
                 }
             }
             Command::PrintActive => {
@@ -960,6 +1046,7 @@ impl Shared {
             dialog = dialog.set_directory(dir);
         }
         let Some(paths) = dialog.pick_files() else {
+            ctx.request_repaint();
             return;
         };
         let mut opened = Vec::new();
@@ -1027,7 +1114,7 @@ impl Shared {
         if clash {
             tracing::warn!("save-all blocked: duplicate tab titles");
             viewer.dup_names = true;
-            ctx.request_repaint_of(viewer_id());
+            ctx.repaint_if_live(viewer_id());
             return false;
         }
         if viewer.tabs.iter().all(|t| t.saved) {
@@ -1079,7 +1166,7 @@ impl Shared {
             let _ = tx.send((tabs, saved_paths));
             wake.request_repaint();
         });
-        ctx.request_repaint_of(viewer_id());
+        ctx.repaint_if_live(viewer_id());
         false
     }
 
@@ -1458,7 +1545,7 @@ impl Shared {
             let _ = tx.send(store);
             wake.request_repaint();
         });
-        ctx.request_repaint_of(viewer_id());
+        ctx.repaint_if_live(viewer_id());
     }
 }
 
@@ -1617,6 +1704,7 @@ impl PixMeApp {
                 bar_pos: Mutex::new(None),
                 bar_rect: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
+            about_open: AtomicBool::new(false),
                 settings_draft: Mutex::new(None),
                 capture: Mutex::new(None),
                 countdown: Mutex::new(None),
@@ -1656,7 +1744,7 @@ impl PixMeApp {
         // capture bar showing at a previous quit) is closed explicitly.
         app.shared.enter(AppState::Viewer, &cc.egui_ctx);
         cc.egui_ctx
-            .send_viewport_cmd_to(bar_id(), egui::ViewportCommand::Close);
+            .cmd_if_live(bar_id(), egui::ViewportCommand::Close);
         app.tap_debug_capture(&cc.egui_ctx, debug_capture)
     }
 
@@ -1715,6 +1803,10 @@ impl eframe::App for PixMeApp {
                     if let Some(pos) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
                         *lock(&shared.bar_pos) = Some(pos);
                     }
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && lock(&shared.countdown).is_some() {
+                        *lock(&shared.countdown) = None;
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
                     let mut toolbar = lock(&shared.toolbar);
                     let mut settings = lock(&shared.settings);
                     toolbar.show(ui, &mut settings, &shared);
@@ -1725,9 +1817,8 @@ impl eframe::App for PixMeApp {
                 // If a capture just landed on a specific monitor, make sure
                 // the viewer opens on that monitor (preserving its relative
                 // placement / size when already known, or centring it there).
-                let target_mon = lock(&shared.viewer_target_monitor).take();
-                if let Some(ref m) = target_mon {
-                    let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), m);
+                if let Some(m) = lock(&shared.viewer_target_monitor).clone() {
+                    let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), &m);
                     *lock(&shared.viewer_rect) = Some(next);
                 }
                 let builder = viewer_builder(lock(&shared.viewer_rect).map(|r| r.min));
@@ -1735,8 +1826,9 @@ impl eframe::App for PixMeApp {
                     let ctx = ui.ctx().clone();
                     shared.pump(&ctx);
                     shared.maybe_focus(&ctx, viewer_id());
-                    if let Some(ref m) = target_mon {
-                        let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), m);
+                    let target = lock(&shared.viewer_target_monitor).take();
+                    if let Some(m) = target {
+                        let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), &m);
                         *lock(&shared.viewer_rect) = Some(next);
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(next.min));
                     } else if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
@@ -1748,7 +1840,7 @@ impl eframe::App for PixMeApp {
                     // eats it) brings the editor back in front — one
                     // command per click, no per-frame focus fight.
                     if lock(&shared.draw).is_some() && ctx.input(|i| i.pointer.any_pressed()) {
-                        ctx.send_viewport_cmd_to(draw_id(), egui::ViewportCommand::Focus);
+                        ctx.cmd_if_live(draw_id(), egui::ViewportCommand::Focus);
                     }
                     ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
                     lock(&shared.viewer).show(ui, &shared);
@@ -1780,6 +1872,161 @@ impl eframe::App for PixMeApp {
                             });
                         if !open {
                             *lock(&shared.startup_notice) = None;
+                        }
+                    }
+                    // Windows About modal — the egui twin of the macOS
+                    // native About panel, framed like the settings modal:
+                    // title band with a painted close cross, compact body.
+                    if shared.about_open.load(Ordering::Relaxed) {
+                        let mut open = true;
+                        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            open = false;
+                        }
+                        egui::Area::new(egui::Id::new("pixme.about_modal"))
+                            .order(egui::Order::Foreground)
+                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                            .show(&ctx, |ui| {
+                                let t = crate::ui::theme::tokens(&ctx);
+                                egui::Frame::default()
+                                    .fill(t.dock)
+                                    .stroke(egui::Stroke::new(1.0, t.card_border))
+                                    .corner_radius(egui::CornerRadius::same(t.radius_lg))
+                                    .show(ui, |ui| {
+                                        ui.set_width(300.0);
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        // Title band: "À propos" + close cross.
+                                        egui::Frame::default()
+                                            .inner_margin(egui::Margin::symmetric(10, 6))
+                                            .fill(t.card)
+                                            .corner_radius(egui::CornerRadius {
+                                                nw: t.radius_lg,
+                                                ne: t.radius_lg,
+                                                sw: 0,
+                                                se: 0,
+                                            })
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            t!("menu.help.about").to_string(),
+                                                        )
+                                                        .color(t.text)
+                                                        .strong(),
+                                                    );
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            let (rect, resp) = ui
+                                                                .allocate_exact_size(
+                                                                    egui::Vec2::splat(20.0),
+                                                                    egui::Sense::click(),
+                                                                );
+                                                            if ui.is_rect_visible(rect) {
+                                                                let hovered = resp.hovered();
+                                                                if hovered {
+                                                                    let fill = egui::Color32::from_rgba_unmultiplied(
+                                                                        t.danger.r(),
+                                                                        t.danger.g(),
+                                                                        t.danger.b(),
+                                                                        34,
+                                                                    );
+                                                                    ui.painter().rect_filled(
+                                                                        rect,
+                                                                        egui::CornerRadius::same(t.radius_sm),
+                                                                        fill,
+                                                                    );
+                                                                }
+                                                                crate::ui::icons::paint(
+                                                                    ui,
+                                                                    rect,
+                                                                    crate::ui::icons::Icon::X,
+                                                                    if hovered { 14.0 } else { 12.0 },
+                                                                    if hovered { t.danger } else { t.icon },
+                                                                );
+                                                            }
+                                                            if resp.clicked() {
+                                                                open = false;
+                                                            }
+                                                        },
+                                                    );
+                                                });
+                                            });
+                                        egui::Frame::default()
+                                            .inner_margin(egui::Margin::same(16))
+                                            .show(ui, |ui| {
+                                                ui.vertical_centered(|ui| {
+                                                    // Full-bleed 256 artwork
+                                                    // (the window icon) — the
+                                                    // 1024 dock master carries
+                                                    // margins + shadow and reads
+                                                    // as "no icon" at 64 px.
+                                                    let icon_rgba =
+                                                        crate::ui::icons::app_icon_rgba(128);
+                                                    let icon_img =
+                                                        egui::ColorImage::from_rgba_unmultiplied(
+                                                            [128, 128],
+                                                            &icon_rgba,
+                                                        );
+                                                    let icon_tex = ctx.load_texture(
+                                                        "pixme://about-icon",
+                                                        icon_img,
+                                                        egui::TextureOptions::LINEAR,
+                                                    );
+                                                    ui.image(egui::load::SizedTexture::new(
+                                                        icon_tex.id(),
+                                                        egui::vec2(64.0, 64.0),
+                                                    ));
+                                                    ui.add_space(6.0);
+                                                    ui.label(
+                                                        egui::RichText::new("PixMe").font(
+                                                            crate::ui::theme::semibold(17.0),
+                                                        ),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "v{}",
+                                                            env!("CARGO_PKG_VERSION")
+                                                        ))
+                                                        .size(11.0),
+                                                    );
+                                                    ui.add_space(8.0);
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            t!("settings.about.copyright")
+                                                                .to_string(),
+                                                        )
+                                                        .size(10.5),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            t!("settings.about.license").to_string(),
+                                                        )
+                                                        .size(10.5),
+                                                    );
+                                                });
+                                                ui.add_space(10.0);
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if crate::ui::widgets::primary_button(
+                                                            ui,
+                                                            "OK",
+                                                        )
+                                                        .clicked()
+                                                        {
+                                                            open = false;
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                    });
+                            });
+                        if !open {
+                            shared.about_open.store(false, Ordering::Relaxed);
                         }
                     }
                 });
@@ -1854,14 +2101,16 @@ impl eframe::App for PixMeApp {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                     return;
                 }
-                // Anchor the card under the floating bar when one is
-                // visible; otherwise it falls back to the cursor monitor.
-                let bar = (*lock(&shared.state) == AppState::Bar)
-                    .then(|| *lock(&shared.bar_rect))
-                    .flatten();
+                // The countdown parks on the monitor PixMe lives on: the
+                // floating bar's when it is up, the viewer's otherwise.
+                let anchor = if *lock(&shared.state) == AppState::Bar {
+                    *lock(&shared.bar_rect)
+                } else {
+                    *lock(&shared.viewer_rect)
+                };
                 let running = lock(&shared.countdown)
                     .as_mut()
-                    .is_some_and(|c| c.show(ui, bar));
+                    .is_some_and(|c| c.show(ui, anchor));
                 if !running && let Some(cd) = lock(&shared.countdown).take() {
                     shared.push(Command::CaptureNow(cd.mode));
                     // Wake the anchor pass: it unregisters this viewport
@@ -1925,7 +2174,7 @@ impl eframe::App for PixMeApp {
                 {
                     tracing::info!("draw_closed");
                     // The modal closed: the viewer gets focus back.
-                    ctx.send_viewport_cmd_to(viewer_id(), egui::ViewportCommand::Focus);
+                    ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
                     if outcome == crate::ui::draw::Outcome::Ok {
                         tracing::info!("draw_committed");
                         session.finalize_pending();
@@ -2003,7 +2252,7 @@ impl eframe::App for PixMeApp {
 /// content; position restored across hide/show cycles.
 fn bar_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
-        .with_title("PixMe")
+        .with_title("PixMe Bar")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
@@ -2079,8 +2328,11 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
             )
         })
         .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
-    egui::ViewportBuilder::default()
-        .with_title("PixMe")
+    let builder = egui::ViewportBuilder::default()
+        // Unique title: Windows' strip_undecorated_frame keys its chrome
+        // strip on it ("PixMe" is already the invisible anchor's title —
+        // and clearing a taskbar-bearing title would blank its button).
+        .with_title("PixMe Overlay")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_resizable(false)
@@ -2089,7 +2341,10 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
         .with_taskbar(false)
         .with_active(true)
         .with_inner_size(size)
-        .with_position(pos)
+        .with_position(pos);
+    #[cfg(target_os = "windows")]
+    let builder = builder.with_visible(false);
+    builder
 }
 
 /// A pinned capture: borderless, transparent, always on top, not a
@@ -2098,7 +2353,7 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
 /// at creation: user drags and zoom resizes use viewport commands.
 fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_title("PixMe")
+        .with_title("PixMe Pin")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
@@ -2116,7 +2371,7 @@ fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
 /// the card then tracks the monitor under the cursor.
 fn countdown_builder() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_title("PixMe")
+        .with_title("PixMe Countdown")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
@@ -2124,7 +2379,7 @@ fn countdown_builder() -> egui::ViewportBuilder {
         .with_always_on_top()
         .with_has_shadow(false)
         .with_taskbar(false)
-        .with_active(true)
+        .with_active(false)
         .with_inner_size([140.0, 140.0])
 }
 
@@ -2197,6 +2452,7 @@ mod tests {
             bar_pos: Mutex::new(None),
             bar_rect: Mutex::new(None),
             settings_open: AtomicBool::new(false),
+            about_open: AtomicBool::new(false),
             settings_draft: Mutex::new(None),
             capture: Mutex::new(None),
             countdown: Mutex::new(None),

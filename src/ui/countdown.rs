@@ -1,34 +1,49 @@
-//! The capture-delay countdown: a floating always-on-top card anchored
-//! just below the floating capture bar, centred on it — it follows the
-//! bar when the user drags it. Without a visible bar (capture launched
-//! from a menu while the viewer is closed) it falls back to the centre
-//! of the monitor under the cursor.
+//! The capture-delay countdown: a floating always-on-top transparent
+//! digit parked at the bottom-right of the monitor under the cursor,
+//! painted in the PixMe accent blue with
+//! a soft outline so it stays readable over any background.
 
 use std::time::{Duration, Instant};
 
-use egui::{Align2, CentralPanel, Frame, Margin, Rect, Vec2, ViewportCommand};
+use egui::{CentralPanel, Frame, Margin, Rect, Vec2, ViewportCommand};
 
 use crate::app::CaptureMode;
 use crate::platform;
-use crate::ui::{theme, widgets};
+use crate::ui::theme;
 
-/// Transparent margin kept around the card so its painted shadow is not
-/// clipped by the viewport bounds (same trick as the floating bar).
+/// Transparent margin kept around the digit so its painted outline is
+/// not clipped by the viewport bounds (same trick as the floating bar).
 const SHADOW_MARGIN: i8 = 14;
 
-/// Gap between the floating bar's bottom edge and the card (its top
-/// already carries `SHADOW_MARGIN` of transparent padding, so `0` puts
-/// the painted card `SHADOW_MARGIN` pt below the bar).
-const BAR_GAP: f32 = 0.0;
-
-/// Side of the square card holding the digit.
+/// Side of the square area holding the digit.
 const CARD_SIDE: f32 = 104.0;
 
-/// Countdown digit size — readable across the screen.
-const DIGIT_SIZE: f32 = 64.0;
+/// 3×5 pixel-font rows for digits 0–9 (top row first, bit 2 = leftmost
+/// column) — the same blocky style as the PixMe icon's "P".
+const PIXEL_DIGITS: [[u8; 5]; 10] = [
+    [0b111, 0b101, 0b101, 0b101, 0b111], // 0
+    [0b010, 0b110, 0b010, 0b010, 0b111], // 1
+    [0b111, 0b001, 0b111, 0b100, 0b111], // 2
+    [0b111, 0b001, 0b111, 0b001, 0b111], // 3
+    [0b101, 0b101, 0b111, 0b001, 0b001], // 4
+    [0b111, 0b100, 0b111, 0b001, 0b111], // 5
+    [0b111, 0b100, 0b111, 0b101, 0b111], // 6
+    [0b111, 0b001, 0b001, 0b010, 0b010], // 7
+    [0b111, 0b101, 0b111, 0b101, 0b111], // 8
+    [0b111, 0b101, 0b111, 0b001, 0b111], // 9
+];
 
-/// Repaint cadence: refreshes the digit and keeps the card following the
-/// bar without spinning.
+/// Distance between the digit area's right edge and the monitor's right
+/// edge. Note the
+/// transparent SHADOW_MARGIN sits inside this distance, so the painted
+/// digit lands `EDGE_MARGIN + SHADOW_MARGIN` from the screen edge.
+const EDGE_MARGIN: f32 = 10.0;
+
+/// Larger clearance at the bottom: the glyph must breathe above the
+/// taskbar/dock, not sit flush on it.
+const BOTTOM_MARGIN: f32 = 40.0;
+
+/// Repaint cadence: refreshes the digit without spinning.
 const REPAINT: Duration = Duration::from_millis(120);
 
 /// A live delayed-capture countdown, armed by `Command::Capture` when the
@@ -62,11 +77,13 @@ impl Countdown {
             .ceil() as u32
     }
 
-    /// Paints the countdown card for this frame and keeps the viewport
-    /// hugging it, anchored under `bar` (the floating bar's outer rect —
-    /// `None` when the bar is closed). Returns `false` once the deadline
-    /// passed — the caller then fires the capture.
-    pub fn show(&mut self, ui: &mut egui::Ui, bar: Option<Rect>) -> bool {
+    /// Paints the countdown digit for this frame and keeps the viewport
+    /// hugging it, parked at the bottom-right of the monitor holding
+    /// `anchor` (the bar or the viewer — i.e. where PixMe lives). Without
+    /// an anchor it falls back to the monitor under the cursor, then the
+    /// primary. Returns `false` once the deadline passed — the caller
+    /// then fires the capture.
+    pub fn show(&mut self, ui: &mut egui::Ui, anchor: Option<Rect>) -> bool {
         let remaining = self.remaining();
         if remaining == 0 {
             return false;
@@ -82,61 +99,102 @@ impl Countdown {
             .frame(Frame::NONE.inner_margin(Margin::same(SHADOW_MARGIN)))
             .show(ui, |ui| {
                 let t = theme::tokens(ui.ctx());
-                widgets::card_frame(t)
-                    .shadow(widgets::card_shadow(t))
-                    .show(ui, |ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(Vec2::splat(CARD_SIDE), egui::Sense::hover());
-                        ui.painter().text(
-                            rect.center(),
-                            Align2::CENTER_CENTER,
-                            remaining.to_string(),
-                            egui::FontId::new(DIGIT_SIZE, egui::FontFamily::Monospace),
-                            t.text,
-                        );
-                    })
-                    .response
-                    .rect
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::splat(CARD_SIDE), egui::Sense::hover());
+                // Pixel-art digits, matching the "P" of the PixMe icon:
+                // a dark drop-shadow pass then the accent-blue fill,
+                // right-aligned inside the card.
+                paint_pixel_number(ui.painter(), rect, remaining, t.accent);
+                rect
             })
             .inner;
-        self.sync_viewport(&ctx, card, bar);
+        self.sync_viewport(&ctx, card, anchor);
         true
     }
 
-    /// Keeps the viewport hugging the card, parked centred under the
-    /// floating bar (following its drags); fallback: centre of the
-    /// monitor under the cursor.
-    fn sync_viewport(&self, ctx: &egui::Context, card: egui::Rect, bar: Option<Rect>) {
+    /// Keeps the viewport hugging the digit area, parked at the
+    /// bottom-right of the monitor holding `anchor` — the window PixMe
+    /// lives on — with cursor-monitor and primary fallbacks.
+    fn sync_viewport(&self, ctx: &egui::Context, card: egui::Rect, anchor: Option<Rect>) {
         let target = card.size() + Vec2::splat(2.0 * f32::from(SHADOW_MARGIN));
         let current = ctx.input(|i| i.viewport().inner_rect.map_or(Vec2::ZERO, |r| r.size()));
         if (target - current).abs().max_elem() > 1.0 {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
         }
-        let pos = match bar {
-            Some(bar) => egui::pos2(bar.center().x - target.x / 2.0, bar.bottom() + BAR_GAP),
-            None => {
-                // No visible bar (menu-launched capture): centre the card
-                // at 60 % of the monitor under the cursor.
-                let Some(m) = platform::cursor_position()
+        // The monitor containing the anchor's centre, tested in native
+        // coordinates against each monitor's own scale (mixed-DPI safe) —
+        // same containment trick as `Command::ShowBar`'s spot check.
+        let anchor_monitor = anchor.and_then(|r| {
+            let centre = r.center();
+            crate::capture::screen::monitors()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|m| {
+                    let scale = m.scale_factor.max(1.0);
+                    let native = platform::ui_to_native(centre, scale);
+                    let mr = &m.rect;
+                    native.x >= mr.x as f32
+                        && native.x < mr.x as f32 + mr.width as f32
+                        && native.y >= mr.y as f32
+                        && native.y < mr.y as f32 + mr.height as f32
+                })
+        });
+        let Some(m) = anchor_monitor
+            .or_else(|| {
+                platform::cursor_position()
                     .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
-                    .or_else(|| crate::capture::screen::primary_monitor().ok())
-                else {
-                    return;
-                };
-                let scale = m.scale_factor.max(1.0);
-                let origin =
-                    platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
-                let size = platform::native_to_ui(
-                    egui::pos2(m.rect.width as f32, m.rect.height as f32),
-                    scale,
-                )
-                .to_vec2();
-                egui::pos2(
-                    origin.x + size.x * 0.5 - target.x / 2.0,
-                    origin.y + size.y * 0.6 - target.y / 2.0,
-                )
-            }
+            })
+            .or_else(|| crate::capture::screen::primary_monitor().ok())
+        else {
+            return;
         };
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+        let scale = m.scale_factor.max(1.0);
+        let origin =
+            platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
+        let size = platform::native_to_ui(
+            egui::pos2(m.rect.width as f32, m.rect.height as f32),
+            scale,
+        )
+        .to_vec2();
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
+            origin.x + size.x - target.x - EDGE_MARGIN,
+            origin.y + size.y - target.y - BOTTOM_MARGIN,
+        )));
     }
+}
+
+/// Paints `n` as right-aligned pixel-art digits inside `area`: a dark
+/// drop-shadow pass offset down-right, then the accent fill — two flat
+/// passes so the glyph stays readable over any wallpaper.
+fn paint_pixel_number(painter: &egui::Painter, area: egui::Rect, n: u32, color: egui::Color32) {
+    const CELL: f32 = 13.0; // one pixel's edge — a digit lands ~36×65 pt
+    const STEP: f32 = CELL * 4.0; // 3-column glyph + 1 column of air
+    const SEAM: f32 = 1.5; // dark seam between pixels (the pixelated look)
+    let label = n.to_string();
+    let width = label.len() as f32 * STEP - CELL;
+    let right = area.right() - 10.0;
+    let top = area.center().y - CELL * 2.5;
+    let paint = |offset: egui::Vec2, c: egui::Color32| {
+        for (i, ch) in label.chars().enumerate() {
+            let Some(d) = ch.to_digit(10) else { continue };
+            let x0 = right - width + i as f32 * STEP + offset.x;
+            let y0 = top + offset.y;
+            for (row, bits) in PIXEL_DIGITS[d as usize].iter().enumerate() {
+                for col in 0..3u8 {
+                    if bits & (0b100 >> col) != 0 {
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x0 + col as f32 * CELL, y0 + row as f32 * CELL),
+                                Vec2::splat(CELL - SEAM),
+                            ),
+                            0.0,
+                            c,
+                        );
+                    }
+                }
+            }
+        }
+    };
+    paint(egui::vec2(4.0, 4.0), egui::Color32::from_black_alpha(140));
+    paint(egui::vec2(0.0, 0.0), color);
 }

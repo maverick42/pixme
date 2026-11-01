@@ -10,10 +10,11 @@
 //! Phase 3: per-monitor DPI awareness (`PROCESS_PER_MONITOR_DPI_AWARE`).
 
 use std::cell::RefCell;
+use std::path::Path;
 
 use rust_i18n::t;
 use tray_icon::TrayIcon;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
 use super::PlatformServices;
 use crate::capture::CaptureError;
@@ -34,15 +35,14 @@ impl PlatformServices for Windows {
     }
 }
 
-/// Windows parity with the permanent macOS Dock icon: the invisible anchor
-/// viewport keeps a taskbar button (clicking it focuses the app, shows
-/// nothing — same dead behaviour as the launcher's Dock icon). The viewer
-/// still gets its own taskbar button while open.
+/// The 1×1 invisible anchor viewport gets NO taskbar button: on Windows a
+/// resident app lives in the notification area (the tray icon), and an
+/// extra taskbar entry would surface an empty ghost window in the taskbar
+/// and Alt+Tab. The viewer still gets its own taskbar button while open.
 pub fn apply_native_options(options: &mut eframe::NativeOptions) {
     options.viewport = options
         .viewport
         .clone()
-        .with_taskbar(true)
         .with_icon(icons::app_icon_data());
 }
 
@@ -65,25 +65,34 @@ thread_local! {
 /// [`crate::app::Command`]s.
 pub fn install_ui(ctx: &egui::Context) {
     let repaint_ctx = ctx.clone();
-    MenuEvent::set_event_handler(Some(move |event| {
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if let Some(command) = super::command_from_menu_id(event.id().0.as_str()) {
             super::queue_menu_command(command);
             crate::app::wake_viewports(&repaint_ctx);
         }
     }));
 
-    let menu = Menu::new();
-    let mut items = Vec::new();
-    for (id, key) in [
-        ("take_capture", "menubar.take_capture"),
-        ("open_viewer", "menubar.open_viewer"),
-    ] {
+    fn add(
+        menu: &Menu,
+        items: &mut Vec<(MenuItem, &'static str, &'static str)>,
+        id: &'static str,
+        key: &'static str,
+    ) {
         let item = MenuItem::with_id(id, t!(key).as_ref(), true, None);
         if let Err(err) = menu.append(&item) {
             tracing::warn!("cannot append tray menu item: {err}");
         }
         items.push((item, key, id));
     }
+
+    let menu = Menu::new();
+    let mut items = Vec::new();
+    add(&menu, &mut items, "take_capture", "menubar.take_capture");
+    add(&menu, &mut items, "open_viewer", "menubar.open_viewer");
+    if let Err(err) = menu.append(&PredefinedMenuItem::separator()) {
+        tracing::warn!("cannot append tray menu separator: {err}");
+    }
+    add(&menu, &mut items, "quit", "menubar.quit");
 
     let mut builder = TrayIcon::builder()
         .with_menu(Box::new(menu.clone()))
@@ -171,16 +180,207 @@ pub fn sync_menu_enabled(modal: crate::app::ModalState) {
     });
 }
 
+/// Strips `WS_CAPTION` and shapes undecorated floating windows (#2246).
+///
+/// ## Known Upstream Bugs (winit / DWM)
+///
+/// 1. **Content offset (31 px down)**: `winit` 0.30 forces `WS_CAPTION | WS_BORDER`
+///    on all windows, even with `decorations: false`, and relies on `WM_NCCALCSIZE`
+///    to hide them. On Windows with Intel graphics drivers or OpenGL, the desktop
+///    compositor still reserves space for the caption, shifting content ~31 px
+///    down and clipping it at the window bottom (emilk/egui#2770, libsdl#12105).
+///    This reproduces the fix from PhotoCraft (`window_frame.rs`, issue #2246):
+///    stripping `WS_CHROME` removes the non-client area so no offset occurs.
+///
+/// 2. **DWM 1 px top line**: on Windows 11, DWM draws an accent line at y=0 on
+///    borderless windows (documented in `winit::platform::windows::WindowExtWindows::set_undecorated_shadow`:
+///    *"Enabling the shadow causes a thin 1px line to appear on the top of the window"*).
+///    Applying a native Win32 window region (`SetWindowRgn`) tells DWM the true
+///    geometry of the window so nothing is drawn outside it:
+///    - For the floating bar and countdown (`"PixMe Bar"`, `"PixMe Countdown"`):
+///      both carry a 14 pt transparent `SHADOW_MARGIN`, so clipping y=0..2
+///      removes the DWM line without touching the card or its soft shadow.
+///    - For pinned captures (`"PixMe Pin"`): sets a rounded-rect region (`16 px`),
+///      matching the card's rounded corners and preserving the full border stroke.
+///
+/// Note: whenever winit touches window flags (focus change, new child window),
+/// it triggers `SWP_FRAMECHANGED` which resets the window region. The guard
+/// reapplies `SetWindowRgn` whenever styles are stripped or dimensions change.
+pub fn strip_undecorated_frame() {
+    use std::collections::HashMap;
+
+    const GWL_STYLE: i32 = -16;
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_TOPMOST: isize = 0x8;
+    const WS_CAPTION: isize = 0x00C0_0000;
+    const WS_CHROME: isize = WS_CAPTION | 0x0008_0000 | 0x0002_0000 | 0x0001_0000; // caption, sysmenu, min, max
+    const WS_EX_WINDOWEDGE: isize = 0x0000_0400;
+    // SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOCOPYBITS
+    const SWP_FLAGS: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020 | 0x0100;
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumThreadWindows(
+            tid: u32,
+            f: unsafe extern "system" fn(isize, isize) -> i32,
+            p: isize,
+        ) -> i32;
+        fn GetWindowLongPtrW(hwnd: isize, idx: i32) -> isize;
+        fn SetWindowLongPtrW(hwnd: isize, idx: i32, v: isize) -> isize;
+        fn SetWindowPos(
+            hwnd: isize,
+            after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+        fn GetWindowTextW(hwnd: isize, s: *mut u16, n: i32) -> i32;
+        fn SetWindowTextW(hwnd: isize, s: *const u16) -> i32;
+        fn GetWindowRect(hwnd: isize, r: *mut WinRect) -> i32;
+        fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateRectRgn(x1: i32, y1: i32, x2: i32, y2: i32) -> isize;
+        fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, cx: i32, cy: i32) -> isize;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        CardWithMargin,
+        Pin,
+        Overlay,
+    }
+
+    thread_local! {
+        static REGIONS: RefCell<HashMap<isize, (i32, i32)>> = RefCell::new(HashMap::new());
+        static ROLES: RefCell<HashMap<isize, Role>> = RefCell::new(HashMap::new());
+    }
+
+    unsafe extern "system" fn visit(hwnd: isize, _lp: isize) -> i32 {
+        let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        if (exstyle & WS_EX_TOPMOST) == 0 {
+            return 1;
+        }
+
+        let mut title_buf = [0u16; 64];
+        let n = unsafe { GetWindowTextW(hwnd, title_buf.as_mut_ptr(), 64) as usize };
+        let title = String::from_utf16_lossy(&title_buf[..n]);
+
+        let role = ROLES.with(|roles| {
+            let mut m = roles.borrow_mut();
+            if let Some(&r) = m.get(&hwnd) {
+                Some(r)
+            } else if title == "PixMe Bar" || title == "PixMe Countdown" {
+                m.insert(hwnd, Role::CardWithMargin);
+                // Clear the window title text in Win32 so DefWindowProc on WM_NCACTIVATE
+                // (fired when focus shifts to countdown) never draws title text.
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                Some(Role::CardWithMargin)
+            } else if title == "PixMe Pin" {
+                m.insert(hwnd, Role::Pin);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                Some(Role::Pin)
+            } else if title == "PixMe Overlay" {
+                m.insert(hwnd, Role::Overlay);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                Some(Role::Overlay)
+            } else {
+                None
+            }
+        });
+
+        let Some(role) = role else {
+            return 1;
+        };
+
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+        let mut need_reapply_region = false;
+        if (style & WS_CHROME) != 0 {
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !WS_CHROME);
+                if (exstyle & WS_EX_WINDOWEDGE) != 0 {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle & !WS_EX_WINDOWEDGE);
+                }
+                SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FLAGS);
+            }
+            need_reapply_region = true;
+        }
+
+        let mut r = WinRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut r) } != 0 {
+            let w = r.right - r.left;
+            let h = r.bottom - r.top;
+            if w > 0 && h > 0 {
+                let size_changed = REGIONS.with(|regs| {
+                    let mut m = regs.borrow_mut();
+                    if m.get(&hwnd).copied() != Some((w, h)) {
+                        m.insert(hwnd, (w, h));
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+                if need_reapply_region || size_changed {
+                    let rgn = match role {
+                        Role::CardWithMargin => {
+                            // Clip the top 2 pixels of empty transparent margin to eliminate
+                            // the DWM top accent line.
+                            unsafe { CreateRectRgn(0, 2, w + 1, h + 1) }
+                        }
+                        Role::Pin => {
+                            // Shape the window to the exact rounded-corner bounds of the pin image.
+                            unsafe { CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16) }
+                        }
+                        Role::Overlay => 0,
+                    };
+                    if rgn != 0 {
+                        unsafe {
+                            SetWindowRgn(hwnd, rgn, 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        1
+    }
+
+    unsafe {
+        EnumThreadWindows(GetCurrentThreadId(), visit, 0);
+    }
+}
+
 /// Reveals `path` selected in Explorer (`explorer /select,<path>`).
 pub fn reveal_in_file_manager(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer")
         .arg(format!("/select,{}", path.display()))
-        .status();
+        .spawn();
 }
 
 /// Opens `dir` in Explorer — the Settings "open folder" buttons.
 pub fn open_folder(dir: &std::path::Path) {
-    let _ = std::process::Command::new("explorer").arg(dir).status();
+    // `.spawn()`, never `.status()`: explorer.exe detaches its window and
+    // often lingers, so waiting on it blocks the UI thread.
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
 }
 
 /// Portable layout: `<exe dir>\data` + `<exe dir>\logs` when the
@@ -512,17 +712,64 @@ pub fn cursor_position() -> Option<(f32, f32)> {
     }
 }
 
-/// One short tick — the system "Asterisk" sound via `MessageBeep`
-/// (respects the sound scheme and volume).
+/// One short tick — a soft click synthesized once in memory and played
+/// through `PlaySoundW` (`SND_MEMORY` keeps it file-free and independent
+/// of the user's sound scheme). `MessageBeep` falls back if playback
+/// fails.
 pub fn tick() {
-    const MB_ICONASTERISK: u32 = 0x40;
+    use std::sync::OnceLock;
+
+    const SND_ASYNC: u32 = 0x0001;
+    const SND_NODEFAULT: u32 = 0x0002;
+    const SND_MEMORY: u32 = 0x0004;
+    const MB_OK: u32 = 0x0;
+
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn PlaySoundW(sound: *const u8, hmod: isize, flags: u32) -> i32;
+    }
     #[link(name = "user32")]
     unsafe extern "system" {
         fn MessageBeep(u_type: u32) -> i32;
     }
-    unsafe {
-        MessageBeep(MB_ICONASTERISK);
+
+    static WAV: OnceLock<Vec<u8>> = OnceLock::new();
+    let wav = WAV.get_or_init(tick_wav);
+    if unsafe { PlaySoundW(wav.as_ptr(), 0, SND_MEMORY | SND_ASYNC | SND_NODEFAULT) } == 0 {
+        unsafe { MessageBeep(MB_OK) };
     }
+}
+
+/// Builds the tick sample: a 2.2 kHz sine burst under an exponential
+/// decay (~250 ms) — a soft metronome-like click, 22.05 kHz 16-bit mono
+/// PCM in a standard RIFF/WAVE wrapper. NOTE: anything under ~100 ms is
+/// swallowed silently by RDP audio redirection on some setups, hence the
+/// generous decay tail.
+fn tick_wav() -> Vec<u8> {
+    const RATE: u32 = 22_050;
+    const MS: usize = 300;
+    let frames = RATE as usize * MS / 1000;
+    let data_bytes = (frames * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for i in 0..frames {
+        let t = i as f32 / RATE as f32;
+        let env = (-25.0 * t).exp();
+        let s = (t * 2.0 * std::f32::consts::PI * 2200.0).sin() * env * 0.8;
+        wav.extend_from_slice(&((s * i16::MAX as f32) as i16).to_le_bytes());
+    }
+    wav
 }
 
 /// Captures the current OS mouse cursor via `GetCursorInfo` + `GetIconInfo`

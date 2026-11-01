@@ -116,7 +116,8 @@ fn about_metadata() -> tray_icon::menu::AboutMetadata {
     tray_icon::menu::AboutMetadata {
         name: Some("PixMe".to_owned()),
         version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        copyright: Some("© 2026 Frédérik Benoist (dev.q2ii.fr)".to_owned()),
+        copyright: Some(format!("© 2026 Frédérik Benoist (dev.q2ii.fr)
+{}", t!("settings.about.license"))),
         icon,
         ..Default::default()
     }

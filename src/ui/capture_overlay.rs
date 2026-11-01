@@ -389,6 +389,8 @@ impl OverlaySession {
                     m.rect.width as f32,
                     m.rect.height as f32,
                 )));
+                #[cfg(target_os = "windows")]
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             }
         }
 

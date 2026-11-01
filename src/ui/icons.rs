@@ -33,6 +33,8 @@ pub enum Icon {
     Settings,
     /// Quit the app / close.
     X,
+    /// Quit PixMe (log out of the app).
+    LogOut,
     /// Dropdown affordance.
     ChevronDown,
     /// Tab strip scroll-left arrow.

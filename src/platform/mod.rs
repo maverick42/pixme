@@ -155,6 +155,15 @@ pub use macos::sync_menu_enabled;
 #[cfg(target_os = "windows")]
 pub use windows::sync_menu_enabled;
 
+/// Strips `WS_CAPTION` from undecorated floating windows to prevent
+/// the compositor offset (PhotoCraft #2246 fix; no-op on macOS).
+#[cfg(target_os = "windows")]
+pub use windows::strip_undecorated_frame;
+/// No-op on macOS (see above).
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn strip_undecorated_frame() {}
+
 /// Reveals a file selected in the OS file manager after saving.
 #[cfg(target_os = "macos")]
 pub use macos::reveal_in_file_manager;
