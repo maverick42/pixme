@@ -849,7 +849,12 @@ impl Viewer {
         };
         if self.tabs[ai].title != first {
             self.tabs[ai].title = first;
+            // The old file is no longer this document's: drop the
+            // saved path with the saved flag (size/delete must not
+            // act on a file the tab no longer claims).
             self.tabs[ai].saved = false;
+            self.tabs[ai].doc.meta.source_path = None;
+            self.tabs[ai].doc.meta.saved_at = None;
         }
         for (k, id) in ids.iter().enumerate() {
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.doc.meta.id == *id) {
@@ -857,6 +862,8 @@ impl Viewer {
                 if tab.title != next {
                     tab.title = next;
                     tab.saved = false;
+                    tab.doc.meta.source_path = None;
+                    tab.doc.meta.saved_at = None;
                 }
             }
         }
@@ -1866,6 +1873,23 @@ impl Viewer {
         }
     }
 
+    /// A byte count in human-readable units ("1.2 MB"), base-1024, one
+    /// decimal from KB up — the status strip's saved-file size.
+    fn human_size(bytes: u64) -> String {
+        const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+        let mut v = bytes as f64;
+        let mut u = 0;
+        while v >= 1024.0 && u < UNITS.len() - 1 {
+            v /= 1024.0;
+            u += 1;
+        }
+        if u == 0 {
+            format!("{bytes} B")
+        } else {
+            format!("{v:.1} {}", UNITS[u])
+        }
+    }
+
     /// The bottom status strip: capture count, active image dimensions
     /// and the app version.
     fn status_strip(&mut self, ui: &mut egui::Ui) {
@@ -1887,7 +1911,9 @@ impl Viewer {
             }
             if let Some(index) = self.active_index() {
                 // Capture date in the active language's local format,
-                // then the current sort mode after a bullet separator.
+                // the saved file's size right after it (when the capture
+                // was saved to disk), then the sort mode — bullets as
+                // separators.
                 let fmt = capture_date_fmt();
                 let date = self.tabs[index].doc.meta.captured_at.format(fmt);
                 let mode = match self.sort_mode {
@@ -1895,11 +1921,19 @@ impl Viewer {
                     Some(TabSort::ByDate) => t!("viewer.tab.sort_date"),
                     None => t!("viewer.sort.insertion"),
                 };
-                ui.label(
-                    egui::RichText::new(format!("{date} · {mode}"))
-                        .color(t.text_dim)
-                        .size(10.0),
-                );
+                let mut label = format!("{date}");
+                if let Some(len) = self.tabs[index]
+                    .doc
+                    .meta
+                    .source_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len())
+                {
+                    label.push_str(&format!(" · {}", Self::human_size(len)));
+                }
+                label.push_str(&format!(" · {mode}"));
+                ui.label(egui::RichText::new(label).color(t.text_dim).size(10.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
@@ -4009,6 +4043,13 @@ fn menu_item(ui: &mut egui::Ui, shared: &Shared, command: Command, label: &str) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn formats_bytes_kb_mb_gb() {
+        assert_eq!(super::Viewer::human_size(512), "512 B");
+        assert_eq!(super::Viewer::human_size(1536), "1.5 KB");
+        assert_eq!(super::Viewer::human_size(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(super::Viewer::human_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
     use super::*;
     use crate::capture::{Capture, MonitorInfo, PhysicalRect};
 
@@ -4188,9 +4229,10 @@ mod tests {
         assert!(v.dirty);
         assert_eq!(
             v.tabs[0].doc.meta.source_path.as_deref(),
-            Some(std::path::Path::new("/tmp/a.png")),
-            "source kept: Enregistrer still proposes that folder"
+            None,
+            "rename drops the old saved path"
         );
+        assert!(v.tabs[0].doc.meta.saved_at.is_none());
 
         // Re-applying the SAME name changes nothing — it stays saved.
         v.mark_saved(0, std::path::PathBuf::from("/tmp/b.png"));
