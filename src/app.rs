@@ -1501,6 +1501,10 @@ impl Shared {
         *lock(&self.store) = store;
         let sort = lock(&self.settings).tab_sort;
         lock(&self.viewer).restore_session(session, sort);
+        // A capture marked saved whose file vanished on disk is not
+        // saved anymore: flag it (red dot) and drop the stale path so
+        // size/delete never act on a file that isn't there.
+        lock(&self.viewer).mark_missing_files_unsaved();
     }
 
     /// `true` when the session is persisted to `session.db` — the
@@ -3077,7 +3081,7 @@ mod tests {
         let guard = lock(&shared.save_dialog);
         let dialog = guard.as_ref().expect("save dialog open");
         assert_eq!(dialog.filename, "new_name");
-        assert_eq!(dialog.existing_ok, Some(path));
+        assert_eq!(dialog.existing_ok, None);
     }
 
     /// Clicking the pin close dot (even with slight pointer drift or near

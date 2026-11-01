@@ -1197,6 +1197,28 @@ impl Viewer {
         }
     }
 
+    /// One startup pass after session restore: any tab marked saved
+    /// whose file no longer exists on disk is flagged unsaved again
+    /// (red dot) and its stale path is dropped — a capture is only
+    /// "saved" while its file is actually there.
+    pub fn mark_missing_files_unsaved(&mut self) {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            if tab.saved
+                && let Some(p) = tab.doc.meta.source_path.as_ref()
+                && std::fs::metadata(p).is_err()
+            {
+                tab.saved = false;
+                tab.doc.meta.source_path = None;
+                tab.doc.meta.saved_at = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.recompute_dirty();
+        }
+    }
+
     /// Duplicates `index` into a new tab: new id and capture date, same
     /// password (a copy of protected content stays protected), a ` (n)`
     /// unique title — the document clone carries annotations and history.
@@ -4214,6 +4236,16 @@ mod tests {
         v.set_active(1);
         assert!(v.is_locked(0));
         assert!(!v.is_locked(1));
+    }
+
+    #[test]
+    fn missing_files_mark_unsaved_at_restore() {
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.mark_saved(0, std::path::PathBuf::from("/tmp/nonexistent-pixme.png"));
+        v.mark_missing_files_unsaved();
+        assert!(!v.tabs[0].saved, "a missing file un-saves the tab");
+        assert_eq!(v.tabs[0].doc.meta.source_path, None);
     }
 
     #[test]
