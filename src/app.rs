@@ -465,7 +465,9 @@ impl Shared {
             ModalState::Draw
         } else if lock(&self.save_dialog).is_some() {
             ModalState::SaveDialog
-        } else if self.settings_open.load(Ordering::Relaxed) || self.about_open.load(Ordering::Relaxed) {
+        } else if self.settings_open.load(Ordering::Relaxed)
+            || self.about_open.load(Ordering::Relaxed)
+        {
             // The About modal is modal to the viewer too: the dimmed veil
             // + click-eater cover the panel until OK / cross / Esc.
             ModalState::Settings
@@ -866,9 +868,7 @@ impl Shared {
                 // guard lives until the end of the statement).
                 let dir = {
                     let s = lock(&self.settings);
-                    s.last_open_dir
-                        .clone()
-                        .or_else(|| s.last_save_dir.clone())
+                    s.last_open_dir.clone().or_else(|| s.last_save_dir.clone())
                 };
                 if let Some(dir) = dir {
                     platform::open_folder(&dir);
@@ -1704,7 +1704,7 @@ impl PixMeApp {
                 bar_pos: Mutex::new(None),
                 bar_rect: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
-            about_open: AtomicBool::new(false),
+                about_open: AtomicBool::new(false),
                 settings_draft: Mutex::new(None),
                 capture: Mutex::new(None),
                 countdown: Mutex::new(None),
@@ -1803,7 +1803,9 @@ impl eframe::App for PixMeApp {
                     if let Some(pos) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
                         *lock(&shared.bar_pos) = Some(pos);
                     }
-                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && lock(&shared.countdown).is_some() {
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                        && lock(&shared.countdown).is_some()
+                    {
                         *lock(&shared.countdown) = None;
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                     }

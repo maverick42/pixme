@@ -55,7 +55,11 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/settings.svg"),
     ),
     (Icon::X, "x", include_bytes!("../../assets/icons/x.svg")),
-    (Icon::LogOut, "log-out", include_bytes!("../../assets/icons/log-out.svg")),
+    (
+        Icon::LogOut,
+        "log-out",
+        include_bytes!("../../assets/icons/log-out.svg"),
+    ),
     (
         Icon::ChevronDown,
         "chevron-down",

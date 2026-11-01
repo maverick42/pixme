@@ -1639,9 +1639,7 @@ impl Viewer {
                 // The native menus' import shortcut (⌘⌥V / Ctrl+Alt+V).
                 shared.push(Command::ImportClipboard);
                 ctx.request_repaint();
-            } else if ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)
-            }) {
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
                 shared.push(Command::OpenSettings);
                 ctx.request_repaint();
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
@@ -1829,7 +1827,12 @@ impl Viewer {
                                 });
                             });
                         egui::Frame::default()
-                            .inner_margin(Margin { left: 14, right: 14, top: 4, bottom: 12 })
+                            .inner_margin(Margin {
+                                left: 14,
+                                right: 14,
+                                top: 4,
+                                bottom: 12,
+                            })
                             .show(ui, |ui| crate::ui::settings::show(ui, shared));
                     });
             });
@@ -2172,68 +2175,166 @@ impl Viewer {
         egui::Frame::default()
             .inner_margin(Margin::symmetric(8, 4))
             .show(ui, |ui| {
-            ui.horizontal(|ui| {
-            // Menu titles, not buttons: no fill, no border — the hover
-            // highlight alone signals them (PhotoCraft's egui menu bar
-            // reads the same way on Windows).
-            let v = &mut ui.style_mut().visuals;
-            v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-            v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-            ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-            menu_button(ui, t!("menu.file").as_ref(), |ui| {
-                let has_doc = self.active_index().is_some();
-                let has_last_dir = {
-                    let s = shared.lock_settings();
-                    s.last_open_dir.is_some() || s.last_save_dir.is_some()
-                };
-                menu_item_icon(ui, shared, Command::OpenFile, t!("menu.file.open").as_ref(), Some(Icon::FolderOpen), shared.command_enabled(&Command::OpenFile));
-                menu_item_icon(ui, shared, Command::ImportClipboard, t!("menu.app.import_clipboard").as_ref(), Some(Icon::ClipboardPaste), shared.command_enabled(&Command::ImportClipboard));
-                ui.separator();
-                menu_item_icon(ui, shared, Command::SaveActive, t!("menu.file.save").as_ref(), Some(Icon::Save), has_doc && shared.command_enabled(&Command::SaveActive));
-                menu_item_icon(ui, shared, Command::SaveAll, t!("menu.file.save_all").as_ref(), Some(Icon::Download), has_doc && shared.command_enabled(&Command::SaveAll));
-                menu_item_icon(ui, shared, Command::RenameActive, t!("menu.file.rename").as_ref(), None, has_doc && shared.command_enabled(&Command::RenameActive));
-                menu_item_icon(ui, shared, Command::DeleteActive, t!("menu.file.delete").as_ref(), Some(Icon::X), has_doc && shared.command_enabled(&Command::DeleteActive));
-                ui.separator();
-                recent_submenu(ui, shared);
-                menu_item_icon(ui, shared, Command::OpenLastDir, t!("vbar.open.last_dir").as_ref(), Some(Icon::Folder), has_last_dir && shared.command_enabled(&Command::OpenLastDir));
-                ui.separator();
-                menu_item_icon(ui, shared, Command::PrintActive, t!("menu.file.print").as_ref(), Some(Icon::Printer), has_doc && shared.command_enabled(&Command::PrintActive));
-                ui.separator();
-                menu_item_icon(ui, shared, Command::Quit, t!("menu.app.quit").as_ref(), Some(Icon::LogOut), shared.command_enabled(&Command::Quit));
-            });
-            menu_button(ui, t!("menu.edit").as_ref(), |ui| {
-                menu_item_icon(ui, shared, Command::UndoActive, t!("menu.edit.undo").as_ref(), Some(Icon::Undo2), shared.command_enabled(&Command::UndoActive));
-                menu_item_icon(ui, shared, Command::RedoActive, t!("menu.edit.redo").as_ref(), Some(Icon::Redo2), shared.command_enabled(&Command::RedoActive));
-                ui.separator();
-                menu_item_icon(ui, shared, Command::CopyActive, t!("menu.edit.copy").as_ref(), Some(Icon::Copy), shared.command_enabled(&Command::CopyActive));
-            });
-            menu_button(ui, t!("menu.capture").as_ref(), |ui| {
-                // Single entry: show the floating bar (same as the "+"
-                // tab button) — the mode picker lives on the bar.
-                menu_item_icon(
-                    ui,
-                    shared,
-                    Command::ShowBar,
-                    t!("menu.capture.launch").as_ref(),
-                    Some(Icon::Plus),
-                    shared.command_enabled(&Command::ShowBar),
-                );
-            });
-            menu_button(ui, t!("settings.title").as_ref(), |ui| {
-                menu_item(
-                    ui,
-                    shared,
-                    Command::OpenSettings,
-                    t!("menu.app.preferences").as_ref(),
-                );
-            });
-            menu_button(ui, t!("menu.help").as_ref(), |ui| {
-                // The website entry stays greyed until it exists.
-                menu_item_icon(ui, shared, Command::OpenViewer, t!("menu.help.visit_site").as_ref(), None, false);
-                ui.separator();
-                menu_item_icon(ui, shared, Command::OpenAbout, t!("menu.help.about").as_ref(), None, shared.command_enabled(&Command::OpenAbout));
-            });
-            });
+                ui.horizontal(|ui| {
+                    // Menu titles, not buttons: no fill, no border — the hover
+                    // highlight alone signals them (PhotoCraft's egui menu bar
+                    // reads the same way on Windows).
+                    let v = &mut ui.style_mut().visuals;
+                    v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+                    menu_button(ui, t!("menu.file").as_ref(), |ui| {
+                        let has_doc = self.active_index().is_some();
+                        let has_last_dir = {
+                            let s = shared.lock_settings();
+                            s.last_open_dir.is_some() || s.last_save_dir.is_some()
+                        };
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::OpenFile,
+                            t!("menu.file.open").as_ref(),
+                            Some(Icon::FolderOpen),
+                            shared.command_enabled(&Command::OpenFile),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::ImportClipboard,
+                            t!("menu.app.import_clipboard").as_ref(),
+                            Some(Icon::ClipboardPaste),
+                            shared.command_enabled(&Command::ImportClipboard),
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::SaveActive,
+                            t!("menu.file.save").as_ref(),
+                            Some(Icon::Save),
+                            has_doc && shared.command_enabled(&Command::SaveActive),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::SaveAll,
+                            t!("menu.file.save_all").as_ref(),
+                            Some(Icon::Download),
+                            has_doc && shared.command_enabled(&Command::SaveAll),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::RenameActive,
+                            t!("menu.file.rename").as_ref(),
+                            None,
+                            has_doc && shared.command_enabled(&Command::RenameActive),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::DeleteActive,
+                            t!("menu.file.delete").as_ref(),
+                            Some(Icon::X),
+                            has_doc && shared.command_enabled(&Command::DeleteActive),
+                        );
+                        ui.separator();
+                        recent_submenu(ui, shared);
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::OpenLastDir,
+                            t!("vbar.open.last_dir").as_ref(),
+                            Some(Icon::Folder),
+                            has_last_dir && shared.command_enabled(&Command::OpenLastDir),
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::PrintActive,
+                            t!("menu.file.print").as_ref(),
+                            Some(Icon::Printer),
+                            has_doc && shared.command_enabled(&Command::PrintActive),
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::Quit,
+                            t!("menu.app.quit").as_ref(),
+                            Some(Icon::LogOut),
+                            shared.command_enabled(&Command::Quit),
+                        );
+                    });
+                    menu_button(ui, t!("menu.edit").as_ref(), |ui| {
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::UndoActive,
+                            t!("menu.edit.undo").as_ref(),
+                            Some(Icon::Undo2),
+                            shared.command_enabled(&Command::UndoActive),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::RedoActive,
+                            t!("menu.edit.redo").as_ref(),
+                            Some(Icon::Redo2),
+                            shared.command_enabled(&Command::RedoActive),
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::CopyActive,
+                            t!("menu.edit.copy").as_ref(),
+                            Some(Icon::Copy),
+                            shared.command_enabled(&Command::CopyActive),
+                        );
+                    });
+                    menu_button(ui, t!("menu.capture").as_ref(), |ui| {
+                        // Single entry: show the floating bar (same as the "+"
+                        // tab button) — the mode picker lives on the bar.
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::ShowBar,
+                            t!("menu.capture.launch").as_ref(),
+                            Some(Icon::Plus),
+                            shared.command_enabled(&Command::ShowBar),
+                        );
+                    });
+                    menu_button(ui, t!("settings.title").as_ref(), |ui| {
+                        menu_item(
+                            ui,
+                            shared,
+                            Command::OpenSettings,
+                            t!("menu.app.preferences").as_ref(),
+                        );
+                    });
+                    menu_button(ui, t!("menu.help").as_ref(), |ui| {
+                        // The website entry stays greyed until it exists.
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::OpenViewer,
+                            t!("menu.help.visit_site").as_ref(),
+                            None,
+                            false,
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::OpenAbout,
+                            t!("menu.help.about").as_ref(),
+                            None,
+                            shared.command_enabled(&Command::OpenAbout),
+                        );
+                    });
+                });
             });
     }
 
@@ -3812,8 +3913,7 @@ fn menu_button(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) 
 
 /// One menu entry dispatching a [`Command`] when clicked, greyed out
 /// when the command is forbidden by the current modal state.
-
-
+///
 /// Menu row with an optional leading icon; `enabled` gates the grey-out
 /// (document presence, last-dir availability, modal state).
 fn menu_item_icon(
@@ -3857,24 +3957,23 @@ fn recent_submenu(ui: &mut egui::Ui, shared: &Shared) {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
         crate::ui::icons::paint(ui, rect, Icon::Folder, 16.0, t.icon);
         // egui's native submenu row: chevron on the right, hover-open.
-        egui::containers::menu::SubMenuButton::new(t!("menu.file.recent"))
-            .ui(ui, |ui| {
-                for path in recents {
-                    let name = path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string());
-                    let command = Command::OpenPath(path.clone());
-                    let enabled = shared.command_enabled(&command);
-                    let resp = ui
-                        .add_enabled(enabled, egui::Button::new(name))
-                        .on_hover_text(path.display().to_string());
-                    if resp.clicked() {
-                        shared.push(command);
-                        ui.close();
-                    }
+        egui::containers::menu::SubMenuButton::new(t!("menu.file.recent")).ui(ui, |ui| {
+            for path in recents {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let command = Command::OpenPath(path.clone());
+                let enabled = shared.command_enabled(&command);
+                let resp = ui
+                    .add_enabled(enabled, egui::Button::new(name))
+                    .on_hover_text(path.display().to_string());
+                if resp.clicked() {
+                    shared.push(command);
+                    ui.close();
                 }
-            });
+            }
+        });
     });
 }
 

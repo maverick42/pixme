@@ -40,10 +40,7 @@ impl PlatformServices for Windows {
 /// extra taskbar entry would surface an empty ghost window in the taskbar
 /// and Alt+Tab. The viewer still gets its own taskbar button while open.
 pub fn apply_native_options(options: &mut eframe::NativeOptions) {
-    options.viewport = options
-        .viewport
-        .clone()
-        .with_icon(icons::app_icon_data());
+    options.viewport = options.viewport.clone().with_icon(icons::app_icon_data());
 }
 
 /// Tray icon edge in pixels (16 px slot × ~2 for high-DPI trays).
