@@ -1911,14 +1911,16 @@ impl eframe::App for PixMeApp {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                     return;
                 }
-                // Anchor the card under the floating bar when one is
-                // visible; otherwise it falls back to the cursor monitor.
-                let bar = (*lock(&shared.state) == AppState::Bar)
-                    .then(|| *lock(&shared.bar_rect))
-                    .flatten();
+                // The countdown parks on the monitor PixMe lives on: the
+                // floating bar's when it is up, the viewer's otherwise.
+                let anchor = if *lock(&shared.state) == AppState::Bar {
+                    *lock(&shared.bar_rect)
+                } else {
+                    *lock(&shared.viewer_rect)
+                };
                 let running = lock(&shared.countdown)
                     .as_mut()
-                    .is_some_and(|c| c.show(ui, bar));
+                    .is_some_and(|c| c.show(ui, anchor));
                 if !running && let Some(cd) = lock(&shared.countdown).take() {
                     shared.push(Command::CaptureNow(cd.mode));
                     // Wake the anchor pass: it unregisters this viewport

@@ -378,7 +378,7 @@ Format: date — context — decision — consequences.
 - **User requirement**: the first `FixedRegion` call shows the placement
   frame (rides the cursor until clicked, then resizable). After any
   confirmed fixed capture, the next `FixedRegion` must open the zone at
-  the **same size and position** as the previous one (FastStone parity).
+  the **same size and position** as the previous one (reference parity).
 - **Implementation**: `Shared.last_fixed_region` stores the confirmed
   selection in monitor-logical space (`selection + screen_offset`).
   `begin_capture` passes it to `OverlaySession` as `restore_fixed`; the
@@ -388,8 +388,7 @@ Format: date — context — decision — consequences.
   cursor — it stays movable/resizable; whatever is confirmed becomes the
   new memory.
 - **Scope**: session memory only (survives bar/viewer cycles, cleared on
-  quit). Persisting to `settings.toml` like FastStone is a possible
-  follow-up.
+  quit). Persisting to `settings.toml` is a possible follow-up.
 
 ## 2026-10-24 — Pin capture: autonomous floating windows, image-level export
 
@@ -572,7 +571,7 @@ Format: date — context — decision — consequences.
 - **Session**: `DrawSession` clones the document + stacks at open; OK writes them back (`Viewer::commit_draw`), Annuler/close drops the clone — the tab is untouched.
 - **Flatten rule**: viewer pixel ops (paste-flatten, crop, resize, opening Draw with a floating paste) bake annotations into `base.image` via `Tab::flatten()` and clear the annotation stacks — objects become non-reselectable by design.
 - **Eraser** is an opaque-colour stroke object (stays selectable/undoable); **Fill** stores its flood-fill mask computed at placement; **Blur** is a parameterized region object (Blur/Pixelate × Rect/Round/Oval).
-- **Stamps** recolour embedded Lucide SVGs (`stamp_icon` map + `raw_svg` accessor) — no FastStone assets.
+- **Stamps** recolour embedded Lucide SVGs (`stamp_icon` map + `raw_svg` accessor) — no third-party assets.
 - **Options bar**: per-tool fields mirror the reference's bottom bar; the Select tool additionally exposes the selected object's own style fields (re-editable).
 - Text is rendered with the embedded Inter faces (bold → SemiBold, italic → faux shear), outline via 4-direction offset pass.
 
@@ -642,7 +641,7 @@ Format: date — context — decision — consequences.
 
 ## 2026-10-25 — session.db: what is stored, when it is written
 
-- **Context**: FastStone loses every capture + annotation at quit;
+- **Context**: the reference tool loses every capture + annotation at quit;
   PixMe's model is already non-destructive (a `Document` = base
   `Capture` + `Vec<Annotation>`, edits flow through `AnnoEdit`), so a
   full-fidelity restore is cheap to reach.
@@ -1073,7 +1072,7 @@ Format: date — context — decision — consequences.
 
 ## 2026-10-28 — Emoji sticker tool (Noto Color Emoji PNGs, Apache 2.0)
 
-- **Context**: the Draw editor needed an emoticon tool. FastStone's
+- **Context**: the Draw editor needed an emoticon tool. The reference's
   `Draw.db` holds 138 embedded PNGs, but its assets are proprietary and
   the project rules forbid reusing them. Emoji-as-text was rejected:
   Inter has no emoji glyphs and egui's rasterizer (ab_glyph) cannot

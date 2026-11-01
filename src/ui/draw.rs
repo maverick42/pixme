@@ -1,6 +1,6 @@
 //! The "Dessiner" annotation window: a separate deferred viewport with
 //! a two-column tool strip (PhotoCraft styling), the composited
-//! document canvas, a FastStone-compatible contextual options bar and
+//! document canvas, a contextual options bar and
 //! OK/Annuler. The session edits a clone of the viewer document — OK
 //! writes it back (annotations stay re-editable on re-entry), Annuler
 //! drops it. Chronological undo/redo uses `AnnoEdit` stacks stored on
