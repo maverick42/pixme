@@ -373,12 +373,14 @@ pub fn strip_undecorated_frame() {
 pub fn reveal_in_file_manager(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer")
         .arg(format!("/select,{}", path.display()))
-        .status();
+        .spawn();
 }
 
 /// Opens `dir` in Explorer — the Settings "open folder" buttons.
 pub fn open_folder(dir: &std::path::Path) {
-    let _ = std::process::Command::new("explorer").arg(dir).status();
+    // `.spawn()`, never `.status()`: explorer.exe detaches its window and
+    // often lingers, so waiting on it blocks the UI thread.
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
 }
 
 /// Portable layout: `<exe dir>\data` + `<exe dir>\logs` when the

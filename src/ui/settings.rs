@@ -17,7 +17,7 @@ use crate::ui::{theme, widgets};
 
 /// Which settings page the sidebar shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SettingsPage {
+pub enum SettingsPage {
     /// Language, appearance and session-database retention.
     #[default]
     General,
@@ -30,6 +30,12 @@ enum SettingsPage {
 /// egui-temp keys: the active page, and a draft parked behind the
 /// "captures will be lost" confirmation.
 const PAGE_KEY: &str = "pixme.settings_page";
+
+/// Opens the settings modal landing on the About page — the egui twin of
+/// the macOS native About panel. Called right before `OpenSettings`.
+pub fn open_about(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(PAGE_KEY), SettingsPage::About));
+}
 const PENDING_DRAFT: &str = "pixme.pending_settings_draft";
 
 /// Draws the settings pages inside the viewer's modal settings window.

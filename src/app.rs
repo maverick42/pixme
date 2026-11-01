@@ -89,6 +89,9 @@ pub enum Command {
     ViewerClosed,
     /// Open the settings window.
     OpenSettings,
+    /// Open the settings window on the About page (egui twin of the
+    /// macOS native About panel).
+    OpenAbout,
     /// The settings window was closed.
     CloseSettings,
     /// Application quit (menu only — never a window-close side effect).
@@ -115,6 +118,8 @@ pub enum Command {
     RenameActive,
     /// Copy the active document to the clipboard.
     CopyActive,
+    /// Delete the active document from the session.
+    DeleteActive,
     /// Open the Draw (Dessiner) editor on the active document.
     OpenDraw,
     /// Revert the newest pixel mutation of the active document.
@@ -215,10 +220,11 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         // Re-invoking the open modal's entry re-focuses it instead of
         // re-opening. When the SETTINGS modal is up the same menu click
         // brings it forward.
-        Command::OpenSettings => modal == ModalState::Settings,
+        Command::OpenSettings | Command::OpenAbout => modal == ModalState::Settings,
         Command::OpenViewer => modal == ModalState::Settings,
         // Everything else is blocked while a modal owns the UI.
-        Command::Capture(_)
+        Command::DeleteActive
+        | Command::Capture(_)
         | Command::CaptureNow(_)
         | Command::ShowBar
         | Command::ImportClipboard
@@ -507,6 +513,7 @@ impl Shared {
         for command in &commands {
             self.dispatch(command.clone(), ctx);
         }
+
         if !commands.is_empty() {
             // Wake the anchor so it (de)registers the child viewports whose
             // state just changed.
@@ -694,6 +701,10 @@ impl Shared {
                 // lost, so the dirty warning is Quit-only.
                 self.enter(AppState::Idle, ctx);
             }
+            Command::OpenAbout => {
+                ui::settings::open_about(ctx);
+                self.dispatch(Command::OpenSettings, ctx);
+            }
             Command::OpenSettings => {
                 if self.settings_open.load(Ordering::Relaxed) {
                     // Already open: re-invocation brings the existing
@@ -841,11 +852,18 @@ impl Shared {
             }
             // Same picker, pre-opened in the last used folder.
             Command::OpenLastDir => {
-                let dir = lock(&self.settings)
-                    .last_open_dir
-                    .clone()
-                    .or_else(|| lock(&self.settings).last_save_dir.clone());
-                self.open_files(dir, ctx);
+                // Single settings lock — a second `lock()` inside
+                // `or_else` would deadlock on the same thread (the first
+                // guard lives until the end of the statement).
+                let dir = {
+                    let s = lock(&self.settings);
+                    s.last_open_dir
+                        .clone()
+                        .or_else(|| s.last_save_dir.clone())
+                };
+                if let Some(dir) = dir {
+                    platform::open_folder(&dir);
+                }
             }
             Command::NewDocument => {
                 // Blank white canvas — the functional reference's "New".
@@ -904,6 +922,12 @@ impl Shared {
                         Ok(()) => tracing::info!("clipboard_copy"),
                         Err(e) => tracing::warn!("copy failed: {e}"),
                     }
+                }
+            }
+            Command::DeleteActive => {
+                if let Some(i) = lock(&self.viewer).active_index() {
+                    lock(&self.viewer).close_tabs(&[i]);
+                    tracing::info!("tab deleted");
                 }
             }
             Command::OpenDraw => {
@@ -1013,6 +1037,7 @@ impl Shared {
             dialog = dialog.set_directory(dir);
         }
         let Some(paths) = dialog.pick_files() else {
+            ctx.request_repaint();
             return;
         };
         let mut opened = Vec::new();
