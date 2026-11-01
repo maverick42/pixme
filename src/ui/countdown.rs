@@ -149,13 +149,10 @@ impl Countdown {
             return;
         };
         let scale = m.scale_factor.max(1.0);
-        let origin =
-            platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
-        let size = platform::native_to_ui(
-            egui::pos2(m.rect.width as f32, m.rect.height as f32),
-            scale,
-        )
-        .to_vec2();
+        let origin = platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
+        let size =
+            platform::native_to_ui(egui::pos2(m.rect.width as f32, m.rect.height as f32), scale)
+                .to_vec2();
         ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
             origin.x + size.x - target.x - EDGE_MARGIN,
             origin.y + size.y - target.y - BOTTOM_MARGIN,

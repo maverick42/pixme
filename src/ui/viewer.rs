@@ -849,7 +849,12 @@ impl Viewer {
         };
         if self.tabs[ai].title != first {
             self.tabs[ai].title = first;
+            // The old file is no longer this document's: drop the
+            // saved path with the saved flag (size/delete must not
+            // act on a file the tab no longer claims).
             self.tabs[ai].saved = false;
+            self.tabs[ai].doc.meta.source_path = None;
+            self.tabs[ai].doc.meta.saved_at = None;
         }
         for (k, id) in ids.iter().enumerate() {
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.doc.meta.id == *id) {
@@ -857,6 +862,8 @@ impl Viewer {
                 if tab.title != next {
                     tab.title = next;
                     tab.saved = false;
+                    tab.doc.meta.source_path = None;
+                    tab.doc.meta.saved_at = None;
                 }
             }
         }
@@ -1190,6 +1197,28 @@ impl Viewer {
         }
     }
 
+    /// One startup pass after session restore: any tab marked saved
+    /// whose file no longer exists on disk is flagged unsaved again
+    /// (red dot) and its stale path is dropped — a capture is only
+    /// "saved" while its file is actually there.
+    pub fn mark_missing_files_unsaved(&mut self) {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            if tab.saved
+                && let Some(p) = tab.doc.meta.source_path.as_ref()
+                && std::fs::metadata(p).is_err()
+            {
+                tab.saved = false;
+                tab.doc.meta.source_path = None;
+                tab.doc.meta.saved_at = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.recompute_dirty();
+        }
+    }
+
     /// Duplicates `index` into a new tab: new id and capture date, same
     /// password (a copy of protected content stays protected), a ` (n)`
     /// unique title — the document clone carries annotations and history.
@@ -1228,6 +1257,27 @@ impl Viewer {
 
     /// Deletes `tab`'s file on disk — the tab itself stays open, now
     /// unsaved again (the file it pointed at is gone).
+    /// The active tab has a file on disk (`File ▸ Supprimer le fichier`
+    /// and the tab menu's entry both gate on this).
+    pub fn active_has_file(&self) -> bool {
+        self.active_index()
+            .and_then(|i| self.tabs.get(i))
+            .is_some_and(|t| t.doc.meta.source_path.is_some())
+    }
+
+    /// Opens the "Supprimer le fichier" confirmation on the active tab —
+    /// same entry point as the tab context menu's item.
+    pub fn open_delete_file_dialog(&mut self) {
+        if let Some(tab) = self.active_index()
+            && self
+                .tabs
+                .get(tab)
+                .is_some_and(|t| t.doc.meta.source_path.is_some())
+        {
+            self.confirm_delete = Some(DeleteFileDialog { tab, error: None });
+        }
+    }
+
     fn delete_tab_file(&mut self, tab: usize) -> Result<(), std::io::Error> {
         let Some(path) = self
             .tabs
@@ -1639,9 +1689,7 @@ impl Viewer {
                 // The native menus' import shortcut (⌘⌥V / Ctrl+Alt+V).
                 shared.push(Command::ImportClipboard);
                 ctx.request_repaint();
-            } else if ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)
-            }) {
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
                 shared.push(Command::OpenSettings);
                 ctx.request_repaint();
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
@@ -1829,7 +1877,12 @@ impl Viewer {
                                 });
                             });
                         egui::Frame::default()
-                            .inner_margin(Margin { left: 14, right: 14, top: 4, bottom: 12 })
+                            .inner_margin(Margin {
+                                left: 14,
+                                right: 14,
+                                top: 4,
+                                bottom: 12,
+                            })
                             .show(ui, |ui| crate::ui::settings::show(ui, shared));
                     });
             });
@@ -1839,6 +1892,23 @@ impl Viewer {
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             // Closing via the cross discards the draft like Annuler.
             *crate::app::lock(&shared.settings_draft) = None;
+        }
+    }
+
+    /// A byte count in human-readable units ("1.2 MB"), base-1024, one
+    /// decimal from KB up — the status strip's saved-file size.
+    fn human_size(bytes: u64) -> String {
+        const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+        let mut v = bytes as f64;
+        let mut u = 0;
+        while v >= 1024.0 && u < UNITS.len() - 1 {
+            v /= 1024.0;
+            u += 1;
+        }
+        if u == 0 {
+            format!("{bytes} B")
+        } else {
+            format!("{v:.1} {}", UNITS[u])
         }
     }
 
@@ -1863,7 +1933,9 @@ impl Viewer {
             }
             if let Some(index) = self.active_index() {
                 // Capture date in the active language's local format,
-                // then the current sort mode after a bullet separator.
+                // the saved file's size right after it (when the capture
+                // was saved to disk), then the sort mode — bullets as
+                // separators.
                 let fmt = capture_date_fmt();
                 let date = self.tabs[index].doc.meta.captured_at.format(fmt);
                 let mode = match self.sort_mode {
@@ -1871,11 +1943,19 @@ impl Viewer {
                     Some(TabSort::ByDate) => t!("viewer.tab.sort_date"),
                     None => t!("viewer.sort.insertion"),
                 };
-                ui.label(
-                    egui::RichText::new(format!("{date} · {mode}"))
-                        .color(t.text_dim)
-                        .size(10.0),
-                );
+                let mut label = format!("{date}");
+                if let Some(len) = self.tabs[index]
+                    .doc
+                    .meta
+                    .source_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len())
+                {
+                    label.push_str(&format!(" · {}", Self::human_size(len)));
+                }
+                label.push_str(&format!(" · {mode}"));
+                ui.label(egui::RichText::new(label).color(t.text_dim).size(10.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
@@ -2172,68 +2252,167 @@ impl Viewer {
         egui::Frame::default()
             .inner_margin(Margin::symmetric(8, 4))
             .show(ui, |ui| {
-            ui.horizontal(|ui| {
-            // Menu titles, not buttons: no fill, no border — the hover
-            // highlight alone signals them (PhotoCraft's egui menu bar
-            // reads the same way on Windows).
-            let v = &mut ui.style_mut().visuals;
-            v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-            v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-            ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-            menu_button(ui, t!("menu.file").as_ref(), |ui| {
-                let has_doc = self.active_index().is_some();
-                let has_last_dir = {
-                    let s = shared.lock_settings();
-                    s.last_open_dir.is_some() || s.last_save_dir.is_some()
-                };
-                menu_item_icon(ui, shared, Command::OpenFile, t!("menu.file.open").as_ref(), Some(Icon::FolderOpen), shared.command_enabled(&Command::OpenFile));
-                menu_item_icon(ui, shared, Command::ImportClipboard, t!("menu.app.import_clipboard").as_ref(), Some(Icon::ClipboardPaste), shared.command_enabled(&Command::ImportClipboard));
-                ui.separator();
-                menu_item_icon(ui, shared, Command::SaveActive, t!("menu.file.save").as_ref(), Some(Icon::Save), has_doc && shared.command_enabled(&Command::SaveActive));
-                menu_item_icon(ui, shared, Command::SaveAll, t!("menu.file.save_all").as_ref(), Some(Icon::Download), has_doc && shared.command_enabled(&Command::SaveAll));
-                menu_item_icon(ui, shared, Command::RenameActive, t!("menu.file.rename").as_ref(), None, has_doc && shared.command_enabled(&Command::RenameActive));
-                menu_item_icon(ui, shared, Command::DeleteActive, t!("menu.file.delete").as_ref(), Some(Icon::X), has_doc && shared.command_enabled(&Command::DeleteActive));
-                ui.separator();
-                recent_submenu(ui, shared);
-                menu_item_icon(ui, shared, Command::OpenLastDir, t!("vbar.open.last_dir").as_ref(), Some(Icon::Folder), has_last_dir && shared.command_enabled(&Command::OpenLastDir));
-                ui.separator();
-                menu_item_icon(ui, shared, Command::PrintActive, t!("menu.file.print").as_ref(), Some(Icon::Printer), has_doc && shared.command_enabled(&Command::PrintActive));
-                ui.separator();
-                menu_item_icon(ui, shared, Command::Quit, t!("menu.app.quit").as_ref(), Some(Icon::LogOut), shared.command_enabled(&Command::Quit));
-            });
-            menu_button(ui, t!("menu.edit").as_ref(), |ui| {
-                menu_item_icon(ui, shared, Command::UndoActive, t!("menu.edit.undo").as_ref(), Some(Icon::Undo2), shared.command_enabled(&Command::UndoActive));
-                menu_item_icon(ui, shared, Command::RedoActive, t!("menu.edit.redo").as_ref(), Some(Icon::Redo2), shared.command_enabled(&Command::RedoActive));
-                ui.separator();
-                menu_item_icon(ui, shared, Command::CopyActive, t!("menu.edit.copy").as_ref(), Some(Icon::Copy), shared.command_enabled(&Command::CopyActive));
-            });
-            menu_button(ui, t!("menu.capture").as_ref(), |ui| {
-                // Single entry: show the floating bar (same as the "+"
-                // tab button) — the mode picker lives on the bar.
-                menu_item_icon(
-                    ui,
-                    shared,
-                    Command::ShowBar,
-                    t!("menu.capture.launch").as_ref(),
-                    Some(Icon::Plus),
-                    shared.command_enabled(&Command::ShowBar),
-                );
-            });
-            menu_button(ui, t!("settings.title").as_ref(), |ui| {
-                menu_item(
-                    ui,
-                    shared,
-                    Command::OpenSettings,
-                    t!("menu.app.preferences").as_ref(),
-                );
-            });
-            menu_button(ui, t!("menu.help").as_ref(), |ui| {
-                // The website entry stays greyed until it exists.
-                menu_item_icon(ui, shared, Command::OpenViewer, t!("menu.help.visit_site").as_ref(), None, false);
-                ui.separator();
-                menu_item_icon(ui, shared, Command::OpenAbout, t!("menu.help.about").as_ref(), None, shared.command_enabled(&Command::OpenAbout));
-            });
-            });
+                ui.horizontal(|ui| {
+                    // Menu titles, not buttons: no fill, no border — the hover
+                    // highlight alone signals them (PhotoCraft's egui menu bar
+                    // reads the same way on Windows).
+                    let v = &mut ui.style_mut().visuals;
+                    v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+                    menu_button(ui, t!("menu.file").as_ref(), |ui| {
+                        let has_doc = self.active_index().is_some();
+                        let has_last_dir = {
+                            let s = shared.lock_settings();
+                            s.last_open_dir.is_some() || s.last_save_dir.is_some()
+                        };
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::OpenFile,
+                            t!("menu.file.open").as_ref(),
+                            Some(Icon::FolderOpen),
+                            shared.command_enabled(&Command::OpenFile),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::ImportClipboard,
+                            t!("menu.app.import_clipboard").as_ref(),
+                            Some(Icon::ClipboardPaste),
+                            shared.command_enabled(&Command::ImportClipboard),
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::SaveActive,
+                            t!("menu.file.save").as_ref(),
+                            Some(Icon::Save),
+                            has_doc && shared.command_enabled(&Command::SaveActive),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::SaveAll,
+                            t!("menu.file.save_all").as_ref(),
+                            Some(Icon::Download),
+                            has_doc && shared.command_enabled(&Command::SaveAll),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::RenameActive,
+                            t!("menu.file.rename").as_ref(),
+                            None,
+                            has_doc && shared.command_enabled(&Command::RenameActive),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::DeleteFileActive,
+                            t!("menu.file.delete").as_ref(),
+                            Some(Icon::X),
+                            self.active_has_file()
+                                && shared.command_enabled(&Command::DeleteFileActive),
+                        );
+                        ui.separator();
+                        recent_submenu(ui, shared);
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::OpenLastDir,
+                            t!("vbar.open.last_dir").as_ref(),
+                            Some(Icon::Folder),
+                            has_last_dir && shared.command_enabled(&Command::OpenLastDir),
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::PrintActive,
+                            t!("menu.file.print").as_ref(),
+                            Some(Icon::Printer),
+                            has_doc && shared.command_enabled(&Command::PrintActive),
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::Quit,
+                            t!("menu.app.quit").as_ref(),
+                            Some(Icon::LogOut),
+                            shared.command_enabled(&Command::Quit),
+                        );
+                    });
+                    menu_button(ui, t!("menu.edit").as_ref(), |ui| {
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::UndoActive,
+                            t!("menu.edit.undo").as_ref(),
+                            Some(Icon::Undo2),
+                            shared.command_enabled(&Command::UndoActive),
+                        );
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::RedoActive,
+                            t!("menu.edit.redo").as_ref(),
+                            Some(Icon::Redo2),
+                            shared.command_enabled(&Command::RedoActive),
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::CopyActive,
+                            t!("menu.edit.copy").as_ref(),
+                            Some(Icon::Copy),
+                            shared.command_enabled(&Command::CopyActive),
+                        );
+                    });
+                    menu_button(ui, t!("menu.capture").as_ref(), |ui| {
+                        // Single entry: show the floating bar (same as the "+"
+                        // tab button) — the mode picker lives on the bar.
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::ShowBar,
+                            t!("menu.capture.launch").as_ref(),
+                            Some(Icon::Plus),
+                            shared.command_enabled(&Command::ShowBar),
+                        );
+                    });
+                    menu_button(ui, t!("settings.title").as_ref(), |ui| {
+                        menu_item(
+                            ui,
+                            shared,
+                            Command::OpenSettings,
+                            t!("menu.app.preferences").as_ref(),
+                        );
+                    });
+                    menu_button(ui, t!("menu.help").as_ref(), |ui| {
+                        // The website entry stays greyed until it exists.
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::OpenViewer,
+                            t!("menu.help.visit_site").as_ref(),
+                            None,
+                            false,
+                        );
+                        ui.separator();
+                        menu_item_icon(
+                            ui,
+                            shared,
+                            Command::OpenAbout,
+                            t!("menu.help.about").as_ref(),
+                            None,
+                            shared.command_enabled(&Command::OpenAbout),
+                        );
+                    });
+                });
             });
     }
 
@@ -3812,8 +3991,7 @@ fn menu_button(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) 
 
 /// One menu entry dispatching a [`Command`] when clicked, greyed out
 /// when the command is forbidden by the current modal state.
-
-
+///
 /// Menu row with an optional leading icon; `enabled` gates the grey-out
 /// (document presence, last-dir availability, modal state).
 fn menu_item_icon(
@@ -3857,24 +4035,23 @@ fn recent_submenu(ui: &mut egui::Ui, shared: &Shared) {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
         crate::ui::icons::paint(ui, rect, Icon::Folder, 16.0, t.icon);
         // egui's native submenu row: chevron on the right, hover-open.
-        egui::containers::menu::SubMenuButton::new(t!("menu.file.recent"))
-            .ui(ui, |ui| {
-                for path in recents {
-                    let name = path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string());
-                    let command = Command::OpenPath(path.clone());
-                    let enabled = shared.command_enabled(&command);
-                    let resp = ui
-                        .add_enabled(enabled, egui::Button::new(name))
-                        .on_hover_text(path.display().to_string());
-                    if resp.clicked() {
-                        shared.push(command);
-                        ui.close();
-                    }
+        egui::containers::menu::SubMenuButton::new(t!("menu.file.recent")).ui(ui, |ui| {
+            for path in recents {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let command = Command::OpenPath(path.clone());
+                let enabled = shared.command_enabled(&command);
+                let resp = ui
+                    .add_enabled(enabled, egui::Button::new(name))
+                    .on_hover_text(path.display().to_string());
+                if resp.clicked() {
+                    shared.push(command);
+                    ui.close();
                 }
-            });
+            }
+        });
     });
 }
 
@@ -3888,6 +4065,13 @@ fn menu_item(ui: &mut egui::Ui, shared: &Shared, command: Command, label: &str) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn formats_bytes_kb_mb_gb() {
+        assert_eq!(super::Viewer::human_size(512), "512 B");
+        assert_eq!(super::Viewer::human_size(1536), "1.5 KB");
+        assert_eq!(super::Viewer::human_size(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(super::Viewer::human_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
     use super::*;
     use crate::capture::{Capture, MonitorInfo, PhysicalRect};
 
@@ -4055,6 +4239,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_files_mark_unsaved_at_restore() {
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.mark_saved(0, std::path::PathBuf::from("/tmp/nonexistent-pixme.png"));
+        v.mark_missing_files_unsaved();
+        assert!(!v.tabs[0].saved, "a missing file un-saves the tab");
+        assert_eq!(v.tabs[0].doc.meta.source_path, None);
+    }
+
+    #[test]
     fn renaming_a_saved_tab_marks_it_unsaved() {
         let mut v = Viewer::default();
         v.push_stub("a");
@@ -4067,9 +4261,10 @@ mod tests {
         assert!(v.dirty);
         assert_eq!(
             v.tabs[0].doc.meta.source_path.as_deref(),
-            Some(std::path::Path::new("/tmp/a.png")),
-            "source kept: Enregistrer still proposes that folder"
+            None,
+            "rename drops the old saved path"
         );
+        assert!(v.tabs[0].doc.meta.saved_at.is_none());
 
         // Re-applying the SAME name changes nothing — it stays saved.
         v.mark_saved(0, std::path::PathBuf::from("/tmp/b.png"));

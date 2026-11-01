@@ -221,17 +221,38 @@ fn folders_page(ui: &mut egui::Ui) {
     let t = theme::tokens(ui.ctx());
     ui.vertical(|ui| {
         ui.add_space(10.0);
+        // Label column sized to the longest row label, so both paths
+        // start at the same x whatever the locale's word lengths.
+        let label_w = [
+            t!("settings.about.data_folder").to_string(),
+            t!("settings.about.logs_folder").to_string(),
+        ]
+        .iter()
+        .map(|s| {
+            ui.painter()
+                .layout_no_wrap(
+                    s.clone(),
+                    egui::FontId::new(10.5, egui::FontFamily::Proportional),
+                    t.text_dim,
+                )
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max)
+        .ceil();
         folder_row(
             ui,
             &t!("settings.about.data_folder"),
             crate::paths::data_dir(),
             "settings.about.open_data",
+            label_w,
         );
         folder_row(
             ui,
             &t!("settings.about.logs_folder"),
             crate::paths::logs_dir(),
             "settings.about.open_logs",
+            label_w,
         );
         ui.add_space(4.0);
         if widgets::secondary_button(ui, &t!("settings.about.copy_diagnostics")).clicked() {
@@ -248,32 +269,45 @@ fn folders_page(ui: &mut egui::Ui) {
 
 /// One About-page location row: label, the path (elided, full path on
 /// hover), a copy button and an open-in-file-manager button.
-fn folder_row(ui: &mut egui::Ui, label: &str, path: &std::path::Path, open_key: &'static str) {
+fn folder_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    path: &std::path::Path,
+    open_key: &'static str,
+    label_w: f32,
+) {
     let t = theme::tokens(ui.ctx());
     let path_text = path.display().to_string();
     ui.horizontal(|ui| {
-        // Natural label — the value starts right after it, same gap as
-        // the "Modèle :" row of the Filename page.
-        ui.label(
-            egui::RichText::new(label)
-                .size(10.5)
-                .color(t.text_dim)
-                .strong(),
+        // `add_sized` would centre the text in its box (`centered_and_justified`)
+        // — a shorter label or path would then start right of a longer row's.
+        ui.allocate_ui_with_layout(
+            egui::vec2(label_w + 2.0, 16.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(10.5)
+                        .color(t.text_dim)
+                        .strong(),
+                );
+            },
         );
-        ui.add_space(2.0);
         // Fixed-width truncating path (full path on hover): the icons
         // stay at a fixed right position on both rows and long paths
-        // never stretch the window.
-        ui.add_sized(
-            [220.0, 16.0],
-            egui::Label::new(
-                egui::RichText::new(&path_text)
-                    .size(10.5)
-                    .color(t.text),
-            )
-            .truncate(),
-        )
-        .on_hover_text(&path_text);
+        // never stretch the window. Left-aligned so both rows' paths
+        // start at the same x.
+        ui.allocate_ui_with_layout(
+            egui::vec2(220.0, 16.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&path_text).size(10.5).color(t.text))
+                        .truncate(),
+                )
+                .on_hover_text(&path_text);
+            },
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::icon_button(ui, Icon::FolderOpen, false)
                 .on_hover_text(t!(open_key).to_string())
@@ -291,7 +325,6 @@ fn folder_row(ui: &mut egui::Ui, label: &str, path: &std::path::Path, open_key: 
         });
     });
 }
-
 
 /// Writes the draft back and persists it — unless the new retention
 /// would lose stored captures, which parks the draft behind the confirm

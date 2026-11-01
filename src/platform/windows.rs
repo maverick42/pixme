@@ -40,10 +40,7 @@ impl PlatformServices for Windows {
 /// extra taskbar entry would surface an empty ghost window in the taskbar
 /// and Alt+Tab. The viewer still gets its own taskbar button while open.
 pub fn apply_native_options(options: &mut eframe::NativeOptions) {
-    options.viewport = options
-        .viewport
-        .clone()
-        .with_icon(icons::app_icon_data());
+    options.viewport = options.viewport.clone().with_icon(icons::app_icon_data());
 }
 
 /// Tray icon edge in pixels (16 px slot × ~2 for high-DPI trays).
@@ -168,7 +165,12 @@ pub fn relabel_menus() {
 /// Greys out tray menu items whose command is forbidden under `modal`
 /// (same [`crate::app::is_command_enabled`] table as the macOS menus).
 /// Called from `Shared::pump`, always on the main thread.
-pub fn sync_menu_enabled(modal: crate::app::ModalState) {
+pub fn sync_menu_enabled(
+    modal: crate::app::ModalState,
+    _has_doc: bool,
+    _has_file: bool,
+    _has_last_dir: bool,
+) {
     INSTALLED.with(|cell| {
         if let Some(installed) = &*cell.borrow() {
             for (item, _key, id) in &installed.items {
