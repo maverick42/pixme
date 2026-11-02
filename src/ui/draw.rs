@@ -220,7 +220,7 @@ impl Default for Opts {
             fill_color: Color32::from_rgb(80, 160, 235),
             width: 3.0,
             dash: Dash::Solid,
-            shadow: 0.0,
+            shadow: 3.0,
             opacity: 1.0,
             line_start: LineEnd::None,
             line_end: LineEnd::Arrow,
@@ -239,10 +239,10 @@ impl Default for Opts {
             blur_style: BlurStyle::Blur,
             blur_strength: 75,
             font: "Arial".to_owned(),
-            font_size: 12.0,
+            font_size: 32.0,
             bold: false,
             italic: false,
-            outline_w: 0.0,
+            outline_w: 2.0,
             outline_color: Color32::WHITE,
             align: TextAlign::Left,
             step_mode: StepMode::Numbers,
@@ -1416,7 +1416,7 @@ impl DrawSession {
             },
             image: img,
             opacity: 1.0,
-            shadow: 0.0,
+            shadow: 3.0,
         }));
     }
 
@@ -1441,7 +1441,7 @@ impl DrawSession {
             rect: r,
             image: img,
             opacity: 1.0,
-            shadow: 0.0,
+            shadow: 3.0,
         }));
         // Continue the press as a plain object move on the new picture;
         // after release the pointer tool keeps it re-grabbable.
@@ -2043,7 +2043,7 @@ impl DrawSession {
                 dash: o.dash,
                 fill: Some(o.fill_color),
                 radius: o.radius,
-                outline: 0.0,
+                outline: o.outline,
                 outline_color: o.line_outline_color,
                 opacity: o.opacity,
                 shadow: if o.line_shadow { 3.0 } else { 0.0 },
@@ -2065,7 +2065,7 @@ impl DrawSession {
                 stroke_w: o.width,
                 dash: o.dash,
                 fill: Some(o.fill_color),
-                outline: 0.0,
+                outline: o.outline,
                 outline_color: o.line_outline_color,
                 opacity: o.opacity,
                 shadow: if o.line_shadow { 3.0 } else { 0.0 },

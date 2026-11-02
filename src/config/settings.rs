@@ -130,7 +130,7 @@ pub struct Settings {
     /// Text-tool font family ("Arial", "Inter", …).
     #[serde(default = "default_text_font")]
     pub text_font: String,
-    /// Text-tool font size in px (menu 8..=72, default 12).
+    /// Text-tool font size in px (menu 8..=72, default 32).
     #[serde(default = "default_text_size")]
     pub text_size: u8,
     /// Text-tool bold toggle.
@@ -160,7 +160,7 @@ fn default_text_font() -> String {
     "Arial".to_owned()
 }
 fn default_text_size() -> u8 {
-    12
+    32
 }
 fn default_outline_color() -> [u8; 3] {
     [255, 255, 255]
@@ -209,7 +209,7 @@ impl Default for Settings {
             text_size: default_text_size(),
             text_bold: false,
             text_italic: false,
-            text_outline: 0,
+            text_outline: 2,
             text_outline_color: default_outline_color(),
             filename_template: default_filename_template(),
             filename_templates: default_filename_templates(),
