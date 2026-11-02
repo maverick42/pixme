@@ -627,16 +627,12 @@ impl OverlaySession {
         // Windows, points on macOS); on macOS the conversion is identity.
         let ppp = crate::platform::window_ppp(
             ctx,
-            self.monitor
-                .as_ref()
-                .map(|m| m.scale_factor)
-                .unwrap_or(1.0),
+            self.monitor.as_ref().map(|m| m.scale_factor).unwrap_or(1.0),
         );
         let global = crate::platform::ui_to_native(pos + outer.min.to_vec2(), ppp);
         let origin = outer.min.to_vec2();
-        let to_ui = |x: i32, y: i32| {
-            crate::platform::native_to_ui(egui::pos2(x as f32, y as f32), ppp)
-        };
+        let to_ui =
+            |x: i32, y: i32| crate::platform::native_to_ui(egui::pos2(x as f32, y as f32), ppp);
         let hit = self.window_list.as_ref().and_then(|list| {
             list.iter().find(|w| {
                 let r = w.rect;
@@ -649,8 +645,11 @@ impl OverlaySession {
         self.picked_window_id = hit.map(|w| w.id);
         self.selection = hit.map(|w| {
             let r = w.rect;
-            Rect::from_min_max(to_ui(r.x, r.y), to_ui(r.x + r.width as i32, r.y + r.height as i32))
-                .translate(-origin)
+            Rect::from_min_max(
+                to_ui(r.x, r.y),
+                to_ui(r.x + r.width as i32, r.y + r.height as i32),
+            )
+            .translate(-origin)
         });
     }
 
@@ -924,11 +923,7 @@ impl OverlaySession {
                 capture.image.height() as f32 / win.rect.height as f32,
             );
             let origin = (win.rect.x as f32, win.rect.y as f32);
-            stamp(
-                std::sync::Arc::make_mut(&mut capture.image),
-                origin,
-                ratio,
-            );
+            stamp(std::sync::Arc::make_mut(&mut capture.image), origin, ratio);
             return Some(capture);
         }
         let mut capture = screen::crop_region(frozen, rect);
@@ -941,7 +936,10 @@ impl OverlaySession {
         );
         stamp(
             std::sync::Arc::make_mut(&mut capture.image),
-            (mon.x as f32 + rect.x as f32 / ratio.0, mon.y as f32 + rect.y as f32 / ratio.1),
+            (
+                mon.x as f32 + rect.x as f32 / ratio.0,
+                mon.y as f32 + rect.y as f32 / ratio.1,
+            ),
             ratio,
         );
         Some(capture)

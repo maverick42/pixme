@@ -742,34 +742,35 @@ impl Shared {
             Command::ConfirmCapture => self.confirm_capture(ctx),
             Command::CancelCapture => self.cancel_capture(ctx),
             Command::ShowBar => {
-                // The bar reopens where the user last dragged it — and on
-                // that monitor. A stale spot (display unplugged since, or a
-                // first-ever show) falls back to top-centre on the monitor
-                // under the mouse.
-                let remembered_monitor = (*lock(&self.bar_pos)).and_then(|pos| {
-                    crate::capture::screen::monitors()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|m| {
-                            let scale = m.scale_factor.max(1.0);
-                            let native = platform::ui_to_native(pos, scale);
-                            let r = &m.rect;
-                            native.x >= r.x as f32
-                                && native.x < r.x as f32 + r.width as f32
-                                && native.y >= r.y as f32
-                                && native.y < r.y as f32 + r.height as f32
-                        })
-                });
+                // The bar reopens where the user last dragged it — but
+                // only while PixMe still lives on that monitor. The
+                // anchor is the visible window's monitor (the viewer's,
+                // or the bar's own when the bar is re-invoked); with no
+                // window up it is the monitor under the mouse. A
+                // remembered spot on another monitor is stale — the bar
+                // re-centres on the anchor instead of popping up where
+                // the user is not looking.
+                let anchor = match *lock(&self.state) {
+                    AppState::Viewer => lock(&self.viewer_monitor).clone(),
+                    AppState::Bar => lock(&self.bar_monitor).clone(),
+                    _ => None,
+                }
+                .or_else(|| {
+                    platform::cursor_position()
+                        .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
+                })
+                .or_else(|| monitor_under(ctx))
+                .or_else(|| crate::capture::screen::primary_monitor().ok());
+                let monitors = crate::capture::screen::monitors().unwrap_or_default();
+                let spot_on_anchor = (*lock(&self.bar_pos))
+                    .zip(anchor.as_ref())
+                    .is_some_and(|(pos, a)| ui_pos_on_anchor(pos, &monitors, a));
                 // `place_on_monitor` asks `sync_viewport` to re-centre the
                 // bar on that monitor next frame — only wanted on the
                 // fallback path, never over a remembered spot.
-                if remembered_monitor.is_none() {
+                if !spot_on_anchor {
                     *lock(&self.bar_pos) = None;
-                    if let Some(m) = platform::cursor_position()
-                        .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
-                        .or_else(|| monitor_under(ctx))
-                        .or_else(|| crate::capture::screen::primary_monitor().ok())
-                    {
+                    if let Some(m) = anchor {
                         let scale = m.scale_factor.max(1.0);
                         let origin = platform::native_to_ui(
                             egui::pos2(m.rect.x as f32, m.rect.y as f32),
@@ -1842,6 +1843,25 @@ fn monitor_under(ctx: &egui::Context) -> Option<MonitorInfo> {
     .and_then(|c| crate::capture::screen::monitor_at(c.x, c.y))
 }
 
+/// Whether `pos` (egui ui points) lands on `anchor`'s monitor, hit-tested
+/// against `monitors` — each candidate converts `pos` with its own scale
+/// (mixed-DPI safe). Monitors compare by rect, not id: xcap ids are not
+/// stable across enumerations on Windows.
+fn ui_pos_on_anchor(pos: egui::Pos2, monitors: &[MonitorInfo], anchor: &MonitorInfo) -> bool {
+    monitors
+        .iter()
+        .find(|m| {
+            let scale = m.scale_factor.max(1.0);
+            let native = platform::ui_to_native(pos, scale);
+            let r = &m.rect;
+            native.x >= r.x as f32
+                && native.x < r.x as f32 + r.width as f32
+                && native.y >= r.y as f32
+                && native.y < r.y as f32 + r.height as f32
+        })
+        .is_some_and(|m| m.rect == anchor.rect)
+}
+
 /// Root application state, created once in [`eframe::App::ui`]'s setup.
 pub struct PixMeApp {
     /// Everything the deferred-viewport callbacks reach.
@@ -2618,15 +2638,10 @@ fn overlay_builder(
     let (size, pos) = monitor
         .map(|m| {
             let s = m.scale_factor.max(1.0);
-            let min = platform::native_to_ui(
-                egui::pos2(m.rect.x as f32, m.rect.y as f32),
-                s,
-            );
-            let sz = platform::native_to_ui(
-                egui::pos2(m.rect.width as f32, m.rect.height as f32),
-                s,
-            )
-            .to_vec2();
+            let min = platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), s);
+            let sz =
+                platform::native_to_ui(egui::pos2(m.rect.width as f32, m.rect.height as f32), s)
+                    .to_vec2();
             (sz, min)
         })
         .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
@@ -3479,5 +3494,50 @@ mod tests {
                 "ClosePin(7) was not queued after clicking at {press_pos:?}"
             );
         }
+    }
+
+    /// `ShowBar` restores the remembered bar spot only while it lands on
+    /// the anchor monitor — a spot from a since-moved viewer is stale.
+    #[test]
+    fn remembered_bar_spot_must_share_the_anchor_monitor() {
+        fn monitor(x: i32, y: i32) -> MonitorInfo {
+            MonitorInfo {
+                id: x as u32,
+                name: "m".into(),
+                rect: crate::capture::PhysicalRect {
+                    x,
+                    y,
+                    width: 1000,
+                    height: 800,
+                },
+                // scale 1.0 keeps `ui_to_native` an identity on both
+                // OSes so the hit test is deterministic.
+                scale_factor: 1.0,
+                is_primary: false,
+            }
+        }
+        let sidecar = monitor(-1133, 819);
+        let main5k = monitor(0, 0);
+        let monitors = vec![sidecar.clone(), main5k];
+        // On the Sidecar display, a spot on it restores.
+        assert!(ui_pos_on_anchor(
+            egui::pos2(-700.0, 900.0),
+            &monitors,
+            &sidecar
+        ));
+        // …but a spot remembered on the BenQ does not.
+        assert!(!ui_pos_on_anchor(
+            egui::pos2(500.0, 300.0),
+            &monitors,
+            &sidecar
+        ));
+        // A spot outside every monitor is stale too.
+        assert!(!ui_pos_on_anchor(
+            egui::pos2(9999.0, 9999.0),
+            &monitors,
+            &sidecar
+        ));
+        // No monitors enumerated (xcap failure): nothing restores.
+        assert!(!ui_pos_on_anchor(egui::pos2(-700.0, 900.0), &[], &sidecar));
     }
 }

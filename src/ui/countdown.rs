@@ -125,13 +125,16 @@ impl Countdown {
     /// points (its own ppp, the factor egui-winit multiplies commands by)
     /// and the position is only resent when it really changed — dragging
     /// the window across a mixed-DPI boundary sends nothing.
-    fn sync_viewport(&mut self, ctx: &egui::Context, card: egui::Rect, anchor: Option<MonitorInfo>) {
+    fn sync_viewport(
+        &mut self,
+        ctx: &egui::Context,
+        card: egui::Rect,
+        anchor: Option<MonitorInfo>,
+    ) {
         let target = card.size() + Vec2::splat(2.0 * f32::from(SHADOW_MARGIN));
         self.sync.request_inner_size(ctx, target);
         let Some(m) = anchor
-            .or_else(|| {
-                platform::cursor_position().and_then(|(x, y)| screen::monitor_at(x, y))
-            })
+            .or_else(|| platform::cursor_position().and_then(|(x, y)| screen::monitor_at(x, y)))
             .or_else(|| screen::primary_monitor().ok())
         else {
             return;

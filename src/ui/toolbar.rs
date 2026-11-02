@@ -74,8 +74,7 @@ impl Toolbar {
                     *crate::app::lock(&shared.bar_rect) =
                         Some(Rect::from_min_size(win + card.min.to_vec2(), card.size()));
                     let ppp = crate::platform::window_ppp(&ctx, 1.0);
-                    let centre =
-                        crate::platform::ui_to_native(win + card.center().to_vec2(), ppp);
+                    let centre = crate::platform::ui_to_native(win + card.center().to_vec2(), ppp);
                     *crate::app::lock(&shared.bar_monitor) =
                         crate::capture::screen::monitor_at(centre.x, centre.y);
                 }

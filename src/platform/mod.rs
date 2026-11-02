@@ -277,10 +277,7 @@ pub fn winit_monitor_index(
 /// scale, never the monitor's: egui-winit multiplies command values back
 /// by the window's ppp, so this yields exact physical targets even when
 /// the window is still on another display (mixed-DPI).
-pub fn monitor_ui_rect(
-    monitor: &crate::capture::MonitorInfo,
-    window_ppp: f32,
-) -> egui::Rect {
+pub fn monitor_ui_rect(monitor: &crate::capture::MonitorInfo, window_ppp: f32) -> egui::Rect {
     let min = native_to_ui(
         egui::pos2(monitor.rect.x as f32, monitor.rect.y as f32),
         window_ppp,
@@ -452,6 +449,7 @@ mod tests {
 
     /// The user's actual setup: a 4K primary at 150 % next to a
     /// 1920×1200 laptop at 100 % — both Windows-physical.
+    #[cfg(target_os = "windows")]
     #[test]
     fn winit_index_matches_mixed_dpi_layout() {
         let placements = [(0, 0, 3840, 2160), (3840, 0, 1920, 1200)];
@@ -464,9 +462,26 @@ mod tests {
         assert_eq!(winit_monitor_index(&gone, &placements, 1), None);
     }
 
+    /// macOS twin of the mixed-DPI layout test: xcap rects are
+    /// CGDisplay POINTS, winit placements physical px — matching goes
+    /// through the ×scale conversion (BenQ 5K + Sidecar iPad, both 2×).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn winit_index_matches_point_space_layout() {
+        let placements = [(0, 0, 5120, 3414), (-2266, 1638, 2266, 1488)];
+        let benq = monitor(0, 0, 2560, 1707, 2.0);
+        let sidecar = monitor(-1133, 819, 1133, 744, 2.0);
+        assert_eq!(winit_monitor_index(&benq, &placements, 1), Some(0));
+        assert_eq!(winit_monitor_index(&sidecar, &placements, 1), Some(1));
+        // A monitor winit doesn't know (unplugged since) has no index.
+        let gone = monitor(0, 1707, 1920, 1080, 2.0);
+        assert_eq!(winit_monitor_index(&gone, &placements, 1), None);
+    }
+
     /// `monitor_ui_rect` must land on the physical target whatever scale
     /// the receiving window currently has: egui-winit multiplies command
     /// values by the window's own ppp.
+    #[cfg(target_os = "windows")]
     #[test]
     fn ui_rect_depends_on_window_scale_not_monitor_scale() {
         // Windows: laptop monitor (physical 3840,0..5760,1200) seen by a
@@ -479,10 +494,19 @@ mod tests {
         // exactly the laptop's physical origin.
         let seen_by_laptop = monitor_ui_rect(&laptop, 1.0);
         assert_eq!(seen_by_laptop.min, egui::pos2(3840.0, 0.0));
-        // macOS path (Points space): identity — egui points ARE the
-        // monitor points, the scale never enters.
-        let retina = monitor(0, 0, 1728, 1117, 2.0);
-        let _ = retina; // covered by monitor_physical_rect tests
+    }
+
+    /// macOS path (Points space): identity — egui points ARE the
+    /// monitor points, the window's scale never enters the geometry.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ui_rect_is_point_space_on_macos() {
+        let sidecar = monitor(-1133, 819, 1133, 744, 2.0);
+        let r = monitor_ui_rect(&sidecar, 1.5);
+        assert_eq!(r.min, egui::pos2(-1133.0, 819.0));
+        assert_eq!(r.size(), egui::vec2(1133.0, 744.0));
+        // Same result whatever the receiving window's ppp.
+        assert_eq!(r, monitor_ui_rect(&sidecar, 1.0));
     }
 
     #[test]

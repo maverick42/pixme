@@ -24,12 +24,12 @@ const BURST_WINDOW: Duration = Duration::from_millis(800);
 /// Whether `target` differs from the last requested value by more than
 /// the one-point tolerance (`None` = nothing requested yet → send).
 fn size_changed(last: Option<Vec2>, target: Vec2) -> bool {
-    last.map_or(true, |l| (l - target).abs().max_elem() > TOLERANCE)
+    last.is_none_or(|l| (l - target).abs().max_elem() > TOLERANCE)
 }
 
 /// `size_changed` for positions.
 fn pos_changed(last: Option<Pos2>, target: Pos2) -> bool {
-    last.map_or(true, |l| (l - target).abs().max_elem() > TOLERANCE)
+    last.is_none_or(|l| (l - target).abs().max_elem() > TOLERANCE)
 }
 
 /// Rolling command-rate tracker shared by every floating window.
