@@ -425,8 +425,14 @@ fn local_app_data() -> std::path::PathBuf {
 /// "Windows 10.0.19045" style — `cmd /c ver` output trimmed to the
 /// version field; ~30 ms once at startup, no extra dependency.
 pub fn os_version() -> String {
+    use std::os::windows::process::CommandExt;
+    // cmd.exe is console-subsystem: spawned from this GUI-subsystem exe
+    // without CREATE_NO_WINDOW, Windows allocates it a console window —
+    // a black flash at every launch.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = std::process::Command::new("cmd")
         .args(["/c", "ver"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()
         .filter(|o| o.status.success())
