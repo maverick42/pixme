@@ -127,6 +127,8 @@ pub enum Icon {
     Blur,
     /// Emoji sticker tool.
     Smile,
+    /// Session-store write failure on a tab / mosaic tile.
+    TriangleAlert,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

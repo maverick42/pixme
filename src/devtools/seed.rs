@@ -149,7 +149,7 @@ impl Rng {
 /// gradient, translucent "window" blocks, thin "text" strips and a
 /// few high-entropy "photo" patches so the PNG keeps a realistic
 /// size. All output is deterministic per `seed`.
-fn synth_image(seed: u64) -> RgbaImage {
+pub(crate) fn synth_image(seed: u64) -> RgbaImage {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
     let mut img = RgbaImage::new(W, H);
     let buf = img.as_mut();

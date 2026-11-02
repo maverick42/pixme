@@ -58,14 +58,21 @@ pub struct Tab {
     /// re-locks it (`false` again), so a protected capture asks for its
     /// password on every activation.
     pub unlocked: bool,
-    /// `doc.revision` as the store last saw it (`Some` on restored
-    /// tabs, `None` on new ones) — unchanged tabs skip `png_encode` +
-    /// postcard at quit.
+    /// `doc.revision` as last handed to the session writer (`Some` on
+    /// restored tabs, `None` on new ones) — unchanged tabs skip
+    /// `png_encode` + postcard.
     pub persisted_rev: Option<u64>,
-    /// True when `doc.base.image` is not yet in the store (new tab, or
-    /// mutated by flatten/resize/undo). Annotation-only edits leave it
-    /// `false` so quit updates the row without touching `base_png`.
+    /// True when `doc.base.image` is not yet handed to the writer (new
+    /// tab, or mutated by flatten/resize/undo). Annotation-only edits
+    /// leave it `false` so the write skips `base_png`.
     pub base_dirty: bool,
+    /// [`Self::fingerprint`] as last handed to the writer — `None`
+    /// until the first write is queued. The drain re-queues any tab
+    /// whose live fingerprint drifts from it.
+    pub stored_fp: Option<u64>,
+    /// The last queued write for this document failed on the worker —
+    /// the tab flags it (warning glyph) until a later write succeeds.
+    pub store_failed: bool,
 }
 
 /// How many pixel mutations stay undoable per tab. Full-image ops keep
@@ -500,6 +507,70 @@ struct DeleteFileDialog {
 }
 
 impl Tab {
+    /// The per-tab half of [`Viewer::sigs`]: a cheap hash of everything
+    /// the store persists for this document. Compared against
+    /// `stored_fp` by the session drain — a drift means the row needs
+    /// a rewrite (content or meta).
+    pub fn fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let d = &self.doc;
+        let mut h = DefaultHasher::new();
+        d.meta.id.hash(&mut h);
+        self.title.hash(&mut h);
+        self.saved.hash(&mut h);
+        d.revision.hash(&mut h);
+        d.next_id().hash(&mut h);
+        d.meta.captured_at.timestamp().hash(&mut h);
+        d.meta.saved_at.map(|s| s.timestamp()).hash(&mut h);
+        d.meta.source_path.hash(&mut h);
+        d.meta.password_hash.hash(&mut h);
+        h.finish()
+    }
+
+    /// The writer-bound snapshot of this document — cheap to build:
+    /// the base pixels ride an `Arc`, postcards encode on the worker.
+    /// `base` only travels when `base_dirty` is set (new capture or
+    /// pixel mutation); annotation/meta edits skip the PNG encode.
+    pub fn to_doc_write(&self, ord: usize) -> crate::store::DocWrite {
+        let d = &self.doc;
+        crate::store::DocWrite {
+            id: d.meta.id.clone(),
+            ord: ord as i64,
+            title: self.title.clone(),
+            saved: self.saved,
+            captured_at: d.meta.captured_at,
+            saved_at: d.meta.saved_at,
+            source_path: d.meta.source_path.clone(),
+            password_hash: d.meta.password_hash.clone(),
+            base: self
+                .base_dirty
+                .then(|| std::sync::Arc::clone(&d.base.image)),
+            scale_factor: d.base.scale_factor,
+            monitor: d.base.monitor.clone(),
+            next_id: d.next_id(),
+            revision: d.revision,
+            annotations: d.annotations.clone(),
+            anno_undo: self.anno_undo.clone(),
+            anno_redo: self.anno_redo.clone(),
+            queued_at: std::time::Instant::now(),
+        }
+    }
+
+    /// The meta-columns snapshot the bulk `write_meta` job carries.
+    pub fn to_meta_row(&self, ord: usize) -> crate::store::MetaRow {
+        let d = &self.doc;
+        crate::store::MetaRow {
+            id: d.meta.id.clone(),
+            ord: ord as i64,
+            title: self.title.clone(),
+            saved: self.saved,
+            saved_at: d.meta.saved_at,
+            source_path: d.meta.source_path.clone(),
+            password_hash: d.meta.password_hash.clone(),
+        }
+    }
+
     /// Bakes annotations into the base image and discards object-level
     /// history — the documented "aplatie" semantics of viewer pixel ops.
     fn flatten(&mut self) {
@@ -557,6 +628,8 @@ impl Viewer {
             insertion,
             persisted_rev: None,
             base_dirty: true,
+            stored_fp: None,
+            store_failed: false,
         });
         // A new document gets a fresh view — a stale zoom would
         // leak onto unrelated pixels — and the tab we leave re-locks.
@@ -595,6 +668,8 @@ impl Viewer {
             insertion,
             persisted_rev: None,
             base_dirty: true,
+            stored_fp: None,
+            store_failed: false,
         });
         let new = self.tabs.len() - 1;
         self.set_active(new);
@@ -645,6 +720,8 @@ impl Viewer {
             insertion,
             persisted_rev: None,
             base_dirty: true,
+            stored_fp: None,
+            store_failed: false,
         });
     }
 
@@ -1058,6 +1135,19 @@ impl Viewer {
         std::mem::take(&mut self.closed_ids)
     }
 
+    /// Forgets the write baseline of every tab — the next store drain
+    /// re-queues the whole session (base pixels included). Used when
+    /// the retention policy may have just pruned rows (or emptied the
+    /// store) behind the tabs' backs.
+    pub fn reset_store_marks(&mut self) {
+        for tab in &mut self.tabs {
+            tab.stored_fp = None;
+            tab.persisted_rev = None;
+            tab.base_dirty = true;
+        }
+        self.persisted_sigs = None;
+    }
+
     /// `true` once the persisted session has been loaded — restore is
     /// a one-shot, never retried within a run.
     pub fn session_restored(&self) -> bool {
@@ -1107,7 +1197,7 @@ impl Viewer {
         let mut restored_tabs = Vec::with_capacity(restored_count + self.tabs.len());
         for (i, t) in session.tabs.into_iter().enumerate() {
             let persisted_rev = Some(t.doc.revision);
-            restored_tabs.push(Tab {
+            let mut tab = Tab {
                 title: t.title,
                 doc: t.doc,
                 saved: t.saved,
@@ -1121,7 +1211,13 @@ impl Viewer {
                 insertion: i,
                 persisted_rev,
                 base_dirty: false,
-            });
+                stored_fp: None,
+                store_failed: false,
+            };
+            // The row just came OUT of the store — it is the baseline
+            // the drain compares against, so nothing re-writes.
+            tab.stored_fp = Some(tab.fingerprint());
+            restored_tabs.push(tab);
         }
         self.next_insertion += restored_count;
         restored_tabs.append(&mut self.tabs);
@@ -1247,6 +1343,8 @@ impl Viewer {
             insertion: self.next_insertion,
             persisted_rev: None,
             base_dirty: true,
+            stored_fp: None,
+            store_failed: false,
         });
         self.next_insertion += 1;
         let new = self.tabs.len() - 1;
@@ -1707,7 +1805,7 @@ impl Viewer {
                     .fill(t.dock),
             )
             .show(ui, |ui| {
-                self.status_strip(ui);
+                self.status_strip(ui, shared);
             });
         CentralPanel::default()
             .frame(
@@ -1913,8 +2011,9 @@ impl Viewer {
     }
 
     /// The bottom status strip: capture count, active image dimensions
-    /// and the app version.
-    fn status_strip(&mut self, ui: &mut egui::Ui) {
+    /// and the app version — plus, right-aligned, the session-database
+    /// READ/WRITE activity indicators (opt-out in Settings ▸ General).
+    fn status_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let t = theme::tokens(ui.ctx());
         ui.horizontal(|ui| {
             let n = self.tabs.len();
@@ -1963,6 +2062,24 @@ impl Viewer {
                         .color(t.text_faint)
                         .size(10.0),
                 );
+                if shared.lock_settings().db_status {
+                    let writing = shared.writer.pending_writes() > 0;
+                    let reading = shared.writer.is_reading();
+                    if writing || reading {
+                        // Activity flags only flip while frames run —
+                        // schedule the green-side repaint so an idle
+                        // queue never leaves a stale red dot.
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(250));
+                    }
+                    db_dot(ui, &t!("vbar.status.write"), writing, &t);
+                    db_dot(ui, &t!("vbar.status.read"), reading, &t);
+                    ui.label(
+                        egui::RichText::new(t!("vbar.status.db").to_string())
+                            .color(t.text_faint)
+                            .size(10.0),
+                    );
+                }
             });
         });
     }
@@ -2494,8 +2611,12 @@ impl Viewer {
         }
         let t = theme::tokens(ui.ctx());
         let tab = &self.tabs[index];
-        let (title, dirty, protected) =
-            (tab.title.clone(), !tab.saved, tab.doc.meta.is_protected());
+        let (title, dirty, protected, failed) = (
+            tab.title.clone(),
+            !tab.saved,
+            tab.doc.meta.is_protected(),
+            tab.store_failed,
+        );
         let selected = index == self.active;
         // A title shared with another tab can't save two files under
         // one name — it takes the danger tint as an inline warning.
@@ -2532,6 +2653,15 @@ impl Viewer {
                             if selected { t.accent } else { t.text_dim },
                         )
                         .paint_at(ui, lock_rect);
+                    }
+                    if failed {
+                        // The session write failed on the worker — the
+                        // glyph is the standing warning until a retry
+                        // (background or quit flush) succeeds.
+                        let (warn_rect, warn_resp) =
+                            ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                        icons::image(Icon::TriangleAlert, 11.0, t.warning).paint_at(ui, warn_rect);
+                        warn_resp.on_hover_text(t!("viewer.tab.write_failed"));
                     }
                     ui.add(
                         egui::Label::new(egui::RichText::new(title).color(if dup {
@@ -3095,7 +3225,8 @@ impl Viewer {
         );
         let tab = &self.tabs[index];
         let title = tab.title.clone();
-        let (dirty, protected) = (!tab.saved, tab.doc.meta.is_protected());
+        let (dirty, protected, failed) =
+            (!tab.saved, tab.doc.meta.is_protected(), tab.store_failed);
         let date = hovered.then(|| {
             tab.doc
                 .meta
@@ -3116,6 +3247,12 @@ impl Viewer {
         if protected {
             let (r, _) = band_ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
             icons::image(Icon::Lock, 11.0, theme::mosaic_chrome::BAND_TEXT).paint_at(&band_ui, r);
+        }
+        if failed {
+            // Same store-failure flag as the tab chip's warning glyph.
+            let (r, warn_resp) = band_ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+            icons::image(Icon::TriangleAlert, 11.0, t.warning).paint_at(&band_ui, r);
+            warn_resp.on_hover_text(t!("viewer.tab.write_failed"));
         }
         band_ui.add(
             egui::Label::new(egui::RichText::new(title).color(theme::mosaic_chrome::BAND_TEXT))
@@ -3783,6 +3920,29 @@ fn paint_loading(ui: &mut egui::Ui) {
         .add(egui::Shape::line(pts, Stroke::new(2.5, t.accent)));
 }
 
+/// The status strip's session-database activity lamp: a dot (green
+/// idle, red while the store thread is busy) and its dim label.
+fn db_dot(ui: &mut egui::Ui, initial: &str, active: bool, t: &theme::Tokens) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+        ui.painter().circle_filled(
+            r.center(),
+            3.0,
+            if active {
+                t.danger
+            } else {
+                theme::annotation::GREEN
+            },
+        );
+        ui.label(
+            egui::RichText::new(initial.to_string())
+                .color(t.text_dim)
+                .size(10.0),
+        );
+    });
+}
+
 fn paint_tab_close(ui: &mut egui::Ui, rect: Rect, hovered: bool) {
     let t = theme::tokens(ui.ctx());
     if ui.is_rect_visible(rect) {
@@ -4110,6 +4270,8 @@ mod tests {
             insertion: v.next_insertion,
             persisted_rev: None,
             base_dirty: true,
+            stored_fp: None,
+            store_failed: false,
         });
         v.next_insertion += 1;
         v.active = v.tabs.len() - 1;

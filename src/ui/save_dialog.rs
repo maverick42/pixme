@@ -7,10 +7,8 @@ use std::sync::Arc;
 
 use egui::{Align, Layout, Ui, Vec2};
 
-use crate::app::Shared;
 use crate::capture::Capture;
-use crate::export::{ExportError, ImageFormat, file::save_capture_to};
-use crate::platform;
+use crate::export::ImageFormat;
 
 use super::{icons::Icon, theme, widgets};
 
@@ -48,6 +46,9 @@ pub struct SaveDialog {
     /// File this document was loaded/saved from: it may be overwritten
     /// without tripping the "file exists" block (re-saving IS the point).
     pub existing_ok: Option<PathBuf>,
+    /// A background save is in flight — the buttons grey out and a
+    /// spinner shows until `pump` lands the result.
+    pub saving: bool,
 }
 
 impl SaveDialog {
@@ -62,6 +63,7 @@ impl SaveDialog {
             error: None,
             viewer_tab: None,
             existing_ok: None,
+            saving: false,
         }
     }
 
@@ -87,27 +89,6 @@ impl SaveDialog {
                 .as_ref()
                 .and_then(|p| std::fs::canonicalize(p).ok())
     }
-
-    /// Writes the file at [`candidate_path`], updates the last-used
-    /// folder and reveals it when asked. On success the caller closes the
-    /// dialog; on failure the error is shown inline.
-    pub fn save(&mut self, shared: &Shared) -> Result<PathBuf, ExportError> {
-        let dir = PathBuf::from(self.folder.trim());
-        if !dir.is_dir() {
-            return Err(ExportError::Failed(t!("save.error_dir").into_owned()));
-        }
-        let path = self.candidate_path();
-        save_capture_to(&self.capture, &path, self.format)?;
-        if self.reveal {
-            platform::reveal_in_file_manager(&path);
-        }
-        // Persist the folder so the next save (and next session) reopens here.
-        let mut s = shared.lock_settings();
-        s.last_save_dir = Some(dir);
-        s.push_recent(path.clone());
-        s.save();
-        Ok(path)
-    }
 }
 
 /// The dialog body for one frame.
@@ -124,56 +105,60 @@ pub fn show(ui: &mut Ui, state: &mut SaveDialog) -> Outcome {
                 .fill(t.dock),
         )
         .show(ui, |ui| {
-            egui::Grid::new("pixme-save-grid")
-                .num_columns(2)
-                .spacing([20.0, 12.0])
-                .show(ui, |ui| {
-                    // -- destination folder -------------------------------
-                    right_label(ui, t!("save.location"));
-                    ui.horizontal(|ui| {
-                        let edit = egui::TextEdit::singleline(&mut state.folder)
+            ui.add_enabled_ui(!state.saving, |ui| {
+                egui::Grid::new("pixme-save-grid")
+                    .num_columns(2)
+                    .spacing([20.0, 12.0])
+                    .show(ui, |ui| {
+                        // -- destination folder -------------------------------
+                        right_label(ui, t!("save.location"));
+                        ui.horizontal(|ui| {
+                            let edit = egui::TextEdit::singleline(&mut state.folder)
+                                .desired_width(280.0)
+                                .font(theme::medium(12.0));
+                            ui.add(edit);
+                            if widgets::icon_button(ui, Icon::Folder, false)
+                                .on_hover_text(t!("save.browse"))
+                                .clicked()
+                                && let Some(dir) = rfd::FileDialog::new()
+                                    .set_directory(&state.folder)
+                                    .pick_folder()
+                            {
+                                state.folder = dir.to_string_lossy().into_owned();
+                            }
+                        });
+                        ui.end_row();
+
+                        // -- format radio -------------------------------------
+                        right_label(ui, t!("save.format"));
+                        ui.horizontal(|ui| {
+                            for f in [ImageFormat::Jpeg, ImageFormat::Png, ImageFormat::Webp] {
+                                ui.radio_value(&mut state.format, f, f.label());
+                                ui.add_space(6.0);
+                            }
+                        });
+                        ui.end_row();
+
+                        // -- file name -----------------------------------------
+                        right_label(ui, t!("save.filename"));
+                        let name = egui::TextEdit::singleline(&mut state.filename)
                             .desired_width(280.0)
                             .font(theme::medium(12.0));
-                        ui.add(edit);
-                        if widgets::icon_button(ui, Icon::Folder, false)
-                            .on_hover_text(t!("save.browse"))
-                            .clicked()
-                            && let Some(dir) = rfd::FileDialog::new()
-                                .set_directory(&state.folder)
-                                .pick_folder()
-                        {
-                            state.folder = dir.to_string_lossy().into_owned();
-                        }
+                        ui.add(name);
+                        ui.end_row();
+
+                        // -- reveal ---------------------------------------------
+                        right_label(ui, t!("save.reveal_label"));
+                        ui.checkbox(&mut state.reveal, t!("save.open_folder"));
+                        ui.end_row();
                     });
-                    ui.end_row();
-
-                    // -- format radio -------------------------------------
-                    right_label(ui, t!("save.format"));
-                    ui.horizontal(|ui| {
-                        for f in [ImageFormat::Jpeg, ImageFormat::Png, ImageFormat::Webp] {
-                            ui.radio_value(&mut state.format, f, f.label());
-                            ui.add_space(6.0);
-                        }
-                    });
-                    ui.end_row();
-
-                    // -- file name -----------------------------------------
-                    right_label(ui, t!("save.filename"));
-                    let name = egui::TextEdit::singleline(&mut state.filename)
-                        .desired_width(280.0)
-                        .font(theme::medium(12.0));
-                    ui.add(name);
-                    ui.end_row();
-
-                    // -- reveal ---------------------------------------------
-                    right_label(ui, t!("save.reveal_label"));
-                    ui.checkbox(&mut state.reveal, t!("save.open_folder"));
-                    ui.end_row();
-                });
+            });
 
             // Live existence check: saving over a FOREIGN file is blocked
             // (the document's own source is exempt — re-save overwrites it).
-            let taken = state.blocked_by_existing();
+            // Skipped while a background save is in flight so the file the
+            // worker just created never flashes the warning before closing.
+            let taken = !state.saving && state.blocked_by_existing();
             if let Some(err) = &state.error {
                 ui.add_space(6.0);
                 ui.colored_label(t.danger, err);
@@ -185,14 +170,21 @@ pub fn show(ui: &mut Ui, state: &mut SaveDialog) -> Outcome {
 
             ui.add_space(12.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(!taken, |ui| {
+                ui.add_enabled_ui(!taken && !state.saving, |ui| {
                     if widgets::primary_button(ui, &t!("save.confirm")).clicked() {
                         outcome = Outcome::Confirm;
                     }
                 });
-                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
-                    outcome = Outcome::Cancel;
+                if state.saving {
+                    ui.add_space(8.0);
+                    ui.spinner();
+                    ui.add_space(8.0);
                 }
+                ui.add_enabled_ui(!state.saving, |ui| {
+                    if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                        outcome = Outcome::Cancel;
+                    }
+                });
             });
         });
 

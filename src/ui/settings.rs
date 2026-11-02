@@ -130,6 +130,11 @@ fn general_page(ui: &mut egui::Ui, draft: &mut Settings) {
             retention_picker(ui, draft);
         });
         widgets::hairline(ui);
+        row(ui, &t!("settings.db_status.label"), |ui| {
+            ui.checkbox(&mut draft.db_status, "")
+                .on_hover_text(t!("settings.db_status.tooltip").to_string());
+        });
+        widgets::hairline(ui);
         row(ui, &t!("settings.general.diagnostic"), |ui| {
             let mut on = crate::logging::diagnostic_enabled();
             if ui
@@ -334,9 +339,7 @@ fn apply(ctx: &egui::Context, shared: &Shared) {
         return;
     };
     let old_retention = lock(&shared.settings).db_retention;
-    if old_retention.more_restrictive(draft.db_retention)
-        && lock(&shared.store).document_count() > 0
-    {
+    if old_retention.more_restrictive(draft.db_retention) && shared.writer.document_count() > 0 {
         ctx.data_mut(|d| d.insert_temp(egui::Id::new(PENDING_DRAFT), draft));
         return;
     }
@@ -348,11 +351,12 @@ fn apply(ctx: &egui::Context, shared: &Shared) {
 /// deliberately left out (they churn silently on every save).
 fn log_changes(old: &Settings, new: &Settings) {
     type Field = (&'static str, fn(&Settings) -> String);
-    let fields: [Field; 9] = [
+    let fields: [Field; 10] = [
         ("language", |s| format!("{:?}", s.language)),
         ("appearance", |s| format!("{:?}", s.appearance)),
         ("copy_to_clipboard", |s| s.copy_to_clipboard.to_string()),
         ("db_retention", |s| format!("{:?}", s.db_retention)),
+        ("db_status", |s| s.db_status.to_string()),
         ("tab_sort", |s| format!("{:?}", s.tab_sort)),
         ("text_color", |s| format!("{:?}", s.text_color)),
         ("text_font", |s| s.text_font.clone()),
@@ -371,13 +375,28 @@ fn log_changes(old: &Settings, new: &Settings) {
 /// to the store, modal closed.
 fn write_back(draft: Settings, shared: &Shared) {
     let retention = draft.db_retention;
-    {
+    let was = {
         let mut settings = lock(&shared.settings);
+        let was = settings.db_retention;
         let old = std::mem::replace(&mut *settings, draft);
         log_changes(&old, &settings);
         settings.save();
+        was
+    };
+    shared.writer.retention(retention);
+    // The apply may have pruned (or emptied) rows the live tabs still
+    // believe persisted — or persistence may just have come back on
+    // after `Never`: forget the write baseline so the next drain
+    // re-queues everything the store is now missing. Done through a
+    // flag: `write_back` runs inside the settings modal, which the
+    // viewer pass paints while HOLDING the viewer lock — locking the
+    // viewer here would self-deadlock. `sync_store` consumes the flag.
+    use crate::config::DbRetention as R;
+    if was != R::Always || retention != R::Always {
+        shared
+            .store_marks_reset
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    lock(&shared.store).apply_retention(retention);
     shared.settings_open.store(false, Ordering::Relaxed);
     *lock(&shared.settings_draft) = None;
 }

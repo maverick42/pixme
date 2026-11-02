@@ -375,21 +375,37 @@ pub struct Shared {
     pub save_dialog: Mutex<Option<crate::ui::save_dialog::SaveDialog>>,
     /// The Draw editor session, open while Some — modal to the viewer.
     pub draw: Mutex<Option<crate::ui::draw::DrawSession>>,
-    /// The session database — documents, annotations and undo stacks
-    /// written at quit, read back on the first viewer open.
-    pub store: Mutex<crate::store::Store>,
-    /// The in-flight session restore: a worker thread owns the Store
-    /// while loading (image decode off the UI thread) and hands it
-    /// back with the session.
-    pub restore_rx: Mutex<
-        Option<std::sync::mpsc::Receiver<(crate::store::StoredSession, crate::store::Store)>>,
-    >,
-    /// The in-flight quit-time save: the worker owns the Store + the
-    /// tabs while writing; its return closes the app.
-    pub quit_rx: Mutex<Option<std::sync::mpsc::Receiver<crate::store::Store>>>,
+    /// The session store's ordered write queue — a dedicated thread
+    /// owns the database for the whole run; every mutation lands there
+    /// shortly after the change that produced it.
+    pub writer: crate::store::writer::Writer,
+    /// The in-flight session restore: the store thread decodes images
+    /// off the UI thread and hands the session back over the channel.
+    pub restore_rx: Mutex<Option<std::sync::mpsc::Receiver<crate::store::StoredSession>>>,
+    /// The in-flight quit-time flush: `Some` while the writer drains
+    /// its queue; the reply (or the deadline) closes the app.
+    pub quit_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// When the quit flush was requested — bounds the wait.
+    quit_started: Mutex<Option<std::time::Instant>>,
     /// The in-flight "Tout enregistrer" batch: the worker owns the tabs
     /// while writing; `pump` reattaches them when it lands.
     save_all: Mutex<Option<SaveAllJob>>,
+    /// The in-flight single-capture save (the save-as dialog's
+    /// Enregistrer): the PNG encode rides a worker so a 5K write never
+    /// stalls a frame; `pump` applies the result.
+    save_one: Mutex<Option<SaveOneJob>>,
+    /// One-shot, non-modal store-failure notice — set the first time a
+    /// session write reports `DocFailed` (translated); the per-tab
+    /// warning glyph is the standing signal afterwards.
+    pub store_notice: Mutex<Option<String>>,
+    /// The notice was already shown once this run — never nags twice.
+    store_notice_seen: AtomicBool,
+    /// Set by the settings apply when the retention policy may have
+    /// pruned (or emptied) the store behind the tabs' backs — the next
+    /// `sync_store` forgets the write baselines so everything missing
+    /// is re-queued. A flag, not a direct lock: the apply runs while
+    /// the viewer lock is already held by its own pass.
+    pub store_marks_reset: AtomicBool,
     /// Viewports that must grab focus once they exist and are visible
     /// (`Focus` is a no-op on a not-yet-visible window, so the child callback
     /// re-sends it until focused; the counter caps retries).
@@ -426,6 +442,26 @@ struct SaveAllJob {
     total: usize,
     then_confirm: bool,
 }
+
+/// A running background single-file save (the save-as dialog): the
+/// encode+write happens off the UI thread; `pump` marks the tab clean,
+/// updates the recent files and closes the dialog on success.
+struct SaveOneJob {
+    rx: std::sync::mpsc::Receiver<Result<(), crate::export::ExportError>>,
+    /// The destination the worker is writing.
+    path: std::path::PathBuf,
+    /// The folder — becomes the next save's default location.
+    dir: std::path::PathBuf,
+    /// The viewer tab to mark clean (`None` for pin saves).
+    viewer_tab: Option<usize>,
+    /// Open the file manager on the result.
+    reveal: bool,
+}
+
+/// How long quit waits for the writer queue to empty before giving up
+/// — a `warn` is logged and the app exits regardless (the session is
+/// a convenience, a stuck disk must not hang the process).
+const QUIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Shared {
     /// Queues a command for dispatch on the next pump.
@@ -516,6 +552,31 @@ impl Shared {
     pub fn pump(&self, ctx: &egui::Context) {
         crate::logging::report_health();
         platform::strip_undecorated_frame();
+        // The quit-time flush finished on the store thread — or the
+        // wait ran out / the writer died: the app closes either way.
+        // Checked before `dispatch` so the pass that initiates `Quit`
+        // always leaves `quit_rx` armed for one frame (the saving veil
+        // and the unit-test `drain_quit` barrier) instead of racing the
+        // worker thread inside the same `pump` call.
+        if lock(&self.quit_rx).is_some() {
+            let flushed = lock(&self.quit_rx)
+                .as_ref()
+                .map(|r| r.try_recv())
+                .is_some_and(|r| !matches!(r, Err(std::sync::mpsc::TryRecvError::Empty)));
+            let timed_out =
+                lock(&self.quit_started).is_some_and(|t| t.elapsed() > QUIT_FLUSH_TIMEOUT);
+            if timed_out {
+                tracing::warn!(
+                    "session flush exceeded {}s — quitting anyway",
+                    QUIT_FLUSH_TIMEOUT.as_secs()
+                );
+            }
+            if flushed || timed_out {
+                *lock(&self.quit_rx) = None;
+                *lock(&self.quit_started) = None;
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
+        }
         let commands: Vec<Command> = platform::take_pending_commands()
             .into_iter()
             .chain(std::mem::take(&mut *lock(&self.pending)))
@@ -570,18 +631,10 @@ impl Shared {
         let done = lock(&self.restore_rx)
             .as_ref()
             .and_then(|r| r.try_recv().ok());
-        if let Some((session, store)) = done {
+        if let Some(session) = done {
             *lock(&self.restore_rx) = None;
-            self.finish_restore(session, store);
+            self.finish_restore(session);
             ctx.repaint_if_live(viewer_id());
-        }
-        // The quit-time save finished on its thread: the store comes
-        // back and the app closes for real.
-        let store_back = lock(&self.quit_rx).as_ref().and_then(|r| r.try_recv().ok());
-        if let Some(store) = store_back {
-            *lock(&self.quit_rx) = None;
-            *lock(&self.store) = store;
-            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
         }
         // A background save-all finished: the tabs come back into the
         // viewer; a ConfirmSave batch then closes the (now clean)
@@ -612,6 +665,40 @@ impl Shared {
             }
             ctx.repaint_if_live(viewer_id());
         }
+        // A background single-file save landed: mark the tab clean,
+        // refresh the recent files and close the dialog — or hand the
+        // error back to it (stays open, inline message).
+        let one_done = lock(&self.save_one)
+            .as_ref()
+            .and_then(|j| j.rx.try_recv().ok());
+        if let Some(result) = one_done {
+            let job = lock(&self.save_one).take().expect("save-one job");
+            match result {
+                Ok(()) => {
+                    tracing::info!(file = %crate::paths::file_name(&job.path), "saved");
+                    if job.reveal {
+                        platform::reveal_in_file_manager(&job.path);
+                    }
+                    if let Some(i) = job.viewer_tab {
+                        lock(&self.viewer).mark_saved(i, job.path.clone());
+                    }
+                    let mut s = lock(&self.settings);
+                    s.last_save_dir = Some(job.dir);
+                    s.push_recent(job.path);
+                    s.save();
+                    *lock(&self.save_dialog) = None;
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+                Err(e) => {
+                    if let Some(dialog) = lock(&self.save_dialog).as_mut() {
+                        dialog.saving = false;
+                        dialog.error = Some(e.to_string());
+                    }
+                    ctx.repaint_if_live(save_dialog_id());
+                }
+            }
+        }
+        self.sync_store(ctx);
     }
 
     /// The one dispatch path for every entry point.
@@ -1239,8 +1326,9 @@ impl Shared {
         };
         // The session ended deliberately (saved-then-closed or
         // discarded): nothing of it may come back at the next launch.
+        // Queued writes stay ordered — the clear runs behind them.
         tracing::info!("session_discarded");
-        lock(&self.store).clear();
+        self.writer.clear();
         if quit {
             self.quit_now(ctx);
         } else {
@@ -1464,7 +1552,7 @@ impl Shared {
     /// `restore_rx`, drained by `pump()`; the viewer paints a spinner
     /// meanwhile. Silent and best-effort (a corrupt database was
     /// already parked as `.bak` when the store opened).
-    fn restore_session(&self, ctx: &egui::Context) {
+    fn restore_session(&self, _ctx: &egui::Context) {
         let needed = {
             let viewer = lock(&self.viewer);
             !viewer.session_restored() && viewer.tabs.is_empty()
@@ -1473,38 +1561,130 @@ impl Shared {
             return;
         }
         // Claim the restore first — a second viewer entry while the
-        // thread runs must not spawn a duplicate loader.
+        // job runs must not queue a duplicate load.
         lock(&self.viewer).start_restore();
-        // Retention `Never` writes nothing: skip the thread entirely.
+        // Retention `Never` reads nothing: skip the job entirely.
         if !self.session_persists() {
             let sort = lock(&self.settings).tab_sort;
             lock(&self.viewer).restore_session(crate::store::StoredSession::default(), sort);
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel();
-        *lock(&self.restore_rx) = Some(rx);
-        // The Store itself rides the thread — one connection, no dual
-        // access, and tests keep their in-memory database. A disabled
-        // placeholder sits in `shared.store` meanwhile.
-        let mut store = std::mem::replace(&mut *lock(&self.store), crate::store::Store::disabled());
-        let wake = ctx.clone();
-        std::thread::spawn(move || {
-            let session = store.load_session();
-            let _ = tx.send((session, store));
-            wake.request_repaint();
-        });
+        // The store thread loads — one connection, PNG decodes off the
+        // UI thread, and it replies over the channel the pump drains.
+        *lock(&self.restore_rx) = Some(self.writer.load());
     }
 
-    /// Installs the result of the loader thread: the store comes back,
-    /// the loaded session swaps into the viewer.
-    fn finish_restore(&self, session: crate::store::StoredSession, store: crate::store::Store) {
-        *lock(&self.store) = store;
+    /// Installs the result of the loader thread: the loaded session
+    /// swaps into the viewer.
+    fn finish_restore(&self, session: crate::store::StoredSession) {
         let sort = lock(&self.settings).tab_sort;
         lock(&self.viewer).restore_session(session, sort);
         // A capture marked saved whose file vanished on disk is not
         // saved anymore: flag it (red dot) and drop the stale path so
         // size/delete never act on a file that isn't there.
         lock(&self.viewer).mark_missing_files_unsaved();
+    }
+
+    /// The one-way session drain, run at the tail of every pump:
+    ///
+    /// 1. Worker events land — a failed write flags its tab (warning
+    ///    glyph) and surfaces the one-shot notice; a successful write
+    ///    clears the flag.
+    /// 2. Closed tabs queue their row deletion.
+    /// 3. Any tab whose [`Tab::fingerprint`] drifted from what the
+    ///    writer last saw is snapshotted and queued — a single
+    ///    detection point covering captures, edits, commits, renames,
+    ///    protection, save-state flips and everything added later.
+    ///
+    /// "Handed to the writer" marks (`stored_fp`, `persisted_rev`,
+    /// `base_dirty`) update at enqueue, not at commit: a failed job is
+    /// retried from the snapshot it already carries, so the marks must
+    /// not lie about needing work.
+    fn sync_store(&self, ctx: &egui::Context) {
+        use crate::store::writer::WriteEvent;
+        for ev in self.writer.drain_events() {
+            match ev {
+                WriteEvent::DocWritten { id, .. } => {
+                    if let Some(tab) = lock(&self.viewer)
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.doc.meta.id == id)
+                    {
+                        tab.store_failed = false;
+                    }
+                }
+                WriteEvent::DocFailed { id } => {
+                    if let Some(tab) = lock(&self.viewer)
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.doc.meta.id == id)
+                    {
+                        tab.store_failed = true;
+                    }
+                    if !self.store_notice_seen.swap(true, Ordering::Relaxed) {
+                        *lock(&self.store_notice) = Some(t!("app.store_write_failed").to_string());
+                    }
+                    ctx.repaint_if_live(viewer_id());
+                }
+            }
+        }
+        // Closed tabs lose their stored rows — a closed capture stays
+        // closed at the next launch.
+        let closed = lock(&self.viewer).take_closed_ids();
+        if !closed.is_empty() {
+            tracing::info!(count = closed.len(), "tabs_closed");
+            self.writer.delete(closed);
+        }
+        if self.store_marks_reset.swap(false, Ordering::Relaxed) {
+            // Settings applied a pruning retention (or left `Never`) —
+            // the store may lack rows the tabs believe written.
+            lock(&self.viewer).reset_store_marks();
+        }
+        if !self.session_persists() || lock(&self.restore_rx).is_some() {
+            // `Never` retention (or a session load still decoding): no
+            // writes — and NO marks touched, so a later return to
+            // `Always` (or the finished load) queues what is needed.
+            return;
+        }
+        let mut viewer = lock(&self.viewer);
+        let sigs = viewer.sigs();
+        if viewer.persisted_sigs == Some(sigs) {
+            return;
+        }
+        let content_same = viewer.persisted_sigs.is_some_and(|(c, _)| c == sigs.0);
+        let meta_same = viewer.persisted_sigs.is_some_and(|(_, m)| m == sigs.1);
+        for (ord, tab) in viewer.tabs.iter_mut().enumerate() {
+            let fp = tab.fingerprint();
+            if tab.stored_fp == Some(fp) {
+                continue;
+            }
+            if tab.persisted_rev == Some(tab.doc.revision) && !tab.base_dirty {
+                // Meta-only drift (rename, save flag, protection…):
+                // the bulk meta write below already covers it.
+                tab.stored_fp = Some(fp);
+            } else {
+                let write = tab.to_doc_write(ord);
+                tab.stored_fp = Some(fp);
+                tab.persisted_rev = Some(tab.doc.revision);
+                tab.base_dirty = false;
+                self.writer.write_doc(write);
+            }
+        }
+        if !content_same {
+            // A reorder or a meta-only change touched rows the per-tab
+            // pass skipped — refresh every meta column in one job.
+            let rows = viewer
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(ord, tab)| tab.to_meta_row(ord))
+                .collect();
+            self.writer.write_meta(rows);
+        }
+        if !meta_same {
+            self.writer.set_session(viewer.active, viewer.next_title());
+        }
+        viewer.persisted_sigs = Some(sigs);
     }
 
     /// `true` when the session is persisted to `session.db` — the
@@ -1514,27 +1694,23 @@ impl Shared {
         lock(&self.settings).db_retention != crate::config::DbRetention::Never
     }
 
-    /// Persists the session (best-effort — a failure never blocks
-    /// quitting), then closes the anchor viewport: eframe exits once
-    /// the root window is gone.
-    ///
-    /// The content signature decides the cost: an unchanged session
-    /// writes nothing; a meta-only drift (active tab, titles, order)
-    /// costs one row of UPDATEs; a real change rides a worker thread
-    /// while the viewer shows the saving veil — `pump()` closes the
-    /// app when the store comes back.
+    /// Queues the quit-time write barrier, then waits — every eager
+    /// write is already done or in flight, so the flush only has to
+    /// drain the tail of the queue, retry parked failures and refresh
+    /// the meta columns. `pump()` closes the app when the barrier
+    /// lifts or the timeout expires; the saving veil covers the wait.
     fn quit_now(&self, ctx: &egui::Context) {
         if !self.session_persists() {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
             return;
         }
-        // A restore still decoding owns the real Store — wait for it and
-        // install the session first, or quit would save into the disabled
-        // placeholder and the whole session would be silently lost.
+        // A restore still decoding is ahead of every write job — wait
+        // for it and install the session first, or its tabs would be
+        // finalized as absent and their rows pruned.
         if let Some(rx) = lock(&self.restore_rx).take()
-            && let Ok((session, store)) = rx.recv()
+            && let Ok(session) = rx.recv()
         {
-            self.finish_restore(session, store);
+            self.finish_restore(session);
         }
         // An open Draw editor still owns its tab's document clone —
         // finalize any open text panel and commit it back so a quit
@@ -1543,42 +1719,31 @@ impl Shared {
             draw.finalize_pending();
             lock(&self.viewer).commit_draw(draw.tab, draw.doc, draw.undo, draw.redo);
         }
-        let mut viewer = lock(&self.viewer);
-        let sigs = viewer.sigs();
-        if viewer.persisted_sigs == Some(sigs) {
-            drop(viewer);
-            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
-            return;
-        }
-        let active = viewer.active_index().unwrap_or(0);
-        let next_title = viewer.next_title();
-        if viewer.persisted_sigs.is_some_and(|(c, _)| c == sigs.0) {
-            // Content identical — only meta drifted: cheap UPDATEs,
-            // no image work, quit stays instant.
-            let rows: Vec<_> = viewer
-                .tabs
-                .iter()
-                .map(|t| (t.doc.meta.id.clone(), t.title.clone(), t.saved))
-                .collect();
-            drop(viewer);
-            lock(&self.store).save_meta(&rows, active, next_title);
-            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
-            return;
-        }
-        // Real changes — tabs and store both ride the worker; the
-        // viewer's saving veil covers the wait and pump() closes the
-        // app when the store returns.
-        let tabs = std::mem::take(&mut viewer.tabs);
-        drop(viewer);
-        let mut store = std::mem::replace(&mut *lock(&self.store), crate::store::Store::disabled());
-        let (tx, rx) = std::sync::mpsc::channel();
-        *lock(&self.quit_rx) = Some(rx);
-        let wake = ctx.clone();
-        std::thread::spawn(move || {
-            store.save_session(&tabs, active, next_title);
-            let _ = tx.send(store);
-            wake.request_repaint();
-        });
+        // Push whatever changed since the last drain (the draw commit
+        // above included), then the barrier: meta refresh + stale-row
+        // prune, and the flush that lifts when the queue is empty.
+        self.sync_store(ctx);
+        let (rows, live, active, next_title) = {
+            let viewer = lock(&self.viewer);
+            (
+                viewer
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(ord, t)| t.to_meta_row(ord))
+                    .collect::<Vec<_>>(),
+                viewer
+                    .tabs
+                    .iter()
+                    .map(|t| t.doc.meta.id.clone())
+                    .collect::<Vec<_>>(),
+                viewer.active_index().unwrap_or(0),
+                viewer.next_title(),
+            )
+        };
+        self.writer.finalize(rows, live, active, next_title);
+        *lock(&self.quit_rx) = Some(self.writer.flush());
+        *lock(&self.quit_started) = Some(std::time::Instant::now());
         ctx.repaint_if_live(viewer_id());
     }
 }
@@ -1748,16 +1913,26 @@ impl PixMeApp {
                 next_pin_id: Mutex::new(0),
                 save_dialog: Mutex::new(None),
                 draw: Mutex::new(None),
-                store: Mutex::new({
-                    let mut store = crate::store::Store::open();
-                    // Launch-time retention: stale captures are pruned
-                    // before anything can restore them.
-                    store.apply_retention(db_retention);
-                    store
-                }),
+                writer: {
+                    // The store thread owns the database for the whole
+                    // run — retention rides the queue first so pruning
+                    // always lands before the session load.
+                    let ctx = cc.egui_ctx.clone();
+                    let writer = crate::store::writer::Writer::spawn(
+                        crate::store::Store::open(),
+                        Some(std::sync::Arc::new(move || wake_viewports(&ctx))),
+                    );
+                    writer.retention(db_retention);
+                    writer
+                },
                 restore_rx: Mutex::new(None),
                 quit_rx: Mutex::new(None),
+                quit_started: Mutex::new(None),
                 save_all: Mutex::new(None),
+                save_one: Mutex::new(None),
+                store_notice: Mutex::new(None),
+                store_notice_seen: AtomicBool::new(false),
+                store_marks_reset: AtomicBool::new(false),
                 pending_focus: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
                 // Windows portable fallback: the one translated notice,
@@ -1880,36 +2055,14 @@ impl eframe::App for PixMeApp {
                     }
                     ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
                     lock(&shared.viewer).show(ui, &shared);
-                    // Tabs closed this frame lose their stored rows —
-                    // a closed capture stays closed at the next launch.
-                    let closed = lock(&shared.viewer).take_closed_ids();
-                    if !closed.is_empty() {
-                        tracing::info!(count = closed.len(), "tabs_closed");
-                        lock(&shared.store).delete_documents(&closed);
-                    }
+                    // One-shot store-failure notice (translated): a write
+                    // failed on the worker — the per-tab warning glyph is
+                    // the standing signal; this explains it once.
+                    notice_window(&ctx, "pixme.store_notice", &shared.store_notice);
                     // Deferred startup notice (Windows data/logs fallback):
                     // the first real window delivers it — non-modal, the
                     // app stays usable.
-                    if lock(&shared.startup_notice).is_some() {
-                        let mut open = true;
-                        egui::Window::new(t!("app.title").to_string())
-                            .collapsible(false)
-                            .resizable(false)
-                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                            .open(&mut open)
-                            .show(&ctx, |ui| {
-                                if let Some(msg) = &*lock(&shared.startup_notice) {
-                                    ui.label(msg);
-                                }
-                                ui.add_space(6.0);
-                                if ui::widgets::primary_button(ui, "OK").clicked() {
-                                    *lock(&shared.startup_notice) = None;
-                                }
-                            });
-                        if !open {
-                            *lock(&shared.startup_notice) = None;
-                        }
-                    }
+                    notice_window(&ctx, "pixme.startup_notice", &shared.startup_notice);
                     // Windows About modal — the egui twin of the macOS
                     // native About panel, framed like the settings modal:
                     // title band with a painted close cross, compact body.
@@ -2245,32 +2398,53 @@ impl eframe::App for PixMeApp {
                         *lock(&shared.save_dialog) = None;
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                     };
+                    let saving = lock(&shared.save_dialog).as_ref().is_some_and(|d| d.saving);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                        close(&ctx);
+                        if !saving {
+                            close(&ctx);
+                        }
                         return;
                     }
-                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if !saving && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         close(&ctx);
                         return;
                     }
                     let mut guard = lock(&shared.save_dialog);
                     if let Some(dialog) = guard.as_mut() {
                         match ui::save_dialog::show(ui, dialog) {
-                            ui::save_dialog::Outcome::Confirm => match dialog.save(&shared) {
-                                Ok(path) => {
-                                    tracing::info!(file = %crate::paths::file_name(&path), "saved");
-                                    // A viewer document is now on disk:
-                                    // the tab flips to clean and records
-                                    // where/when it was written.
-                                    if let Some(i) = dialog.viewer_tab {
-                                        lock(&shared.viewer).mark_saved(i, path);
-                                    }
-                                    drop(guard);
-                                    close(&ctx);
+                            ui::save_dialog::Outcome::Confirm => {
+                                let dir = std::path::PathBuf::from(dialog.folder.trim());
+                                if !dir.is_dir() {
+                                    dialog.error = Some(t!("save.error_dir").into_owned());
+                                } else {
+                                    // The encode+write rides a worker —
+                                    // a 5K PNG must not stall a frame.
+                                    // `pump` lands the result (mark_saved,
+                                    // recent files, close) or hands the
+                                    // error back to the dialog.
+                                    let path = dialog.candidate_path();
+                                    let capture = std::sync::Arc::clone(&dialog.capture);
+                                    let format = dialog.format;
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    let wake = ctx.clone();
+                                    std::thread::spawn(move || {
+                                        let res = crate::export::file::save_capture_to(
+                                            &capture, &path, format,
+                                        );
+                                        let _ = tx.send(res);
+                                        wake_viewports(&wake);
+                                    });
+                                    dialog.saving = true;
+                                    *lock(&shared.save_one) = Some(SaveOneJob {
+                                        rx,
+                                        path: dialog.candidate_path(),
+                                        dir,
+                                        viewer_tab: dialog.viewer_tab,
+                                        reveal: dialog.reveal,
+                                    });
                                 }
-                                Err(e) => dialog.error = Some(e.to_string()),
-                            },
+                            }
                             ui::save_dialog::Outcome::Cancel => {
                                 drop(guard);
                                 close(&ctx);
@@ -2281,6 +2455,33 @@ impl eframe::App for PixMeApp {
                 },
             );
         }
+    }
+}
+
+/// One-shot non-modal notice window (store failure or Windows
+/// portable fallback): distinct egui ID, translated OK button.
+fn notice_window(ctx: &egui::Context, id: &'static str, slot: &Mutex<Option<String>>) {
+    if lock(slot).is_none() {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new(t!("app.title").to_string())
+        .id(egui::Id::new(id))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            if let Some(msg) = &*lock(slot) {
+                ui.label(msg);
+            }
+            ui.add_space(6.0);
+            if ui::widgets::primary_button(ui, &t!("draw.ok")).clicked() {
+                *lock(slot) = None;
+            }
+        });
+    if !open {
+        *lock(slot) = None;
     }
 }
 
@@ -2498,10 +2699,18 @@ mod tests {
             next_pin_id: Mutex::new(0),
             save_dialog: Mutex::new(None),
             draw: Mutex::new(None),
-            store: Mutex::new(crate::store::Store::open_in_memory()),
+            writer: crate::store::writer::Writer::spawn(
+                crate::store::Store::open_in_memory(),
+                None,
+            ),
             restore_rx: Mutex::new(None),
             quit_rx: Mutex::new(None),
+            quit_started: Mutex::new(None),
             save_all: Mutex::new(None),
+            save_one: Mutex::new(None),
+            store_notice: Mutex::new(None),
+            store_notice_seen: AtomicBool::new(false),
+            store_marks_reset: AtomicBool::new(false),
             pending_focus: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             last_language: Mutex::new(Language::Auto),
@@ -2518,25 +2727,23 @@ mod tests {
         *lock(&shared.state)
     }
 
-    /// Blocks on the loader thread and installs its result — the
+    /// Blocks on the store thread's load and installs its result — the
     /// synchronous twin of the drain `pump()` does each frame.
     fn drain_restore(shared: &Shared) {
         let rx = lock(&shared.restore_rx).take();
         if let Some(rx) = rx
-            && let Ok((session, store)) = rx.recv()
+            && let Ok(session) = rx.recv()
         {
-            shared.finish_restore(session, store);
+            shared.finish_restore(session);
         }
     }
 
-    /// Blocks on the quit-time save thread and puts the store back —
-    /// the synchronous twin of the drain `pump()` does each frame.
+    /// Blocks on the quit-time flush — the synchronous twin of the
+    /// drain `pump()` does each frame.
     fn drain_quit(shared: &Shared) {
         let rx = lock(&shared.quit_rx).take();
-        if let Some(rx) = rx
-            && let Ok(store) = rx.recv()
-        {
-            *lock(&shared.store) = store;
+        if let Some(rx) = rx {
+            let _ = rx.recv();
         }
     }
 
@@ -2683,8 +2890,9 @@ mod tests {
         assert_eq!(lock(&shared.viewer).tabs.len(), 1);
     }
 
-    /// A quit that changed nothing writes nothing — the signature check
-    /// short-circuits before any store work.
+    /// A quit that changed nothing queues no document write — the
+    /// fingerprint check short-circuits before any row work, and the
+    /// flush barrier still lands.
     #[test]
     fn unchanged_quit_writes_nothing() {
         let (shared, ctx) = harness();
@@ -2693,26 +2901,31 @@ mod tests {
         drain_restore(&shared);
         drive(&shared, &ctx, Command::Quit);
         assert!(
-            lock(&shared.quit_rx).is_none(),
-            "unchanged quit must not write"
+            lock(&shared.quit_rx).is_some(),
+            "quit always flushes the writer queue"
+        );
+        drain_quit(&shared);
+        assert!(
+            shared.writer.drain_events().is_empty(),
+            "unchanged quit must not rewrite any document"
         );
     }
 
-    /// A quit landing while the restore worker still owns the real
-    /// Store must drain it first — otherwise the session is written
-    /// into the disabled placeholder and silently lost.
+    /// A quit landing while the store thread is still loading must
+    /// wait for the session first — otherwise the load's tabs would be
+    /// finalized as absent and their rows pruned.
     #[test]
     fn quit_drains_an_in_flight_restore() {
         let (shared, ctx) = harness();
-        // Simulate a loader that finished decoding but whose result
-        // pump() has not drained yet.
-        let mut store = crate::store::Store::open_in_memory();
+        // Seed the shared store, then simulate a finished load whose
+        // result pump() has not drained yet.
         let mut v = Viewer::default();
         v.push_stub("from_db");
-        store.save_session(&v.tabs, 0, v.next_title());
-        let session = store.load_session();
+        shared.writer.write_doc(v.tabs[0].to_doc_write(0));
+        shared.writer.flush().recv().expect("seed write");
+        let session = shared.writer.load().recv().expect("load reply");
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send((session, store)).unwrap();
+        tx.send(session).unwrap();
         *lock(&shared.restore_rx) = Some(rx);
 
         drive(&shared, &ctx, Command::Quit);
@@ -2747,6 +2960,31 @@ mod tests {
         drive(&shared, &ctx, Command::OpenViewer);
         drain_restore(&shared);
         assert_eq!(lock(&shared.viewer).tabs.len(), 1);
+    }
+
+    /// When retention empties the store (`Never`) and later comes back
+    /// (`Always`), `store_marks_reset` forces `sync_store` to re-queue
+    /// the full document (base pixels included), not a meta-only UPDATE.
+    #[test]
+    fn reset_store_marks_rewrites_full_documents_after_never() {
+        let (shared, ctx) = harness();
+        drive(&shared, &ctx, Command::OpenViewer);
+        drain_restore(&shared);
+        lock(&shared.viewer).push_stub("capture 1");
+        shared.pump(&ctx);
+        shared.writer.flush().recv().expect("initial write");
+        assert_eq!(shared.writer.document_count(), 1);
+
+        // Simulate switching retention to Never (clears DB), then back
+        // to Always with `store_marks_reset` set.
+        shared.writer.retention(crate::config::DbRetention::Never);
+        shared.writer.flush().recv().expect("clear");
+        assert_eq!(shared.writer.document_count(), 0);
+
+        shared.store_marks_reset.store(true, Ordering::Relaxed);
+        shared.pump(&ctx);
+        shared.writer.flush().recv().expect("rewrite");
+        assert_eq!(shared.writer.document_count(), 1);
     }
 
     /// A discarded session empties the store — a later viewer open

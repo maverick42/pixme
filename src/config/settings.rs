@@ -118,6 +118,10 @@ pub struct Settings {
     pub recent_files: Vec<PathBuf>,
     /// Session-database retention (never / today / always).
     pub db_retention: DbRetention,
+    /// Show the session-database READ/WRITE activity indicators in the
+    /// viewer's status strip.
+    #[serde(default = "default_db_status")]
+    pub db_status: bool,
     /// Tab ordering — `None` = insertion order.
     pub tab_sort: Option<TabSort>,
     /// Text-tool colour `[r, g, b]` persisted across sessions.
@@ -182,6 +186,9 @@ fn default_filename_templates() -> Vec<String> {
 fn default_filename_counter() -> u64 {
     1
 }
+fn default_db_status() -> bool {
+    true
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -195,6 +202,7 @@ impl Default for Settings {
             last_open_dir: None,
             recent_files: Vec::new(),
             db_retention: DbRetention::default(),
+            db_status: default_db_status(),
             tab_sort: None,
             text_color: default_text_color(),
             text_font: default_text_font(),
