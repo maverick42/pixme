@@ -12,7 +12,6 @@
 // Phase 1 scaffold: public module APIs (capture, editor, export, widgets) are
 // consumed from phase 2 onward. Remove this allow as real callers land.
 #![allow(dead_code)]
-
 // Shipped binaries are GUI-subsystem (no console window on launch); debug and
 // dev-tools builds keep a console so tracing echo and `--bench-store` /
 // `--seed-session` output stay visible — mirrors `logging::console_enabled`.

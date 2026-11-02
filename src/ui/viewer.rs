@@ -1412,9 +1412,12 @@ impl Viewer {
     }
 
     /// Every view-mode switch funnels here so the change is logged.
+    /// Both views re-centre on the current capture: the grid scrolls to
+    /// the active tile, the tab strip to the active chip.
     fn set_view_mode(&mut self, mode: ViewMode) {
         if self.view_mode != mode {
             self.view_mode = mode;
+            self.scroll_active_into_view = true;
             tracing::info!(mode = ?mode, "view_mode");
         }
     }
@@ -2962,6 +2965,7 @@ impl Viewer {
                 }
                 ui.add_space(spacing);
             });
+        self.scroll_active_into_view = false;
         if self.mos_built_frame > 0 || t_frame.elapsed().as_millis() > 16 {
             tracing::debug!(
                 frame_ms = t_frame.elapsed().as_secs_f64() * 1e3,
@@ -3028,7 +3032,9 @@ impl Viewer {
         let tile_hovered =
             resp.hovered() || close.hovered() || anchor.hovered() || anchor.dragged();
         // Frame: card at rest, accent-soft when selected — the tab
-        // chips' selected treatment.
+        // chips' selected treatment. The active tile additionally wears
+        // a 1-pt accent ring OUTSIDE its frame so the current capture
+        // reads at a glance in the grid.
         ui.painter().rect(
             rect,
             CornerRadius::same(t.radius_md),
@@ -3043,6 +3049,14 @@ impl Viewer {
             ),
             StrokeKind::Inside,
         );
+        if selected {
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(t.radius_md),
+                Stroke::new(1.0, t.accent),
+                StrokeKind::Outside,
+            );
+        }
         // Pixels stay hidden for protected tabs: no thumbnail is ever
         // generated or painted, just a centred padlock — a proven
         // password unlocks the canvas, never the mosaic tile.
@@ -3106,6 +3120,9 @@ impl Viewer {
         }
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if self.scroll_active_into_view && selected {
+            resp.scroll_to_me(None);
         }
         // Dragging the top-left grip starts an OS drag-out of the full
         // rendered capture (base + annotations, never the mosaic thumbnail)
