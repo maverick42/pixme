@@ -5,11 +5,13 @@
 
 use std::time::{Duration, Instant};
 
-use egui::{CentralPanel, Frame, Margin, Rect, Vec2, ViewportCommand};
+use egui::{CentralPanel, Frame, Margin, Vec2};
 
 use crate::app::CaptureMode;
+use crate::capture::{MonitorInfo, screen};
 use crate::platform;
 use crate::ui::theme;
+use crate::ui::viewport_sync::ViewportSync;
 
 /// Transparent margin kept around the digit so its painted outline is
 /// not clipped by the viewport bounds (same trick as the floating bar).
@@ -57,6 +59,9 @@ pub struct Countdown {
     /// The second currently displayed — a tick sounds each time it
     /// changes, including the first shown digit.
     shown: Option<u32>,
+    /// Last geometry this window asked for — commands are deduped
+    /// against it, never against the reported (transient) rect.
+    sync: ViewportSync,
 }
 
 impl Countdown {
@@ -66,6 +71,7 @@ impl Countdown {
             mode,
             deadline: Instant::now() + Duration::from_secs(u64::from(secs)),
             shown: None,
+            sync: ViewportSync::new("PixMe Countdown"),
         }
     }
 
@@ -78,12 +84,13 @@ impl Countdown {
     }
 
     /// Paints the countdown digit for this frame and keeps the viewport
-    /// hugging it, parked at the bottom-right of the monitor holding
-    /// `anchor` (the bar or the viewer — i.e. where PixMe lives). Without
-    /// an anchor it falls back to the monitor under the cursor, then the
-    /// primary. Returns `false` once the deadline passed — the caller
-    /// then fires the capture.
-    pub fn show(&mut self, ui: &mut egui::Ui, anchor: Option<Rect>) -> bool {
+    /// hugging it, parked at the bottom-right of `anchor`'s monitor (the
+    /// bar's or the viewer's — resolved in native units by the owner, so
+    /// no window's points are mixed here). Without an anchor it falls
+    /// back to the monitor under the cursor, then the primary. Returns
+    /// `false` once the deadline passed — the caller then fires the
+    /// capture.
+    pub fn show(&mut self, ui: &mut egui::Ui, anchor: Option<MonitorInfo>) -> bool {
         let remaining = self.remaining();
         if remaining == 0 {
             return false;
@@ -113,50 +120,31 @@ impl Countdown {
     }
 
     /// Keeps the viewport hugging the digit area, parked at the
-    /// bottom-right of the monitor holding `anchor` — the window PixMe
-    /// lives on — with cursor-monitor and primary fallbacks.
-    fn sync_viewport(&self, ctx: &egui::Context, card: egui::Rect, anchor: Option<Rect>) {
+    /// bottom-right of `anchor`'s monitor — with cursor-monitor and
+    /// primary fallbacks. The monitor rect is expressed in THIS window's
+    /// points (its own ppp, the factor egui-winit multiplies commands by)
+    /// and the position is only resent when it really changed — dragging
+    /// the window across a mixed-DPI boundary sends nothing.
+    fn sync_viewport(&mut self, ctx: &egui::Context, card: egui::Rect, anchor: Option<MonitorInfo>) {
         let target = card.size() + Vec2::splat(2.0 * f32::from(SHADOW_MARGIN));
-        let current = ctx.input(|i| i.viewport().inner_rect.map_or(Vec2::ZERO, |r| r.size()));
-        if (target - current).abs().max_elem() > 1.0 {
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
-        }
-        // The monitor containing the anchor's centre, tested in native
-        // coordinates against each monitor's own scale (mixed-DPI safe) —
-        // same containment trick as `Command::ShowBar`'s spot check.
-        let anchor_monitor = anchor.and_then(|r| {
-            let centre = r.center();
-            crate::capture::screen::monitors()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|m| {
-                    let scale = m.scale_factor.max(1.0);
-                    let native = platform::ui_to_native(centre, scale);
-                    let mr = &m.rect;
-                    native.x >= mr.x as f32
-                        && native.x < mr.x as f32 + mr.width as f32
-                        && native.y >= mr.y as f32
-                        && native.y < mr.y as f32 + mr.height as f32
-                })
-        });
-        let Some(m) = anchor_monitor
+        self.sync.request_inner_size(ctx, target);
+        let Some(m) = anchor
             .or_else(|| {
-                platform::cursor_position()
-                    .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
+                platform::cursor_position().and_then(|(x, y)| screen::monitor_at(x, y))
             })
-            .or_else(|| crate::capture::screen::primary_monitor().ok())
+            .or_else(|| screen::primary_monitor().ok())
         else {
             return;
         };
-        let scale = m.scale_factor.max(1.0);
-        let origin = platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
-        let size =
-            platform::native_to_ui(egui::pos2(m.rect.width as f32, m.rect.height as f32), scale)
-                .to_vec2();
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
-            origin.x + size.x - target.x - EDGE_MARGIN,
-            origin.y + size.y - target.y - BOTTOM_MARGIN,
-        )));
+        let ppp = platform::window_ppp(ctx, m.scale_factor.max(1.0));
+        let mon = platform::monitor_ui_rect(&m, ppp);
+        self.sync.request_outer_position(
+            ctx,
+            egui::pos2(
+                mon.max.x - target.x - EDGE_MARGIN,
+                mon.max.y - target.y - BOTTOM_MARGIN,
+            ),
+        );
     }
 }
 

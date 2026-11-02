@@ -342,6 +342,16 @@ pub struct Shared {
     /// Last on-screen outer rect of the bar viewport — the countdown card
     /// anchors below it and follows its drags.
     pub bar_rect: Mutex<Option<egui::Rect>>,
+    /// Monitor the floating bar currently sits on — resolved in NATIVE
+    /// units at write time (bar's own ppp), so the countdown never has to
+    /// mix two windows' point spaces (mixed-DPI safe).
+    pub bar_monitor: Mutex<Option<MonitorInfo>>,
+    /// Monitor the viewer currently sits on — same role as `bar_monitor`.
+    pub viewer_monitor: Mutex<Option<MonitorInfo>>,
+    /// winit `available_monitors()` placements `(x, y, w, h)` in physical
+    /// pixels, snapshotted for the overlay's `with_monitor`/`SetMonitor`
+    /// targeting (xcap and winit don't enumerate in the same order).
+    pub winit_placements: Mutex<Vec<(i32, i32, u32, u32)>>,
     /// Whether the settings window is open.
     pub settings_open: AtomicBool,
     /// The Windows About modal is open (egui twin of the native panel).
@@ -1902,6 +1912,9 @@ impl PixMeApp {
                 toolbar: Mutex::new(Toolbar::default()),
                 bar_pos: Mutex::new(None),
                 bar_rect: Mutex::new(None),
+                bar_monitor: Mutex::new(None),
+                viewer_monitor: Mutex::new(None),
+                winit_placements: Mutex::new(Vec::new()),
                 settings_open: AtomicBool::new(false),
                 about_open: AtomicBool::new(false),
                 settings_draft: Mutex::new(None),
@@ -1991,7 +2004,7 @@ impl eframe::App for PixMeApp {
     /// The anchor pass: dispatch queued commands, then (de)register child
     /// viewports to match the state machine. Nothing is drawn — the anchor
     /// is a 1×1 transparent window.
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, _ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = _ui.ctx().clone();
         self.shared.pump(&ctx);
 
@@ -2029,7 +2042,13 @@ impl eframe::App for PixMeApp {
                 // the viewer opens on that monitor (preserving its relative
                 // placement / size when already known, or centring it there).
                 if let Some(m) = lock(&shared.viewer_target_monitor).clone() {
-                    let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), &m);
+                    // The window is being (re)built ON m: its ppp is m's
+                    // own scale.
+                    let next = place_viewer_on_monitor(
+                        *lock(&shared.viewer_rect),
+                        &m,
+                        m.scale_factor.max(1.0),
+                    );
                     *lock(&shared.viewer_rect) = Some(next);
                 }
                 let builder = viewer_builder(lock(&shared.viewer_rect).map(|r| r.min));
@@ -2039,11 +2058,21 @@ impl eframe::App for PixMeApp {
                     shared.maybe_focus(&ctx, viewer_id());
                     let target = lock(&shared.viewer_target_monitor).take();
                     if let Some(m) = target {
-                        let next = place_viewer_on_monitor(*lock(&shared.viewer_rect), &m);
+                        // `OuterPosition` is converted back by THIS
+                        // window's current ppp — convert with it so the
+                        // physical target is exact even mid-DPI-change.
+                        let ppp = platform::window_ppp(&ctx, m.scale_factor.max(1.0));
+                        let next =
+                            place_viewer_on_monitor(*lock(&shared.viewer_rect), &m, ppp);
                         *lock(&shared.viewer_rect) = Some(next);
+                        *lock(&shared.viewer_monitor) = Some(m);
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(next.min));
                     } else if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
                         *lock(&shared.viewer_rect) = Some(outer);
+                        let ppp = platform::window_ppp(&ctx, 1.0);
+                        let centre = platform::ui_to_native(outer.center(), ppp);
+                        *lock(&shared.viewer_monitor) =
+                            crate::capture::screen::monitor_at(centre.x, centre.y);
                     }
                     // Draw is modal to the viewer: deferred viewports are
                     // plain top-level windows with no OS child-window
@@ -2252,12 +2281,32 @@ impl eframe::App for PixMeApp {
                     Step::Gone => self.shared.enter(AppState::Idle, &ctx),
                     Step::Overlay => {
                         let shared = Arc::clone(&self.shared);
+                        // winit monitor placements (physical px, both
+                        // OSes): lets `with_monitor`/`SetMonitor` target
+                        // the captured display — xcap and winit do not
+                        // enumerate in the same order.
+                        let placements: Vec<(i32, i32, u32, u32)> = frame
+                            .winit_window()
+                            .map(|w| {
+                                w.available_monitors()
+                                    .map(|m| {
+                                        let p = m.position();
+                                        let s = m.size();
+                                        (p.x, p.y, s.width, s.height)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        *lock(&shared.winit_placements) = placements.clone();
                         let monitor = lock(&shared.capture)
                             .as_ref()
                             .and_then(|s| s.monitor.clone());
+                        let winit_idx = monitor
+                            .as_ref()
+                            .and_then(|m| platform::winit_monitor_index(m, &placements, 1));
                         ctx.show_viewport_deferred(
                             overlay_id(),
-                            overlay_builder(monitor.as_ref()),
+                            overlay_builder(monitor.as_ref(), winit_idx),
                             move |ui, _class| {
                                 let ctx = ui.ctx().clone();
                                 shared.pump(&ctx);
@@ -2291,11 +2340,13 @@ impl eframe::App for PixMeApp {
                     return;
                 }
                 // The countdown parks on the monitor PixMe lives on: the
-                // floating bar's when it is up, the viewer's otherwise.
+                // floating bar's when it is up, the viewer's otherwise —
+                // resolved in native units by the owner window, so no two
+                // windows' point spaces are ever mixed here.
                 let anchor = if *lock(&shared.state) == AppState::Bar {
-                    *lock(&shared.bar_rect)
+                    lock(&shared.bar_monitor).clone()
                 } else {
-                    *lock(&shared.viewer_rect)
+                    lock(&shared.viewer_monitor).clone()
                 };
                 let running = lock(&shared.countdown)
                     .as_mut()
@@ -2521,22 +2572,21 @@ fn viewer_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
     }
 }
 
-/// Computes the viewer's outer rectangle on `monitor` (in egui ui points):
-/// if `current` is already on `monitor` (its centre falls inside `monitor`'s
-/// bounds), it is kept as-is; otherwise the window is centred on `monitor`
-/// (clamped inside it).
-fn place_viewer_on_monitor(current: Option<egui::Rect>, monitor: &MonitorInfo) -> egui::Rect {
-    let scale = monitor.scale_factor.max(1.0);
-    let mon_min = platform::native_to_ui(
-        egui::pos2(monitor.rect.x as f32, monitor.rect.y as f32),
-        scale,
-    );
-    let mon_size = platform::native_to_ui(
-        egui::pos2(monitor.rect.width as f32, monitor.rect.height as f32),
-        scale,
-    )
-    .to_vec2();
-    let mon_rect = egui::Rect::from_min_size(mon_min, mon_size);
+/// Computes the viewer's outer rectangle on `monitor` (in egui ui points
+/// of a window whose `native_pixels_per_point` is `ppp` — the receiving
+/// window's OWN scale, never the monitor's: egui-winit multiplies
+/// `OuterPosition` back by that scale, so this lands on exact physical
+/// coordinates). If `current` is already on `monitor` (its centre falls
+/// inside `monitor`'s bounds), it is kept as-is; otherwise the window is
+/// centred on `monitor` (clamped inside it).
+fn place_viewer_on_monitor(
+    current: Option<egui::Rect>,
+    monitor: &MonitorInfo,
+    ppp: f32,
+) -> egui::Rect {
+    let mon_rect = platform::monitor_ui_rect(monitor, ppp);
+    let mon_min = mon_rect.min;
+    let mon_size = mon_rect.size();
     if let Some(rect) = current
         && mon_rect.contains(rect.center())
     {
@@ -2554,15 +2604,30 @@ fn place_viewer_on_monitor(current: Option<egui::Rect>, monitor: &MonitorInfo) -
 }
 
 /// The capture overlay: a borderless always-on-top window covering the
-/// monitor being captured. `MonitorInfo.rect` is already in logical points
-/// (xcap reports `CGDisplay` bounds) — no scale-factor conversion here.
-fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::ViewportBuilder {
+/// monitor being captured. `MonitorInfo.rect` is in the OS-native display
+/// space (physical px on Windows, points on macOS) — it is converted to
+/// that monitor's logical units via `native_to_ui` for the position/size
+/// *fallback*. On Windows the real placement is `with_monitor(idx)`
+/// (borderless fullscreen resolved by winit, immune to every scale
+/// assumption); macOS keeps the manual cover (its Fullscreen API would
+/// animate a new Space — the points-based rect is already exact there).
+fn overlay_builder(
+    monitor: Option<&crate::capture::MonitorInfo>,
+    winit_idx: Option<usize>,
+) -> egui::ViewportBuilder {
     let (size, pos) = monitor
         .map(|m| {
-            (
-                egui::vec2(m.rect.width as f32, m.rect.height as f32),
+            let s = m.scale_factor.max(1.0);
+            let min = platform::native_to_ui(
                 egui::pos2(m.rect.x as f32, m.rect.y as f32),
+                s,
+            );
+            let sz = platform::native_to_ui(
+                egui::pos2(m.rect.width as f32, m.rect.height as f32),
+                s,
             )
+            .to_vec2();
+            (sz, min)
         })
         .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
     let builder = egui::ViewportBuilder::default()
@@ -2580,7 +2645,16 @@ fn overlay_builder(monitor: Option<&crate::capture::MonitorInfo>) -> egui::Viewp
         .with_inner_size(size)
         .with_position(pos);
     #[cfg(target_os = "windows")]
-    let builder = builder.with_visible(false);
+    let builder = {
+        let builder = builder.with_visible(false);
+        match winit_idx {
+            // winit places the window: borderless fullscreen on the
+            // captured monitor, physical-rect exact, no manual geometry.
+            Some(idx) => builder.with_monitor(idx),
+            None => builder,
+        }
+    };
+    let _ = winit_idx;
     builder
 }
 
@@ -2688,6 +2762,9 @@ mod tests {
             toolbar: Mutex::new(Toolbar::default()),
             bar_pos: Mutex::new(None),
             bar_rect: Mutex::new(None),
+            bar_monitor: Mutex::new(None),
+            viewer_monitor: Mutex::new(None),
+            winit_placements: Mutex::new(Vec::new()),
             settings_open: AtomicBool::new(false),
             about_open: AtomicBool::new(false),
             settings_draft: Mutex::new(None),

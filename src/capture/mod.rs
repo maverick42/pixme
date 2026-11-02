@@ -59,9 +59,12 @@ pub struct MonitorInfo {
     pub id: u32,
     /// OS display name.
     pub name: String,
-    /// Bounds in **logical points** (global display coordinates — xcap
-    /// reports `CGDisplay` bounds; captured *images* are `rect ×
-    /// scale_factor` physical pixels).
+    /// Bounds in the OS-native display space — **physical pixels on
+    /// Windows** (xcap reads `DEVMODEW` position and `dmPelsWidth/
+    /// dmPelsHeight`), **points on macOS** (`CGDisplayBounds`). See
+    /// `platform::NATIVE_SPACE`; captured *images* are always
+    /// `rect × scale_factor` physical pixels on macOS and already
+    /// `rect` physical pixels on Windows.
     pub rect: PhysicalRect,
     /// Device pixels per logical point.
     pub scale_factor: f32,

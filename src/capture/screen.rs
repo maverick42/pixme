@@ -6,7 +6,9 @@ use xcap::Monitor;
 
 use super::{Capture, CaptureError, MonitorInfo, PhysicalRect};
 
-/// All connected monitors as [`MonitorInfo`] (physical-pixel bounds).
+/// All connected monitors as [`MonitorInfo`] — `rect` in OS-native
+/// display units (physical px on Windows, points on macOS; see
+/// `platform::NATIVE_SPACE`).
 pub fn monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
     let list = Monitor::all().map_err(|e| CaptureError::Failed(e.to_string()))?;
     let mut out = Vec::with_capacity(list.len());
@@ -44,7 +46,7 @@ pub fn primary_monitor() -> Result<MonitorInfo, CaptureError> {
         .ok_or(CaptureError::Failed("no monitor".into()))
 }
 
-/// The monitor whose bounds contain the logical point `(x, y)` — the same
+/// The monitor whose bounds contain the native point `(x, y)` — the same
 /// global display space `MonitorInfo::rect` lives in. `None` when the point
 /// falls outside every monitor (gaps in a non-rectangular arrangement).
 pub fn monitor_at(x: f32, y: f32) -> Option<MonitorInfo> {
@@ -59,7 +61,7 @@ pub fn monitor_at(x: f32, y: f32) -> Option<MonitorInfo> {
     })
 }
 
-/// One `xcap` monitor as our [`MonitorInfo`] (logical-point bounds).
+/// One `xcap` monitor as our [`MonitorInfo`] (native-unit bounds).
 pub fn monitor_info(m: &Monitor) -> Result<MonitorInfo, CaptureError> {
     Ok(MonitorInfo {
         id: m.id().unwrap_or_default(),

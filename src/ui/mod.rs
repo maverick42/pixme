@@ -14,6 +14,7 @@ pub mod settings;
 pub mod theme;
 pub mod toolbar;
 pub mod viewer;
+pub mod viewport_sync;
 pub mod widgets;
 
 pub(crate) mod icon_data;

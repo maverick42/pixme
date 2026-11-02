@@ -12,6 +12,7 @@ use rust_i18n::t;
 use crate::app::{CaptureMode, Command, Shared};
 use crate::config::Settings;
 use crate::ui::icons::{self, Icon};
+use crate::ui::viewport_sync::ViewportSync;
 use crate::ui::{theme, widgets};
 
 /// Transparent margin kept around the bar so its painted shadow is not
@@ -29,11 +30,23 @@ const MENU_RESERVE: f32 = 360.0;
 const TOP_MARGIN: f32 = 0.12;
 
 /// State of the floating toolbar window.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Toolbar {
     /// Monitor the bar should be top-centred on once its content size is
     /// known (`ShowBar` sets this to the monitor under the cursor).
     target_monitor: Option<crate::capture::MonitorInfo>,
+    /// Last geometry this window asked for — commands are deduped
+    /// against it, never against the reported (transient) rect.
+    sync: ViewportSync,
+}
+
+impl Default for Toolbar {
+    fn default() -> Self {
+        Self {
+            target_monitor: None,
+            sync: ViewportSync::new("PixMe Bar"),
+        }
+    }
 }
 
 impl Toolbar {
@@ -53,11 +66,18 @@ impl Toolbar {
                 let content = self.capture_bar(ui, settings, shared);
                 // The painted card's on-screen bounds (not the viewport's
                 // `outer_rect`, which is 360 pt taller while a menu is
-                // open): the countdown card anchors just below this.
+                // open): the countdown card anchors just below this. Its
+                // monitor is resolved in NATIVE units with this window's
+                // own scale — the only safe conversion on mixed DPI.
                 if let Some(win) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
                     let card = content.response.rect;
                     *crate::app::lock(&shared.bar_rect) =
                         Some(Rect::from_min_size(win + card.min.to_vec2(), card.size()));
+                    let ppp = crate::platform::window_ppp(&ctx, 1.0);
+                    let centre =
+                        crate::platform::ui_to_native(win + card.center().to_vec2(), ppp);
+                    *crate::app::lock(&shared.bar_monitor) =
+                        crate::capture::screen::monitor_at(centre.x, centre.y);
                 }
                 let mut rect = content.response.rect;
                 if content.inner {
@@ -229,27 +249,23 @@ impl Toolbar {
     /// Keeps the viewport hugging its content, and when `ShowBar` set a
     /// `target_monitor`, moves it to the top-centre of that monitor once
     /// the content size is known — consumed immediately so a user drag is
-    /// never overridden afterwards.
+    /// never overridden afterwards. Commands are deduped against the last
+    /// REQUESTED geometry (never the reported rect, which lies mid-DPI
+    /// transition); positions are converted with THIS window's scale, the
+    /// one egui-winit multiplies commands back by — not the monitor's.
     fn sync_viewport(&mut self, ctx: &egui::Context, content: Rect) {
         let target = content.size() + Vec2::splat(2.0 * f32::from(SHADOW_MARGIN));
-        let current = ctx.input(|i| i.viewport().inner_rect.map_or(Vec2::ZERO, |r| r.size()));
-        if (target - current).abs().max_elem() > 1.0 {
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
-        }
+        self.sync.request_inner_size(ctx, target);
         if let Some(m) = self.target_monitor.take() {
-            let scale = m.scale_factor.max(1.0);
-            let origin =
-                crate::platform::native_to_ui(egui::pos2(m.rect.x as f32, m.rect.y as f32), scale);
-            let size = crate::platform::native_to_ui(
-                egui::pos2(m.rect.width as f32, m.rect.height as f32),
-                scale,
-            )
-            .to_vec2();
-            let pos = egui::pos2(
-                origin.x + (size.x - target.x) / 2.0,
-                origin.y + size.y * TOP_MARGIN,
+            let ppp = crate::platform::window_ppp(ctx, m.scale_factor.max(1.0));
+            let mon = crate::platform::monitor_ui_rect(&m, ppp);
+            self.sync.request_outer_position(
+                ctx,
+                egui::pos2(
+                    mon.min.x + (mon.width() - target.x) / 2.0,
+                    mon.min.y + mon.height() * TOP_MARGIN,
+                ),
             );
-            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
         }
     }
 }
