@@ -592,7 +592,9 @@ pub fn print_image(img: &image::RgbaImage, job_title: &str) -> Result<(), String
             usage: u32,
             rop: u32,
         ) -> i32;
-        fn DeleteDC(hdc: isize) -> i32;
+        // HDC is a HANDLE — `*mut c_void` like the cursor-snapshot block
+        // (one signature for one symbol: clashing_extern_declarations).
+        fn DeleteDC(hdc: *mut c_void) -> i32;
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -728,7 +730,9 @@ pub fn print_image(img: &image::RgbaImage, job_title: &str) -> Result<(), String
         } else {
             AbortDoc(hdc);
         }
-        DeleteDC(hdc);
+        // `pd.h_dc` is a real HDC; isize and `*mut c_void` are the same
+        // 64-bit register slot on Win64.
+        DeleteDC(hdc as *mut c_void);
 
         if printed {
             Ok(())
