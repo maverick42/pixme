@@ -20,6 +20,8 @@ mod app;
 mod capture;
 mod config;
 #[cfg(feature = "dev-tools")]
+mod devbench;
+#[cfg(feature = "dev-tools")]
 mod devseed;
 mod editor;
 mod export;
@@ -54,6 +56,17 @@ fn main() -> eframe::Result<()> {
         }
         let _guard = instance;
         let code = devseed::run(count);
+        logging::shutdown();
+        std::process::exit(code);
+    }
+
+    // Dev tool (dev-tools feature only): `pixme --bench-store [N]`
+    // measures the session write pipeline on N synthetic captures —
+    // PNG compression trade-off, per-doc enqueue/flush timings — into
+    // a throwaway database. The real session is never touched.
+    #[cfg(feature = "dev-tools")]
+    if let Some(count) = devbench::requested() {
+        let code = devbench::run(count);
         logging::shutdown();
         std::process::exit(code);
     }

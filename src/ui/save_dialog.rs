@@ -7,10 +7,8 @@ use std::sync::Arc;
 
 use egui::{Align, Layout, Ui, Vec2};
 
-use crate::app::Shared;
 use crate::capture::Capture;
-use crate::export::{ExportError, ImageFormat, file::save_capture_to};
-use crate::platform;
+use crate::export::ImageFormat;
 
 use super::{icons::Icon, theme, widgets};
 
@@ -48,6 +46,9 @@ pub struct SaveDialog {
     /// File this document was loaded/saved from: it may be overwritten
     /// without tripping the "file exists" block (re-saving IS the point).
     pub existing_ok: Option<PathBuf>,
+    /// A background save is in flight — the buttons grey out and a
+    /// spinner shows until `pump` lands the result.
+    pub saving: bool,
 }
 
 impl SaveDialog {
@@ -62,6 +63,7 @@ impl SaveDialog {
             error: None,
             viewer_tab: None,
             existing_ok: None,
+            saving: false,
         }
     }
 
@@ -86,27 +88,6 @@ impl SaveDialog {
                 .existing_ok
                 .as_ref()
                 .and_then(|p| std::fs::canonicalize(p).ok())
-    }
-
-    /// Writes the file at [`candidate_path`], updates the last-used
-    /// folder and reveals it when asked. On success the caller closes the
-    /// dialog; on failure the error is shown inline.
-    pub fn save(&mut self, shared: &Shared) -> Result<PathBuf, ExportError> {
-        let dir = PathBuf::from(self.folder.trim());
-        if !dir.is_dir() {
-            return Err(ExportError::Failed(t!("save.error_dir").into_owned()));
-        }
-        let path = self.candidate_path();
-        save_capture_to(&self.capture, &path, self.format)?;
-        if self.reveal {
-            platform::reveal_in_file_manager(&path);
-        }
-        // Persist the folder so the next save (and next session) reopens here.
-        let mut s = shared.lock_settings();
-        s.last_save_dir = Some(dir);
-        s.push_recent(path.clone());
-        s.save();
-        Ok(path)
     }
 }
 
@@ -185,11 +166,16 @@ pub fn show(ui: &mut Ui, state: &mut SaveDialog) -> Outcome {
 
             ui.add_space(12.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(!taken, |ui| {
+                ui.add_enabled_ui(!taken && !state.saving, |ui| {
                     if widgets::primary_button(ui, &t!("save.confirm")).clicked() {
                         outcome = Outcome::Confirm;
                     }
                 });
+                if state.saving {
+                    ui.add_space(8.0);
+                    ui.spinner();
+                    ui.add_space(8.0);
+                }
                 if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
                     outcome = Outcome::Cancel;
                 }

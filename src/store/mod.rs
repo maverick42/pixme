@@ -3,11 +3,12 @@
 //! annotations and the chronological undo/redo stacks — and the next
 //! viewer open restores them silently.
 //!
-//! The store only sees writes at three points: app quit (one
-//! transaction rewrites the whole session), tab close (that document's
-//! row is deleted at once) and session discard (the store is emptied).
-//! A crash or kill between writes loses what changed — an accepted
-//! trade-off: PixMe stays a resident app with no background writing.
+//! Writes are eager, not quit-time: a dedicated [`writer::Writer`]
+//! thread owns the `Store` for the whole run and drains an ordered job
+//! queue — every document lands on disk shortly after the change that
+//! created it, so a crash or kill only loses what happened in the last
+//! few hundred milliseconds. PNG encoding and SQLite I/O never run on
+//! the UI thread; quitting flushes the queue behind a bounded wait.
 //!
 //! One row per tab; per row, three postcard blobs (`annotations`,
 //! `anno_undo`, `anno_redo`) hold the object model and its history —
@@ -16,6 +17,7 @@
 //! whole pre-op images, far too heavy for a small database.
 
 pub mod ser;
+pub mod writer;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -91,6 +93,69 @@ pub struct StoredSession {
     pub active: usize,
     /// The auto-title counter (`Capture N` keeps counting up).
     pub next_title: usize,
+}
+
+/// One document as the writer must persist it — a UI-side snapshot
+/// cloned cheaply (the base image rides an `Arc`, postcards are
+/// encoded on the worker). Produced by `Tab::to_doc_write`.
+pub struct DocWrite {
+    /// `doc.meta.id` — the row's primary key.
+    pub id: String,
+    /// Display position when the snapshot was taken.
+    pub ord: i64,
+    /// Tab label.
+    pub title: String,
+    /// Clean flag (matches disk).
+    pub saved: bool,
+    /// Capture instant (display + retention cutoff).
+    pub captured_at: chrono::DateTime<chrono::Local>,
+    /// Last successful file save, if any.
+    pub saved_at: Option<chrono::DateTime<chrono::Local>>,
+    /// File this document was loaded from / saved to.
+    pub source_path: Option<PathBuf>,
+    /// Protection hash (`None` = unprotected).
+    pub password_hash: Option<String>,
+    /// `Some` ⇒ the base pixels changed: re-encode and replace
+    /// `base_png`. `None` ⇒ keep the stored blob (annotation/meta
+    /// edit — the expensive column is untouched).
+    pub base: Option<std::sync::Arc<image::RgbaImage>>,
+    /// HiDPI factor of the captured frame.
+    pub scale_factor: f32,
+    /// Monitor record the capture came from.
+    pub monitor: crate::capture::MonitorInfo,
+    /// Annotation id counter — restores without re-issuing ids.
+    pub next_id: u64,
+    /// `doc.revision` of the snapshot — informational (telemetry).
+    pub revision: u64,
+    /// The object model.
+    pub annotations: Vec<crate::editor::document::Annotation>,
+    /// Chronological undo stack.
+    pub anno_undo: VecDeque<AnnoEdit>,
+    /// Redo side of the stack.
+    pub anno_redo: VecDeque<AnnoEdit>,
+    /// When the job was queued — the enqueue→committed span is the
+    /// crash-loss window, logged per write.
+    pub queued_at: std::time::Instant,
+}
+
+/// The meta columns of one document row — everything EXCEPT the heavy
+/// blobs (`base_png`, annotations, history). Sent for reorders,
+/// renames, save-state flips and the quit-time refresh.
+pub struct MetaRow {
+    /// `doc.meta.id` — the row's primary key.
+    pub id: String,
+    /// Display position.
+    pub ord: i64,
+    /// Tab label.
+    pub title: String,
+    /// Clean flag.
+    pub saved: bool,
+    /// Last successful file save, if any.
+    pub saved_at: Option<chrono::DateTime<chrono::Local>>,
+    /// File this document was loaded from / saved to.
+    pub source_path: Option<PathBuf>,
+    /// Protection hash.
+    pub password_hash: Option<String>,
 }
 
 /// The session database — a `None` connection means the file could not
@@ -309,6 +374,160 @@ impl Store {
         if let Err(err) = tx.commit() {
             tracing::warn!("session meta save failed: {err:#}");
         }
+    }
+
+    /// Upserts one document row — the eager counterpart of
+    /// `save_session`'s per-tab branches. `w.base = Some` runs the full
+    /// INSERT (PNG encode included); `None` updates the object/meta
+    /// columns only and is an error when the row does not exist yet
+    /// (a first write always carries pixels).
+    pub fn write_doc(&mut self, w: &DocWrite) -> anyhow::Result<()> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(());
+        };
+        let saved_at = w.saved_at.as_ref().map(|d| d.to_rfc3339());
+        let source_path = w
+            .source_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let annotations = postcard::to_allocvec(&w.annotations)?;
+        let anno_undo = postcard::to_allocvec(&w.anno_undo)?;
+        let anno_redo = postcard::to_allocvec(&w.anno_redo)?;
+        match &w.base {
+            Some(image) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO documents (
+                        doc_id, ord, title, saved,
+                        captured_at, captured_epoch, saved_at, source_path, password_hash,
+                        base_png, scale_factor, monitor_json,
+                        next_id, annotations, anno_undo, anno_redo
+                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                    params![
+                        w.id,
+                        w.ord,
+                        w.title,
+                        w.saved,
+                        w.captured_at.to_rfc3339(),
+                        w.captured_at.timestamp(),
+                        saved_at,
+                        source_path,
+                        w.password_hash,
+                        ser::png_encode(image)?,
+                        w.scale_factor,
+                        serde_json::to_string(&w.monitor)?,
+                        w.next_id as i64,
+                        annotations,
+                        anno_undo,
+                        anno_redo,
+                    ],
+                )?;
+            }
+            None => {
+                let n = conn.execute(
+                    "UPDATE documents SET
+                        ord=?2, title=?3, saved=?4, saved_at=?5,
+                        source_path=?6, password_hash=?7,
+                        next_id=?8, annotations=?9, anno_undo=?10, anno_redo=?11
+                     WHERE doc_id=?1",
+                    params![
+                        w.id,
+                        w.ord,
+                        w.title,
+                        w.saved,
+                        saved_at,
+                        source_path,
+                        w.password_hash,
+                        w.next_id as i64,
+                        annotations,
+                        anno_undo,
+                        anno_redo,
+                    ],
+                )?;
+                anyhow::ensure!(n > 0, "no stored row for {}", w.id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refreshes the meta columns of every listed row — reorders,
+    /// renames, save-state flips. No blob is touched; a row that is
+    /// not stored yet is skipped (its `DocWrite` carries the values).
+    pub fn write_meta(&mut self, rows: &[MetaRow]) -> anyhow::Result<()> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(());
+        };
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE documents SET
+                    ord=?2, title=?3, saved=?4, saved_at=?5,
+                    source_path=?6, password_hash=?7
+                 WHERE doc_id=?1",
+            )?;
+            for r in rows {
+                let saved_at = r.saved_at.as_ref().map(|d| d.to_rfc3339());
+                let source_path = r
+                    .source_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned());
+                stmt.execute(params![
+                    r.id,
+                    r.ord,
+                    r.title,
+                    r.saved,
+                    saved_at,
+                    source_path,
+                    r.password_hash,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Writes the session row (active tab, auto-title counter).
+    pub fn set_session(&mut self, active: usize, next_title: usize) -> anyhow::Result<()> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(());
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO session (id, active, next_title) VALUES (0, ?1, ?2)",
+            params![active as i64, next_title as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The quit-time barrier: refresh every meta column, the session
+    /// row, and drop any stored row whose document is gone (covers a
+    /// delete that failed mid-session). Queued after the eager jobs so
+    /// it only ever polishes what they wrote.
+    pub fn finalize(
+        &mut self,
+        rows: &[MetaRow],
+        live: &[String],
+        active: usize,
+        next_title: usize,
+    ) -> anyhow::Result<()> {
+        if self.conn.is_none() {
+            return Ok(());
+        }
+        self.write_meta(rows)?;
+        self.set_session(active, next_title)?;
+        let live: std::collections::HashSet<&str> = live.iter().map(String::as_str).collect();
+        let stored: Vec<String> = {
+            let conn = self.conn.as_mut().expect("checked above");
+            let mut s = conn.prepare("SELECT doc_id FROM documents")?;
+            let rows = s.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let conn = self.conn.as_mut().expect("checked above");
+        for id in stored {
+            if !live.contains(id.as_str()) {
+                conn.execute("DELETE FROM documents WHERE doc_id = ?1", params![id])?;
+                self.needs_vacuum = true;
+            }
+        }
+        Ok(())
     }
 
     /// Empties the store — the session was deliberately discarded, so

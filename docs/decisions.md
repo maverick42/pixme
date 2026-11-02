@@ -1683,3 +1683,52 @@ Format: date — context — decision — consequences.
   - macOS version is 100% unaffected (`strip_undecorated_frame` is an inlined
     no-op on macOS in `src/platform/mod.rs`).
 
+
+## 2026-11-01 — Session store: eager write-through on a dedicated writer thread
+
+- **Context**: the session was persisted only at quit (one `save_session`
+  transaction) plus per-tab deletes — a crash, a kill or a system blue
+  screen between writes lost the whole session's changes. The user asked
+  for captures to reach disk "as fast as possible" (the Draw editor
+  excepted: its document is written when it exits).
+- **Decision**:
+  - A dedicated `pixme-store` thread owns the `Store` for the whole run
+    (`src/store/writer.rs`) and drains a strictly-ordered job queue:
+    `DocWrite` (full row, `base_png` re-encoded only when `base_dirty`),
+    `Meta` (bulk meta-columns refresh — reorders, renames, save flips),
+    `Session` (active tab + title counter), `Delete`, `Clear`,
+    `Retention`, `Load`, `Finalize` (quit barrier: meta refresh +
+    stale-row prune), `Flush` (reply barrier). No PNG encoding or SQLite
+    I/O ever runs on the UI thread.
+  - Change detection is a single drain (`Shared::sync_store`, tail of
+    every pump): each tab carries `stored_fp` (a hash of everything the
+    store persists); a drift re-queues that document. No per-mutation
+    call sites — every current and future change is caught. "Handed to
+    the writer" marks (`stored_fp`, `persisted_rev`, `base_dirty`) move
+    at enqueue, not at commit: failed jobs retry from their snapshot.
+  - Quit (and every clean exit) enqueues `Finalize` + `Flush` and waits
+    on the barrier behind the saving veil — bounded by
+    `QUIT_FLUSH_TIMEOUT` (10 s) after which a `warn` is logged and the
+    app exits anyway. `Writer::drop` sends `Shutdown` and joins, so the
+    `Store` Drop (VACUUM) still runs on forgotten queues.
+  - Failures: a job is retried once in place, then parked and retried
+    again at flush; the document reports `DocFailed` — its tab and
+    mosaic tile show a `TriangleAlert` glyph (new Lucide icon) until a
+    write succeeds, and a single translated notice (`app.store_write_failed`,
+    EN/FR/ES) explains it once per run. No write failure ever blocks or
+    crashes the app.
+  - Single-file "Enregistrer" (save-as dialog) now encodes on a worker
+    too (`SaveOneJob`) — a 5K PNG write no longer stalls frames; the
+    dialog shows a spinner and greys its buttons.
+- **Consequences**:
+  - The loss window shrinks from "everything since launch" to
+    enqueue→commit time (measured in the hundreds of ms on 5K frames —
+    see `--bench-store` output and the `queued_ms` log field).
+  - **Privacy trade-off (accepted, user-requested)**: captures land in
+    `session.db` at creation even when never explicitly saved.
+    Mitigations kept: `PRAGMA secure_delete` zeroes deleted payloads,
+    tab close deletes the row, Discard empties the store, `.bak` files
+    age out after 7 days, and no temp copy is written anywhere else.
+  - `dev-tools` gains `pixme --bench-store [N]`: PNG compression
+    trade-off, per-doc enqueue cost, `queued_ms`/`work_ms` stats and
+    restore timing on N synthetic 5K captures.
