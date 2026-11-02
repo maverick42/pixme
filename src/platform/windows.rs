@@ -366,8 +366,11 @@ pub fn strip_undecorated_frame() {
                             unsafe { CreateRectRgn(0, 2, w + 1, h + 1) }
                         }
                         Role::Pin => {
-                            // Shape the window to the exact rounded-corner bounds of the pin image.
-                            unsafe { CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16) }
+                            // Shape the window to the rounded-corner bounds of the pin
+                            // image; the top 2px clip removes the DWM accent line and
+                            // eats into the window's TOP_MARGIN transparent rows, so
+                            // no image pixel is cropped.
+                            unsafe { CreateRoundRectRgn(0, 2, w + 1, h + 1, 16, 16) }
                         }
                         Role::Overlay => 0,
                     };

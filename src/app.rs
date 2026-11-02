@@ -2693,8 +2693,10 @@ fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
         .with_has_shadow(true)
         .with_taskbar(false)
         .with_active(true)
-        .with_inner_size(size)
-        .with_position(origin);
+        // TOP_MARGIN transparent rows above the image: the Windows
+        // region clip removes the DWM accent line without cropping it.
+        .with_inner_size(size + egui::vec2(0.0, crate::ui::pin::TOP_MARGIN))
+        .with_position(origin - egui::vec2(0.0, crate::ui::pin::TOP_MARGIN));
     #[cfg(target_os = "windows")]
     // Hidden until `strip_undecorated_frame` shows it (see `bar_builder`).
     let builder = builder.with_visible(false);
