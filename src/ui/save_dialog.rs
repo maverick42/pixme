@@ -105,56 +105,60 @@ pub fn show(ui: &mut Ui, state: &mut SaveDialog) -> Outcome {
                 .fill(t.dock),
         )
         .show(ui, |ui| {
-            egui::Grid::new("pixme-save-grid")
-                .num_columns(2)
-                .spacing([20.0, 12.0])
-                .show(ui, |ui| {
-                    // -- destination folder -------------------------------
-                    right_label(ui, t!("save.location"));
-                    ui.horizontal(|ui| {
-                        let edit = egui::TextEdit::singleline(&mut state.folder)
+            ui.add_enabled_ui(!state.saving, |ui| {
+                egui::Grid::new("pixme-save-grid")
+                    .num_columns(2)
+                    .spacing([20.0, 12.0])
+                    .show(ui, |ui| {
+                        // -- destination folder -------------------------------
+                        right_label(ui, t!("save.location"));
+                        ui.horizontal(|ui| {
+                            let edit = egui::TextEdit::singleline(&mut state.folder)
+                                .desired_width(280.0)
+                                .font(theme::medium(12.0));
+                            ui.add(edit);
+                            if widgets::icon_button(ui, Icon::Folder, false)
+                                .on_hover_text(t!("save.browse"))
+                                .clicked()
+                                && let Some(dir) = rfd::FileDialog::new()
+                                    .set_directory(&state.folder)
+                                    .pick_folder()
+                            {
+                                state.folder = dir.to_string_lossy().into_owned();
+                            }
+                        });
+                        ui.end_row();
+
+                        // -- format radio -------------------------------------
+                        right_label(ui, t!("save.format"));
+                        ui.horizontal(|ui| {
+                            for f in [ImageFormat::Jpeg, ImageFormat::Png, ImageFormat::Webp] {
+                                ui.radio_value(&mut state.format, f, f.label());
+                                ui.add_space(6.0);
+                            }
+                        });
+                        ui.end_row();
+
+                        // -- file name -----------------------------------------
+                        right_label(ui, t!("save.filename"));
+                        let name = egui::TextEdit::singleline(&mut state.filename)
                             .desired_width(280.0)
                             .font(theme::medium(12.0));
-                        ui.add(edit);
-                        if widgets::icon_button(ui, Icon::Folder, false)
-                            .on_hover_text(t!("save.browse"))
-                            .clicked()
-                            && let Some(dir) = rfd::FileDialog::new()
-                                .set_directory(&state.folder)
-                                .pick_folder()
-                        {
-                            state.folder = dir.to_string_lossy().into_owned();
-                        }
+                        ui.add(name);
+                        ui.end_row();
+
+                        // -- reveal ---------------------------------------------
+                        right_label(ui, t!("save.reveal_label"));
+                        ui.checkbox(&mut state.reveal, t!("save.open_folder"));
+                        ui.end_row();
                     });
-                    ui.end_row();
-
-                    // -- format radio -------------------------------------
-                    right_label(ui, t!("save.format"));
-                    ui.horizontal(|ui| {
-                        for f in [ImageFormat::Jpeg, ImageFormat::Png, ImageFormat::Webp] {
-                            ui.radio_value(&mut state.format, f, f.label());
-                            ui.add_space(6.0);
-                        }
-                    });
-                    ui.end_row();
-
-                    // -- file name -----------------------------------------
-                    right_label(ui, t!("save.filename"));
-                    let name = egui::TextEdit::singleline(&mut state.filename)
-                        .desired_width(280.0)
-                        .font(theme::medium(12.0));
-                    ui.add(name);
-                    ui.end_row();
-
-                    // -- reveal ---------------------------------------------
-                    right_label(ui, t!("save.reveal_label"));
-                    ui.checkbox(&mut state.reveal, t!("save.open_folder"));
-                    ui.end_row();
-                });
+            });
 
             // Live existence check: saving over a FOREIGN file is blocked
             // (the document's own source is exempt — re-save overwrites it).
-            let taken = state.blocked_by_existing();
+            // Skipped while a background save is in flight so the file the
+            // worker just created never flashes the warning before closing.
+            let taken = !state.saving && state.blocked_by_existing();
             if let Some(err) = &state.error {
                 ui.add_space(6.0);
                 ui.colored_label(t.danger, err);
@@ -176,9 +180,11 @@ pub fn show(ui: &mut Ui, state: &mut SaveDialog) -> Outcome {
                     ui.spinner();
                     ui.add_space(8.0);
                 }
-                if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
-                    outcome = Outcome::Cancel;
-                }
+                ui.add_enabled_ui(!state.saving, |ui| {
+                    if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                        outcome = Outcome::Cancel;
+                    }
+                });
             });
         });
 

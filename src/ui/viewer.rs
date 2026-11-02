@@ -1136,12 +1136,14 @@ impl Viewer {
     }
 
     /// Forgets the write baseline of every tab — the next store drain
-    /// re-queues the whole session. Used when the retention policy may
-    /// have just pruned rows (or emptied the store) behind the tabs'
-    /// backs.
+    /// re-queues the whole session (base pixels included). Used when
+    /// the retention policy may have just pruned rows (or emptied the
+    /// store) behind the tabs' backs.
     pub fn reset_store_marks(&mut self) {
         for tab in &mut self.tabs {
             tab.stored_fp = None;
+            tab.persisted_rev = None;
+            tab.base_dirty = true;
         }
         self.persisted_sigs = None;
     }

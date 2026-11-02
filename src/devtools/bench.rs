@@ -65,9 +65,9 @@ fn encode_timed(
 }
 
 /// Wraps a synthetic frame in the `Document`/`Tab` shape the writer
-/// consumes — same shape `devseed` produces.
+/// consumes — same shape `seed` produces.
 fn synth_document(seed: u64) -> Document {
-    let image = crate::devseed::synth_image(seed);
+    let image = super::seed::synth_image(seed);
     let mut doc = Document::new(Capture {
         scale_factor: 2.0,
         monitor: MonitorInfo {
@@ -96,7 +96,7 @@ pub fn run(count: usize) -> i32 {
     std::fs::create_dir_all(&dir).expect("bench dir");
 
     // -- PNG compression trade-off -----------------------------------
-    let probe = crate::devseed::synth_image(0);
+    let probe = super::seed::synth_image(0);
     println!(
         "== PNG encode, {}x{} RGBA ({} MiB raw) ==",
         probe.width(),

@@ -20,9 +20,7 @@ mod app;
 mod capture;
 mod config;
 #[cfg(feature = "dev-tools")]
-mod devbench;
-#[cfg(feature = "dev-tools")]
-mod devseed;
+mod devtools;
 mod editor;
 mod export;
 mod i18n;
@@ -47,7 +45,7 @@ fn main() -> eframe::Result<()> {
     // performance test data. Use PIXME_DATA_DIR to keep it away from
     // a real session.
     #[cfg(feature = "dev-tools")]
-    if let Some(count) = devseed::requested() {
+    if let Some(count) = devtools::seed::requested() {
         let instance = instance_guard();
         if instance.as_ref().is_some_and(|i| !i.is_single()) {
             eprintln!("pixme: quit the running instance before seeding the session");
@@ -55,7 +53,7 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         }
         let _guard = instance;
-        let code = devseed::run(count);
+        let code = devtools::seed::run(count);
         logging::shutdown();
         std::process::exit(code);
     }
@@ -65,8 +63,8 @@ fn main() -> eframe::Result<()> {
     // PNG compression trade-off, per-doc enqueue/flush timings — into
     // a throwaway database. The real session is never touched.
     #[cfg(feature = "dev-tools")]
-    if let Some(count) = devbench::requested() {
-        let code = devbench::run(count);
+    if let Some(count) = devtools::bench::requested() {
+        let code = devtools::bench::run(count);
         logging::shutdown();
         std::process::exit(code);
     }

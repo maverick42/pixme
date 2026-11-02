@@ -139,12 +139,6 @@ impl Writer {
         }
     }
 
-    /// A writer with persistence off — jobs are accepted and dropped.
-    /// Used where a `Shared` is needed but no database exists.
-    pub fn disabled() -> Self {
-        Self::spawn(Store::disabled(), None)
-    }
-
     /// Enqueue a job; a dead worker (it cannot — the channel outlives
     /// the handle) only logs.
     fn send(&self, job: Job) {
@@ -435,7 +429,7 @@ fn run(
     }
 
     let mut parked: Vec<Job> = Vec::new();
-    while let Ok(job) = rx.recv() {
+    while let Ok(mut job) = rx.recv() {
         if let Job::Flush(reply) = job {
             // Everything queued before the flush is done: parked
             // failures get their last retry now, then the barrier lifts.
@@ -443,10 +437,37 @@ fn run(
                 let _ = run_one(&mut store, parked_job, &emit, &count, false);
             }
             let _ = reply.send(());
+            if let Some(w) = &wake {
+                w();
+            }
             continue;
         }
         if matches!(job, Job::Shutdown) {
             break;
+        }
+        // Keep `parked` coherent with newer jobs: a fresh `Doc`
+        // supersedes an older parked snapshot for the same id (inheriting
+        // its `base` pixels if the initial insert was the one that
+        // failed); a `Delete` or `Clear` drops parked writes so a flush
+        // never resurrects a closed tab or a discarded session.
+        if let Job::Doc(w) = &mut job {
+            for p in &mut parked {
+                if let Job::Doc(prev) = p
+                    && prev.id == w.id
+                    && w.base.is_none()
+                {
+                    w.base = prev.base.take();
+                }
+            }
+            let id = w.id.clone();
+            parked.retain(|p| !matches!(p, Job::Doc(prev) if prev.id == id));
+        } else if let Job::Delete(ids) = &job {
+            parked.retain(|p| !matches!(p, Job::Doc(prev) if ids.contains(&prev.id)));
+        } else if matches!(
+            job,
+            Job::Clear | Job::Retention(crate::config::DbRetention::Never)
+        ) {
+            parked.clear();
         }
         // A finished load hands the session back — the viewer sleeps
         // until woken, same for every event the jobs emit inside.
@@ -551,5 +572,35 @@ mod tests {
         writer.flush().recv().expect("flush reply");
         let session = writer.load().recv().expect("load reply");
         assert_eq!(session.tabs.len(), 2);
+    }
+
+    /// A failed write emits `DocFailed` and parks; a later full write
+    /// for the same document supersedes the parked failure and commits.
+    #[test]
+    fn failed_write_reports_and_later_doc_supersedes_parked() {
+        let writer = Writer::spawn(Store::open_in_memory(), None);
+        let viewer = viewer_with(1);
+        let id = viewer.tabs[0].doc.meta.id.clone();
+        // `base = None` on a non-existent row fails the UPDATE twice
+        // and parks the job.
+        let mut bad = viewer.tabs[0].to_doc_write(0);
+        bad.base = None;
+        writer.write_doc(bad);
+        // Queue a full write right behind it: it supersedes the parked
+        // failure and inserts the row.
+        writer.write_doc(viewer.tabs[0].to_doc_write(0));
+        writer.flush().recv().expect("flush reply");
+        assert_eq!(writer.document_count(), 1);
+        let events = writer.drain_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WriteEvent::DocFailed { id: fid } if *fid == id))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WriteEvent::DocWritten { id: wid, .. } if *wid == id))
+        );
     }
 }

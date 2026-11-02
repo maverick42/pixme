@@ -186,16 +186,6 @@ impl Store {
         }
     }
 
-    /// A placeholder with persistence off — `Shared` swaps it in while
-    /// the real store loads the session on a worker thread, then takes
-    /// the real one back through the restore channel.
-    pub fn disabled() -> Self {
-        Self {
-            conn: None,
-            needs_vacuum: false,
-        }
-    }
-
     /// Opens (and migrates) the database at `path`. A file that fails to
     /// open or migrate once is moved aside to `<name>.bak` and rebuilt;
     /// a second failure leaves persistence disabled, logged.
@@ -347,32 +337,6 @@ impl Store {
         if removed > 0 {
             tracing::info!(removed, "retention pruned old captures");
             self.needs_vacuum = true;
-        }
-    }
-
-    /// Meta-only persist — the quit-time content signature proved the
-    /// rows identical, so only `ord`/`title`/`saved` and the session
-    /// row (active tab, title counter) are refreshed. No image work.
-    pub fn save_meta(&mut self, rows: &[(String, String, bool)], active: usize, next_title: usize) {
-        let Some(conn) = self.conn.as_mut() else {
-            return;
-        };
-        let Ok(tx) = conn.transaction() else {
-            return;
-        };
-        let _ = tx.execute(
-            "UPDATE session SET active=?1, next_title=?2 WHERE id=0",
-            params![active as i64, next_title as i64],
-        );
-        if let Ok(mut stmt) =
-            tx.prepare("UPDATE documents SET ord=?2, title=?3, saved=?4 WHERE doc_id=?1")
-        {
-            for (ord, (id, title, saved)) in rows.iter().enumerate() {
-                let _ = stmt.execute(params![id, ord as i64, title, saved]);
-            }
-        }
-        if let Err(err) = tx.commit() {
-            tracing::warn!("session meta save failed: {err:#}");
         }
     }
 

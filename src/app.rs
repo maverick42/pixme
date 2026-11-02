@@ -552,6 +552,31 @@ impl Shared {
     pub fn pump(&self, ctx: &egui::Context) {
         crate::logging::report_health();
         platform::strip_undecorated_frame();
+        // The quit-time flush finished on the store thread — or the
+        // wait ran out / the writer died: the app closes either way.
+        // Checked before `dispatch` so the pass that initiates `Quit`
+        // always leaves `quit_rx` armed for one frame (the saving veil
+        // and the unit-test `drain_quit` barrier) instead of racing the
+        // worker thread inside the same `pump` call.
+        if lock(&self.quit_rx).is_some() {
+            let flushed = lock(&self.quit_rx)
+                .as_ref()
+                .map(|r| r.try_recv())
+                .is_some_and(|r| !matches!(r, Err(std::sync::mpsc::TryRecvError::Empty)));
+            let timed_out =
+                lock(&self.quit_started).is_some_and(|t| t.elapsed() > QUIT_FLUSH_TIMEOUT);
+            if timed_out {
+                tracing::warn!(
+                    "session flush exceeded {}s — quitting anyway",
+                    QUIT_FLUSH_TIMEOUT.as_secs()
+                );
+            }
+            if flushed || timed_out {
+                *lock(&self.quit_rx) = None;
+                *lock(&self.quit_started) = None;
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
+        }
         let commands: Vec<Command> = platform::take_pending_commands()
             .into_iter()
             .chain(std::mem::take(&mut *lock(&self.pending)))
@@ -610,27 +635,6 @@ impl Shared {
             *lock(&self.restore_rx) = None;
             self.finish_restore(session);
             ctx.repaint_if_live(viewer_id());
-        }
-        // The quit-time flush finished on the store thread — or the
-        // wait ran out / the writer died: the app closes either way.
-        if lock(&self.quit_rx).is_some() {
-            let flushed = lock(&self.quit_rx)
-                .as_ref()
-                .map(|r| r.try_recv())
-                .is_some_and(|r| !matches!(r, Err(std::sync::mpsc::TryRecvError::Empty)));
-            let timed_out =
-                lock(&self.quit_started).is_some_and(|t| t.elapsed() > QUIT_FLUSH_TIMEOUT);
-            if timed_out {
-                tracing::warn!(
-                    "session flush exceeded {}s — quitting anyway",
-                    QUIT_FLUSH_TIMEOUT.as_secs()
-                );
-            }
-            if flushed || timed_out {
-                *lock(&self.quit_rx) = None;
-                *lock(&self.quit_started) = None;
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
-            }
         }
         // A background save-all finished: the tabs come back into the
         // viewer; a ConfirmSave batch then closes the (now clean)
@@ -1636,9 +1640,10 @@ impl Shared {
             // the store may lack rows the tabs believe written.
             lock(&self.viewer).reset_store_marks();
         }
-        if !self.session_persists() {
-            // `Never` retention: no writes — and NO marks touched, so a
-            // later return to `Always` re-queues the whole session.
+        if !self.session_persists() || lock(&self.restore_rx).is_some() {
+            // `Never` retention (or a session load still decoding): no
+            // writes — and NO marks touched, so a later return to
+            // `Always` (or the finished load) queues what is needed.
             return;
         }
         let mut viewer = lock(&self.viewer);
@@ -2053,49 +2058,11 @@ impl eframe::App for PixMeApp {
                     // One-shot store-failure notice (translated): a write
                     // failed on the worker — the per-tab warning glyph is
                     // the standing signal; this explains it once.
-                    if lock(&shared.store_notice).is_some() {
-                        let mut open = true;
-                        egui::Window::new(t!("app.title").to_string())
-                            .collapsible(false)
-                            .resizable(false)
-                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                            .open(&mut open)
-                            .show(&ctx, |ui| {
-                                if let Some(msg) = &*lock(&shared.store_notice) {
-                                    ui.label(msg);
-                                }
-                                ui.add_space(6.0);
-                                if ui::widgets::primary_button(ui, "OK").clicked() {
-                                    *lock(&shared.store_notice) = None;
-                                }
-                            });
-                        if !open {
-                            *lock(&shared.store_notice) = None;
-                        }
-                    }
+                    notice_window(&ctx, "pixme.store_notice", &shared.store_notice);
                     // Deferred startup notice (Windows data/logs fallback):
                     // the first real window delivers it — non-modal, the
                     // app stays usable.
-                    if lock(&shared.startup_notice).is_some() {
-                        let mut open = true;
-                        egui::Window::new(t!("app.title").to_string())
-                            .collapsible(false)
-                            .resizable(false)
-                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                            .open(&mut open)
-                            .show(&ctx, |ui| {
-                                if let Some(msg) = &*lock(&shared.startup_notice) {
-                                    ui.label(msg);
-                                }
-                                ui.add_space(6.0);
-                                if ui::widgets::primary_button(ui, "OK").clicked() {
-                                    *lock(&shared.startup_notice) = None;
-                                }
-                            });
-                        if !open {
-                            *lock(&shared.startup_notice) = None;
-                        }
-                    }
+                    notice_window(&ctx, "pixme.startup_notice", &shared.startup_notice);
                     // Windows About modal — the egui twin of the macOS
                     // native About panel, framed like the settings modal:
                     // title band with a painted close cross, compact body.
@@ -2431,12 +2398,15 @@ impl eframe::App for PixMeApp {
                         *lock(&shared.save_dialog) = None;
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                     };
+                    let saving = lock(&shared.save_dialog).as_ref().is_some_and(|d| d.saving);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                        close(&ctx);
+                        if !saving {
+                            close(&ctx);
+                        }
                         return;
                     }
-                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if !saving && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         close(&ctx);
                         return;
                     }
@@ -2485,6 +2455,33 @@ impl eframe::App for PixMeApp {
                 },
             );
         }
+    }
+}
+
+/// One-shot non-modal notice window (store failure or Windows
+/// portable fallback): distinct egui ID, translated OK button.
+fn notice_window(ctx: &egui::Context, id: &'static str, slot: &Mutex<Option<String>>) {
+    if lock(slot).is_none() {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new(t!("app.title").to_string())
+        .id(egui::Id::new(id))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            if let Some(msg) = &*lock(slot) {
+                ui.label(msg);
+            }
+            ui.add_space(6.0);
+            if ui::widgets::primary_button(ui, &t!("draw.ok")).clicked() {
+                *lock(slot) = None;
+            }
+        });
+    if !open {
+        *lock(slot) = None;
     }
 }
 
@@ -2963,6 +2960,31 @@ mod tests {
         drive(&shared, &ctx, Command::OpenViewer);
         drain_restore(&shared);
         assert_eq!(lock(&shared.viewer).tabs.len(), 1);
+    }
+
+    /// When retention empties the store (`Never`) and later comes back
+    /// (`Always`), `store_marks_reset` forces `sync_store` to re-queue
+    /// the full document (base pixels included), not a meta-only UPDATE.
+    #[test]
+    fn reset_store_marks_rewrites_full_documents_after_never() {
+        let (shared, ctx) = harness();
+        drive(&shared, &ctx, Command::OpenViewer);
+        drain_restore(&shared);
+        lock(&shared.viewer).push_stub("capture 1");
+        shared.pump(&ctx);
+        shared.writer.flush().recv().expect("initial write");
+        assert_eq!(shared.writer.document_count(), 1);
+
+        // Simulate switching retention to Never (clears DB), then back
+        // to Always with `store_marks_reset` set.
+        shared.writer.retention(crate::config::DbRetention::Never);
+        shared.writer.flush().recv().expect("clear");
+        assert_eq!(shared.writer.document_count(), 0);
+
+        shared.store_marks_reset.store(true, Ordering::Relaxed);
+        shared.pump(&ctx);
+        shared.writer.flush().recv().expect("rewrite");
+        assert_eq!(shared.writer.document_count(), 1);
     }
 
     /// A discarded session empties the store — a later viewer open
