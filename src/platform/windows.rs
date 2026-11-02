@@ -250,6 +250,8 @@ pub fn strip_undecorated_frame() {
         fn SetWindowTextW(hwnd: isize, s: *const u16) -> i32;
         fn GetWindowRect(hwnd: isize, r: *mut WinRect) -> i32;
         fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
         fn GetCurrentThreadId() -> u32;
     }
 
@@ -259,9 +261,13 @@ pub fn strip_undecorated_frame() {
         fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, cx: i32, cy: i32) -> isize;
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    const SW_SHOWNOACTIVATE: i32 = 4;
+    const SW_SHOW: i32 = 5;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Role {
-        CardWithMargin,
+        Bar,
+        Countdown,
         Pin,
         Overlay,
     }
@@ -277,6 +283,8 @@ pub fn strip_undecorated_frame() {
             return 1;
         }
 
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+
         let mut title_buf = [0u16; 64];
         let n = unsafe { GetWindowTextW(hwnd, title_buf.as_mut_ptr(), 64) as usize };
         let title = String::from_utf16_lossy(&title_buf[..n]);
@@ -285,12 +293,16 @@ pub fn strip_undecorated_frame() {
             let mut m = roles.borrow_mut();
             if let Some(&r) = m.get(&hwnd) {
                 Some(r)
-            } else if title == "PixMe Bar" || title == "PixMe Countdown" {
-                m.insert(hwnd, Role::CardWithMargin);
+            } else if title == "PixMe Bar" {
+                m.insert(hwnd, Role::Bar);
                 // Clear the window title text in Win32 so DefWindowProc on WM_NCACTIVATE
                 // (fired when focus shifts to countdown) never draws title text.
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::CardWithMargin)
+                Some(Role::Bar)
+            } else if title == "PixMe Countdown" {
+                m.insert(hwnd, Role::Countdown);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                Some(Role::Countdown)
             } else if title == "PixMe Pin" {
                 m.insert(hwnd, Role::Pin);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
@@ -308,9 +320,14 @@ pub fn strip_undecorated_frame() {
             return 1;
         };
 
-        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
         let mut need_reapply_region = false;
         if (style & WS_CHROME) != 0 {
+            // A window caught with chrome while VISIBLE is a title-bar
+            // flash in the act: creation race or mid-life re-decoration
+            // (winit re-applies WS_CAPTION on frame changes).
+            if unsafe { IsWindowVisible(hwnd) } != 0 {
+                tracing::debug!(hwnd, ?role, "chrome_stripped_on_visible_window");
+            }
             unsafe {
                 SetWindowLongPtrW(hwnd, GWL_STYLE, style & !WS_CHROME);
                 if (exstyle & WS_EX_WINDOWEDGE) != 0 {
@@ -343,7 +360,7 @@ pub fn strip_undecorated_frame() {
 
                 if need_reapply_region || size_changed {
                     let rgn = match role {
-                        Role::CardWithMargin => {
+                        Role::Bar | Role::Countdown => {
                             // Clip the top 2 pixels of empty transparent margin to eliminate
                             // the DWM top accent line.
                             unsafe { CreateRectRgn(0, 2, w + 1, h + 1) }
@@ -360,6 +377,24 @@ pub fn strip_undecorated_frame() {
                         }
                     }
                 }
+            }
+        }
+
+        // Chrome-less viewports are created hidden (`with_visible(false)`):
+        // egui's `Visible(true)` would go through winit's `apply_diff`,
+        // which re-applies WS_CAPTION via `to_window_styles` right after
+        // ShowWindow — a title-bar flash at reveal. Showing the window
+        // here, once stripped, bypasses winit's flag machinery entirely.
+        // The overlay is excluded: it must be placed (SetMonitor) before
+        // being shown and reveals itself through egui — its borderless-
+        // fullscreen flag makes that path caption-free.
+        if role != Role::Overlay && unsafe { IsWindowVisible(hwnd) } == 0 {
+            let cmd = match role {
+                Role::Countdown => SW_SHOWNOACTIVATE, // .with_active(false)
+                _ => SW_SHOW,
+            };
+            unsafe {
+                ShowWindow(hwnd, cmd);
             }
         }
 

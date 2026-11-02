@@ -1732,3 +1732,53 @@ Format: date — context — decision — consequences.
   - `dev-tools` gains `pixme --bench-store [N]`: PNG compression
     trade-off, per-doc enqueue cost, `queued_ms`/`work_ms` stats and
     restore timing on N synthetic 5K captures.
+
+## 2026-11-02 — Windows chrome-less viewports: hidden creation + `ShowWindow` bypassing winit
+
+- **Context**: a Windows 0.30 winit quirk — `to_window_styles`
+  (`window_state.rs`) re-applies `WS_CAPTION | WS_BORDER | WS_SYSMENU`
+  **on every flag change, including `VISIBLE`** — means neither
+  visible-at-creation NOR egui's `ViewportCommand::Visible(true)` (→
+  `set_visible` → `apply_diff` → `SetWindowLongW`) can show a
+  chrome-less window without a one-frame title bar. The caption reads
+  *empty* because the strip also clears the title text.
+- **Decision**: chrome-less viewports (bar, pins, countdown) are
+  created `with_visible(false)` (Windows-only `#[cfg]`) and
+  `strip_undecorated_frame`'s `visit` shows them itself —
+  `ShowWindow(hwnd, SW_SHOW)` directly on the already-stripped hwnd
+  (`SW_SHOWNOACTIVATE` for the countdown, mirroring `with_active`).
+  winit never sees a `VISIBLE` flag diff, so its style re-application
+  never runs. The overlay keeps its egui `Visible(true)` reveal —
+  its `SetMonitor` sets `MARKER_BORDERLESS_FULLSCREEN` first, which
+  makes `to_window_styles` drop `WS_OVERLAPPEDWINDOW`, so that path
+  is already caption-free. `Role` split `CardWithMargin` into
+  `Bar`/`Countdown` for the per-role show flag. Decorated windows,
+  the root anchor and macOS are untouched.
+- **Consequences**: no caption can ever be painted on
+  bar/pin/countdown. `chrome_stripped_on_visible_window` (debug
+  level) alarms if a window is ever caught visible-with-chrome —
+  the flash signature. Residual: winit may re-add chrome mid-life on
+  frame changes (re-stripped next pump). Guarded by the
+  `chromeless_viewports_start_hidden` test.
+
+## 2026-11-02 — The "empty title bar at the top of the screen" is explorer's edge-UI strip, not a PixMe window
+
+- **Context**: a full-width empty strip at the top of the screen
+  flashed whenever the capture overlay appeared or disappeared.
+  A `SetWinEventHook` probe (used during diagnosis, since removed)
+  showed the only window toggling at those exact moments is
+  **`EdgeUiInputTopWndClass`, a 1585×4 explorer.exe window at the top
+  of the screen** — Windows' touch edge-input strip, hidden by the
+  shell while any screen-covering window exists and re-shown when it
+  goes away.
+- **Decision**: no code change — the strip's hide/show is explorer's
+  own generic fullscreen detection, not a reaction to
+  `MarkFullscreenWindow` (verified: it toggles identically with the
+  manual `OuterPosition`/`InnerSize` placement, so the SetMonitor
+  path was kept). Suppressing it would mean hiding another process's
+  window — rejected as out-of-process tampering. It renders
+  invisibly on healthy systems; a visible white strip suggests an
+  explorer glitch (explorer restart can reset it).
+- **Consequences**: the flash is a Windows shell artifact outside
+  PixMe's control. Any screenshot/capture tool showing a
+  screen-covering overlay triggers the same toggle.

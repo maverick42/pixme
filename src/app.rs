@@ -2571,6 +2571,11 @@ fn bar_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
         // Accessory apps stay inert until a window asks for focus.
         .with_active(true)
         .with_inner_size([340.0, 48.0]);
+    #[cfg(target_os = "windows")]
+    // winit forces WS_CAPTION at creation — created hidden; the pump's
+    // `strip_undecorated_frame` ShowWindow's it once chrome-free (egui's
+    // `Visible(true)` would re-apply the caption via winit's apply_diff).
+    let builder = builder.with_visible(false);
     match position {
         Some(pos) => builder.with_position(pos),
         None => builder,
@@ -2678,7 +2683,7 @@ fn overlay_builder(
 /// close dot and the control strip. The builder position/size only apply
 /// at creation: user drags and zoom resizes use viewport commands.
 fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default()
+    let builder = egui::ViewportBuilder::default()
         .with_title("PixMe Pin")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
@@ -2689,14 +2694,18 @@ fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
         .with_taskbar(false)
         .with_active(true)
         .with_inner_size(size)
-        .with_position(origin)
+        .with_position(origin);
+    #[cfg(target_os = "windows")]
+    // Hidden until `strip_undecorated_frame` shows it (see `bar_builder`).
+    let builder = builder.with_visible(false);
+    builder
 }
 
 /// The capture-delay countdown: borderless, transparent, always on top,
 /// sized to its painted card. The position only applies at creation —
 /// the card then tracks the monitor under the cursor.
 fn countdown_builder() -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default()
+    let builder = egui::ViewportBuilder::default()
         .with_title("PixMe Countdown")
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
@@ -2706,7 +2715,11 @@ fn countdown_builder() -> egui::ViewportBuilder {
         .with_has_shadow(false)
         .with_taskbar(false)
         .with_active(false)
-        .with_inner_size([140.0, 140.0])
+        .with_inner_size([140.0, 140.0]);
+    #[cfg(target_os = "windows")]
+    // Hidden until `strip_undecorated_frame` shows it (see `bar_builder`).
+    let builder = builder.with_visible(false);
+    builder
 }
 
 /// The pin save-as window: a small decorated form floating above the
@@ -2766,6 +2779,25 @@ pub fn run() -> eframe::Result<()> {
 mod tests {
     //! Lifecycle invariants: one state machine, identical on both OSes.
     use super::*;
+
+    /// Windows: every chrome-less viewport starts hidden — winit forces
+    /// `WS_CAPTION` at creation and a window shown before
+    /// `strip_undecorated_frame` ran flashes a title bar. Decorated
+    /// windows keep the default (created visible).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn chromeless_viewports_start_hidden() {
+        assert_eq!(bar_builder(None).visible, Some(false));
+        assert_eq!(
+            pin_builder(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0)).visible,
+            Some(false)
+        );
+        assert_eq!(countdown_builder().visible, Some(false));
+        assert_eq!(overlay_builder(None, None).visible, Some(false));
+        assert_eq!(viewer_builder(None).visible, None);
+        assert_eq!(save_dialog_builder().visible, None);
+        assert_eq!(draw_builder("t").visible, None);
+    }
 
     fn harness() -> (Shared, egui::Context) {
         let shared = Shared {
