@@ -585,6 +585,17 @@ impl Shared {
                 *lock(&self.quit_rx) = None;
                 *lock(&self.quit_started) = None;
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                // The Close only sits in the root's command queue until the
+                // root's next pass — nothing else repaints it in Idle, so
+                // the app would never actually shut down.
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            } else {
+                // No viewport may be repainting while the flush drains
+                // (Idle: only the anchor exists — the saving veil's own
+                // request_repaint does this when the viewer is open):
+                // keep the pump alive so `flushed`/`timed_out` get
+                // evaluated, or the app deadlocks with modal=Saving.
+                ctx.request_repaint();
             }
         }
         let commands: Vec<Command> = platform::take_pending_commands()

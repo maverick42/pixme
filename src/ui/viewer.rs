@@ -2271,6 +2271,7 @@ impl Viewer {
                                     self.tabs[i].doc.base.image.width(),
                                     self.tabs[i].doc.base.image.height(),
                                 );
+                                tracing::info!(size = %format!("{w}x{h}"), "resize_open");
                                 self.resize = Some(ResizeDialog {
                                     width: w.to_string(),
                                     height: h.to_string(),
