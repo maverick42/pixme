@@ -2,9 +2,9 @@
 //!
 //! One tab per capture of the session, a vertical capture bar starting new
 //! captures, and the translated Save/Discard/Cancel confirmation when a
-//! dirty session would be lost. On Windows the viewer also draws the
-//! application's menu strip (no global menu bar exists); on macOS the same
-//! actions live in the native PixMe/File/Edit/Window menus.
+//! dirty session would be lost. On macOS the application's actions live in
+//! the native PixMe/File/Edit/Window menus; on Windows the tray menu and
+//! the toolbar carry them.
 //! The toolbar carries the file/edit actions (open, save, select, zoom,
 //! resize, clipboard, print, close); Draw lands in the next phase.
 
@@ -1933,10 +1933,6 @@ impl Viewer {
                 // carries its own margins, so the column stays flush
                 // and compact like the reference.
                 ui.spacing_mut().item_spacing.y = 0.0;
-                if !shared.has_native_app_menu() {
-                    self.menu_strip(ui, shared);
-                    widgets::hairline(ui);
-                }
                 self.toolbar_strip(ui, shared);
                 widgets::hairline(ui);
                 if self.view_mode == ViewMode::Tabs {
@@ -2704,80 +2700,6 @@ impl Viewer {
         } else {
             1.0
         }
-    }
-
-    /// egui menu strip for OSes without a native menu bar (Windows). Same
-    /// commands as the native menus — the only difference is where they
-    /// render.
-    fn menu_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
-        egui::Frame::default()
-            .inner_margin(Margin::symmetric(8, 4))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // Menu titles, not buttons: no fill, no border — the hover
-                    // highlight alone signals them (PhotoCraft's egui menu bar
-                    // reads the same way on Windows).
-                    let v = &mut ui.style_mut().visuals;
-                    v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-                    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-                    menu_button(ui, t!("menu.edit").as_ref(), |ui| {
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::UndoActive,
-                            t!("menu.edit.undo").as_ref(),
-                            Some(Icon::Undo2),
-                            shared.command_enabled(&Command::UndoActive),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::RedoActive,
-                            t!("menu.edit.redo").as_ref(),
-                            Some(Icon::Redo2),
-                            shared.command_enabled(&Command::RedoActive),
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::CopyActive,
-                            t!("menu.edit.copy").as_ref(),
-                            Some(Icon::Copy),
-                            shared.command_enabled(&Command::CopyActive),
-                        );
-                    });
-                    menu_button(ui, t!("settings.title").as_ref(), |ui| {
-                        menu_item(
-                            ui,
-                            shared,
-                            Command::OpenSettings,
-                            t!("menu.app.preferences").as_ref(),
-                        );
-                    });
-                    menu_button(ui, t!("menu.help").as_ref(), |ui| {
-                        // The website entry stays greyed until it exists.
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::OpenViewer,
-                            t!("menu.help.visit_site").as_ref(),
-                            None,
-                            false,
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::OpenAbout,
-                            t!("menu.help.about").as_ref(),
-                            None,
-                            shared.command_enabled(&Command::OpenAbout),
-                        );
-                    });
-                });
-            });
     }
 
     /// The capture tab strip: one selectable label per capture — red
@@ -4419,59 +4341,6 @@ fn mosaic_zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) 
             }
         }
     });
-}
-
-/// One top-level menu label opening a popup (egui menu strip style).
-fn menu_button(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-    let mut resp = ui.button(label);
-    // Anchor the dropdown to the title's text edge, not the padded button
-    // edge — the flat titles carry no visible frame, so aligning the popup
-    // on the text is what reads like a real menu bar (egui's own SubMenu
-    // does the same trick in the vertical axis).
-    resp.interact_rect.min.x += ui.spacing().button_padding.x;
-    egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(180.0);
-        add(ui);
-    });
-}
-
-/// One menu entry dispatching a [`Command`] when clicked, greyed out
-/// when the command is forbidden by the current modal state.
-///
-/// Menu row with an optional leading icon; `enabled` gates the grey-out
-/// (document presence, last-dir availability, modal state).
-fn menu_item_icon(
-    ui: &mut egui::Ui,
-    shared: &Shared,
-    command: Command,
-    label: &str,
-    icon: Option<Icon>,
-    enabled: bool,
-) {
-    ui.add_enabled_ui(enabled, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            // The icon slot is always reserved so icon-less rows keep
-            // their labels aligned with the iconed ones.
-            let t = crate::ui::theme::tokens(ui.ctx());
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
-            if let Some(icon) = icon {
-                crate::ui::icons::paint(ui, rect, icon, 16.0, t.icon);
-            }
-            if ui.button(label).clicked() {
-                shared.push(command);
-                ui.close();
-            }
-        });
-    });
-}
-
-fn menu_item(ui: &mut egui::Ui, shared: &Shared, command: Command, label: &str) {
-    let enabled = shared.command_enabled(&command);
-    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-        shared.push(command);
-        ui.close();
-    }
 }
 
 #[cfg(test)]

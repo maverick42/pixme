@@ -518,12 +518,6 @@ impl Shared {
         lock(&self.settings)
     }
 
-    /// Whether the OS shows a native application menu bar (macOS) or the
-    /// viewer must draw its own menu strip (Windows).
-    pub fn has_native_app_menu(&self) -> bool {
-        platform::current().has_native_app_menu()
-    }
-
     /// A modal child viewport is up (save-as, settings) — other windows
     /// dim themselves and refuse input while one is open.
     pub fn modal_child_open(&self) -> bool {

@@ -29,10 +29,6 @@ impl PlatformServices for Windows {
         Ok(())
     }
 
-    fn has_native_app_menu(&self) -> bool {
-        // Menus are drawn inside the viewer window (egui menu strip).
-        false
-    }
 }
 
 /// The 1×1 invisible anchor viewport gets NO taskbar button: on Windows a

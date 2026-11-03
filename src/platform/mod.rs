@@ -35,10 +35,6 @@ pub trait PlatformServices: Send + Sync {
         None
     }
 
-    /// Whether the OS provides a native application menu bar (macOS: yes —
-    /// menus live at the top of the screen; Windows: no — the viewer renders
-    /// its own egui menu strip inside the window instead).
-    fn has_native_app_menu(&self) -> bool;
 }
 
 /// The implementation for the running OS.

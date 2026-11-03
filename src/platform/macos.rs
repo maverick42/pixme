@@ -34,11 +34,6 @@ impl PlatformServices for MacOs {
         Ok(())
     }
 
-    fn has_native_app_menu(&self) -> bool {
-        // The PixMe/Capture/File/Window menus live on the system menu bar.
-        true
-    }
-
     fn capture_permission_status(&self) -> Option<bool> {
         // Read-only TCC preflight — never prompts.
         Some(core_graphics::access::ScreenCaptureAccess.preflight())
