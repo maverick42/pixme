@@ -119,27 +119,6 @@ fn separator(menu: &impl MenuAppend) {
     append(menu, &PredefinedMenuItem::separator());
 }
 
-/// Metadata for the native About panel (PixMe menu → "About PixMe").
-/// `license`, `authors`, `comments` and `website` are unsupported on
-/// macOS; the panel shows name, version, copyright and the artwork.
-fn about_metadata() -> tray_icon::menu::AboutMetadata {
-    let icon = {
-        let d = icons::dock_icon_data();
-        tray_icon::menu::Icon::from_rgba(d.rgba.clone(), d.width, d.height).ok()
-    };
-    tray_icon::menu::AboutMetadata {
-        name: Some("PixMe".to_owned()),
-        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        copyright: Some(format!(
-            "© 2026 Frédérik Benoist (dev.q2ii.fr)
-{}",
-            t!("settings.about.license")
-        )),
-        icon,
-        ..Default::default()
-    }
-}
-
 /// The append operation `Menu` and `Submenu` share.
 trait MenuAppend {
     fn append(&self, item: &dyn IsMenuItem) -> tray_icon::menu::Result<()>;
@@ -234,10 +213,13 @@ pub fn install_ui(ctx: &egui::Context) {
     // Application menu bar (system menu bar, always present).
     let app_menu = Menu::new();
     let app = Submenu::new("PixMe", true);
-    let about =
-        PredefinedMenuItem::about(Some(t!("menu.app.about").as_ref()), Some(about_metadata()));
+    // The About entry opens the settings modal on its About page —
+    // one About surface on both OSes, no native panel.
+    let about = MenuItem::with_id("about", t!("menu.app.about").as_ref(), true, None);
     append(&app, &about);
-    labels.predef.push((about, "menu.app.about"));
+    labels
+        .items
+        .push((about, "menu.app.about", "about".to_owned()));
     // Greyed until the website exists — registered for relabeling but its
     // id maps to no command, so `sync_menu_enabled` leaves it disabled.
     let visit = MenuItem::with_id(

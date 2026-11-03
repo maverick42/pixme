@@ -1,5 +1,5 @@
 //! The settings window content, edited as a DRAFT: pages on the left
-//! (General, File name), the page's rows on the right, and an
+//! (General, File name, About), the page's rows on the right, and an
 //! OK / Annuler footer. `OK` writes the draft back to `Shared.settings`
 //! and persists it; Annuler / the painted cross / Escape discard it.
 //! A retention switch that would lose stored captures asks for
@@ -23,8 +23,8 @@ pub enum SettingsPage {
     General,
     /// The saved-file filename template and its editable presets.
     Filename,
-    /// Data and log folder locations, diagnostics bundle.
-    Folders,
+    /// App identity, version, data/log folder locations, diagnostics.
+    About,
 }
 
 /// egui-temp keys: the active page, and a draft parked behind the
@@ -61,7 +61,7 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
                 |ui| match page {
                     SettingsPage::General => general_page(ui, draft),
                     SettingsPage::Filename => filename_page(ui, draft),
-                    SettingsPage::Folders => folders_page(ui),
+                    SettingsPage::About => about_page(ui),
                 },
             );
         });
@@ -101,7 +101,7 @@ fn sidebar(ui: &mut egui::Ui, page: &mut SettingsPage) {
         for (value, key) in [
             (SettingsPage::General, "settings.page.general"),
             (SettingsPage::Filename, "settings.page.filename"),
-            (SettingsPage::Folders, "settings.page.folders"),
+            (SettingsPage::About, "settings.page.about"),
         ] {
             if ui
                 .selectable_label(*page == value, t!(key).to_string())
@@ -222,10 +222,38 @@ fn filename_page(ui: &mut egui::Ui, draft: &mut Settings) {
 
 /// "Dossiers" page: the data and log folder locations — copyable,
 /// openable in the OS file manager — plus the diagnostics bundle.
-fn folders_page(ui: &mut egui::Ui) {
+fn about_page(ui: &mut egui::Ui) {
     let t = theme::tokens(ui.ctx());
     ui.vertical(|ui| {
-        ui.add_space(10.0);
+        ui.add_space(4.0);
+        // App identity — the content the standalone About window used to
+        // show: the 256 artwork, the name, the running version, licence.
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            let icon_rgba = crate::ui::icons::app_icon_rgba(128);
+            let icon_img = egui::ColorImage::from_rgba_unmultiplied([128, 128], &icon_rgba);
+            let icon_tex =
+                ui.ctx()
+                    .load_texture("pixme://about-icon", icon_img, egui::TextureOptions::LINEAR);
+            ui.image(egui::load::SizedTexture::new(
+                icon_tex.id(),
+                egui::vec2(48.0, 48.0),
+            ));
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("PixMe").color(t.text).strong());
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(10.5)
+                        .color(t.text_dim),
+                );
+                ui.label(
+                    egui::RichText::new(t!("settings.about.license").to_string())
+                        .size(10.5)
+                        .color(t.text_faint),
+                );
+            });
+        });
+        ui.add_space(8.0);
         // Label column sized to the longest row label, so both paths
         // start at the same x whatever the locale's word lengths.
         let label_w = [
@@ -270,6 +298,12 @@ fn folders_page(ui: &mut egui::Ui) {
                 .color(t.text_faint),
         );
     });
+}
+
+/// Opens the settings modal straight on `page` — the About menu entry
+/// uses it; `show` reads the choice back through `PAGE_KEY`.
+pub fn open_at(ctx: &egui::Context, page: SettingsPage) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(PAGE_KEY), page));
 }
 
 /// One About-page location row: label, the path (elided, full path on

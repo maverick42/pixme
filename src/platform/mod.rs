@@ -170,6 +170,7 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
     Some(match id {
         "open_viewer" => Command::OpenViewer,
         "settings" => Command::OpenSettings,
+        "about" => Command::OpenAbout,
         "import_clipboard" => Command::ImportClipboard,
         "edit.undo" => Command::UndoActive,
         "edit.redo" => Command::RedoActive,
