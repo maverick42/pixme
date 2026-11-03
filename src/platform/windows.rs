@@ -397,7 +397,12 @@ pub fn strip_undecorated_frame() {
                     }
                 });
 
-                if need_reapply_region || size_changed {
+                // The anchor's empty region is reapplied EVERY pass: a
+                // winit `SWP_FRAMECHANGED` (DPI change, new child window,
+                // focus) resets the region without touching (w,h) —
+                // checking size alone would leave the ring restored.
+                // Free on a 1×1 window.
+                if need_reapply_region || size_changed || role == Role::Anchor {
                     let rgn = match role {
                         Role::Countdown => {
                             // Clip the top 2 pixels of empty transparent margin to eliminate

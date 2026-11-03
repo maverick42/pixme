@@ -2846,6 +2846,11 @@ pub fn run() -> eframe::Result<()> {
             .with_has_shadow(false)
             .with_taskbar(false)
             .with_active(false)
+            // Hidden at creation: on Windows the strip guard applies the
+            // empty region BEFORE the first ShowWindow — killing the
+            // startup-race ring. On macOS the anchor simply stays
+            // invisible (it is a 1×1 transparent window anyway).
+            .with_visible(false)
             .with_inner_size([1.0, 1.0]),
         // Geometry persistence would restore a stale bar-sized rect onto the
         // invisible anchor; all positions are computed by the app instead.
