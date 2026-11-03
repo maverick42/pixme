@@ -433,6 +433,21 @@ pub use windows::{
     left_mouse_down, unhide_cursor,
 };
 
+/// Brings the app itself frontmost (dock reopen — `Focus` alone does
+/// not activate the app on macOS) and deminiaturizes the viewer.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{activate_app, viewer_is_minimized};
+/// No-op on Windows: the winit `Focus` path already foregrounds it.
+#[cfg(target_os = "windows")]
+#[inline]
+pub(crate) fn activate_app() {}
+/// Windows reads `ViewportInfo::minimized` from egui directly.
+#[cfg(target_os = "windows")]
+#[inline]
+pub(crate) fn viewer_is_minimized() -> bool {
+    false
+}
+
 /// Re-grabs the capture overlay's focus while `Capturing` — Windows
 /// only: Alt+Tab can steal it and Esc would then hit another app. The
 /// macOS capture kiosk already locks the session, making this a no-op.

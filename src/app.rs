@@ -788,6 +788,11 @@ impl Shared {
                 // it forward: `enter` only requests focus on a state
                 // CHANGE, so de-minimize and focus explicitly here.
                 ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
+                // macOS: `Focus`/`Minimized` viewport commands do not
+                // activate the application — without `NSApp activate`
+                // the viewer stays behind the frontmost app (dock
+                // reopen needed two clicks).
+                platform::activate_app();
                 // The direct Focus command both wakes the (possibly
                 // sleeping) viewport and, on macOS, activates the app
                 // (`activateIgnoringOtherApps` + `makeKeyAndOrderFront`)
@@ -808,10 +813,18 @@ impl Shared {
             }
             Command::ToggleViewer => {
                 // The resident icon's left click: open the viewer from
-                // Idle (with the same bring-to-front as `OpenViewer`),
-                // close it back when it is up — `ViewerClosed` carries
-                // the Draw guard, so this just forwards.
-                if *lock(&self.state) == AppState::Viewer {
+                // Idle or when minimized in the Dock/taskbar (with the
+                // same bring-to-front as `OpenViewer`), close it back
+                // when it is up and visible — `ViewerClosed` carries the
+                // Draw guard, so this just forwards.
+                let minimized = ctx.input(|i| {
+                    i.raw
+                        .viewports
+                        .get(&viewer_id())
+                        .and_then(|v| v.minimized)
+                        .unwrap_or(false)
+                }) || platform::viewer_is_minimized();
+                if *lock(&self.state) == AppState::Viewer && !minimized {
                     self.dispatch(Command::ViewerClosed, ctx);
                 } else {
                     self.dispatch(Command::OpenViewer, ctx);
@@ -2720,11 +2733,12 @@ pub fn run() -> eframe::Result<()> {
             .with_has_shadow(false)
             .with_taskbar(false)
             .with_active(false)
-            // Hidden at creation: on Windows the strip guard applies the
-            // empty region BEFORE the first ShowWindow — killing the
-            // startup-race ring. On macOS the anchor simply stays
-            // invisible (it is a 1×1 transparent window anyway).
-            .with_visible(false)
+            // Hidden at creation on Windows only: the strip guard applies
+            // the empty region BEFORE the first ShowWindow — killing the
+            // startup-race ring. macOS keeps it visible: an invisible
+            // ROOT drops repaint requests and starves the command pump
+            // (queued resident-icon commands needed two clicks).
+            .with_visible(cfg!(target_os = "macos"))
             .with_inner_size([1.0, 1.0]),
         // Geometry persistence would restore a stale bar-sized rect onto the
         // invisible anchor; all positions are computed by the app instead.

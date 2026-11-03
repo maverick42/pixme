@@ -161,40 +161,10 @@ pub fn install_ui(ctx: &egui::Context) {
     }));
 
     let mut labels = Labels::default();
-
-    // Status item (the resident surface — left click toggles the
-    // viewer, right click opens this menu): Open, Settings, a greyed
-    // Check for updates (placeholder — no updater yet), Quit. Captures
-    // start only from the viewer's own capture bar.
-    let status_menu = Menu::new();
-    item(
-        &mut labels,
-        &status_menu,
-        "open_viewer",
-        "menubar.open_viewer",
-        None,
-    );
-    item(
-        &mut labels,
-        &status_menu,
-        "settings",
-        "menu.app.preferences",
-        None,
-    );
-    let updates = MenuItem::with_id(
-        "check_updates",
-        t!("menubar.check_updates").as_ref(),
-        false,
-        None,
-    );
-    append(&status_menu, &updates);
-    labels
-        .items
-        .push((updates, "menubar.check_updates", "check_updates".to_owned()));
-    separator(&status_menu);
-    item(&mut labels, &status_menu, "quit", "menubar.quit", None);
-    let tray = install_status_item(status_menu);
-    install_dock_reopen_hook();
+    // Status item: pure toggle surface — left click toggles the viewer
+    // (no right-click menu: the app menu carries the same entries).
+    let tray = install_status_item();
+    install_dock_reopen_hook(ctx.clone());
 
     // Application menu bar (system menu bar, always present).
     let app_menu = Menu::new();
@@ -336,11 +306,10 @@ pub fn sync_menu_enabled(
 }
 
 /// The menu-bar status item with its template (monochrome) icon.
-fn install_status_item(menu: Menu) -> Option<TrayIcon> {
+fn install_status_item() -> Option<TrayIcon> {
     let mut builder = TrayIcon::builder()
-        .with_menu(Box::new(menu))
-        // Left click toggles the viewer (TrayIconEvent); the menu is
-        // for the right click.
+        // Left click toggles the viewer (TrayIconEvent); no menu —
+        // the app menu bar's PixMe menu carries the same entries.
         .with_menu_on_left_click(false)
         .with_tooltip("PixMe");
     match tray_icon::Icon::from_rgba(icons::menubar_icon_rgba(), STATUS_ICON_PX, STATUS_ICON_PX) {
@@ -923,7 +892,7 @@ pub fn dismiss_active_menus() -> bool {
 /// is deprecated there and silently ignored on 15.x, which left the real
 /// menu bar interactive during captures); the legacy selector is the
 /// fallback on older systems. Main thread only.
-fn activate_app() {
+pub fn activate_app() {
     use std::ffi::c_void;
 
     #[link(name = "objc", kind = "dylib")]
@@ -934,14 +903,24 @@ fn activate_app() {
     }
 
     type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendUsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+    type MsgSendIdUsize = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
     type MsgSendVoid = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    type MsgSendVoidId = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
     type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
+    type MsgSendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
     type MsgSendBoolSel = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
 
     unsafe {
         let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_usize: MsgSendUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_usize: MsgSendIdUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_isize: MsgSendIsize = std::mem::transmute(objc_msgSend as *const ());
         let send_void: MsgSendVoid = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_id: MsgSendVoidId = std::mem::transmute(objc_msgSend as *const ());
         let send_void_bool: MsgSendVoidBool = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool: MsgSendBool = std::mem::transmute(objc_msgSend as *const ());
         let send_bool_sel: MsgSendBoolSel = std::mem::transmute(objc_msgSend as *const ());
         let cls = objc_getClass(c"NSApplication".as_ptr());
         if cls.is_null() {
@@ -962,6 +941,85 @@ fn activate_app() {
                 true,
             );
         }
+        // Any normal-level window (the viewer — the 1×1 anchor is
+        // floating-level) that is miniaturized in the Dock is pulled
+        // straight out and ordered front: `ViewportCommand::Minimized(false)`
+        // waits on the child viewport's pass, which AppKit pauses while
+        // the window is minimized.
+        let windows = send_id(app, sel_registerName(c"windows".as_ptr()));
+        if !windows.is_null() {
+            let count = send_usize(windows, sel_registerName(c"count".as_ptr()));
+            let sel_obj = sel_registerName(c"objectAtIndex:".as_ptr());
+            let sel_level = sel_registerName(c"level".as_ptr());
+            let sel_min = sel_registerName(c"isMiniaturized".as_ptr());
+            let sel_demin = sel_registerName(c"deminiaturize:".as_ptr());
+            let sel_vis = sel_registerName(c"isVisible".as_ptr());
+            let sel_key_front = sel_registerName(c"makeKeyAndOrderFront:".as_ptr());
+            for i in 0..count {
+                let win = send_id_usize(windows, sel_obj, i);
+                if win.is_null() || send_isize(win, sel_level) != 0 {
+                    continue;
+                }
+                let was_min = send_bool(win, sel_min);
+                if was_min {
+                    send_void_id(win, sel_demin, std::ptr::null_mut());
+                }
+                if was_min || send_bool(win, sel_vis) {
+                    send_void_id(win, sel_key_front, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+}
+
+/// Whether the viewer's native `NSWindow` is currently miniaturized in
+/// the Dock (yellow `-` button): `ToggleViewer` must then restore it
+/// instead of closing it to `Idle`.
+pub fn viewer_is_minimized() -> bool {
+    use std::ffi::c_void;
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendUsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+    type MsgSendIdUsize = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
+    type MsgSendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_usize: MsgSendUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_usize: MsgSendIdUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_isize: MsgSendIsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool: MsgSendBool = std::mem::transmute(objc_msgSend as *const ());
+        let cls = objc_getClass(c"NSApplication".as_ptr());
+        if cls.is_null() {
+            return false;
+        }
+        let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
+        if app.is_null() {
+            return false;
+        }
+        let windows = send_id(app, sel_registerName(c"windows".as_ptr()));
+        if windows.is_null() {
+            return false;
+        }
+        let count = send_usize(windows, sel_registerName(c"count".as_ptr()));
+        let sel_obj = sel_registerName(c"objectAtIndex:".as_ptr());
+        let sel_level = sel_registerName(c"level".as_ptr());
+        let sel_min = sel_registerName(c"isMiniaturized".as_ptr());
+        for i in 0..count {
+            let win = send_id_usize(windows, sel_obj, i);
+            if !win.is_null() && send_isize(win, sel_level) == 0 && send_bool(win, sel_min) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1153,11 +1211,15 @@ pub fn refocus_capture_overlay(_ctx: &egui::Context, _id: egui::ViewportId) {}
 /// focuses the viewer without moving it. `applicationShouldHandleReopen:
 /// hasVisibleWindows:` is added on the app delegate when nothing answers
 /// it, or swizzled onto winit's implementation (which still runs first).
-fn install_dock_reopen_hook() {
+fn install_dock_reopen_hook(ctx: egui::Context) {
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static ORIG: AtomicUsize = AtomicUsize::new(0);
+    // The C callback can't capture: the egui context is parked in a
+    // static so the queued OpenViewer also wakes the pump.
+    static DOCK_CTX: std::sync::Mutex<Option<egui::Context>> = std::sync::Mutex::new(None);
+    *DOCK_CTX.lock().unwrap() = Some(ctx);
 
     unsafe extern "C" fn on_reopen(
         this: *mut c_void,
@@ -1176,8 +1238,11 @@ fn install_dock_reopen_hook() {
             }
         };
         // Queue, don't act — the delegate callback runs mid-event and
-        // the command is pumped on the next pass.
+        // the command is pumped on the next pass, which we wake now.
         super::queue_menu_command(crate::app::Command::OpenViewer);
+        if let Some(ctx) = DOCK_CTX.lock().unwrap().as_ref() {
+            crate::app::wake_viewports(ctx);
+        }
         result
     }
 
