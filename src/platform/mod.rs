@@ -209,9 +209,103 @@ pub use macos::open_folder;
 #[cfg(target_os = "windows")]
 pub use windows::open_folder;
 
+/// The display unit [`crate::capture::MonitorInfo::rect`] is expressed in:
+/// **physical pixels on Windows** (xcap reads `DEVMODEW`), **points on
+/// macOS** (`CGDisplayBounds`). winit's `available_monitors()` reports
+/// physical pixels on both OSes, so matching an xcap monitor to a winit
+/// index goes through this unit conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeSpace {
+    /// Raw device pixels — `scale_factor` is only informational.
+    Physical,
+    /// Logical points — multiply by `scale_factor` for physical pixels.
+    Points,
+}
+
+/// The [`NativeSpace`] of `MonitorInfo::rect` on this OS.
+#[cfg(target_os = "windows")]
+pub const NATIVE_SPACE: NativeSpace = NativeSpace::Physical;
+/// The [`NativeSpace`] of `MonitorInfo::rect` on this OS.
+#[cfg(not(target_os = "windows"))]
+pub const NATIVE_SPACE: NativeSpace = NativeSpace::Points;
+
+/// `MonitorInfo::rect` expressed in **physical pixels** — the space
+/// winit's `available_monitors()` reports on both OSes (Windows gives it
+/// directly; macOS points are multiplied by `scale_factor` and rounded).
+pub fn monitor_physical_rect(
+    rect: &crate::capture::PhysicalRect,
+    scale_factor: f32,
+    space: NativeSpace,
+) -> (i32, i32, u32, u32) {
+    match space {
+        NativeSpace::Physical => (rect.x, rect.y, rect.width, rect.height),
+        NativeSpace::Points => {
+            let s = f64::from(scale_factor.max(0.0));
+            (
+                (f64::from(rect.x) * s).round() as i32,
+                (f64::from(rect.y) * s).round() as i32,
+                (f64::from(rect.width) * s).round().max(1.0) as u32,
+                (f64::from(rect.height) * s).round().max(1.0) as u32,
+            )
+        }
+    }
+}
+
+/// The index (winit `available_monitors()` order) of the monitor matching
+/// `monitor`'s physical bounds, within `tol` px — xcap and winit do not
+/// enumerate in the same order, and PhotoCraft's picker matches the same
+/// way. `placements` are `(x, y, width, height)` in physical pixels.
+pub fn winit_monitor_index(
+    monitor: &crate::capture::MonitorInfo,
+    placements: &[(i32, i32, u32, u32)],
+    tol: i32,
+) -> Option<usize> {
+    let (x, y, w, h) = monitor_physical_rect(&monitor.rect, monitor.scale_factor, NATIVE_SPACE);
+    let (w, h) = (w as i64, h as i64);
+    placements.iter().position(|&(px, py, pw, ph)| {
+        (px - x).abs() <= tol
+            && (py - y).abs() <= tol
+            && (i64::from(pw) - w).abs() <= i64::from(tol)
+            && (i64::from(ph) - h).abs() <= i64::from(tol)
+    })
+}
+
+/// `monitor`'s rect expressed in the egui "ui points" of a window whose
+/// `native_pixels_per_point` is `window_ppp` — the space
+/// `ViewportCommand::OuterPosition` and reported `outer_rect`/`inner_rect`
+/// speak for THAT window. Always convert with the receiving window's own
+/// scale, never the monitor's: egui-winit multiplies command values back
+/// by the window's ppp, so this yields exact physical targets even when
+/// the window is still on another display (mixed-DPI).
+pub fn monitor_ui_rect(monitor: &crate::capture::MonitorInfo, window_ppp: f32) -> egui::Rect {
+    let min = native_to_ui(
+        egui::pos2(monitor.rect.x as f32, monitor.rect.y as f32),
+        window_ppp,
+    );
+    let size = native_to_ui(
+        egui::pos2(monitor.rect.width as f32, monitor.rect.height as f32),
+        window_ppp,
+    )
+    .to_vec2();
+    egui::Rect::from_min_size(min, size)
+}
+
+/// The window's own `native_pixels_per_point`, or `fallback` while egui
+/// has not reported one yet (first frames after creation).
+pub fn window_ppp(ctx: &egui::Context, fallback: f32) -> f32 {
+    ctx.input(|i| i.viewport().native_pixels_per_point)
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .unwrap_or(fallback)
+}
+
 /// egui window "ui points" (`ViewportInfo::outer_rect`) → OS-native global
 /// units, the space `MonitorInfo::rect` lives in (CGDisplay bounds on
 /// macOS, virtual-screen pixels on Windows).
+///
+/// `native_pixels_per_point` is ALWAYS the receiving window's own scale —
+/// never the target monitor's: egui-winit multiplies command values back
+/// by the window's ppp, so this conversion lands on exact native units
+/// whatever monitor the window currently sits on.
 ///
 /// macOS: winit derives window positions from logical points
 /// (`LogicalPosition::to_physical`), so egui's division by
@@ -294,8 +388,138 @@ pub use windows::cursor_snapshot;
 /// (the OS composites the cursor on its own). Counter-based — always pair
 /// with `unhide_cursor`.
 #[cfg(target_os = "macos")]
-pub use macos::{dismiss_active_menus, elevate_overlay, hide_cursor, unhide_cursor};
+pub use macos::{
+    capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay, hide_cursor,
+    left_mouse_down, unhide_cursor,
+};
 /// Hides / unhides the OS cursor and dismisses active popup menus around a
-/// capture (see above).
+/// capture (see above). `capture_chrome_*` arms/disarms the capture kiosk
+/// (menu bar + Dock hidden on macOS; no-op on Windows). `left_mouse_down`
+/// polls the physical button so edge-swallowed presses still drag.
 #[cfg(target_os = "windows")]
-pub use windows::{dismiss_active_menus, elevate_overlay, hide_cursor, unhide_cursor};
+pub use windows::{
+    capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay, hide_cursor,
+    left_mouse_down, unhide_cursor,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{MonitorInfo, PhysicalRect};
+
+    fn monitor(x: i32, y: i32, w: u32, h: u32, scale: f32) -> MonitorInfo {
+        MonitorInfo {
+            id: 1,
+            name: "test".into(),
+            rect: PhysicalRect {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+            scale_factor: scale,
+            is_primary: false,
+        }
+    }
+
+    /// Windows convention: xcap rects are already physical pixels — the
+    /// scale factor never enters the geometry.
+    #[test]
+    fn windows_physical_rect_is_passthrough() {
+        let m = monitor(3840, 0, 1920, 1200, 1.0);
+        assert_eq!(
+            monitor_physical_rect(&m.rect, m.scale_factor, NativeSpace::Physical),
+            (3840, 0, 1920, 1200)
+        );
+        let m = monitor(0, 0, 3840, 2160, 1.5);
+        assert_eq!(
+            monitor_physical_rect(&m.rect, m.scale_factor, NativeSpace::Physical),
+            (0, 0, 3840, 2160),
+            "Windows monitor rects are physical pixels regardless of scale"
+        );
+    }
+
+    /// macOS convention: xcap rects are CGDisplay points — the physical
+    /// rect (what winit reports) is points × scale.
+    #[test]
+    fn macos_points_rect_scales_to_physical() {
+        let m = monitor(0, 0, 1728, 1117, 2.0);
+        assert_eq!(
+            monitor_physical_rect(&m.rect, m.scale_factor, NativeSpace::Points),
+            (0, 0, 3456, 2234)
+        );
+        let m = monitor(1728, -667, 3008, 1692, 2.0);
+        assert_eq!(
+            monitor_physical_rect(&m.rect, m.scale_factor, NativeSpace::Points),
+            (3456, -1334, 6016, 3384)
+        );
+    }
+
+    /// The user's actual setup: a 4K primary at 150 % next to a
+    /// 1920×1200 laptop at 100 % — both Windows-physical.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn winit_index_matches_mixed_dpi_layout() {
+        let placements = [(0, 0, 3840, 2160), (3840, 0, 1920, 1200)];
+        let primary = monitor(0, 0, 3840, 2160, 1.5);
+        let laptop = monitor(3840, 0, 1920, 1200, 1.0);
+        assert_eq!(winit_monitor_index(&primary, &placements, 1), Some(0));
+        assert_eq!(winit_monitor_index(&laptop, &placements, 1), Some(1));
+        // A monitor winit doesn't know (unplugged since) has no index.
+        let gone = monitor(0, 2160, 1920, 1080, 1.0);
+        assert_eq!(winit_monitor_index(&gone, &placements, 1), None);
+    }
+
+    /// macOS twin of the mixed-DPI layout test: xcap rects are
+    /// CGDisplay POINTS, winit placements physical px — matching goes
+    /// through the ×scale conversion (BenQ 5K + Sidecar iPad, both 2×).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn winit_index_matches_point_space_layout() {
+        let placements = [(0, 0, 5120, 3414), (-2266, 1638, 2266, 1488)];
+        let benq = monitor(0, 0, 2560, 1707, 2.0);
+        let sidecar = monitor(-1133, 819, 1133, 744, 2.0);
+        assert_eq!(winit_monitor_index(&benq, &placements, 1), Some(0));
+        assert_eq!(winit_monitor_index(&sidecar, &placements, 1), Some(1));
+        // A monitor winit doesn't know (unplugged since) has no index.
+        let gone = monitor(0, 1707, 1920, 1080, 2.0);
+        assert_eq!(winit_monitor_index(&gone, &placements, 1), None);
+    }
+
+    /// `monitor_ui_rect` must land on the physical target whatever scale
+    /// the receiving window currently has: egui-winit multiplies command
+    /// values by the window's own ppp.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ui_rect_depends_on_window_scale_not_monitor_scale() {
+        // Windows: laptop monitor (physical 3840,0..5760,1200) seen by a
+        // window still on the 150 % 4K (ppp 1.5).
+        let laptop = monitor(3840, 0, 1920, 1200, 1.0);
+        let r = monitor_ui_rect(&laptop, 1.5);
+        assert_eq!(r.min, egui::pos2(2560.0, 0.0));
+        assert_eq!(r.size(), egui::vec2(1280.0, 800.0));
+        // Sending these points, winit computes min × 1.5 = (3840, 0) px —
+        // exactly the laptop's physical origin.
+        let seen_by_laptop = monitor_ui_rect(&laptop, 1.0);
+        assert_eq!(seen_by_laptop.min, egui::pos2(3840.0, 0.0));
+    }
+
+    /// macOS path (Points space): identity — egui points ARE the
+    /// monitor points, the window's scale never enters the geometry.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ui_rect_is_point_space_on_macos() {
+        let sidecar = monitor(-1133, 819, 1133, 744, 2.0);
+        let r = monitor_ui_rect(&sidecar, 1.5);
+        assert_eq!(r.min, egui::pos2(-1133.0, 819.0));
+        assert_eq!(r.size(), egui::vec2(1133.0, 744.0));
+        // Same result whatever the receiving window's ppp.
+        assert_eq!(r, monitor_ui_rect(&sidecar, 1.0));
+    }
+
+    #[test]
+    fn window_ppp_falls_back_until_reported() {
+        let ctx = egui::Context::default();
+        assert_eq!(window_ppp(&ctx, 1.5), 1.5);
+    }
+}

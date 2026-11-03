@@ -25,6 +25,10 @@ const STRIP_PAD: f32 = 10.0;
 const ZOOMS: [f32; 3] = [0.5, 1.0, 2.0];
 /// Corner rounding of the pinned image.
 const ROUNDING: f32 = 10.0;
+/// Transparent margin above the image: on Windows the native region
+/// clip (2px) that removes the DWM top accent line eats into it
+/// instead of cropping the image — the bar's SHADOW_MARGIN pattern.
+pub const TOP_MARGIN: f32 = 2.0;
 /// Dark scoop hugging the top-left corner behind the close dot.
 const HALO: f32 = 34.0;
 /// Below this width/height only the close dot is shown — there is no
@@ -79,7 +83,9 @@ impl PinWindow {
         if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer.min));
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+            size + egui::vec2(0.0, TOP_MARGIN),
+        ));
     }
 
     /// On-screen logical size at the current zoom (physical px ÷ scale).
@@ -94,7 +100,11 @@ impl PinWindow {
     /// The pinned image plus, on hover, its control chrome.
     pub fn show(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let ctx = ui.ctx().clone();
-        let rect = ui.max_rect();
+        // The image sits below a transparent top margin that the
+        // Windows region clip removes (DWM accent line) — everything
+        // (paint, stroke, hit zones) works on the image rect.
+        let full = ui.max_rect();
+        let rect = Rect::from_min_max(full.min + egui::vec2(0.0, TOP_MARGIN), full.max);
         let t = theme::tokens(&ctx);
 
         let img = &self.capture.image;

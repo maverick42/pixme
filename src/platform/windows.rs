@@ -250,6 +250,8 @@ pub fn strip_undecorated_frame() {
         fn SetWindowTextW(hwnd: isize, s: *const u16) -> i32;
         fn GetWindowRect(hwnd: isize, r: *mut WinRect) -> i32;
         fn SetWindowRgn(hwnd: isize, hrgn: isize, redraw: i32) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
         fn GetCurrentThreadId() -> u32;
     }
 
@@ -259,11 +261,18 @@ pub fn strip_undecorated_frame() {
         fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, cx: i32, cy: i32) -> isize;
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    const SW_SHOWNOACTIVATE: i32 = 4;
+    const SW_SHOW: i32 = 5;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Role {
-        CardWithMargin,
+        Bar,
+        Countdown,
         Pin,
         Overlay,
+        /// The invisible 1×1 root anchor ("PixMe" + WS_EX_TOPMOST — the
+        /// viewer is not topmost, so no other "PixMe" window qualifies).
+        Anchor,
     }
 
     thread_local! {
@@ -277,30 +286,40 @@ pub fn strip_undecorated_frame() {
             return 1;
         }
 
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+
         let mut title_buf = [0u16; 64];
         let n = unsafe { GetWindowTextW(hwnd, title_buf.as_mut_ptr(), 64) as usize };
         let title = String::from_utf16_lossy(&title_buf[..n]);
 
-        let role = ROLES.with(|roles| {
+        let (role, first_seen) = ROLES.with(|roles| {
             let mut m = roles.borrow_mut();
             if let Some(&r) = m.get(&hwnd) {
-                Some(r)
-            } else if title == "PixMe Bar" || title == "PixMe Countdown" {
-                m.insert(hwnd, Role::CardWithMargin);
+                (Some(r), false)
+            } else if title == "PixMe Bar" {
+                m.insert(hwnd, Role::Bar);
                 // Clear the window title text in Win32 so DefWindowProc on WM_NCACTIVATE
                 // (fired when focus shifts to countdown) never draws title text.
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::CardWithMargin)
+                (Some(Role::Bar), true)
+            } else if title == "PixMe Countdown" {
+                m.insert(hwnd, Role::Countdown);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                (Some(Role::Countdown), true)
             } else if title == "PixMe Pin" {
                 m.insert(hwnd, Role::Pin);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::Pin)
+                (Some(Role::Pin), true)
             } else if title == "PixMe Overlay" {
                 m.insert(hwnd, Role::Overlay);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::Overlay)
+                (Some(Role::Overlay), true)
+            } else if title == "PixMe" {
+                m.insert(hwnd, Role::Anchor);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                (Some(Role::Anchor), true)
             } else {
-                None
+                (None, false)
             }
         });
 
@@ -308,9 +327,24 @@ pub fn strip_undecorated_frame() {
             return 1;
         };
 
-        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+        if role == Role::Overlay && first_seen {
+            // The taskbar is itself TOPMOST: a later-created topmost
+            // window wins the band anyway, but re-asserting precedence
+            // here guarantees the frozen frame stays selectable edge to
+            // edge (the capture must reach the taskbar's clock).
+            unsafe {
+                SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+            }
+        }
+
         let mut need_reapply_region = false;
         if (style & WS_CHROME) != 0 {
+            // A window caught with chrome while VISIBLE is a title-bar
+            // flash in the act: creation race or mid-life re-decoration
+            // (winit re-applies WS_CAPTION on frame changes).
+            if unsafe { IsWindowVisible(hwnd) } != 0 {
+                tracing::debug!(hwnd, ?role, "chrome_stripped_on_visible_window");
+            }
             unsafe {
                 SetWindowLongPtrW(hwnd, GWL_STYLE, style & !WS_CHROME);
                 if (exstyle & WS_EX_WINDOWEDGE) != 0 {
@@ -343,14 +377,31 @@ pub fn strip_undecorated_frame() {
 
                 if need_reapply_region || size_changed {
                     let rgn = match role {
-                        Role::CardWithMargin => {
+                        Role::Bar | Role::Countdown => {
                             // Clip the top 2 pixels of empty transparent margin to eliminate
                             // the DWM top accent line.
                             unsafe { CreateRectRgn(0, 2, w + 1, h + 1) }
                         }
                         Role::Pin => {
-                            // Shape the window to the exact rounded-corner bounds of the pin image.
-                            unsafe { CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16) }
+                            // Shape the window to the rounded-corner bounds of the pin
+                            // image; the top 2px clip removes the DWM accent line and
+                            // eats into the window's TOP_MARGIN transparent rows, so
+                            // no image pixel is cropped.
+                            unsafe { CreateRoundRectRgn(0, 2, w + 1, h + 1, 16, 16) }
+                        }
+                        Role::Anchor => {
+                            // Empty region: Windows 11 draws a rounded DWM
+                            // border + top accent line on borderless windows,
+                            // which on this degenerate 1×1 window shows as a
+                            // small ring floating on the desktop. The anchor
+                            // paints nothing — clip everything away. The size
+                            // guard keeps a recycled hwnd (Windows does reuse
+                            // them) from ever being blanked.
+                            if w <= 8 && h <= 8 {
+                                unsafe { CreateRectRgn(0, 0, 0, 0) }
+                            } else {
+                                0
+                            }
                         }
                         Role::Overlay => 0,
                     };
@@ -360,6 +411,24 @@ pub fn strip_undecorated_frame() {
                         }
                     }
                 }
+            }
+        }
+
+        // Chrome-less viewports are created hidden (`with_visible(false)`):
+        // egui's `Visible(true)` would go through winit's `apply_diff`,
+        // which re-applies WS_CAPTION via `to_window_styles` right after
+        // ShowWindow — a title-bar flash at reveal. Showing the window
+        // here, once stripped, bypasses winit's flag machinery entirely.
+        // The overlay is excluded: it must be placed (SetMonitor) before
+        // being shown and reveals itself through egui — its borderless-
+        // fullscreen flag makes that path caption-free.
+        if role != Role::Overlay && unsafe { IsWindowVisible(hwnd) } == 0 {
+            let cmd = match role {
+                Role::Countdown | Role::Anchor => SW_SHOWNOACTIVATE, // .with_active(false)
+                _ => SW_SHOW,
+            };
+            unsafe {
+                ShowWindow(hwnd, cmd);
             }
         }
 
@@ -425,8 +494,14 @@ fn local_app_data() -> std::path::PathBuf {
 /// "Windows 10.0.19045" style — `cmd /c ver` output trimmed to the
 /// version field; ~30 ms once at startup, no extra dependency.
 pub fn os_version() -> String {
+    use std::os::windows::process::CommandExt;
+    // cmd.exe is console-subsystem: spawned from this GUI-subsystem exe
+    // without CREATE_NO_WINDOW, Windows allocates it a console window —
+    // a black flash at every launch.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = std::process::Command::new("cmd")
         .args(["/c", "ver"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -548,7 +623,9 @@ pub fn print_image(img: &image::RgbaImage, job_title: &str) -> Result<(), String
             usage: u32,
             rop: u32,
         ) -> i32;
-        fn DeleteDC(hdc: isize) -> i32;
+        // HDC is a HANDLE — `*mut c_void` like the cursor-snapshot block
+        // (one signature for one symbol: clashing_extern_declarations).
+        fn DeleteDC(hdc: *mut c_void) -> i32;
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -684,7 +761,9 @@ pub fn print_image(img: &image::RgbaImage, job_title: &str) -> Result<(), String
         } else {
             AbortDoc(hdc);
         }
-        DeleteDC(hdc);
+        // `pd.h_dc` is a real HDC; isize and `*mut c_void` are the same
+        // 64-bit register slot on Win64.
+        DeleteDC(hdc as *mut c_void);
 
         if printed {
             Ok(())
@@ -712,6 +791,19 @@ pub fn cursor_position() -> Option<(f32, f32)> {
     } else {
         None
     }
+}
+
+/// Whether the left mouse button is currently held — `GetAsyncKeyState`
+/// reads the physical state, not window-delivered events, so a press the
+/// OS edge zones eat (e.g. the taskbar's own hit band) still registers.
+/// The overlay polls this for drags started at the screen edge.
+pub fn left_mouse_down() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    const VK_LBUTTON: i32 = 0x01;
+    unsafe { GetAsyncKeyState(VK_LBUTTON) & 0x8000u16 as i16 != 0 }
 }
 
 /// One short tick — a soft click synthesized once in memory and played
@@ -1028,5 +1120,14 @@ pub fn dismiss_active_menus() -> bool {
 }
 
 /// No-op on Windows (`with_always_on_top()` already places the overlay at
-/// `HWND_TOPMOST`).
+/// `HWND_TOPMOST`; `strip_undecorated_frame` re-asserts it above the
+/// taskbar on creation).
 pub fn elevate_overlay() {}
+
+/// No-op on Windows — there is no system chrome to hide during a
+/// capture: the taskbar is simply covered by the topmost overlay (its
+/// frozen pixels stay selectable underneath).
+pub fn capture_chrome_enter() {}
+
+/// No-op on Windows (see [`capture_chrome_enter`]).
+pub fn capture_chrome_exit() {}

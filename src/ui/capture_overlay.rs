@@ -41,6 +41,11 @@ const COPIED_SECS: f32 = 1.2;
 /// one `dismiss_active_menus` posted — covers the overlay's whole
 /// create-window-and-become-key path (~100-300 ms observed).
 const SYNTHETIC_ESC_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
+/// Frames spent re-placing the window while macOS's visibleFrame clamp
+/// expands (menu bar / Dock hiding animates over ~0.3 s) — bounded so a
+/// failed kiosk can never spin the viewport command pump forever.
+#[cfg(not(target_os = "windows"))]
+const MAX_NUDGE_TRIES: u8 = 150;
 
 /// One of the eight resize handles.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,6 +114,18 @@ pub struct OverlaySession {
     /// Whether the post-creation fullscreen nudge was sent (macOS clamps at
     /// init; a programmatic setFrame may escape it).
     nudged: bool,
+    /// Re-placement attempts sent while macOS's `visibleFrame` clamp
+    /// expands during the kiosk's hide animation — capped by
+    /// [`MAX_NUDGE_TRIES`]. Read only off Windows.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    nudge_tries: u8,
+    /// The live drag began via an OS-eaten press (egui never saw it) —
+    /// its release may be re-delivered as a synthetic click.
+    blind_drag: bool,
+    /// Fresh presses are ignored until this instant: after a blind drag,
+    /// the OS replays the gesture's release as a click at the drop point,
+    /// which would otherwise restart a selection where it ended.
+    suppress_press_until: Option<std::time::Instant>,
     /// Freeze failed permanently (permission, window gone) — cancel out.
     pub failed: bool,
     /// Pick mode (`WindowOrObject`): the on-screen window list, enumerated
@@ -122,6 +139,11 @@ pub struct OverlaySession {
     /// position. Every other mode (including Pin) starts blank like a plain
     /// region capture.
     restore_sel: Option<(u32, Rect)>,
+    /// The rect the frozen image is painted into (window-local, can be
+    /// shifted by `screen_offset`): every window-point → image-pixel
+    /// mapping derives from `image.size / displayed.size` — the actual
+    /// rendered ratio, never an assumed scale factor.
+    displayed: Option<Rect>,
     /// Full-screen frozen frame texture for the current `monitor`.
     texture: Option<egui::TextureHandle>,
     /// Magnifier source texture (rebuilt around the cursor each frame).
@@ -162,6 +184,9 @@ impl OverlaySession {
                 || (matches!(mode, CaptureMode::FixedRegion) && remembered.is_some()),
             screen_offset: Vec2::ZERO,
             nudged: false,
+            nudge_tries: 0,
+            blind_drag: false,
+            suppress_press_until: None,
             failed: false,
             window_list: None,
             picked_window_id: None,
@@ -170,6 +195,7 @@ impl OverlaySession {
             } else {
                 None
             },
+            displayed: None,
             texture: None,
             loupe: None,
             copied_at: None,
@@ -200,6 +226,7 @@ impl OverlaySession {
         self.frozen = Some(frame);
         self.texture = None;
         self.nudged = false;
+        self.nudge_tries = 0;
         self.screen_offset = Vec2::ZERO;
         // If a remembered selection belonged to a different monitor than the
         // one we ended up on, drop it (in FixedRegion, let the frame ride the
@@ -279,6 +306,15 @@ impl OverlaySession {
                     if let Some(id) = initial_id {
                         self.activate_monitor(id);
                     }
+                    if !self.instant && self.frozen.is_some() {
+                        // The frozen frames are safe: hide the REAL menu
+                        // bar and Dock now (capture kiosk) so their frozen
+                        // image under the overlay is all that remains —
+                        // selectable, unclickable (iScreenShot behaviour).
+                        // Instant captures show no overlay: skip the
+                        // pointless chrome flicker.
+                        crate::platform::capture_chrome_enter();
+                    }
                     if let Some(frame) = &self.frozen {
                         // Dev hook: PIXME_DUMP_FROZEN=/path.png dumps the frozen frame.
                         if let Some(path) = std::env::var_os("PIXME_DUMP_FROZEN") {
@@ -310,7 +346,15 @@ impl OverlaySession {
             shared.push(Command::CancelCapture);
             return;
         }
-        let rect = ui.max_rect();
+        // The whole window, not `ui.max_rect()`: the deferred-viewport
+        // callback is wrapped in a default CentralPanel whose ~8 pt inner
+        // margin shrinks the interact area — presses in the outer 8 px of
+        // the screen (the (0,0) corner, the menu-bar strip edge) never
+        // reached the selection. `screen_rect` is the viewport's real
+        // bounds, so painting AND input cover the monitor edge to edge.
+        let rect = ctx
+            .input(|i| i.viewport().inner_rect)
+            .unwrap_or_else(|| ui.max_rect());
         let t = theme::tokens(&ctx);
         ui.painter().rect_filled(rect, 0.0, t.dock);
 
@@ -381,16 +425,55 @@ impl OverlaySession {
             if !self.nudged {
                 self.nudged = true;
                 crate::platform::elevate_overlay();
-                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
-                    m.rect.x as f32,
-                    m.rect.y as f32,
-                )));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
-                    m.rect.width as f32,
-                    m.rect.height as f32,
-                )));
                 #[cfg(target_os = "windows")]
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                {
+                    // Windows: hand placement to winit — borderless
+                    // fullscreen on the captured monitor by index (exact
+                    // physical rect, no scale arithmetic). Fallback for an
+                    // unmatched monitor: the rect in that monitor's own
+                    // logical units (native ÷ ITS scale), the best the
+                    // position/size path can express.
+                    let placements = crate::app::lock(&shared.winit_placements);
+                    match crate::platform::winit_monitor_index(&m, &placements, 1) {
+                        Some(idx) => {
+                            drop(placements);
+                            ctx.send_viewport_cmd(ViewportCommand::SetMonitor(idx));
+                        }
+                        None => {
+                            drop(placements);
+                            let s = m.scale_factor.max(1.0);
+                            let min = crate::platform::native_to_ui(
+                                egui::pos2(m.rect.x as f32, m.rect.y as f32),
+                                s,
+                            );
+                            let size = crate::platform::native_to_ui(
+                                egui::pos2(m.rect.width as f32, m.rect.height as f32),
+                                s,
+                            )
+                            .to_vec2();
+                            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(min));
+                            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                        }
+                    }
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // macOS constrains `setFrame` to the screen's visibleFrame
+                // (menu bar and Dock excluded). While the capture kiosk
+                // hides that chrome the visible frame keeps expanding
+                // (~0.3 s) and the clamped window lags behind — keep
+                // re-placing until it covers the monitor's real frame,
+                // capped so a failed kiosk can never spin.
+                let want = egui::vec2(m.rect.width as f32, m.rect.height as f32);
+                let aligned = (outer.min - origin).abs().max_elem() <= 1.0
+                    && (outer.size() - want).abs().max_elem() <= 1.0;
+                if !aligned && self.nudge_tries < MAX_NUDGE_TRIES {
+                    self.nudge_tries += 1;
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(origin));
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
+                }
             }
         }
 
@@ -413,6 +496,7 @@ impl OverlaySession {
         // The frame is painted shifted by `-screen_offset` so it stays in
         // sync with the (possibly clamped) physical screen.
         let image_rect = rect.translate(-self.screen_offset);
+        self.displayed = Some(image_rect);
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         ui.painter()
             .image(tex.id(), image_rect, full_uv, Color32::WHITE);
@@ -438,7 +522,21 @@ impl OverlaySession {
 
         // -- input ---------------------------------------------------------
         let resp = ui.interact(rect, ui.id().with("overlay"), Sense::click_and_drag());
-        let cursor = self.cursor_pos(&ctx);
+        let os_down = crate::platform::left_mouse_down();
+        // A press swallowed by an OS edge zone never reaches egui — and
+        // the window never got clicked, so it is not key either (Esc and
+        // Enter would go to the previous app). Reclaim focus during the
+        // blind drag and track the OS cursor (egui's `latest_pos` is
+        // stale for the crosshair and loupe too).
+        let blind = os_down && !ctx.input(|i| i.pointer.primary_down());
+        if blind {
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+        let cursor = if blind {
+            self.os_cursor_pos(&ctx)
+        } else {
+            self.cursor_pos(&ctx)
+        };
         if matches!(self.mode, CaptureMode::WindowOrObject) {
             self.pick_window(&ctx, cursor);
         } else {
@@ -448,12 +546,22 @@ impl OverlaySession {
                     self.selection =
                         Some(slide_inside(Rect::from_center_size(pos, FIXED_SIZE), rect));
                 }
-                if resp.drag_started() || resp.clicked() {
+                if resp.drag_started()
+                    || resp.clicked()
+                    || (os_down && cursor.is_some_and(|p| rect.contains(p)))
+                {
                     self.placed = true;
                 }
             }
-            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                self.handle_drag(pos, &resp, rect);
+            // Feed the drag from the real button state, not only egui's
+            // pointer events: OS edge zones (the 1 px top strip on macOS)
+            // swallow mouseDown before delivery, so a press starting at
+            // the screen edge never reaches `resp` — but the held button
+            // and the cursor are still ours.
+            let pos = cursor
+                .filter(|_| os_down || self.drag.is_some() || resp.is_pointer_button_down_on());
+            if let Some(pos) = pos {
+                self.handle_drag(pos, &resp, rect, os_down);
             }
         }
         if resp.double_clicked() && self.selection.is_some() {
@@ -472,6 +580,13 @@ impl OverlaySession {
         if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
             return Some(pos);
         }
+        self.os_cursor_pos(ctx)
+    }
+
+    /// Cursor position from the OS only (no egui pointer state) — the
+    /// reliable path when egui cannot see the drag because the press was
+    /// swallowed by an OS edge zone.
+    fn os_cursor_pos(&self, ctx: &egui::Context) -> Option<Pos2> {
         let (cx, cy) = crate::platform::cursor_position()?;
         let m = self.monitor.as_ref()?;
         let native_scale = ctx
@@ -486,13 +601,44 @@ impl OverlaySession {
         Some(cursor_ui - origin_ui.to_vec2() - self.screen_offset)
     }
 
+    /// Image pixels per window point, per axis — the ACTUAL rendered
+    /// ratio (`image.size / displayed.size`), never an assumed scale
+    /// factor: correct whatever scale the window ended up with.
+    fn img_ratio(&self) -> Option<Vec2> {
+        let d = self.displayed?;
+        let img = &self.frozen.as_ref()?.image;
+        if d.width() <= 0.0 || d.height() <= 0.0 {
+            return None;
+        }
+        Some(Vec2::new(
+            img.width() as f32 / d.width(),
+            img.height() as f32 / d.height(),
+        ))
+    }
+
+    /// Window-local point → physical image pixel coordinates (origin at
+    /// the frozen frame's top-left).
+    fn img_pos(&self, pos: Pos2) -> Option<Pos2> {
+        let d = self.displayed?;
+        let r = self.img_ratio()?;
+        let p = pos - d.min;
+        Some(Pos2::new(p.x * r.x, p.y * r.y))
+    }
+
     /// Pointer input: hit-test handles → inside → outside, update selection.
     /// The selection never leaves `bounds` (the window = the visible monitor
     /// area): out-of-window drags stop at the edges instead of overrunning
-    /// the menu bar or the screen borders.
-    fn handle_drag(&mut self, pos: Pos2, resp: &egui::Response, bounds: Rect) {
+    /// the menu bar or the screen borders. `os_down` is the physical left
+    /// button — a press eaten by an OS edge zone (`resp.drag_started`
+    /// never fired) still starts a drag while the cursor sits in bounds.
+    fn handle_drag(&mut self, pos: Pos2, resp: &egui::Response, bounds: Rect, os_down: bool) {
+        let in_bounds = bounds.contains(pos);
         let pos = clamp_pos(pos, bounds);
-        if resp.drag_started() {
+        let synthetic = self
+            .suppress_press_until
+            .is_some_and(|until| std::time::Instant::now() < until);
+        if self.drag.is_none() && !synthetic && (resp.drag_started() || (os_down && in_bounds)) {
+            self.blind_drag = !resp.drag_started();
             self.drag = Some(if let Some(sel) = self.selection {
                 if let Some(h) = hit_handle(sel, pos) {
                     Drag::Resize(h)
@@ -535,8 +681,17 @@ impl OverlaySession {
                 }
             }
         }
-        if resp.drag_stopped() {
+        if resp.drag_stopped() || (!os_down && self.drag.is_some()) {
+            let was_blind = self.blind_drag;
             self.drag = None;
+            self.blind_drag = false;
+            if was_blind {
+                // The OS replays the gesture's release as a synthetic
+                // click at the drop point — do not let it restart a
+                // selection where this one ended.
+                self.suppress_press_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+            }
             if let Some(sel) = self.selection {
                 // Shrink-to-nothing counts as no selection.
                 if sel.width() < 2.0 || sel.height() < 2.0 {
@@ -559,31 +714,32 @@ impl OverlaySession {
         let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
             return;
         };
-        // Window-local → global logical point, hit-test front-to-back.
-        let global = pos + outer.min.to_vec2();
+        // Window-local → global NATIVE point with this window's own ppp —
+        // `w.rect` lives in MonitorInfo's native space (physical px on
+        // Windows, points on macOS); on macOS the conversion is identity.
+        let ppp = crate::platform::window_ppp(
+            ctx,
+            self.monitor.as_ref().map(|m| m.scale_factor).unwrap_or(1.0),
+        );
+        let global = crate::platform::ui_to_native(pos + outer.min.to_vec2(), ppp);
         let origin = outer.min.to_vec2();
+        let to_ui =
+            |x: i32, y: i32| crate::platform::native_to_ui(egui::pos2(x as f32, y as f32), ppp);
         let hit = self.window_list.as_ref().and_then(|list| {
             list.iter().find(|w| {
                 let r = w.rect;
-                Rect::from_min_max(
-                    Pos2::new(r.x as f32, r.y as f32),
-                    Pos2::new(
-                        (r.x + r.width as i32) as f32,
-                        (r.y + r.height as i32) as f32,
-                    ),
-                )
-                .contains(global)
+                global.x >= r.x as f32
+                    && global.x < (r.x + r.width as i32) as f32
+                    && global.y >= r.y as f32
+                    && global.y < (r.y + r.height as i32) as f32
             })
         });
         self.picked_window_id = hit.map(|w| w.id);
         self.selection = hit.map(|w| {
             let r = w.rect;
             Rect::from_min_max(
-                Pos2::new(r.x as f32, r.y as f32),
-                Pos2::new(
-                    (r.x + r.width as i32) as f32,
-                    (r.y + r.height as i32) as f32,
-                ),
+                to_ui(r.x, r.y),
+                to_ui(r.x + r.width as i32, r.y + r.height as i32),
             )
             .translate(-origin)
         });
@@ -662,7 +818,6 @@ impl OverlaySession {
     /// flipped to whichever side of the cursor keeps it on screen.
     fn loupe(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pos: Pos2) {
         let rect = ui.max_rect();
-        let scale = self.frozen.as_ref().map(|f| f.scale_factor).unwrap_or(1.0);
         let text_h = 78.0_f32;
         let size = Vec2::new(LOUPE_SIDE, LOUPE_SIDE + text_h);
         // Prefer below-right of the cursor; flip near edges.
@@ -686,7 +841,7 @@ impl OverlaySession {
         );
 
         // Zoomed pixels around the cursor (physical px → NEAREST texture).
-        if let Some(sample) = self.sample_loupe(pos, scale) {
+        if let Some(sample) = self.sample_loupe(pos) {
             let zoomed = egui::ColorImage::from_rgba_unmultiplied(
                 [LOUPE_SAMPLE as usize, LOUPE_SAMPLE as usize],
                 &sample,
@@ -722,12 +877,16 @@ impl OverlaySession {
         let mut y = text_rect.min.y + 14.0;
         let line1 = match self.selection {
             Some(sel) => {
-                let phys = sel.size() * scale;
+                let phys = self
+                    .img_pos(sel.min)
+                    .zip(self.img_pos(sel.max))
+                    .map(|(a, b)| b - a)
+                    .unwrap_or(Vec2::ZERO);
                 format!("{:.0} * {:.0}", phys.x.max(0.0), phys.y.max(0.0))
             }
             None => {
-                let p = pos + self.screen_offset;
-                format!("{:.0}, {:.0}", p.x * scale, p.y * scale)
+                let p = self.img_pos(pos).unwrap_or_default();
+                format!("{:.0}, {:.0}", p.x, p.y)
             }
         };
         for (text, color) in [
@@ -761,12 +920,12 @@ impl OverlaySession {
     }
 
     /// Raw RGBA bytes of the `LOUPE_SAMPLE`² area centred on the cursor.
-    fn sample_loupe(&self, pos: Pos2, scale: f32) -> Option<Vec<u8>> {
+    fn sample_loupe(&self, pos: Pos2) -> Option<Vec<u8>> {
         let img = &self.frozen.as_ref()?.image;
         let (w, h) = (img.width() as i32, img.height() as i32);
-        let p = pos + self.screen_offset;
-        let cx = (p.x * scale) as i32;
-        let cy = (p.y * scale) as i32;
+        let p = self.img_pos(pos)?;
+        let cx = p.x as i32;
+        let cy = p.y as i32;
         let half = LOUPE_SAMPLE / 2;
         let mut out = Vec::with_capacity((LOUPE_SAMPLE * LOUPE_SAMPLE * 4) as usize);
         for dy in -half..=half {
@@ -787,9 +946,8 @@ impl OverlaySession {
     fn cursor_hex(&self, ctx: &egui::Context) -> Option<String> {
         let img = &self.frozen.as_ref()?.image;
         let pos = self.cursor_pos(ctx)?;
-        let scale = self.frozen.as_ref()?.scale_factor;
-        let p = pos + self.screen_offset;
-        let (x, y) = ((p.x * scale) as i64, (p.y * scale) as i64);
+        let p = self.img_pos(pos)?;
+        let (x, y) = (p.x as i64, p.y as i64);
         if x < 0 || y < 0 || x >= img.width() as i64 || y >= img.height() as i64 {
             return None;
         }
@@ -818,22 +976,26 @@ impl OverlaySession {
     pub fn take_capture(&self) -> Option<Capture> {
         let frozen = self.frozen.as_ref()?;
         let sel = self.selection?;
-        let s = frozen.scale_factor;
-        let min = sel.min.to_vec2() + self.screen_offset;
+        // Selection → physical image pixels via the REAL rendered ratio
+        // (image / displayed rect) — never an assumed scale factor, so a
+        // mis-sized or mixed-DPI window still crops what was selected.
+        let a = self.img_pos(sel.min)?;
+        let b = self.img_pos(sel.max)?;
         let rect = PhysicalRect {
-            x: (min.x * s).round() as i32,
-            y: (min.y * s).round() as i32,
-            width: (sel.width() * s).round().max(1.0) as u32,
-            height: (sel.height() * s).round().max(1.0) as u32,
+            x: a.x.round() as i32,
+            y: a.y.round() as i32,
+            width: (b.x - a.x).round().max(1.0) as u32,
+            height: (b.y - a.y).round().max(1.0) as u32,
         };
         // Stamp the freeze-time cursor at the position it had when the
-        // frames were grabbed (`snap.position`) — the point of the photo.
-        // `origin` is the image's top-left in global logical points.
-        let stamp = |img: &mut image::RgbaImage, origin: (f32, f32), sf: f32| {
+        // frames were grabbed (`snap.position`, native display units).
+        // `ratio` = image px per native unit of the stamped surface —
+        // derived from the surface itself, not a monitor scale.
+        let stamp = |img: &mut image::RgbaImage, origin: (f32, f32), ratio: (f32, f32)| {
             if let Some(snap) = self.cursor.as_ref() {
-                let px = ((snap.position.0 - origin.0) * sf).round() as i64
+                let px = ((snap.position.0 - origin.0) * ratio.0).round() as i64
                     - i64::from(snap.hotspot_px.0);
-                let py = ((snap.position.1 - origin.1) * sf).round() as i64
+                let py = ((snap.position.1 - origin.1) * ratio.1).round() as i64
                     - i64::from(snap.hotspot_px.1);
                 image::imageops::overlay(img, &snap.image, px, py);
             }
@@ -846,21 +1008,31 @@ impl OverlaySession {
             && !win.is_menu
             && let Ok(mut capture) = window::capture_window(win.id)
         {
-            // The window's own top-left in global logical points.
-            let origin = (win.rect.x as f32, win.rect.y as f32);
-            stamp(
-                std::sync::Arc::make_mut(&mut capture.image),
-                origin,
-                capture.scale_factor,
+            // The window's own top-left in native units; px/native ratio
+            // of the window's own image.
+            let ratio = (
+                capture.image.width() as f32 / win.rect.width as f32,
+                capture.image.height() as f32 / win.rect.height as f32,
             );
+            let origin = (win.rect.x as f32, win.rect.y as f32);
+            stamp(std::sync::Arc::make_mut(&mut capture.image), origin, ratio);
             return Some(capture);
         }
         let mut capture = screen::crop_region(frozen, rect);
         let mon = &capture.monitor.rect;
+        // px/native of the frozen frame; the crop's top-left in native
+        // units = monitor origin + image-px offset ÷ that ratio.
+        let ratio = (
+            frozen.image.width() as f32 / mon.width as f32,
+            frozen.image.height() as f32 / mon.height as f32,
+        );
         stamp(
             std::sync::Arc::make_mut(&mut capture.image),
-            (mon.x as f32 + min.x, mon.y as f32 + min.y),
-            s,
+            (
+                mon.x as f32 + rect.x as f32 / ratio.0,
+                mon.y as f32 + rect.y as f32 / ratio.1,
+            ),
+            ratio,
         );
         Some(capture)
     }

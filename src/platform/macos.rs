@@ -805,6 +805,21 @@ pub fn cursor_position() -> Option<(f32, f32)> {
     Some((loc.x as f32, loc.y as f32))
 }
 
+/// Whether the left mouse button is currently held — read from the HID
+/// event source, NOT from window events: the 1 px strip at the very top
+/// of the screen is a WindowServer tracking zone that swallows
+/// `mouseDown` before delivery, so a press starting there never reaches
+/// egui. The overlay polls this so a drag started at the screen edge
+/// still creates a selection.
+pub fn left_mouse_down() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceButtonState(state_id: i32, button: i32) -> bool;
+    }
+    // kCGEventSourceStateHIDSystemState = 1, kCGMouseButtonLeft = 0.
+    unsafe { CGEventSourceButtonState(1, 0) }
+}
+
 /// One short tick — AppKit `NSBeep`, a plain C symbol playing the user's
 /// chosen system alert sound (respects its volume and mute).
 pub fn tick() {
@@ -1000,9 +1015,6 @@ pub fn dismiss_active_menus() -> bool {
         fn objc_msgSend();
     }
 
-    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-    type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
-
     const ESCAPE_KEYCODE: u16 = 53;
     const POPUP_MENU_LAYER: i32 = 100;
     const HID_EVENT_TAP: u32 = 0;
@@ -1043,22 +1055,129 @@ pub fn dismiss_active_menus() -> bool {
         }
     }
 
+    activate_app();
+    posted
+}
+
+/// Brings PixMe frontmost so `presentationOptions` and `makeKey` apply —
+/// `-[NSApplication activate]` on macOS 14+ (`activateIgnoringOtherApps:`
+/// is deprecated there and silently ignored on 15.x, which left the real
+/// menu bar interactive during captures); the legacy selector is the
+/// fallback on older systems. Main thread only.
+fn activate_app() {
+    use std::ffi::c_void;
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendVoid = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
+    type MsgSendBoolSel = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
+
     unsafe {
         let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_void: MsgSendVoid = std::mem::transmute(objc_msgSend as *const ());
         let send_void_bool: MsgSendVoidBool = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool_sel: MsgSendBoolSel = std::mem::transmute(objc_msgSend as *const ());
         let cls = objc_getClass(c"NSApplication".as_ptr());
-        if !cls.is_null() {
-            let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
-            if !app.is_null() {
-                send_void_bool(
-                    app,
-                    sel_registerName(c"activateIgnoringOtherApps:".as_ptr()),
-                    true,
-                );
-            }
+        if cls.is_null() {
+            return;
+        }
+        let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
+        if app.is_null() {
+            return;
+        }
+        let responds = sel_registerName(c"respondsToSelector:".as_ptr());
+        let activate = sel_registerName(c"activate".as_ptr());
+        if send_bool_sel(app, responds, activate) {
+            send_void(app, activate);
+        } else {
+            send_void_bool(
+                app,
+                sel_registerName(c"activateIgnoringOtherApps:".as_ptr()),
+                true,
+            );
         }
     }
-    posted
+}
+
+/// Enters the capture kiosk: hides the REAL menu bar and Dock and locks
+/// process switching (Cmd+Tab) and Hide-application for as long as PixMe
+/// is frontmost — the trick iScreenShot-style tools use so no system
+/// chrome can be interacted with mid-capture. The frozen frame taken
+/// before this call already carries the menu bar's and Dock's pixels, so
+/// their screen areas stay selectable under the overlay while nothing
+/// real can be clicked through. Reversed by [`capture_chrome_exit`]
+/// (and by process exit — the options never outlive the app).
+///
+/// Only meaningful once the screen is frozen: called from the overlay
+/// session after `frozen_all` lands, never before (hiding chrome first
+/// would photograph the empty strips).
+pub fn capture_chrome_enter() {
+    /// `NSApplicationPresentationHideDock` — the Dock stays gone while
+    /// PixMe is frontmost.
+    const HIDE_DOCK: usize = 1 << 1;
+    /// `NSApplicationPresentationHideMenuBar` — the menu bar cannot be
+    /// clicked or revealed; the overlay's frozen image of it takes its
+    /// place.
+    const HIDE_MENU_BAR: usize = 1 << 3;
+    /// `NSApplicationPresentationDisableProcessSwitching` — no Cmd+Tab
+    /// away mid-capture.
+    const DISABLE_PROCESS_SWITCHING: usize = 1 << 5;
+    /// `NSApplicationPresentationDisableHideApplication` — Cmd+H cannot
+    /// stash the overlay away either.
+    const DISABLE_HIDE_APPLICATION: usize = 1 << 8;
+
+    set_presentation_options(
+        HIDE_DOCK | HIDE_MENU_BAR | DISABLE_PROCESS_SWITCHING | DISABLE_HIDE_APPLICATION,
+    );
+}
+
+/// Leaves the capture kiosk: `presentationOptions` back to default — the
+/// real menu bar and Dock slide back in. Called on every transition out
+/// of `Capturing`; a no-op when the kiosk was never armed (instant
+/// fullscreen captures, a failed freeze).
+pub fn capture_chrome_exit() {
+    set_presentation_options(0);
+}
+
+/// `NSApp.presentationOptions = options` — `setPresentationOptions:` on
+/// the shared application, main thread only.
+fn set_presentation_options(options: usize) {
+    use std::ffi::c_void;
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendVoidUsize = unsafe extern "C" fn(*mut c_void, *mut c_void, usize);
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_usize: MsgSendVoidUsize = std::mem::transmute(objc_msgSend as *const ());
+        let cls = objc_getClass(c"NSApplication".as_ptr());
+        if cls.is_null() {
+            return;
+        }
+        let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
+        if app.is_null() {
+            return;
+        }
+        send_void_usize(
+            app,
+            sel_registerName(c"setPresentationOptions:".as_ptr()),
+            options,
+        );
+    }
 }
 
 /// Raises the capture overlay window to `kCGScreenSaverWindowLevel` (1000) —
@@ -1082,7 +1201,6 @@ pub fn elevate_overlay() {
     type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
     type MsgSendVoidIsize = unsafe extern "C" fn(*mut c_void, *mut c_void, isize);
     type MsgSendVoidId = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
-    type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
 
     const FLOATING_LEVEL: isize = 3;
     const SCREEN_SAVER_LEVEL: isize = 1000;
@@ -1095,7 +1213,6 @@ pub fn elevate_overlay() {
         let send_isize: MsgSendIsize = std::mem::transmute(objc_msgSend as *const ());
         let send_void_isize: MsgSendVoidIsize = std::mem::transmute(objc_msgSend as *const ());
         let send_void_id: MsgSendVoidId = std::mem::transmute(objc_msgSend as *const ());
-        let send_void_bool: MsgSendVoidBool = std::mem::transmute(objc_msgSend as *const ());
 
         let cls = objc_getClass(c"NSApplication".as_ptr());
         if cls.is_null() {
@@ -1105,11 +1222,7 @@ pub fn elevate_overlay() {
         if app.is_null() {
             return;
         }
-        send_void_bool(
-            app,
-            sel_registerName(c"activateIgnoringOtherApps:".as_ptr()),
-            true,
-        );
+        activate_app();
         let windows = send_id(app, sel_registerName(c"windows".as_ptr()));
         if windows.is_null() {
             return;

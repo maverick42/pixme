@@ -1732,3 +1732,118 @@ Format: date — context — decision — consequences.
   - `dev-tools` gains `pixme --bench-store [N]`: PNG compression
     trade-off, per-doc enqueue cost, `queued_ms`/`work_ms` stats and
     restore timing on N synthetic 5K captures.
+
+## 2026-11-02 — Windows chrome-less viewports: hidden creation + `ShowWindow` bypassing winit
+
+- **Context**: a Windows 0.30 winit quirk — `to_window_styles`
+  (`window_state.rs`) re-applies `WS_CAPTION | WS_BORDER | WS_SYSMENU`
+  **on every flag change, including `VISIBLE`** — means neither
+  visible-at-creation NOR egui's `ViewportCommand::Visible(true)` (→
+  `set_visible` → `apply_diff` → `SetWindowLongW`) can show a
+  chrome-less window without a one-frame title bar. The caption reads
+  *empty* because the strip also clears the title text.
+- **Decision**: chrome-less viewports (bar, pins, countdown) are
+  created `with_visible(false)` (Windows-only `#[cfg]`) and
+  `strip_undecorated_frame`'s `visit` shows them itself —
+  `ShowWindow(hwnd, SW_SHOW)` directly on the already-stripped hwnd
+  (`SW_SHOWNOACTIVATE` for the countdown, mirroring `with_active`).
+  winit never sees a `VISIBLE` flag diff, so its style re-application
+  never runs. The overlay keeps its egui `Visible(true)` reveal —
+  its `SetMonitor` sets `MARKER_BORDERLESS_FULLSCREEN` first, which
+  makes `to_window_styles` drop `WS_OVERLAPPEDWINDOW`, so that path
+  is already caption-free. `Role` split `CardWithMargin` into
+  `Bar`/`Countdown` for the per-role show flag. Decorated windows,
+  the root anchor and macOS are untouched.
+- **Consequences**: no caption can ever be painted on
+  bar/pin/countdown. `chrome_stripped_on_visible_window` (debug
+  level) alarms if a window is ever caught visible-with-chrome —
+  the flash signature. Residual: winit may re-add chrome mid-life on
+  frame changes (re-stripped next pump). Guarded by the
+  `chromeless_viewports_start_hidden` test.
+
+## 2026-11-02 — Capture kiosk: real menu bar + Dock hidden during selection; overlay covers them
+
+- **Context**: rectangular and window-pick captures could not reach the
+  macOS menu bar or Dock (and the Windows taskbar): macOS clamps
+  `setFrame` to the screen's `visibleFrame` (menu bar / Dock excluded),
+  so the overlay never covered those strips even at
+  `kCGScreenSaverWindowLevel`, and the Windows taskbar is itself
+  TOPMOST. iScreenShot-style tools get past this by disabling the real
+  chrome outright during capture — the user's explicit reference.
+- **Decision**: while a non-instant capture is live (the frozen frames
+  are already safe), enter a capture kiosk —
+  `NSApplication.presentationOptions = HideDock | HideMenuBar |
+  DisableProcessSwitching | DisableHideApplication`. The REAL chrome
+  disappears (menu bar cannot be clicked or revealed, Cmd+Tab is dead);
+  its pixels live on in the frozen frame painted by the overlay, so
+  every screen strip stays selectable but unclickable. Because the
+  visibleFrame clamp only releases as the hide animates (~0.3 s), the
+  overlay re-sends `OuterPosition`/`InnerSize` every frame until the
+  window covers the monitor's true frame, capped at 150 tries — the
+  existing `screen_offset` mapping keeps image↔screen exact throughout.
+  `enter()` calls `capture_chrome_exit()` on every transition out of
+  `Capturing` (process exit also restores the options automatically).
+  Windows needs no hiding: the overlay is topmost + borderless
+  fullscreen over the taskbar — `strip_undecorated_frame` additionally
+  re-asserts `HWND_TOPMOST` on the overlay at creation so the taskbar's
+  own topmost band can never win.
+- **Consequences**: region/fixed/pin captures can select over the menu
+  bar, Dock and taskbar (their clock included — the user's stated goal);
+  menus are truly inert during selection, matching iScreenShoter.
+  Instant fullscreen captures never enter the kiosk (no flicker). If
+  the kiosk hide ever fails, the overlay simply stays clamped below the
+  menu bar as before — `screen_offset` keeps the capture correct.
+
+## 2026-11-02 — Anchor gets an empty window region; bar geometry ledger resets on re-entry
+
+- **Context**: two Windows-only artifacts reported together. (1) A
+  small persistent ring floating on the desktop, sitting where the old
+  console window's icon used to be — the invisible 1×1 root anchor is a
+  real `WS_EX_TOPMOST` window with winit-forced `WS_CAPTION`, so
+  Windows 11's DWM rounded border + top accent line draw around its
+  degenerate rect as a small ring. `strip_undecorated_frame` clipped
+  every floating window except the anchor (its "PixMe" title had no
+  role). (2) The floating bar painted correctly on first show but was
+  clipped on every re-show: eframe destroys a deferred viewport's HWND
+  when it is not emitted (`remove_viewports_not_in` drops the `Viewport`
+  → `Window::drop` → `destroy_window`) and rebuilds it at the builder's
+  default `340×48` on re-entry — while `Toolbar.sync` (the
+  `ViewportSync` ledger) survives in `Shared`, deduping the
+  `InnerSize`/`OuterPosition` resend forever.
+- **Decision**: (1) give the anchor its own `Role::Anchor` — title
+  match "PixMe" + `WS_EX_TOPMOST` (the viewer is not topmost, so no
+  other "PixMe" window can match), its title cleared, `WS_CHROME`
+  stripped like the other floating windows, and an **empty**
+  `SetWindowRgn` clipped so nothing can draw (a `w<=8 && h<=8` guard
+  keeps a recycled hwnd from ever being blanked). (2)
+  `Toolbar::reset_sync()` clears the ledger on every `enter(Bar)` — a
+  recreated window gets its geometry commands resent, exactly like the
+  first show.
+- **Consequences**: the anchor can no longer draw anything (it paints
+  nothing by design). Bar re-shows send size+position once, then the
+  ledger dedupes normally — no resize feedback loops. If a small ring
+  persists after this, it is an explorer/touch artifact (cf. the
+  `EdgeUiInputTopWndClass` entry) outside PixMe's control, not our
+  window.
+
+## 2026-11-02 — The "empty title bar at the top of the screen" is explorer's edge-UI strip, not a PixMe window
+
+- **Context**: a full-width empty strip at the top of the screen
+  flashed whenever the capture overlay appeared or disappeared.
+  A `SetWinEventHook` probe (used during diagnosis, since removed)
+  showed the only window toggling at those exact moments is
+  **`EdgeUiInputTopWndClass`, a 1585×4 explorer.exe window at the top
+  of the screen** — Windows' touch edge-input strip, hidden by the
+  shell while any screen-covering window exists and re-shown when it
+  goes away.
+- **Decision**: no code change — the strip's hide/show is explorer's
+  own generic fullscreen detection, not a reaction to
+  `MarkFullscreenWindow` (verified: it toggles identically with the
+  manual `OuterPosition`/`InnerSize` placement, so the SetMonitor
+  path was kept). Suppressing it would mean hiding another process's
+  window — rejected as out-of-process tampering. It renders
+  invisibly on healthy systems; a visible white strip suggests an
+  explorer glitch (explorer restart can reset it).
+- **Consequences**: the flash is a Windows shell artifact outside
+  PixMe's control. Any screenshot/capture tool showing a
+  screen-covering overlay triggers the same toggle.
