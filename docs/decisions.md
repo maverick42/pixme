@@ -1956,3 +1956,24 @@ Format: date — context — decision — consequences.
 - **Consequences**: verified on macOS that an invisible root viewport
   keeps the event pump alive. Windows-side: needs a build/launch check
   on the Windows box.
+
+## 2026-11-03 — Viewer bounds clamp replaces the hard move lock (user feedback)
+
+- **Context**: the move lock (`setMovable(false)` / caption-drag
+  swallow) made the viewer fully immovable — the user never asked for
+  that; the requirement is only that the window can't be dragged
+  beyond its monitor's limits (crossing monitors stays on the status
+  strip buttons).
+- **Decision**: the OS move lock is removed. The viewer callback now
+  clamps the reported `outer_rect` to the CURRENT monitor's UI bounds
+  every settled frame (`clamp_rect_inside` + `viewer_sync`), falling
+  back to the monitor under the centre when the current one went away.
+  `Settings.last_monitor` (stable id) is persisted alongside
+  `rect_native` in the same debounced flush — written during a gesture
+  but flushed to disk only after ~500 ms of quiet, so persistence lands
+  at the END of a move. At launch the last monitor's saved rect is
+  restored through the normal `viewer_target` path.
+- **Consequences**: dragging inside the monitor is free again; the
+  boundary is a rubber wall (one frame of lag). The macOS/Windows
+  lock implementations were deleted — nothing platform-specific
+  remains to verify for this.

@@ -351,12 +351,6 @@ pub struct Shared {
     /// `prefs.monitors[id].rect_native` is stale and `pump` flushes a
     /// debounced `settings.save()`.
     pub monitor_geom_dirty_at: Mutex<Option<std::time::Instant>>,
-    /// The OS move lock was applied to the viewer window (macOS
-    /// `setMovable`, Windows caption subclass) — retried while the
-    /// native window is being created.
-    pub viewer_move_lock_done: AtomicBool,
-    /// Move-lock attempts so far (~1.5 s bound, like `maybe_focus`).
-    pub viewer_move_lock_tries: std::sync::atomic::AtomicU8,
     /// winit `available_monitors()` placements `(x, y, w, h)` in physical
     /// pixels, snapshotted for the overlay's `with_monitor`/`SetMonitor`
     /// targeting (xcap and winit don't enumerate in the same order).
@@ -1357,10 +1351,8 @@ impl Shared {
                 self.request_focus(viewer_id());
                 // The viewport's native window is destroyed on
                 // deregistration and rebuilt on re-entry: the geometry
-                // ledger and the OS move lock must be re-applied.
+                // ledger must be re-applied.
                 *lock(&self.viewer_sync) = ui::viewport_sync::ViewportSync::new("PixMe Viewer");
-                self.viewer_move_lock_done.store(false, Ordering::Relaxed);
-                self.viewer_move_lock_tries.store(0, Ordering::Relaxed);
             }
         }
         // Restoring runs on EVERY viewer entry (guarded to once): a
@@ -1979,6 +1971,19 @@ impl PixMeApp {
         let debug_capture = std::env::var("PIXME_CAPTURE")
             .ok()
             .and_then(|v| debug_mode(&v));
+        // The launch landing: the viewer reopens on the monitor it last
+        // sat on (stable id), at its saved rect when prefs hold one —
+        // applied by the normal target path on the first viewer pass.
+        let inventory = platform::monitor_identities();
+        let initial_target = settings.last_monitor.as_deref().and_then(|id| {
+            inventory
+                .iter()
+                .find(|m| m.stable_id == id)
+                .map(|m| ViewerTarget {
+                    monitor: m.info.clone(),
+                    native_rect: settings.monitors.get(id).and_then(|p| p.rect_native),
+                })
+        });
         let app = Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(AppState::Idle),
@@ -1988,14 +1993,12 @@ impl PixMeApp {
                 settings: Mutex::new(settings),
                 viewer: Mutex::new(Viewer::default()),
                 viewer_rect: Mutex::new(None),
-                viewer_target: Mutex::new(None),
+                viewer_target: Mutex::new(initial_target),
                 viewer_monitor: Mutex::new(None),
-                monitors: Mutex::new(platform::monitor_identities()),
+                monitors: Mutex::new(inventory),
                 viewer_sync: Mutex::new(ui::viewport_sync::ViewportSync::new("PixMe Viewer")),
                 viewer_geo_settle: Mutex::new(0),
                 monitor_geom_dirty_at: Mutex::new(None),
-                viewer_move_lock_done: AtomicBool::new(false),
-                viewer_move_lock_tries: std::sync::atomic::AtomicU8::new(0),
                 winit_placements: Mutex::new(Vec::new()),
                 settings_open: AtomicBool::new(false),
                 about_open: AtomicBool::new(false),
@@ -2112,22 +2115,6 @@ impl eframe::App for PixMeApp {
                     let ctx = ui.ctx().clone();
                     shared.pump(&ctx);
                     shared.maybe_focus(&ctx, viewer_id());
-                    // The viewer is position-locked (macOS `setMovable`,
-                    // Windows caption-drag swallow): retry until the
-                    // platform call finds the freshly-created native
-                    // window, ~1.5 s bound like `maybe_focus`.
-                    if !shared.viewer_move_lock_done.load(Ordering::Relaxed) {
-                        if platform::viewer_move_lock() {
-                            shared.viewer_move_lock_done.store(true, Ordering::Relaxed);
-                        } else if shared
-                            .viewer_move_lock_tries
-                            .fetch_add(1, Ordering::Relaxed)
-                            >= 90
-                        {
-                            tracing::warn!("viewer move lock never applied");
-                            shared.viewer_move_lock_done.store(true, Ordering::Relaxed);
-                        }
-                    }
                     let target = lock(&shared.viewer_target).take();
                     if let Some(t) = target {
                         // Commands are converted back by THIS window's
@@ -2162,32 +2149,68 @@ impl eframe::App for PixMeApp {
                         let mut settle = lock(&shared.viewer_geo_settle);
                         if *settle > 0 {
                             *settle -= 1;
-                        } else if *lock(&shared.viewer_rect) != Some(outer) {
-                            *lock(&shared.viewer_rect) = Some(outer);
+                        } else {
                             let ppp = platform::window_ppp(&ctx, 1.0);
+                            // The viewer is freely draggable WITHIN its
+                            // monitor but never beyond its limits —
+                            // crossing to another monitor is the status
+                            // strip's buttons' job. When the reported
+                            // rect pokes past the current monitor's
+                            // bounds, clamp it back inside and push it
+                            // via the geometry ledger. A stale current
+                            // monitor (disconnected) falls back to the
+                            // monitor under the centre.
                             let centre = platform::ui_to_native(outer.center(), ppp);
-                            let mon = crate::capture::screen::monitor_at(centre.x, centre.y);
-                            *lock(&shared.viewer_monitor) = mon.clone();
-                            // Persist the rect on the current monitor —
-                            // debounced: a resize gesture floods, one
-                            // flush per half-second caps it.
-                            if let Some(m) = mon
-                                && let Some(id) = shared.monitor_stable_id(&m)
-                            {
-                                let n_min = platform::ui_to_native(outer.min, ppp);
-                                let n_max = platform::ui_to_native(outer.max, ppp);
-                                let rect = [
-                                    n_min.x as i32,
-                                    n_min.y as i32,
-                                    (n_max.x - n_min.x) as i32,
-                                    (n_max.y - n_min.y) as i32,
-                                ];
-                                let mut s = lock(&shared.settings);
-                                let prefs = s.monitors.entry(id).or_default();
-                                if prefs.rect_native != Some(rect) {
-                                    prefs.rect_native = Some(rect);
-                                    *lock(&shared.monitor_geom_dirty_at) =
-                                        Some(std::time::Instant::now());
+                            let hit = crate::capture::screen::monitor_at(centre.x, centre.y);
+                            let cur = lock(&shared.viewer_monitor).clone().filter(|c| {
+                                lock(&shared.monitors)
+                                    .iter()
+                                    .any(|id| id.info.rect == c.rect)
+                            });
+                            let bounds = cur.or(hit);
+                            let mut eff = outer;
+                            if let Some(m) = &bounds {
+                                let cl = clamp_rect_inside(
+                                    outer,
+                                    platform::monitor_ui_rect(m, ppp),
+                                );
+                                if cl != outer {
+                                    eff = cl;
+                                    lock(&shared.viewer_sync)
+                                        .request_outer_position(&ctx, eff.min);
+                                }
+                            }
+                            *lock(&shared.viewer_monitor) = bounds;
+                            if *lock(&shared.viewer_rect) != Some(eff) {
+                                *lock(&shared.viewer_rect) = Some(eff);
+                                // Persist the rect on the current monitor
+                                // — debounced: a move/resize gesture
+                                // floods, one flush per half-second caps
+                                // it (the last write lands at the end of
+                                // the gesture).
+                                if let Some(m) = lock(&shared.viewer_monitor).clone()
+                                    && let Some(id) = shared.monitor_stable_id(&m)
+                                {
+                                    let n_min = platform::ui_to_native(eff.min, ppp);
+                                    let n_max = platform::ui_to_native(eff.max, ppp);
+                                    let rect = [
+                                        n_min.x as i32,
+                                        n_min.y as i32,
+                                        (n_max.x - n_min.x) as i32,
+                                        (n_max.y - n_min.y) as i32,
+                                    ];
+                                    let mut s = lock(&shared.settings);
+                                    let prefs = s.monitors.entry(id.clone()).or_default();
+                                    if prefs.rect_native != Some(rect) {
+                                        prefs.rect_native = Some(rect);
+                                        *lock(&shared.monitor_geom_dirty_at) =
+                                            Some(std::time::Instant::now());
+                                    }
+                                    if s.last_monitor.as_deref() != Some(id.as_str()) {
+                                        s.last_monitor = Some(id);
+                                        *lock(&shared.monitor_geom_dirty_at) =
+                                            Some(std::time::Instant::now());
+                                    }
                                 }
                             }
                         }
@@ -2709,6 +2732,25 @@ fn target_ui_rect(t: &ViewerTarget, current: Option<egui::Rect>, ppp: f32) -> eg
     }
 }
 
+/// `r` clamped inside `mon` (both in the same UI space): keeps the size
+/// unless `r` is already bigger than the monitor — then it shrinks to
+/// fit. The viewer can be dragged anywhere within its monitor but never
+/// beyond its limits (crossing monitors is the buttons' job).
+fn clamp_rect_inside(r: egui::Rect, mon: egui::Rect) -> egui::Rect {
+    let size = r.size().min(mon.size());
+    let min_x = if size.x >= mon.width() {
+        mon.min.x
+    } else {
+        r.min.x.clamp(mon.min.x, mon.max.x - size.x)
+    };
+    let min_y = if size.y >= mon.height() {
+        mon.min.y
+    } else {
+        r.min.y.clamp(mon.min.y, mon.max.y - size.y)
+    };
+    egui::Rect::from_min_size(egui::pos2(min_x, min_y), size)
+}
+
 /// The capture overlay: a borderless always-on-top window covering the
 /// monitor being captured. `MonitorInfo.rect` is in the OS-native display
 /// space (physical px on Windows, points on macOS) — it is converted to
@@ -2900,8 +2942,6 @@ mod tests {
             viewer_sync: Mutex::new(ui::viewport_sync::ViewportSync::new("PixMe Viewer")),
             viewer_geo_settle: Mutex::new(0),
             monitor_geom_dirty_at: Mutex::new(None),
-            viewer_move_lock_done: AtomicBool::new(false),
-            viewer_move_lock_tries: std::sync::atomic::AtomicU8::new(0),
             winit_placements: Mutex::new(Vec::new()),
             settings_open: AtomicBool::new(false),
             about_open: AtomicBool::new(false),

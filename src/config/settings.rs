@@ -172,6 +172,10 @@ pub struct Settings {
     /// window geometry; entries survive disconnects (see [`MonitorPrefs`]).
     #[serde(default)]
     pub monitors: std::collections::BTreeMap<String, MonitorPrefs>,
+    /// The stable id of the monitor the viewer last sat on — restored
+    /// at launch so the app reopens where it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_monitor: Option<String>,
 }
 
 fn default_text_color() -> [u8; 3] {
@@ -236,6 +240,7 @@ impl Default for Settings {
             filename_templates: default_filename_templates(),
             filename_counter: default_filename_counter(),
             monitors: std::collections::BTreeMap::new(),
+            last_monitor: None,
         }
     }
 }

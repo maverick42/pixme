@@ -1303,67 +1303,6 @@ pub(crate) fn stable_monitor_id(monitor: &crate::capture::MonitorInfo) -> Option
         Some(CFString::wrap_under_create_rule(raw).to_string())
     }
 }
-
-/// `setMovable(false)` on the viewer's NSWindow — it can no longer be
-/// user-dragged (parity with the Windows caption-drag swallow) while
-/// staying resizable; programmatic `setFrame`/`OuterPosition` still
-/// works. The viewer is the "PixMe"-titled window at NORMAL level — the
-/// always-on-top anchor shares the title but floats higher. Returns
-/// `true` once applied; callers retry while the window is created.
-pub(crate) fn viewer_move_lock() -> bool {
-    use core_foundation::base::TCFType;
-    use core_foundation::string::{CFString, CFStringRef};
-    use std::ffi::c_void;
-
-    #[link(name = "objc", kind = "dylib")]
-    unsafe extern "C" {
-        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
-        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
-        fn objc_msgSend();
-    }
-    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-    type MsgSendUsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
-    type MsgSendIdUsize = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
-    type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
-    type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
-
-    unsafe {
-        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
-        let send_usize: MsgSendUsize = std::mem::transmute(objc_msgSend as *const ());
-        let send_id_usize: MsgSendIdUsize = std::mem::transmute(objc_msgSend as *const ());
-        let send_isize: MsgSendIsize = std::mem::transmute(objc_msgSend as *const ());
-        let send_void_bool: MsgSendVoidBool = std::mem::transmute(objc_msgSend as *const ());
-
-        let cls = objc_getClass(c"NSApplication".as_ptr());
-        let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
-        let windows = send_id(app, sel_registerName(c"windows".as_ptr()));
-        if windows.is_null() {
-            return false;
-        }
-        let count = send_usize(windows, sel_registerName(c"count".as_ptr()));
-        let sel_obj = sel_registerName(c"objectAtIndex:".as_ptr());
-        let sel_level = sel_registerName(c"level".as_ptr());
-        let sel_title = sel_registerName(c"title".as_ptr());
-        let sel_movable = sel_registerName(c"setMovable:".as_ptr());
-        for i in 0..count {
-            let win = send_id_usize(windows, sel_obj, i);
-            if win.is_null() || send_isize(win, sel_level) != 0 {
-                continue;
-            }
-            let title = send_id(win, sel_title);
-            if title.is_null() {
-                continue;
-            }
-            let name = CFString::wrap_under_get_rule(title as CFStringRef).to_string();
-            if name == "PixMe" {
-                send_void_bool(win, sel_movable, false);
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// No-op on macOS: the capture kiosk (`presentationOptions` +
 /// screensaver-level overlay) already keeps the session's focus —
 /// there is nothing to hand back.
