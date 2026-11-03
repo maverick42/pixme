@@ -200,14 +200,6 @@ pub use macos::sync_menu_enabled;
 #[cfg(target_os = "windows")]
 pub use windows::sync_menu_enabled;
 
-/// Rebuilds the File ▸ Recents submenu when the list changed (see above).
-#[cfg(target_os = "macos")]
-pub use macos::sync_recent_menu;
-/// No-op on Windows: its menus are egui-drawn every frame.
-#[cfg(target_os = "windows")]
-#[inline]
-pub fn sync_recent_menu(_recents: &[std::path::PathBuf]) {}
-
 /// Strips `WS_CAPTION` from undecorated floating windows to prevent
 /// the compositor offset (PhotoCraft #2246 fix; no-op on macOS).
 #[cfg(target_os = "windows")]

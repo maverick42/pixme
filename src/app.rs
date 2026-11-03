@@ -675,7 +675,7 @@ impl Shared {
         // succeeds, history cleared): the macOS File menu is native and
         // must be re-synced explicitly — a no-op on Windows, whose menus
         // are egui-drawn every frame.
-        platform::sync_recent_menu(&lock(&self.settings).recent_files);
+
         // A background session restore lands here — swap the empty
         // session for the loaded tabs and drop the spinner.
         let done = lock(&self.restore_rx)

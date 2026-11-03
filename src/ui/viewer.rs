@@ -2303,18 +2303,19 @@ impl Viewer {
                             // Menus render every frame, forced open on the
                             // caret-click frame — see `tool_popup`.
                             open_menu(ui, &r, shared, has_last_dir, menu_clicked);
-                            if widgets::tool_button(
+                            let r = widgets::tool_button(
                                 ui,
                                 Icon::Save,
                                 &t!("vbar.save.label"),
-                                false,
+                                true,
                                 false,
                                 has_doc,
-                            )
-                            .clicked()
-                            {
+                            );
+                            let save_clicked = r.clicked() && widgets::caret_hit(&r, true);
+                            if r.clicked() && !save_clicked {
                                 shared.push(Command::SaveActive);
                             }
+                            save_menu(ui, &r, shared, has_doc, save_clicked);
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
                             if widgets::tool_button(
                                 ui,
@@ -2686,91 +2687,6 @@ impl Viewer {
                     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
                     v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
                     ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-                    menu_button(ui, t!("menu.file").as_ref(), |ui| {
-                        let has_doc = self.active_index().is_some();
-                        let has_last_dir = {
-                            let s = shared.lock_settings();
-                            s.last_open_dir.is_some() || s.last_save_dir.is_some()
-                        };
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::OpenFile,
-                            t!("menu.file.open").as_ref(),
-                            Some(Icon::FolderOpen),
-                            shared.command_enabled(&Command::OpenFile),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::ImportClipboard,
-                            t!("menu.app.import_clipboard").as_ref(),
-                            Some(Icon::ClipboardPaste),
-                            shared.command_enabled(&Command::ImportClipboard),
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::SaveActive,
-                            t!("menu.file.save").as_ref(),
-                            Some(Icon::Save),
-                            has_doc && shared.command_enabled(&Command::SaveActive),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::SaveAll,
-                            t!("menu.file.save_all").as_ref(),
-                            Some(Icon::Download),
-                            has_doc && shared.command_enabled(&Command::SaveAll),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::RenameActive,
-                            t!("menu.file.rename").as_ref(),
-                            None,
-                            has_doc && shared.command_enabled(&Command::RenameActive),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::DeleteFileActive,
-                            t!("menu.file.delete").as_ref(),
-                            Some(Icon::X),
-                            self.active_has_file()
-                                && shared.command_enabled(&Command::DeleteFileActive),
-                        );
-                        ui.separator();
-                        recent_submenu(ui, shared);
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::OpenLastDir,
-                            t!("vbar.open.last_dir").as_ref(),
-                            Some(Icon::Folder),
-                            has_last_dir && shared.command_enabled(&Command::OpenLastDir),
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::PrintActive,
-                            t!("menu.file.print").as_ref(),
-                            Some(Icon::Printer),
-                            has_doc && shared.command_enabled(&Command::PrintActive),
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::Quit,
-                            t!("menu.app.quit").as_ref(),
-                            Some(Icon::LogOut),
-                            shared.command_enabled(&Command::Quit),
-                        );
-                    });
                     menu_button(ui, t!("menu.edit").as_ref(), |ui| {
                         menu_item_icon(
                             ui,
@@ -4366,6 +4282,23 @@ fn open_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_last_dir: bool
     });
 }
 
+/// The Save button's caret popup: batch save — the only "save all"
+/// entry point left with the menus gone.
+fn save_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_doc: bool, open: bool) {
+    tool_popup(ui, resp, "save-menu", open, |ui| {
+        if ui
+            .add_enabled(
+                has_doc && shared.command_enabled(&Command::SaveAll),
+                egui::Button::new(t!("menu.file.save_all")),
+            )
+            .clicked()
+        {
+            shared.push(Command::SaveAll);
+            ui.close();
+        }
+    });
+}
+
 /// The recent-files rows under File → Open / Ouvrir: up to five entries
 /// (newest first) named by file, full path on hover — hidden entirely
 /// when the list is empty.
@@ -4494,41 +4427,6 @@ fn menu_item_icon(
             if ui.button(label).clicked() {
                 shared.push(command);
                 ui.close();
-            }
-        });
-    });
-}
-
-/// The "Récents" submenu: up to five most recent files, hidden entirely
-/// when the list is empty.
-fn recent_submenu(ui: &mut egui::Ui, shared: &Shared) {
-    let recents = shared.lock_settings().recent_files.clone();
-    if recents.is_empty() {
-        return;
-    }
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        // Same reserved icon slot as the other rows — alignment is kept
-        // and the submenu gets its folder glyph.
-        let t = crate::ui::theme::tokens(ui.ctx());
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
-        crate::ui::icons::paint(ui, rect, Icon::Folder, 16.0, t.icon);
-        // egui's native submenu row: chevron on the right, hover-open.
-        egui::containers::menu::SubMenuButton::new(t!("menu.file.recent")).ui(ui, |ui| {
-            for path in recents {
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                let command = Command::OpenPath(path.clone());
-                let enabled = shared.command_enabled(&command);
-                let resp = ui
-                    .add_enabled(enabled, egui::Button::new(name))
-                    .on_hover_text(path.display().to_string());
-                if resp.clicked() {
-                    shared.push(command);
-                    ui.close();
-                }
             }
         });
     });

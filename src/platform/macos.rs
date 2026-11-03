@@ -87,20 +87,6 @@ struct Installed {
     _tray: Option<TrayIcon>,
     _app_menu: Menu,
     labels: Labels,
-    /// File ▸ Recents: the submenu, its parent and the file list it was
-    /// last built with — [`sync_recent_menu`] re-syncs it because a
-    /// native menu is not re-queried when settings change.
-    recent: RecentMenu,
-}
-
-/// The File ▸ Recents submenu state (dynamic, unlike the keyed items).
-struct RecentMenu {
-    /// The "Fichier" submenu the Recents submenu sits in.
-    parent: Submenu,
-    sub: Submenu,
-    items: Vec<MenuItem>,
-    paths: Vec<std::path::PathBuf>,
-    shown: bool,
 }
 
 thread_local! {
@@ -250,70 +236,6 @@ pub fn install_ui(ctx: &egui::Context) {
     );
     append(&app_menu, &app);
 
-    // Mirrors the viewer's egui File menu (minus Quit, which lives in
-    // the PixMe menu here): Open / Import | Save / Save all / Rename /
-    // Delete | Recents / last folder | Print.
-    let file = Submenu::new(t!("menu.file").as_ref(), true);
-    labels.subs.push((file.clone(), "menu.file"));
-    item(
-        &mut labels,
-        &file,
-        "file.open",
-        "menu.file.open",
-        Some(Accelerator::new(Modifiers::META, Code::KeyO)),
-    );
-    item(
-        &mut labels,
-        &file,
-        "import_clipboard",
-        "menu.app.import_clipboard",
-        Some(Accelerator::new(
-            Modifiers::META | Modifiers::ALT,
-            Code::KeyV,
-        )),
-    );
-    separator(&file);
-    item(
-        &mut labels,
-        &file,
-        "file.save",
-        "menu.file.save",
-        Some(Accelerator::new(Modifiers::META, Code::KeyS)),
-    );
-    item(
-        &mut labels,
-        &file,
-        "file.save_all",
-        "menu.file.save_all",
-        Some(Accelerator::new(
-            Modifiers::META | Modifiers::SHIFT,
-            Code::KeyS,
-        )),
-    );
-    item(&mut labels, &file, "file.rename", "menu.file.rename", None);
-    item(&mut labels, &file, "file.delete", "menu.file.delete", None);
-    separator(&file);
-    // The Recents submenu is appended by `sync_recent_menu` only while
-    // the list is non-empty — hidden entirely when it is, as on Windows.
-    let recent_sub = Submenu::new(t!("menu.file.recent").as_ref(), true);
-    labels.subs.push((recent_sub.clone(), "menu.file.recent"));
-    item(
-        &mut labels,
-        &file,
-        "file.open_last_dir",
-        "vbar.open.last_dir",
-        None,
-    );
-    separator(&file);
-    item(
-        &mut labels,
-        &file,
-        "file.print",
-        "menu.file.print",
-        Some(Accelerator::new(Modifiers::META, Code::KeyP)),
-    );
-    append(&app_menu, &file);
-
     // The Edit submenu carries the OS copy/paste conventions (⌘C/⌘V):
     // key equivalents go through AppKit, so they reach us no matter
     // which egui viewport holds focus.
@@ -363,13 +285,6 @@ pub fn install_ui(ctx: &egui::Context) {
             _tray: tray,
             _app_menu: app_menu,
             labels,
-            recent: RecentMenu {
-                parent: file,
-                sub: recent_sub,
-                items: Vec::new(),
-                paths: Vec::new(),
-                shown: false,
-            },
         });
     });
 }
@@ -416,62 +331,6 @@ pub fn sync_menu_enabled(
                     item.set_enabled(enabled(&command));
                 }
             }
-            for item in &installed.recent.items {
-                if let Some(command) = super::command_from_menu_id(item.id().0.as_str()) {
-                    item.set_enabled(enabled(&command));
-                }
-            }
-        }
-    });
-}
-
-/// Rebuilds the File ▸ Recents submenu when `recents` no longer matches
-/// the list it was built with — settings change without a modal
-/// transition, so `Shared::pump` feeds this every pass (cheap compare).
-/// Called on the main thread, where the thread_local muda handles live.
-pub fn sync_recent_menu(recents: &[std::path::PathBuf]) {
-    INSTALLED.with(|cell| {
-        let Some(installed) = &mut *cell.borrow_mut() else {
-            return;
-        };
-        let recent = &mut installed.recent;
-        if recent.paths == recents {
-            return;
-        }
-        recent.paths = recents.to_vec();
-        while recent.sub.remove_at(0).is_some() {}
-        recent.items.clear();
-        if recents.is_empty() {
-            if recent.shown {
-                if let Err(err) = recent.parent.remove(&recent.sub) {
-                    tracing::warn!("cannot remove recent submenu: {err}");
-                }
-                recent.shown = false;
-            }
-            return;
-        }
-        for path in recents {
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let item = MenuItem::with_id(format!("recent:{}", path.display()), name, true, None);
-            append(&recent.sub, &item);
-            recent.items.push(item);
-        }
-        if !recent.shown {
-            // Insert just before "Ouvrir le dernier dossier" — mirroring
-            // the viewer's File menu order.
-            let pos = recent
-                .parent
-                .items()
-                .iter()
-                .position(|kind| kind.id().0 == "file.open_last_dir")
-                .unwrap_or_else(|| recent.parent.items().len());
-            if let Err(err) = recent.parent.insert(&recent.sub, pos) {
-                tracing::warn!("cannot insert recent submenu: {err}");
-            }
-            recent.shown = true;
         }
     });
 }

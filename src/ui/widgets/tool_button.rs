@@ -30,7 +30,15 @@ pub fn tool_button(
     enabled: bool,
 ) -> Response {
     let t = theme::tokens(ui.ctx());
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(TOOL_W, TOOL_H), Sense::click());
+    // The caption zone is `rect - caret`: grow the button when the label
+    // would clip (long translations like "Enregistrer" under the caret).
+    let label_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), theme::medium(10.0), t.text)
+        .size()
+        .x;
+    let width = TOOL_W.max(label_w + 6.0 + if has_menu { CARET_W } else { 0.0 });
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, TOOL_H), Sense::click());
     let (icon_tint, text_col) = if !enabled {
         (t.text_faint, t.text_faint)
     } else if response.hovered() {
