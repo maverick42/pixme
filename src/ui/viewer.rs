@@ -334,6 +334,11 @@ pub struct Viewer {
     resize: Option<ResizeDialog>,
     /// The rename prompt's draft, open while Some.
     rename: Option<RenameState>,
+    /// The monitor-rename prompt's draft, open while Some.
+    monitor_rename: Option<MonitorRename>,
+    /// Disconnected-monitor buttons dismissed this run — the prefs entry
+    /// itself is kept, so a reconnect brings the monitor back silently.
+    dismissed_monitors: std::collections::HashSet<String>,
     /// The protection dialog (set/change/remove password), open while Some.
     protect: Option<ProtectDialog>,
     /// The "delete the file on disk" confirmation, open while Some.
@@ -425,6 +430,8 @@ impl Default for Viewer {
             resize: None,
             dup_names: false,
             rename: None,
+            monitor_rename: None,
+            dismissed_monitors: std::collections::HashSet::new(),
             protect: None,
             confirm_delete: None,
             unlock_draft: String::new(),
@@ -456,6 +463,67 @@ impl Default for Viewer {
             debug_edit_step: 0,
         }
     }
+}
+
+/// The monitor-rename prompt: the monitor's stable id + draft + focus flag.
+struct MonitorRename {
+    /// Key into `Settings::monitors`.
+    stable_id: String,
+    /// Field content.
+    draft: String,
+    /// The name field grabs focus once on open.
+    focused: bool,
+}
+
+/// One status-strip monitor row: a connected inventory entry, or a
+/// persisted prefs entry whose monitor is currently absent.
+struct MonitorRow {
+    /// Key into `Settings::monitors` / `Command::SelectMonitor`.
+    stable_id: String,
+    /// Custom name when set, else the OS name (or a fallback).
+    label: String,
+    /// The monitor's bounds — matched against the viewer's monitor by
+    /// rect (xcap ids are not stable across enumerations on Windows).
+    rect: crate::capture::PhysicalRect,
+    /// `false` for persisted-but-absent monitors (greyed, dismissible).
+    connected: bool,
+}
+
+/// The status strip's monitor rows: connected monitors in enumeration
+/// order, then persisted-but-absent entries (unless the user dismissed
+/// them this run — dismissal is visual only, prefs are never dropped).
+fn monitor_rows(
+    inventory: &[crate::platform::MonitorIdentity],
+    prefs: &std::collections::BTreeMap<String, crate::config::MonitorPrefs>,
+    dismissed: &std::collections::HashSet<String>,
+) -> Vec<MonitorRow> {
+    let mut rows: Vec<MonitorRow> = inventory
+        .iter()
+        .map(|m| MonitorRow {
+            stable_id: m.stable_id.clone(),
+            label: prefs
+                .get(&m.stable_id)
+                .and_then(|p| p.name.clone())
+                .unwrap_or_else(|| m.info.name.clone()),
+            rect: m.info.rect,
+            connected: true,
+        })
+        .collect();
+    for (id, p) in prefs {
+        if dismissed.contains(id) || rows.iter().any(|r| r.stable_id == *id) {
+            continue;
+        }
+        rows.push(MonitorRow {
+            stable_id: id.clone(),
+            label: p
+                .name
+                .clone()
+                .unwrap_or_else(|| t!("viewer.monitor.fallback").to_string()),
+            rect: crate::capture::PhysicalRect::default(),
+            connected: false,
+        });
+    }
+    rows
 }
 
 /// The rename prompt: draft + whether it already failed uniqueness.
@@ -776,9 +844,20 @@ impl Viewer {
         self.confirm_close
             || self.resize.is_some()
             || self.rename.is_some()
+            || self.monitor_rename.is_some()
             || self.protect.is_some()
             || self.confirm_delete.is_some()
             || self.dup_names
+    }
+
+    /// Opens the monitor-rename prompt for `stable_id` (status strip
+    /// right-click), pre-filled with `draft` (custom or OS name).
+    pub fn open_monitor_rename(&mut self, stable_id: String, draft: String) {
+        self.monitor_rename = Some(MonitorRename {
+            stable_id,
+            draft,
+            focused: false,
+        });
     }
 
     /// `(tab index, doc clone, anno stacks)` — opening Draw snapshots
@@ -1726,6 +1805,7 @@ impl Viewer {
         let modal_open = self.confirm_close
             || self.resize.is_some()
             || self.rename.is_some()
+            || self.monitor_rename.is_some()
             || self.protect.is_some()
             || self.confirm_delete.is_some()
             || self.dup_names
@@ -1913,6 +1993,7 @@ impl Viewer {
         self.confirm_dialog(&ctx, shared);
         self.resize_dialog(&ctx);
         self.rename_dialog(&ctx);
+        self.monitor_rename_dialog(&ctx, shared);
         self.protect_dialog(&ctx);
         self.delete_file_dialog(&ctx);
         self.dup_names_dialog(&ctx);
@@ -2082,6 +2163,66 @@ impl Viewer {
                         .color(t.text_faint)
                         .size(10.0),
                 );
+                // Monitor group, right-aligned next to the version: ↻
+                // refresh, then one button per known monitor — connected
+                // entries select the viewer's monitor (right-click
+                // renames), persisted-but-absent ones stay greyed until
+                // a click dismisses them (prefs are never dropped).
+                if ui
+                    .add_enabled_ui(shared.command_enabled(&Command::RefreshMonitors), |ui| {
+                        widgets::icon_button(ui, Icon::RefreshCw, false)
+                    })
+                    .inner
+                    .on_hover_text(t!("viewer.monitor.refresh"))
+                    .clicked()
+                {
+                    shared.push(Command::RefreshMonitors);
+                }
+                let rows = monitor_rows(
+                    &crate::app::lock(&shared.monitors),
+                    &shared.lock_settings().monitors,
+                    &self.dismissed_monitors,
+                );
+                let current = crate::app::lock(&shared.viewer_monitor).clone();
+                for row in rows.iter().rev() {
+                    let is_current =
+                        row.connected && current.as_ref().is_some_and(|m| m.rect == row.rect);
+                    let tip = if !row.connected {
+                        t!("viewer.monitor.disconnected", name = row.label.as_str())
+                    } else if is_current {
+                        t!("viewer.monitor.current", name = row.label.as_str())
+                    } else {
+                        row.label.clone().into()
+                    };
+                    if row.connected {
+                        let resp = ui
+                            .add_enabled_ui(
+                                shared.command_enabled(&Command::SelectMonitor(
+                                    row.stable_id.clone(),
+                                )),
+                                |ui| widgets::icon_button(ui, Icon::Monitor, is_current),
+                            )
+                            .inner
+                            .on_hover_text(tip);
+                        if resp.clicked() {
+                            shared.push(Command::SelectMonitor(row.stable_id.clone()));
+                        } else if resp.secondary_clicked() {
+                            shared.push(Command::RenameMonitor(row.stable_id.clone()));
+                        }
+                    } else {
+                        // Greyed, dismissible ghost: painted manually
+                        // (icon_button has no disabled tint).
+                        let (rect, resp) = ui
+                            .allocate_exact_size(Vec2::splat(widgets::BUTTON_SIZE), Sense::click());
+                        icons::paint(ui, rect, Icon::Monitor, 16.0, t.text_faint);
+                        let resp = resp.on_hover_text(tip);
+                        if resp.clicked() {
+                            self.dismissed_monitors.insert(row.stable_id.clone());
+                        } else if resp.secondary_clicked() {
+                            shared.push(Command::RenameMonitor(row.stable_id.clone()));
+                        }
+                    }
+                }
                 if shared.lock_settings().db_status {
                     let writing = shared.writer.pending_writes() > 0;
                     let reading = shared.writer.is_reading();
@@ -3066,6 +3207,7 @@ impl Viewer {
         let modal_open = self.confirm_close
             || self.resize.is_some()
             || self.rename.is_some()
+            || self.monitor_rename.is_some()
             || self.protect.is_some()
             || self.confirm_delete.is_some()
             || shared.modal_child_open();
@@ -3732,6 +3874,69 @@ impl Viewer {
         }
         if !(cancel || (apply && !state.taken)) {
             self.rename = Some(state);
+        }
+    }
+
+    /// The monitor-rename prompt (status strip right-click): one name
+    /// field. Applying writes `Settings::monitors[id].name` — an empty
+    /// draft clears the custom name back to the OS name.
+    fn monitor_rename_dialog(&mut self, ctx: &egui::Context, shared: &Shared) {
+        let Some(mut state) = self.monitor_rename.take() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-monitor-rename"),
+            &t!("viewer.monitor.rename_title"),
+            300.0,
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t!("dialog.rename.label").to_string());
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut state.draft)
+                            .desired_width(180.0)
+                            .font(theme::medium(12.0)),
+                    );
+                    if !state.focused {
+                        field.request_focus();
+                        state.focused = true;
+                    }
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                });
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::primary_button(ui, &t!("dialog.rename.ok")).clicked() {
+                        apply = true;
+                    }
+                    if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            },
+        );
+        if resp.should_close() || resp.inner.0 {
+            cancel = true;
+        }
+        if apply {
+            let name = state.draft.trim().to_owned();
+            {
+                let mut s = shared.lock_settings();
+                let prefs = s.monitors.entry(state.stable_id.clone()).or_default();
+                prefs.name = (!name.is_empty()).then_some(name.clone());
+                s.save();
+            }
+            tracing::info!(
+                setting = "monitor_name",
+                id = %state.stable_id,
+                "settings_changed"
+            );
+        }
+        if !(cancel || apply) {
+            self.monitor_rename = Some(state);
         }
     }
 
@@ -4972,5 +5177,54 @@ mod tests {
         v.mosaic_zoom_in();
         v.sync_thumb_queue();
         assert!(v.thumb_queue.is_empty());
+    }
+
+    /// Connected inventory rows first, persisted-but-absent after;
+    /// dismissed ghosts stay hidden while their prefs entry survives.
+    #[test]
+    fn monitor_rows_union_and_dismissal() {
+        fn ident(id: &str, x: i32) -> crate::platform::MonitorIdentity {
+            crate::platform::MonitorIdentity {
+                stable_id: id.to_owned(),
+                info: MonitorInfo {
+                    id: 1,
+                    name: format!("OS {id}"),
+                    rect: PhysicalRect {
+                        x,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                    },
+                    scale_factor: 1.0,
+                    is_primary: false,
+                },
+            }
+        }
+        let inventory = vec![ident("a", 0)];
+        let mut prefs = std::collections::BTreeMap::new();
+        prefs.insert(
+            "a".to_owned(),
+            crate::config::MonitorPrefs {
+                name: Some("Bureau".into()),
+                rect_native: None,
+            },
+        );
+        prefs.insert(
+            "gone".to_owned(),
+            crate::config::MonitorPrefs {
+                name: Some("Ancien".into()),
+                rect_native: None,
+            },
+        );
+        let rows = monitor_rows(&inventory, &prefs, &std::collections::HashSet::new());
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].connected && rows[0].label == "Bureau");
+        assert!(!rows[1].connected && rows[1].label == "Ancien");
+        // A dismissed ghost disappears — its prefs entry is untouched.
+        let dismissed: std::collections::HashSet<String> =
+            ["gone".to_owned()].into_iter().collect();
+        let rows = monitor_rows(&inventory, &prefs, &dismissed);
+        assert_eq!(rows.len(), 1);
+        assert!(prefs.contains_key("gone"));
     }
 }

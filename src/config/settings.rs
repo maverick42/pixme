@@ -85,6 +85,23 @@ pub enum TabSort {
     ByDate,
 }
 
+/// Per-monitor persisted preferences, keyed by the monitor's stable id
+/// ([`crate::platform::MonitorIdentity::stable_id`]). Entries are never
+/// dropped when the monitor disconnects — a reconnected display gets its
+/// name and geometry back silently.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitorPrefs {
+    /// The user's display name for the monitor (`None` = the OS name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The viewer window's rect on this monitor `[x, y, w, h]`, in the
+    /// monitor's native units (physical px on Windows, points on macOS)
+    /// — applied when the monitor is re-selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rect_native: Option<[i32; 4]>,
+}
+
 /// The complete persisted settings file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -151,6 +168,10 @@ pub struct Settings {
     /// Sequential counter consumed by `#` placeholders in the template.
     #[serde(default = "default_filename_counter")]
     pub filename_counter: u64,
+    /// Per-monitor preferences, keyed by stable id — names and saved
+    /// window geometry; entries survive disconnects (see [`MonitorPrefs`]).
+    #[serde(default)]
+    pub monitors: std::collections::BTreeMap<String, MonitorPrefs>,
 }
 
 fn default_text_color() -> [u8; 3] {
@@ -214,6 +235,7 @@ impl Default for Settings {
             filename_template: default_filename_template(),
             filename_templates: default_filename_templates(),
             filename_counter: default_filename_counter(),
+            monitors: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -379,5 +401,33 @@ mod tests {
         assert_eq!(s.recent_files, vec![PathBuf::from("/tmp/a.png")]);
         s.remove_recent(&PathBuf::from("/tmp/missing.png"));
         assert_eq!(s.recent_files, vec![PathBuf::from("/tmp/a.png")]);
+    }
+
+    /// The monitors map round-trips through JSON, including the sparse
+    /// optional fields (a name-only entry writes no `rect_native` key).
+    #[test]
+    fn monitor_prefs_serde_round_trip() {
+        let mut s = Settings::default();
+        s.monitors.insert(
+            "uuid-1".into(),
+            MonitorPrefs {
+                name: Some("Dell bureau".into()),
+                rect_native: Some([0, 0, 2560, 1440]),
+            },
+        );
+        s.monitors.insert(
+            "uuid-2".into(),
+            MonitorPrefs {
+                name: Some("Side".into()),
+                rect_native: None,
+            },
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("rect_native\":null"));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.monitors, s.monitors);
+        // A prefs file without the key at all still loads (older versions).
+        let bare: Settings = serde_json::from_str("{}").unwrap();
+        assert!(bare.monitors.is_empty());
     }
 }

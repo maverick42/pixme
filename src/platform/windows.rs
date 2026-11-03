@@ -1123,3 +1123,81 @@ pub fn capture_chrome_enter() {}
 
 /// No-op on Windows (see [`capture_chrome_enter`]).
 pub fn capture_chrome_exit() {}
+
+/// The monitor's PNP DeviceID (`EnumDisplayDevicesW` with
+/// `EDD_GET_DEVICE_INTERFACE_NAME`) — stable per physical monitor on the
+/// same port; it may change when the cable moves ports, which the
+/// geometry-key fallback covers poorly (documented limitation). `None`
+/// when no entry matches the xcap device name (`\\.\DISPLAYn`).
+pub(crate) fn stable_monitor_id(monitor: &crate::capture::MonitorInfo) -> Option<String> {
+    const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 0x0000_0001;
+
+    // DISPLAY_DEVICEW — cb, DeviceName[32], DeviceString[128],
+    // StateFlags, DeviceID[128], DeviceKey[128].
+    #[repr(C)]
+    struct DisplayDevice {
+        cb: u32,
+        device_name: [u16; 32],
+        device_string: [u16; 128],
+        state_flags: u32,
+        device_id: [u16; 128],
+        device_key: [u16; 128],
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumDisplayDevicesW(
+            dev: *const u16,
+            num: u32,
+            dd: *mut DisplayDevice,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn blank() -> DisplayDevice {
+        DisplayDevice {
+            cb: std::mem::size_of::<DisplayDevice>() as u32,
+            device_name: [0; 32],
+            device_string: [0; 128],
+            state_flags: 0,
+            device_id: [0; 128],
+            device_key: [0; 128],
+        }
+    }
+    fn utf16_trim(buf: &[u16]) -> String {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    }
+
+    for i in 0.. {
+        let mut dd = blank();
+        if unsafe { EnumDisplayDevicesW(std::ptr::null(), i, &mut dd, 0) } == 0 {
+            break;
+        }
+        // xcap's monitor name is the GDI device name ("\\.\DISPLAY1")
+        // read from MONITORINFOEXW.szDevice — the adapter to drill into.
+        if utf16_trim(&dd.device_name) != monitor.name {
+            continue;
+        }
+        for j in 0.. {
+            let mut md = blank();
+            if unsafe {
+                EnumDisplayDevicesW(
+                    dd.device_name.as_ptr(),
+                    j,
+                    &mut md,
+                    EDD_GET_DEVICE_INTERFACE_NAME,
+                )
+            } == 0
+            {
+                break;
+            }
+            let id = utf16_trim(&md.device_id);
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+        break;
+    }
+    None
+}

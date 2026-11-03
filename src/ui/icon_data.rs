@@ -295,4 +295,9 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         "triangle-alert",
         include_bytes!("../../assets/icons/triangle-alert.svg"),
     ),
+    (
+        Icon::RefreshCw,
+        "refresh-cw",
+        include_bytes!("../../assets/icons/refresh-cw.svg"),
+    ),
 ];

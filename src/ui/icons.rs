@@ -129,6 +129,8 @@ pub enum Icon {
     Smile,
     /// Session-store write failure on a tab / mosaic tile.
     TriangleAlert,
+    /// Re-enumerate the connected monitors (status strip).
+    RefreshCw,
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

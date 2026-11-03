@@ -1232,3 +1232,37 @@ pub fn elevate_overlay() {
         }
     }
 }
+
+/// The display's stable UUID (`CGDisplayCreateUUIDFromDisplayID`) — derived
+/// from the monitor's vendor/model/serial, it survives reconnects, port
+/// changes and reboots, unlike `CGDirectDisplayID` which is per-session.
+/// `None` when the OS reports none: the caller falls back to a geometry key.
+pub(crate) fn stable_monitor_id(monitor: &crate::capture::MonitorInfo) -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::ffi::c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *const c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        // `NULL` allocator = kCFAllocatorDefault.
+        fn CFUUIDCreateString(alloc: *const c_void, uuid: *const c_void) -> CFStringRef;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    unsafe {
+        let uuid = CGDisplayCreateUUIDFromDisplayID(monitor.id);
+        if uuid.is_null() {
+            return None;
+        }
+        let raw = CFUUIDCreateString(std::ptr::null(), uuid);
+        CFRelease(uuid);
+        if raw.is_null() {
+            return None;
+        }
+        Some(CFString::wrap_under_create_rule(raw).to_string())
+    }
+}

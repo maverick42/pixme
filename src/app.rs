@@ -128,6 +128,12 @@ pub enum Command {
     ConfirmDiscard,
     /// Unsaved-session confirmation: cancel.
     ConfirmCancel,
+    /// Move the viewer onto the monitor with this stable id (status strip).
+    SelectMonitor(String),
+    /// Re-enumerate the connected monitors (status strip ↻ button).
+    RefreshMonitors,
+    /// Open the monitor-rename prompt (status strip right-click).
+    RenameMonitor(String),
     /// Close a pinned capture window.
     ClosePin(u32),
     /// Copy a pinned capture's image to the clipboard.
@@ -232,6 +238,9 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         | Command::RenameActive
         | Command::OpenDraw
         | Command::PrintActive
+        | Command::SelectMonitor(_)
+        | Command::RefreshMonitors
+        | Command::RenameMonitor(_)
         | Command::SavePin(_) => false,
     }
 }
@@ -324,6 +333,10 @@ pub struct Shared {
     /// write time (the viewer's own ppp), so the countdown never has to
     /// mix two windows' point spaces (mixed-DPI safe).
     pub viewer_monitor: Mutex<Option<MonitorInfo>>,
+    /// The connected monitors with their OS-stable ids — the status
+    /// strip's monitor row. Snapshot refreshed at startup and on
+    /// [`Command::RefreshMonitors`]; never re-enumerated per frame.
+    pub monitors: Mutex<Vec<platform::MonitorIdentity>>,
     /// winit `available_monitors()` placements `(x, y, w, h)` in physical
     /// pixels, snapshotted for the overlay's `with_monitor`/`SetMonitor`
     /// targeting (xcap and winit don't enumerate in the same order).
@@ -828,6 +841,41 @@ impl Shared {
                 let mut viewer = lock(&self.viewer);
                 viewer.confirm_close = false;
                 viewer.confirm_then_quit = false;
+            }
+            Command::SelectMonitor(stable_id) => {
+                let target = lock(&self.monitors)
+                    .iter()
+                    .find(|m| m.stable_id == stable_id)
+                    .map(|m| m.info.clone());
+                if let Some(m) = target {
+                    // The viewer pass applies it via
+                    // `place_viewer_on_monitor` — kept if already on
+                    // that monitor, centred there otherwise.
+                    *lock(&self.viewer_target_monitor) = Some(m);
+                    ctx.repaint_if_live(viewer_id());
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
+            Command::RefreshMonitors => {
+                *lock(&self.monitors) = platform::monitor_identities();
+                tracing::info!(count = lock(&self.monitors).len(), "monitors_refreshed");
+                ctx.repaint_if_live(viewer_id());
+            }
+            Command::RenameMonitor(stable_id) => {
+                // The draft opens on the custom name, or the OS name when
+                // none was chosen yet — the field never starts empty.
+                let name = lock(&self.settings)
+                    .monitors
+                    .get(&stable_id)
+                    .and_then(|p| p.name.clone())
+                    .or_else(|| {
+                        lock(&self.monitors)
+                            .iter()
+                            .find(|m| m.stable_id == stable_id)
+                            .map(|m| m.info.name.clone())
+                    })
+                    .unwrap_or_else(|| stable_id.clone());
+                lock(&self.viewer).open_monitor_rename(stable_id, name);
             }
             Command::ClosePin(id) => {
                 // Deregistering the viewport next pass destroys the window.
@@ -1841,6 +1889,7 @@ impl PixMeApp {
                 viewer_rect: Mutex::new(None),
                 viewer_target_monitor: Mutex::new(None),
                 viewer_monitor: Mutex::new(None),
+                monitors: Mutex::new(platform::monitor_identities()),
                 winit_placements: Mutex::new(Vec::new()),
                 settings_open: AtomicBool::new(false),
                 about_open: AtomicBool::new(false),
@@ -2660,6 +2709,7 @@ mod tests {
             viewer_rect: Mutex::new(None),
             viewer_target_monitor: Mutex::new(None),
             viewer_monitor: Mutex::new(None),
+            monitors: Mutex::new(Vec::new()),
             winit_placements: Mutex::new(Vec::new()),
             settings_open: AtomicBool::new(false),
             about_open: AtomicBool::new(false),
@@ -3009,6 +3059,9 @@ mod tests {
             Command::ConfirmSave,
             Command::ConfirmDiscard,
             Command::ConfirmCancel,
+            Command::SelectMonitor(String::new()),
+            Command::RefreshMonitors,
+            Command::RenameMonitor(String::new()),
             Command::ClosePin(0),
             Command::CopyPin(0),
             Command::SavePin(0),
@@ -3077,6 +3130,21 @@ mod tests {
             (Command::ConfirmSave, true, true, true, true),
             (Command::ConfirmDiscard, true, true, true, true),
             (Command::ConfirmCancel, true, true, true, true),
+            (
+                Command::SelectMonitor(String::new()),
+                false,
+                false,
+                false,
+                false,
+            ),
+            (Command::RefreshMonitors, false, false, false, false),
+            (
+                Command::RenameMonitor(String::new()),
+                false,
+                false,
+                false,
+                false,
+            ),
             (Command::ClosePin(1), true, true, true, true),
             (Command::CopyPin(1), true, true, true, true),
             (Command::SavePin(1), false, false, false, false),

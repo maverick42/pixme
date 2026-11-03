@@ -104,6 +104,46 @@ pub use macos::window_list;
 #[cfg(target_os = "windows")]
 pub use windows::window_list;
 
+/// A connected monitor plus its OS-stable identifier — the key used by
+/// the persisted `monitors` prefs map (custom name and, later, saved
+/// geometry). The stable id survives disconnect/reconnect cycles
+/// (CGDisplay UUID on macOS, monitor PNP DeviceID on Windows); when the
+/// OS reports none, a geometry key stands in.
+#[derive(Clone, Debug)]
+pub struct MonitorIdentity {
+    /// Stable key into `Settings::monitors`.
+    pub stable_id: String,
+    /// The live monitor record (xcap enumeration).
+    pub info: crate::capture::MonitorInfo,
+}
+
+/// The OS-stable id for `info`, or `None` — the caller falls back to a
+/// geometry key.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::stable_monitor_id;
+/// The OS-stable id for `info` (see above).
+#[cfg(target_os = "windows")]
+pub(crate) use windows::stable_monitor_id;
+
+/// The connected monitors with their stable identities, for the status
+/// strip's monitor row. Enumeration failures yield an empty list (the
+/// strip simply shows no monitor buttons).
+pub fn monitor_identities() -> Vec<MonitorIdentity> {
+    crate::capture::screen::monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|info| {
+            let stable_id = stable_monitor_id(&info).unwrap_or_else(|| {
+                format!(
+                    "rect:{},{},{}x{}",
+                    info.rect.x, info.rect.y, info.rect.width, info.rect.height
+                )
+            });
+            MonitorIdentity { stable_id, info }
+        })
+        .collect()
+}
+
 /// Lock helper: recover a poisoned mutex rather than crash a menu callback.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
