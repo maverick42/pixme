@@ -396,6 +396,12 @@ pub struct Shared {
     /// The in-flight quit-time flush: `Some` while the writer drains
     /// its queue; the reply (or the deadline) closes the app.
     pub quit_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// The in-flight monitor refresh: `RefreshMonitors` enumerates off
+    /// the UI thread — `xcap` + `EnumDisplayDevices` + `QueryDisplayConfig`
+    /// can block for a long time (RDP, indirect displays) — and `pump`
+    /// swaps the list in when the reply lands.
+    pub monitors_rx:
+        Mutex<Option<std::sync::mpsc::Receiver<Vec<platform::MonitorIdentity>>>>,
     /// When the quit flush was requested — bounds the wait.
     quit_started: Mutex<Option<std::time::Instant>>,
     /// The in-flight "Tout enregistrer" batch: the worker owns the tabs
@@ -686,6 +692,28 @@ impl Shared {
             self.finish_restore(session);
             ctx.repaint_if_live(viewer_id());
         }
+        // A background monitor refresh lands here — swap the cached
+        // list. While it runs, keep repainting so the poll stays alive
+        // in Idle too (same trap as `quit_rx`). Bound first: a scrutinee
+        // temporary would keep the `monitors_rx` guard held through the
+        // match arms, which relock it — instant self-deadlock.
+        let refresh = lock(&self.monitors_rx).as_ref().map(|r| r.try_recv());
+        match refresh {
+            Some(Ok(list)) => {
+                tracing::info!(count = list.len(), "monitors_refreshed");
+                *lock(&self.monitors) = list;
+                *lock(&self.monitors_rx) = None;
+                ctx.repaint_if_live(viewer_id());
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                // The worker died mid-enumeration — free the slot so a
+                // later refresh can retry.
+                tracing::warn!("monitor refresh worker died");
+                *lock(&self.monitors_rx) = None;
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => ctx.request_repaint(),
+            None => {}
+        }
         // A background save-all finished: the tabs come back into the
         // viewer; a ConfirmSave batch then closes the (now clean)
         // session, or keeps it open when some tab is still unsaved.
@@ -920,9 +948,17 @@ impl Shared {
                 }
             }
             Command::RefreshMonitors => {
-                *lock(&self.monitors) = platform::monitor_identities();
-                tracing::info!(count = lock(&self.monitors).len(), "monitors_refreshed");
-                ctx.repaint_if_live(viewer_id());
+                // Enumeration blocks on OS display queries — run it off
+                // the UI thread; `pump` swaps the list in on reply.
+                if lock(&self.monitors_rx).is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(platform::monitor_identities());
+                    });
+                    *lock(&self.monitors_rx) = Some(rx);
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    ctx.repaint_if_live(viewer_id());
+                }
             }
             Command::RenameMonitor(stable_id) => {
                 // The draft opens on the custom name, or the OS name when
@@ -2032,6 +2068,7 @@ impl PixMeApp {
                 },
                 restore_rx: Mutex::new(None),
                 quit_rx: Mutex::new(None),
+                monitors_rx: Mutex::new(None),
                 quit_started: Mutex::new(None),
                 save_all: Mutex::new(None),
                 save_one: Mutex::new(None),
@@ -2807,6 +2844,7 @@ mod tests {
             ),
             restore_rx: Mutex::new(None),
             quit_rx: Mutex::new(None),
+            monitors_rx: Mutex::new(None),
             quit_started: Mutex::new(None),
             save_all: Mutex::new(None),
             save_one: Mutex::new(None),

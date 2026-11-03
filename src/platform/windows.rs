@@ -1306,6 +1306,19 @@ pub(crate) fn monitor_kind(info: &crate::capture::MonitorInfo) -> crate::capture
         header: DisplayConfigDeviceInfoHeader,
         view_gdi_device_name: [u16; 32],
     }
+    // DISPLAYCONFIG_MODE_INFO: QueryDisplayConfig fills one 64-byte
+    // struct per mode — header (infoType, id, adapterId LUID) plus the
+    // 48-byte target/source/desktop-image union. The modes are unused
+    // here but the buffer must still be real: sizing it in `c_void`
+    // elements overflows the allocation eightfold.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayConfigModeInfo {
+        info_type: u32,
+        id: u32,
+        adapter_id: i64,
+        payload: [u64; 6],
+    }
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -1354,17 +1367,22 @@ pub(crate) fn monitor_kind(info: &crate::capture::MonitorInfo) -> crate::capture
         };
         n_path as usize
     ];
-    let mut modes: Vec<c_void> = Vec::new();
-    if n_mode > 0 {
-        modes.reserve(n_mode as usize);
-    }
+    let mut modes = vec![
+        DisplayConfigModeInfo {
+            info_type: 0,
+            id: 0,
+            adapter_id: 0,
+            payload: [0; 6],
+        };
+        n_mode as usize
+    ];
     if unsafe {
         QueryDisplayConfig(
             QDC_ONLY_ACTIVE_PATHS,
             &mut n_path,
             paths.as_mut_ptr(),
             &mut n_mode,
-            modes.as_mut_ptr(),
+            modes.as_mut_ptr() as *mut c_void,
             std::ptr::null_mut(),
         )
     } != 0
