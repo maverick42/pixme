@@ -536,7 +536,21 @@ impl OverlaySession {
         if blind {
             ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
-        let cursor = if blind {
+        // A press swallowed by the WindowServer top-edge zone freezes the
+        // overlay's repaints: no OS event reaches egui, so show() stops
+        // running and the selection never follows the cursor. Poll a
+        // repaint every 16 ms while the physical button is held without
+        // egui seeing a press (or while a drag is live) so the blind
+        // drag keeps tracking the OS cursor.
+        if blind || self.drag.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        let cursor = if blind || self.drag.is_some() {
+            // The OS cursor, not egui's `latest_pos`: a press swallowed by
+            // the top-edge zone captures the mouse — egui stops receiving
+            // mouse-moves, so its position freezes at the press point. At
+            // release `blind` flips false and the stale egui pos would
+            // squash the selection back to nothing.
             self.os_cursor_pos(&ctx)
         } else {
             self.cursor_pos(&ctx)
@@ -636,12 +650,18 @@ impl OverlaySession {
     /// button — a press eaten by an OS edge zone (`resp.drag_started`
     /// never fired) still starts a drag while the cursor sits in bounds.
     fn handle_drag(&mut self, pos: Pos2, resp: &egui::Response, bounds: Rect, os_down: bool) {
-        let in_bounds = bounds.contains(pos);
         let pos = clamp_pos(pos, bounds);
         let synthetic = self
             .suppress_press_until
             .is_some_and(|until| std::time::Instant::now() < until);
-        if self.drag.is_none() && !synthetic && (resp.drag_started() || (os_down && in_bounds)) {
+        // A press swallowed by an OS edge zone (macOS top strip) never
+        // reaches egui — start the blind drag on the physical button
+        // alone. `in_bounds` must NOT gate it: pressing at the very top
+        // of the screen puts the cursor outside the window's bounds, and
+        // gating there left the press dead (no selection, drag end on
+        // release, nothing to cancel with Esc). `pos` is clamped to the
+        // bounds, so the anchor lands on the top edge.
+        if self.drag.is_none() && !synthetic && (resp.drag_started() || os_down) {
             self.blind_drag = !resp.drag_started();
             self.drag = Some(if let Some(sel) = self.selection {
                 if let Some(h) = hit_handle(sel, pos) {
