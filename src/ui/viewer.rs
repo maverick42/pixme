@@ -2470,6 +2470,18 @@ impl Viewer {
                             }
                             if widgets::tool_button(
                                 ui,
+                                Icon::Settings,
+                                &t!("vbar.settings.label"),
+                                false,
+                                false,
+                                shared.command_enabled(&Command::OpenSettings),
+                            )
+                            .clicked()
+                            {
+                                shared.push(Command::OpenSettings);
+                            }
+                            if widgets::tool_button(
+                                ui,
                                 Icon::X,
                                 &t!("vbar.close.label"),
                                 false,
