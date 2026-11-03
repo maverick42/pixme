@@ -400,8 +400,7 @@ pub struct Shared {
     /// the UI thread — `xcap` + `EnumDisplayDevices` + `QueryDisplayConfig`
     /// can block for a long time (RDP, indirect displays) — and `pump`
     /// swaps the list in when the reply lands.
-    pub monitors_rx:
-        Mutex<Option<std::sync::mpsc::Receiver<Vec<platform::MonitorIdentity>>>>,
+    pub monitors_rx: Mutex<Option<std::sync::mpsc::Receiver<Vec<platform::MonitorIdentity>>>>,
     /// When the quit flush was requested — bounds the wait.
     quit_started: Mutex<Option<std::time::Instant>>,
     /// The in-flight "Tout enregistrer" batch: the worker owns the tabs

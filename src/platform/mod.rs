@@ -34,7 +34,6 @@ pub trait PlatformServices: Send + Sync {
     fn capture_permission_status(&self) -> Option<bool> {
         None
     }
-
 }
 
 /// The implementation for the running OS.

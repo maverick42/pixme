@@ -358,6 +358,7 @@ impl OverlaySession {
         // bounds, so painting AND input cover the monitor edge to edge.
         let rect = ctx
             .input(|i| i.viewport().inner_rect)
+            .map(|r| Rect::from_min_size(Pos2::ZERO, r.size()))
             .unwrap_or_else(|| ui.max_rect());
         let t = theme::tokens(&ctx);
         ui.painter().rect_filled(rect, 0.0, t.dock);

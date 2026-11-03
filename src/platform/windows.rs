@@ -28,7 +28,6 @@ impl PlatformServices for Windows {
         // Windows needs no screen-capture permission.
         Ok(())
     }
-
 }
 
 /// The 1×1 invisible anchor viewport gets NO taskbar button: on Windows a
