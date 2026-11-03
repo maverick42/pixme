@@ -440,6 +440,17 @@ pub use windows::{
     left_mouse_down, unhide_cursor,
 };
 
+/// Locks the viewer window in place: position changes then happen only
+/// through the status-strip monitor buttons. macOS applies
+/// `setMovable(false)` on the viewer's NSWindow; Windows subclasses the
+/// viewer HWND to swallow caption drags and `SC_MOVE`. Returns `true`
+/// once applied — callers retry while the native window is created.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::viewer_move_lock;
+/// Locks the viewer window in place (see above).
+#[cfg(target_os = "windows")]
+pub(crate) use windows::viewer_move_lock;
+
 #[cfg(test)]
 mod tests {
     use super::*;

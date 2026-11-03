@@ -326,9 +326,9 @@ pub struct Shared {
     /// Last on-screen outer rectangle of the viewer viewport (restored on
     /// reopen and translated onto the captured monitor after a capture).
     pub viewer_rect: Mutex<Option<egui::Rect>>,
-    /// Monitor the viewer must appear on when it next opens (set after a
-    /// capture confirms so the viewer lands on the captured screen).
-    pub viewer_target_monitor: Mutex<Option<MonitorInfo>>,
+    /// Where the viewer must land: a monitor plus, when one was saved,
+    /// its persisted outer rect in NATIVE units (per-monitor geometry).
+    pub viewer_target: Mutex<Option<ViewerTarget>>,
     /// Monitor the viewer currently sits on — resolved in NATIVE units at
     /// write time (the viewer's own ppp), so the countdown never has to
     /// mix two windows' point spaces (mixed-DPI safe).
@@ -337,6 +337,23 @@ pub struct Shared {
     /// strip's monitor row. Snapshot refreshed at startup and on
     /// [`Command::RefreshMonitors`]; never re-enumerated per frame.
     pub monitors: Mutex<Vec<platform::MonitorIdentity>>,
+    /// Geometry ledger for programmatic viewer moves — commands are
+    /// deduped against the last REQUESTED rect, never reported ones.
+    pub viewer_sync: Mutex<ui::viewport_sync::ViewportSync>,
+    /// Frames to skip before re-sampling the reported `viewer_rect` —
+    /// set after a programmatic move so a transient mid-DPI rect is
+    /// never persisted.
+    pub viewer_geo_settle: Mutex<u8>,
+    /// The viewer's native rect changed on its current monitor —
+    /// `prefs.monitors[id].rect_native` is stale and `pump` flushes a
+    /// debounced `settings.save()`.
+    pub monitor_geom_dirty_at: Mutex<Option<std::time::Instant>>,
+    /// The OS move lock was applied to the viewer window (macOS
+    /// `setMovable`, Windows caption subclass) — retried while the
+    /// native window is being created.
+    pub viewer_move_lock_done: AtomicBool,
+    /// Move-lock attempts so far (~1.5 s bound, like `maybe_focus`).
+    pub viewer_move_lock_tries: std::sync::atomic::AtomicU8,
     /// winit `available_monitors()` placements `(x, y, w, h)` in physical
     /// pixels, snapshotted for the overlay's `with_monitor`/`SetMonitor`
     /// targeting (xcap and winit don't enumerate in the same order).
@@ -426,6 +443,17 @@ pub struct Shared {
     /// One-shot notice drawn by the first window to appear (the Windows
     /// data/logs fallback message — set at startup, cleared on OK).
     pub startup_notice: Mutex<Option<String>>,
+}
+
+/// Where the viewer must land: `monitor` plus the persisted outer rect
+/// in the monitor's NATIVE units when prefs hold one (`None` = centre
+/// the window on that monitor with its current size).
+#[derive(Clone, Debug)]
+pub struct ViewerTarget {
+    /// The destination monitor.
+    pub monitor: MonitorInfo,
+    /// Saved outer rect `[x, y, w, h]` in native units, if any.
+    pub native_rect: Option<[i32; 4]>,
 }
 
 /// `capture_id` source — every capture gets one id so its whole life
@@ -551,6 +579,15 @@ impl Shared {
     pub fn pump(&self, ctx: &egui::Context) {
         crate::logging::report_health();
         platform::strip_undecorated_frame();
+        // Debounced per-monitor geometry save: the viewer writes
+        // `rect_native` on every settled move/resize — a half-second of
+        // quiet flushes `prefs.json` once per gesture.
+        let flush = lock(&self.monitor_geom_dirty_at)
+            .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(500));
+        if flush {
+            *lock(&self.monitor_geom_dirty_at) = None;
+            lock(&self.settings).save();
+        }
         // The quit-time flush finished on the store thread — or the
         // wait ran out / the writer died: the app closes either way.
         // Checked before `dispatch` so the pass that initiates `Quit`
@@ -848,10 +885,9 @@ impl Shared {
                     .find(|m| m.stable_id == stable_id)
                     .map(|m| m.info.clone());
                 if let Some(m) = target {
-                    // The viewer pass applies it via
-                    // `place_viewer_on_monitor` — kept if already on
-                    // that monitor, centred there otherwise.
-                    *lock(&self.viewer_target_monitor) = Some(m);
+                    // The viewer pass applies it: the saved native rect
+                    // when prefs hold one, centred otherwise.
+                    *lock(&self.viewer_target) = Some(self.viewer_target_for(m));
                     ctx.repaint_if_live(viewer_id());
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
@@ -1294,6 +1330,12 @@ impl Shared {
             // front.
             if next == AppState::Viewer {
                 self.request_focus(viewer_id());
+                // The viewport's native window is destroyed on
+                // deregistration and rebuilt on re-entry: the geometry
+                // ledger and the OS move lock must be re-applied.
+                *lock(&self.viewer_sync) = ui::viewport_sync::ViewportSync::new("PixMe Viewer");
+                self.viewer_move_lock_done.store(false, Ordering::Relaxed);
+                self.viewer_move_lock_tries.store(0, Ordering::Relaxed);
             }
         }
         // Restoring runs on EVERY viewer entry (guarded to once): a
@@ -1302,6 +1344,30 @@ impl Shared {
             self.restore_session(ctx);
         }
         ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+
+    /// The stable id of the inventory monitor matching `m` by rect —
+    /// xcap ids are unstable across enumerations on Windows.
+    fn monitor_stable_id(&self, m: &MonitorInfo) -> Option<String> {
+        lock(&self.monitors)
+            .iter()
+            .find(|id| id.info.rect == m.rect)
+            .map(|id| id.stable_id.clone())
+    }
+
+    /// The landing target for `m`: the persisted native rect when prefs
+    /// hold one for its stable id, else the centred/current-size default.
+    fn viewer_target_for(&self, m: MonitorInfo) -> ViewerTarget {
+        let native_rect = self.monitor_stable_id(&m).and_then(|id| {
+            lock(&self.settings)
+                .monitors
+                .get(&id)
+                .and_then(|p| p.rect_native)
+        });
+        ViewerTarget {
+            monitor: m,
+            native_rect,
+        }
     }
 
     /// Resolves the dirty-session confirmation: ends the session and either
@@ -1478,7 +1544,7 @@ impl Shared {
             return;
         }
         // Open the viewer on the monitor that was just captured.
-        *lock(&self.viewer_target_monitor) = Some(frame.monitor.clone());
+        *lock(&self.viewer_target) = Some(self.viewer_target_for(frame.monitor.clone()));
         let title = {
             let mut viewer = lock(&self.viewer);
             let title = self.capture_title();
@@ -1689,6 +1755,11 @@ impl Shared {
     /// the meta columns. `pump()` closes the app when the barrier
     /// lifts or the timeout expires; the saving veil covers the wait.
     fn quit_now(&self, ctx: &egui::Context) {
+        // Flush a pending monitor-geometry save first — the debounce
+        // timer may not have fired yet.
+        if lock(&self.monitor_geom_dirty_at).take().is_some() {
+            lock(&self.settings).save();
+        }
         if !self.session_persists() {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
             return;
@@ -1887,9 +1958,14 @@ impl PixMeApp {
                 settings: Mutex::new(settings),
                 viewer: Mutex::new(Viewer::default()),
                 viewer_rect: Mutex::new(None),
-                viewer_target_monitor: Mutex::new(None),
+                viewer_target: Mutex::new(None),
                 viewer_monitor: Mutex::new(None),
                 monitors: Mutex::new(platform::monitor_identities()),
+                viewer_sync: Mutex::new(ui::viewport_sync::ViewportSync::new("PixMe Viewer")),
+                viewer_geo_settle: Mutex::new(0),
+                monitor_geom_dirty_at: Mutex::new(None),
+                viewer_move_lock_done: AtomicBool::new(false),
+                viewer_move_lock_tries: std::sync::atomic::AtomicU8::new(0),
                 winit_placements: Mutex::new(Vec::new()),
                 settings_open: AtomicBool::new(false),
                 about_open: AtomicBool::new(false),
@@ -1991,13 +2067,13 @@ impl eframe::App for PixMeApp {
                 // If a capture just landed on a specific monitor, make sure
                 // the viewer opens on that monitor (preserving its relative
                 // placement / size when already known, or centring it there).
-                if let Some(m) = lock(&shared.viewer_target_monitor).clone() {
-                    // The window is being (re)built ON m: its ppp is m's
-                    // own scale.
-                    let next = place_viewer_on_monitor(
+                if let Some(t) = lock(&shared.viewer_target).clone() {
+                    // The window is being (re)built ON the target monitor:
+                    // its ppp is the monitor's own scale.
+                    let next = target_ui_rect(
+                        &t,
                         *lock(&shared.viewer_rect),
-                        &m,
-                        m.scale_factor.max(1.0),
+                        t.monitor.scale_factor.max(1.0),
                     );
                     *lock(&shared.viewer_rect) = Some(next);
                 }
@@ -2006,23 +2082,85 @@ impl eframe::App for PixMeApp {
                     let ctx = ui.ctx().clone();
                     shared.pump(&ctx);
                     shared.maybe_focus(&ctx, viewer_id());
-                    let target = lock(&shared.viewer_target_monitor).take();
-                    if let Some(m) = target {
-                        // `OuterPosition` is converted back by THIS
-                        // window's current ppp — convert with it so the
-                        // physical target is exact even mid-DPI-change.
-                        let ppp = platform::window_ppp(&ctx, m.scale_factor.max(1.0));
+                    // The viewer is position-locked (macOS `setMovable`,
+                    // Windows caption-drag swallow): retry until the
+                    // platform call finds the freshly-created native
+                    // window, ~1.5 s bound like `maybe_focus`.
+                    if !shared.viewer_move_lock_done.load(Ordering::Relaxed) {
+                        if platform::viewer_move_lock() {
+                            shared.viewer_move_lock_done.store(true, Ordering::Relaxed);
+                        } else if shared
+                            .viewer_move_lock_tries
+                            .fetch_add(1, Ordering::Relaxed)
+                            >= 90
+                        {
+                            tracing::warn!("viewer move lock never applied");
+                            shared.viewer_move_lock_done.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    let target = lock(&shared.viewer_target).take();
+                    if let Some(t) = target {
+                        // Commands are converted back by THIS window's
+                        // current ppp — convert with it so the physical
+                        // target is exact even mid-DPI-change.
+                        let ppp =
+                            platform::window_ppp(&ctx, t.monitor.scale_factor.max(1.0));
                         let next =
-                            place_viewer_on_monitor(*lock(&shared.viewer_rect), &m, ppp);
+                            target_ui_rect(&t, *lock(&shared.viewer_rect), ppp);
                         *lock(&shared.viewer_rect) = Some(next);
-                        *lock(&shared.viewer_monitor) = Some(m);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(next.min));
+                        *lock(&shared.viewer_monitor) = Some(t.monitor);
+                        // `next` is the OUTER rect: `InnerSize` needs the
+                        // decoration delta (outer − inner reported last
+                        // frame; zero until measured).
+                        let deco = ctx.input(|i| {
+                            match (i.viewport().outer_rect, i.viewport().inner_rect) {
+                                (Some(o), Some(n)) => o.size() - n.size(),
+                                _ => egui::Vec2::ZERO,
+                            }
+                        });
+                        let inner = (next.size() - deco).max(egui::vec2(100.0, 100.0));
+                        {
+                            let mut sync = lock(&shared.viewer_sync);
+                            sync.request_outer_position(&ctx, next.min);
+                            sync.request_inner_size(&ctx, inner);
+                        }
+                        // The reported rect lies for a frame or two while
+                        // the move (and any DPI hand-off) settles — never
+                        // persist it.
+                        *lock(&shared.viewer_geo_settle) = 2;
                     } else if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-                        *lock(&shared.viewer_rect) = Some(outer);
-                        let ppp = platform::window_ppp(&ctx, 1.0);
-                        let centre = platform::ui_to_native(outer.center(), ppp);
-                        *lock(&shared.viewer_monitor) =
-                            crate::capture::screen::monitor_at(centre.x, centre.y);
+                        let mut settle = lock(&shared.viewer_geo_settle);
+                        if *settle > 0 {
+                            *settle -= 1;
+                        } else if *lock(&shared.viewer_rect) != Some(outer) {
+                            *lock(&shared.viewer_rect) = Some(outer);
+                            let ppp = platform::window_ppp(&ctx, 1.0);
+                            let centre = platform::ui_to_native(outer.center(), ppp);
+                            let mon = crate::capture::screen::monitor_at(centre.x, centre.y);
+                            *lock(&shared.viewer_monitor) = mon.clone();
+                            // Persist the rect on the current monitor —
+                            // debounced: a resize gesture floods, one
+                            // flush per half-second caps it.
+                            if let Some(m) = mon
+                                && let Some(id) = shared.monitor_stable_id(&m)
+                            {
+                                let n_min = platform::ui_to_native(outer.min, ppp);
+                                let n_max = platform::ui_to_native(outer.max, ppp);
+                                let rect = [
+                                    n_min.x as i32,
+                                    n_min.y as i32,
+                                    (n_max.x - n_min.x) as i32,
+                                    (n_max.y - n_min.y) as i32,
+                                ];
+                                let mut s = lock(&shared.settings);
+                                let prefs = s.monitors.entry(id).or_default();
+                                if prefs.rect_native != Some(rect) {
+                                    prefs.rect_native = Some(rect);
+                                    *lock(&shared.monitor_geom_dirty_at) =
+                                        Some(std::time::Instant::now());
+                                }
+                            }
+                        }
                     }
                     // Draw is modal to the viewer: deferred viewports are
                     // plain top-level windows with no OS child-window
@@ -2527,6 +2665,20 @@ fn place_viewer_on_monitor(
     egui::Rect::from_min_size(pos, size)
 }
 
+/// The viewer's landing rect in the target window's UI units: the
+/// persisted native outer rect converted with `ppp` when one was saved
+/// for the monitor, else the keep-if-inside / centred placement.
+fn target_ui_rect(t: &ViewerTarget, current: Option<egui::Rect>, ppp: f32) -> egui::Rect {
+    match t.native_rect {
+        Some([x, y, w, h]) => {
+            let min = platform::native_to_ui(egui::pos2(x as f32, y as f32), ppp);
+            let size = platform::native_to_ui(egui::pos2(w as f32, h as f32), ppp).to_vec2();
+            egui::Rect::from_min_size(min, size)
+        }
+        None => place_viewer_on_monitor(current, &t.monitor, ppp),
+    }
+}
+
 /// The capture overlay: a borderless always-on-top window covering the
 /// monitor being captured. `MonitorInfo.rect` is in the OS-native display
 /// space (physical px on Windows, points on macOS) — it is converted to
@@ -2707,9 +2859,14 @@ mod tests {
             settings: Mutex::new(Settings::default()),
             viewer: Mutex::new(Viewer::default()),
             viewer_rect: Mutex::new(None),
-            viewer_target_monitor: Mutex::new(None),
+            viewer_target: Mutex::new(None),
             viewer_monitor: Mutex::new(None),
             monitors: Mutex::new(Vec::new()),
+            viewer_sync: Mutex::new(ui::viewport_sync::ViewportSync::new("PixMe Viewer")),
+            viewer_geo_settle: Mutex::new(0),
+            monitor_geom_dirty_at: Mutex::new(None),
+            viewer_move_lock_done: AtomicBool::new(false),
+            viewer_move_lock_tries: std::sync::atomic::AtomicU8::new(0),
             winit_placements: Mutex::new(Vec::new()),
             settings_open: AtomicBool::new(false),
             about_open: AtomicBool::new(false),
