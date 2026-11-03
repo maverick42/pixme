@@ -813,18 +813,20 @@ impl Shared {
             }
             Command::ToggleViewer => {
                 // The resident icon's left click: open the viewer from
-                // Idle or when minimized in the Dock/taskbar (with the
-                // same bring-to-front as `OpenViewer`), close it back
-                // when it is up and visible — `ViewerClosed` carries the
-                // Draw guard, so this just forwards.
-                let minimized = ctx.input(|i| {
-                    i.raw
-                        .viewports
-                        .get(&viewer_id())
-                        .and_then(|v| v.minimized)
-                        .unwrap_or(false)
-                }) || platform::viewer_is_minimized();
-                if *lock(&self.state) == AppState::Viewer && !minimized {
+                // Idle, minimized in the Dock/taskbar, or simply sitting
+                // behind another app (with the same bring-to-front as
+                // `OpenViewer`) — close it back only when it is up AND
+                // focused. `ViewerClosed` carries the Draw guard, so
+                // this just forwards.
+                let (minimized, focused) = ctx.input(|i| {
+                    let v = i.raw.viewports.get(&viewer_id());
+                    (
+                        v.and_then(|v| v.minimized).unwrap_or(false),
+                        v.and_then(|v| v.focused).unwrap_or(false),
+                    )
+                });
+                let minimized = minimized || platform::viewer_is_minimized();
+                if *lock(&self.state) == AppState::Viewer && !minimized && focused {
                     self.dispatch(Command::ViewerClosed, ctx);
                 } else {
                     self.dispatch(Command::OpenViewer, ctx);

@@ -1243,3 +1243,168 @@ pub(crate) fn stable_monitor_id(monitor: &crate::capture::MonitorInfo) -> Option
 pub fn refocus_capture_overlay(ctx: &egui::Context, id: egui::ViewportId) {
     ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
 }
+
+/// Classifies `info` for the status-strip icon via
+/// `QueryDisplayConfig`/`DisplayConfigGetDeviceInfo`: the path target's
+/// `outputTechnology` distinguishes internal laptop panels
+/// (INTERNAL / LVDS / embedded-DisplayPort), indirect/virtual drivers
+/// (Spacedesk, Miracast receivers...) and real video transports. A path
+/// that can't be resolved yields `Unknown` — never a guessed type.
+pub(crate) fn monitor_kind(info: &crate::capture::MonitorInfo) -> crate::capture::MonitorKind {
+    use crate::capture::MonitorKind;
+
+    const QDC_ONLY_ACTIVE_PATHS: u32 = 0x0000_0002;
+    const DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME: u32 = 1;
+    // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY values (wingdi.h).
+    const TECH_LVDS: u32 = 6;
+    const TECH_DISPLAYPORT_EMBEDDED: u32 = 11;
+    const TECH_MIRACAST: u32 = 15;
+    const TECH_INDIRECT_WIRED: u32 = 16;
+    const TECH_INDIRECT_WIRELESS: u32 = 17;
+    const TECH_INDIRECT_VIRTUAL: u32 = 18;
+    const TECH_INTERNAL: u32 = 0x8000_0000;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayConfigPathSourceInfo {
+        adapter_id: i64,
+        id: u32,
+        mode_info_idx: u32,
+        status_flags: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayConfigPathTargetInfo {
+        adapter_id: i64,
+        id: u32,
+        mode_info_idx: u32,
+        output_technology: u32,
+        rotation: u32,
+        scaling: u32,
+        refresh_num: u32,
+        refresh_den: u32,
+        scan_line_ordering: u32,
+        target_available: i32,
+        status_flags: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayConfigPathInfo {
+        source_info: DisplayConfigPathSourceInfo,
+        target_info: DisplayConfigPathTargetInfo,
+        flags: u32,
+    }
+    #[repr(C)]
+    struct DisplayConfigDeviceInfoHeader {
+        ty: u32,
+        size: u32,
+        adapter_id: i64,
+        id: u32,
+    }
+    #[repr(C)]
+    struct DisplayConfigSourceDeviceName {
+        header: DisplayConfigDeviceInfoHeader,
+        view_gdi_device_name: [u16; 32],
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetDisplayConfigBufferSizes(flags: u32, n_path: *mut u32, n_mode: *mut u32) -> i32;
+        fn QueryDisplayConfig(
+            flags: u32,
+            n_path: *mut u32,
+            paths: *mut DisplayConfigPathInfo,
+            n_mode: *mut u32,
+            modes: *mut c_void,
+            topology: *mut c_void,
+        ) -> i32;
+        fn DisplayConfigGetDeviceInfo(packet: *mut DisplayConfigDeviceInfoHeader) -> i32;
+    }
+
+    use std::ffi::c_void;
+
+    let mut n_path = 0u32;
+    let mut n_mode = 0u32;
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut n_path, &mut n_mode) } != 0
+    {
+        return MonitorKind::Unknown;
+    }
+    let mut paths = vec![
+        DisplayConfigPathInfo {
+            source_info: DisplayConfigPathSourceInfo {
+                adapter_id: 0,
+                id: 0,
+                mode_info_idx: 0,
+                status_flags: 0,
+            },
+            target_info: DisplayConfigPathTargetInfo {
+                adapter_id: 0,
+                id: 0,
+                mode_info_idx: 0,
+                output_technology: 0,
+                rotation: 0,
+                scaling: 0,
+                refresh_num: 0,
+                refresh_den: 0,
+                scan_line_ordering: 0,
+                target_available: 0,
+                status_flags: 0,
+            },
+            flags: 0,
+        };
+        n_path as usize
+    ];
+    let mut modes: Vec<c_void> = Vec::new();
+    if n_mode > 0 {
+        modes.reserve(n_mode as usize);
+    }
+    if unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut n_path,
+            paths.as_mut_ptr(),
+            &mut n_mode,
+            modes.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        return MonitorKind::Unknown;
+    }
+    paths.truncate(n_path as usize);
+
+    for path in &paths {
+        let mut src = DisplayConfigSourceDeviceName {
+            header: DisplayConfigDeviceInfoHeader {
+                ty: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DisplayConfigSourceDeviceName>() as u32,
+                adapter_id: path.source_info.adapter_id,
+                id: path.source_info.id,
+            },
+            view_gdi_device_name: [0u16; 32],
+        };
+        if unsafe { DisplayConfigGetDeviceInfo(&mut src.header) } != 0 {
+            continue;
+        }
+        let end = src
+            .view_gdi_device_name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(32);
+        if String::from_utf16_lossy(&src.view_gdi_device_name[..end]) != info.name {
+            continue;
+        }
+        return match path.target_info.output_technology {
+            TECH_INTERNAL | TECH_LVDS | TECH_DISPLAYPORT_EMBEDDED => MonitorKind::BuiltIn,
+            TECH_INDIRECT_WIRED
+            | TECH_INDIRECT_WIRELESS
+            | TECH_INDIRECT_VIRTUAL
+            | TECH_MIRACAST => MonitorKind::Virtual,
+            // Real video transports: VGA/S-Video/Composite/Component/DVI/
+            // HDMI/D-JPN/SDI/DisplayPort/UDI/SDTV dongle/DP USB tunnel.
+            0..=5 | 8..=10 | 12..=14 | 19 => MonitorKind::External,
+            _ => MonitorKind::Unknown,
+        };
+    }
+    MonitorKind::Unknown
+}

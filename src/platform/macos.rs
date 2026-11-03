@@ -1207,6 +1207,210 @@ pub(crate) fn stable_monitor_id(monitor: &crate::capture::MonitorInfo) -> Option
 /// there is nothing to hand back.
 pub fn refocus_capture_overlay(_ctx: &egui::Context, _id: egui::ViewportId) {}
 
+/// Classifies `info` for the status-strip icon: `CGDisplayIsBuiltin`
+/// covers the laptop panel. The `IODisplayCreateInfoDictionary`
+/// transport splits the rest — `"Virtual"` marks virtual/indirect
+/// displays; an iPad is only claimed `Tablet` when the product name
+/// mentions it (Sidecar), never on the transport alone. Uncertain
+/// lookups fall back to `Unknown`; a plain external monitor reports
+/// no virtual transport → `External`.
+pub(crate) fn monitor_kind(info: &crate::capture::MonitorInfo) -> crate::capture::MonitorKind {
+    use crate::capture::MonitorKind;
+    use std::ffi::{c_char, c_void};
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayIsBuiltin(display: u32) -> bool;
+        fn CGDisplayIOServicePort(display: u32) -> u32;
+    }
+    unsafe extern "C" {
+        fn dlsym(handle: *const c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryEntryCreateCFProperties(
+            entry: u32,
+            properties: *mut core_foundation::dictionary::CFDictionaryRef,
+            allocator: *const c_void,
+            options: u32,
+        ) -> i32;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFStringGetCString(
+            s: *const c_void,
+            buf: *mut c_char,
+            size: isize,
+            encoding: u32,
+        ) -> bool;
+        fn CFRelease(cf: *const c_void);
+        fn CFNumberGetValue(n: *const c_void, ty: i64, out: *mut i32) -> bool;
+    }
+
+    let id = info.id;
+    if unsafe { CGDisplayIsBuiltin(id) } {
+        return MonitorKind::BuiltIn;
+    }
+    // `NSScreen.localizedName` is the one reliable Sidecar signal on
+    // Apple Silicon — an iPad reports "Sidecar Display (AirPlay)" or
+    // the device name there even though `CGDisplayIOServicePort` is
+    // dead (returns 0). Checked first: it must not be gated behind
+    // the IOKit probe below. `Tablet` only on an explicit iPad/
+    // Sidecar marker; a virtual/AirPlay name without it → `Virtual`.
+    let localized = ns_localized_name(id).to_lowercase();
+    if localized.contains("ipad") || localized.contains("sidecar") {
+        return MonitorKind::Tablet;
+    }
+    if localized.contains("virtual") || localized.contains("airplay") {
+        return MonitorKind::Virtual;
+    }
+    // `CGDisplayIsVirtual` marks virtual displays — Sidecar iPads
+    // included; they report no IODisplay transport, so without this
+    // they fell to `Unknown`. It isn't exported by older SDKs — weak
+    // `dlsym` lookup so the check simply stays false where missing.
+    let is_virtual = unsafe {
+        let f = dlsym(-2isize as *const c_void, c"CGDisplayIsVirtual".as_ptr());
+        if f.is_null() {
+            false
+        } else {
+            let f: unsafe extern "C" fn(u32) -> bool = std::mem::transmute(f);
+            f(id)
+        }
+    };
+    if is_virtual {
+        return MonitorKind::Virtual;
+    }
+
+    let port = unsafe { CGDisplayIOServicePort(id) };
+    if port == 0 {
+        // No IOKit entry (Apple Silicon) — a localized name was still
+        // readable → a real non-builtin display IS external; nothing
+        // readable at all → Unknown (never guessed).
+        return if localized.is_empty() {
+            MonitorKind::Unknown
+        } else {
+            MonitorKind::External
+        };
+    }
+    let mut dict: core_foundation::dictionary::CFDictionaryRef = std::ptr::null();
+    let ok = unsafe { IORegistryEntryCreateCFProperties(port, &mut dict, std::ptr::null(), 0) };
+    unsafe { IOObjectRelease(port) };
+    if ok != 0 || dict.is_null() {
+        return MonitorKind::Unknown;
+    }
+    let read_str = |key: &core::ffi::CStr| -> String {
+        unsafe {
+            let cf_key = {
+                #[link(name = "CoreFoundation", kind = "framework")]
+                unsafe extern "C" {
+                    fn CFStringCreateWithCString(
+                        alloc: *const c_void,
+                        s: *const c_char,
+                        enc: u32,
+                    ) -> *const c_void;
+                }
+                CFStringCreateWithCString(std::ptr::null(), key.as_ptr(), 0x08000100)
+            };
+            if cf_key.is_null() {
+                return String::new();
+            }
+            let v = CFDictionaryGetValue(dict as *const c_void, cf_key);
+            CFRelease(cf_key);
+            let mut buf = [0i8; 128];
+            if !v.is_null() && CFStringGetCString(v, buf.as_mut_ptr(), 128, 0x08000100) {
+                std::ffi::CStr::from_ptr(buf.as_ptr())
+                    .to_string_lossy()
+                    .to_lowercase()
+            } else {
+                String::new()
+            }
+        }
+    };
+    let name = read_str(c"IOServicePropertyTransportType");
+    let product = read_str(c"kDisplayProductName");
+    unsafe { CFRelease(dict as *const c_void) };
+
+    // Sidecar surfaces as a "Virtual" transport whose product name is
+    // the iPad — only then do we claim `Tablet`; a bare virtual
+    // transport stays `Virtual`, never a guessed tablet.
+    if product.contains("ipad") || product.contains("sidecar") {
+        return MonitorKind::Tablet;
+    }
+    if name.contains("virtual") || product.contains("virtual") {
+        return MonitorKind::Virtual;
+    }
+    if name.is_empty() && product.is_empty() {
+        return MonitorKind::Unknown;
+    }
+    MonitorKind::External
+}
+
+/// `NSScreen.localizedName` for `id` — Sidecar iPads report their
+/// device name ("iPad") there even when no IOKit transport exists.
+pub(crate) fn ns_localized_name(id: u32) -> String {
+    use std::ffi::{c_char, c_void};
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    type MId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MIdId = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+    type MIdChar = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char) -> *mut c_void;
+    type MIdUsz = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    type MUsz = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+    type MU32 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+    type MCChar = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const c_char;
+    unsafe {
+        let send_id: MId = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_id: MIdId = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_char: MIdChar = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_usz: MIdUsz = std::mem::transmute(objc_msgSend as *const ());
+        let send_usz: MUsz = std::mem::transmute(objc_msgSend as *const ());
+        let send_u32: MU32 = std::mem::transmute(objc_msgSend as *const ());
+        let send_cchar: MCChar = std::mem::transmute(objc_msgSend as *const ());
+        let screens = send_id(
+            objc_getClass(c"NSScreen".as_ptr()),
+            sel_registerName(c"screens".as_ptr()),
+        );
+        if screens.is_null() {
+            return String::new();
+        }
+        let key = send_id_char(
+            objc_getClass(c"NSString".as_ptr()),
+            sel_registerName(c"stringWithUTF8String:".as_ptr()),
+            c"NSScreenNumber".as_ptr(),
+        );
+        let count = send_usz(screens, sel_registerName(c"count".as_ptr()));
+        for i in 0..count {
+            let s = send_id_usz(screens, sel_registerName(c"objectAtIndex:".as_ptr()), i);
+            if s.is_null() {
+                continue;
+            }
+            let dd = send_id(s, sel_registerName(c"deviceDescription".as_ptr()));
+            if dd.is_null() {
+                continue;
+            }
+            let num = send_id_id(dd, sel_registerName(c"objectForKey:".as_ptr()), key);
+            if num.is_null() || send_u32(num, sel_registerName(c"unsignedIntValue".as_ptr())) != id
+            {
+                continue;
+            }
+            let n = send_id(s, sel_registerName(c"localizedName".as_ptr()));
+            if !n.is_null() {
+                let p = send_cchar(n, sel_registerName(c"UTF8String".as_ptr()));
+                if !p.is_null() {
+                    return std::ffi::CStr::from_ptr(p).to_string_lossy().to_string();
+                }
+            }
+        }
+        String::new()
+    }
+}
+
 /// A Dock-icon click queues `OpenViewer` — the arm un-minimizes and
 /// focuses the viewer without moving it. `applicationShouldHandleReopen:
 /// hasVisibleWindows:` is added on the app delegate when nothing answers

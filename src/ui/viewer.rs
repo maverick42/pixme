@@ -487,6 +487,8 @@ struct MonitorRow {
     rect: crate::capture::PhysicalRect,
     /// `false` for persisted-but-absent monitors (greyed, dismissible).
     connected: bool,
+    /// Display-type classification — icon + tooltip only.
+    kind: crate::capture::MonitorKind,
 }
 
 /// The status strip's monitor rows: connected monitors in enumeration
@@ -507,6 +509,7 @@ fn monitor_rows(
                 .unwrap_or_else(|| m.info.name.clone()),
             rect: m.info.rect,
             connected: true,
+            kind: m.kind,
         })
         .collect();
     for (id, p) in prefs {
@@ -521,9 +524,21 @@ fn monitor_rows(
                 .unwrap_or_else(|| t!("viewer.monitor.fallback").to_string()),
             rect: crate::capture::PhysicalRect::default(),
             connected: false,
+            kind: crate::capture::MonitorKind::Unknown,
         });
     }
     rows
+}
+
+/// The translated display-type label for a status-strip monitor tooltip.
+fn monitor_kind_label(kind: crate::capture::MonitorKind) -> std::borrow::Cow<'static, str> {
+    match kind {
+        crate::capture::MonitorKind::BuiltIn => t!("viewer.monitor.kind.builtin"),
+        crate::capture::MonitorKind::External => t!("viewer.monitor.kind.external"),
+        crate::capture::MonitorKind::Tablet => t!("viewer.monitor.kind.tablet"),
+        crate::capture::MonitorKind::Virtual => t!("viewer.monitor.kind.virtual"),
+        crate::capture::MonitorKind::Unknown => t!("viewer.monitor.kind.unknown"),
+    }
 }
 
 /// The rename prompt: draft + whether it already failed uniqueness.
@@ -2182,12 +2197,17 @@ impl Viewer {
                 for row in rows.iter().rev() {
                     let is_current =
                         row.connected && current.as_ref().is_some_and(|m| m.rect == row.rect);
+                    let kind_tip = monitor_kind_label(row.kind);
                     let tip = if !row.connected {
                         t!("viewer.monitor.disconnected", name = row.label.as_str())
                     } else if is_current {
                         t!("viewer.monitor.current", name = row.label.as_str())
                     } else {
-                        row.label.clone().into()
+                        t!(
+                            "viewer.monitor.typed",
+                            name = row.label.as_str(),
+                            kind = kind_tip
+                        )
                     };
                     if row.connected {
                         let resp = ui
@@ -2195,7 +2215,13 @@ impl Viewer {
                                 shared.command_enabled(&Command::SelectMonitor(
                                     row.stable_id.clone(),
                                 )),
-                                |ui| widgets::icon_button(ui, Icon::Monitor, is_current),
+                                |ui| {
+                                    widgets::icon_button(
+                                        ui,
+                                        crate::ui::icons::monitor_icon(row.kind),
+                                        is_current,
+                                    )
+                                },
                             )
                             .inner
                             .on_hover_text(tip);
@@ -5111,6 +5137,7 @@ mod tests {
                     scale_factor: 1.0,
                     is_primary: false,
                 },
+                kind: crate::capture::MonitorKind::Unknown,
             }
         }
         let inventory = vec![ident("a", 0)];

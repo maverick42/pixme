@@ -50,6 +50,23 @@ pub struct PhysicalRect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WindowId(pub u64);
 
+/// What kind of display a monitor is — informational only (status-strip
+/// icon + tooltip); never drives capture, selection or persistence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MonitorKind {
+    /// A laptop's integrated panel (CGDisplayIsBuiltin / INTERNAL tech).
+    BuiltIn,
+    /// A regular desktop monitor.
+    External,
+    /// A tablet used as a display (iPad via Sidecar).
+    Tablet,
+    /// A virtual/indirect display driver.
+    Virtual,
+    /// Type not reliably determined — never guessed.
+    #[default]
+    Unknown,
+}
+
 /// One connected monitor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonitorInfo {

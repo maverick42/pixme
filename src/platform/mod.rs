@@ -115,6 +115,9 @@ pub struct MonitorIdentity {
     pub stable_id: String,
     /// The live monitor record (xcap enumeration).
     pub info: crate::capture::MonitorInfo,
+    /// Display-type classification for the status-strip icon —
+    /// informational only.
+    pub kind: crate::capture::MonitorKind,
 }
 
 /// The OS-stable id for `info`, or `None` — the caller falls back to a
@@ -124,6 +127,14 @@ pub(crate) use macos::stable_monitor_id;
 /// The OS-stable id for `info` (see above).
 #[cfg(target_os = "windows")]
 pub(crate) use windows::stable_monitor_id;
+
+/// Classifies `info` for the status-strip icon — pure data, never a
+/// capture/selection input. Anything uncertain resolves to `Unknown`.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::monitor_kind;
+/// Classifies `info` (see above).
+#[cfg(target_os = "windows")]
+pub(crate) use windows::monitor_kind;
 
 /// The connected monitors with their stable identities, for the status
 /// strip's monitor row. Enumeration failures yield an empty list (the
@@ -139,7 +150,23 @@ pub fn monitor_identities() -> Vec<MonitorIdentity> {
                     info.rect.x, info.rect.y, info.rect.width, info.rect.height
                 )
             });
-            MonitorIdentity { stable_id, info }
+            let kind = monitor_kind(&info);
+            // xcap falls back to a generic "Display #…" name for
+            // virtuals (Sidecar) — the OS-localized name is friendlier.
+            #[cfg(target_os = "macos")]
+            let info = {
+                let mut info = info;
+                let localized = macos::ns_localized_name(info.id);
+                if !localized.is_empty() {
+                    info.name = localized;
+                }
+                info
+            };
+            MonitorIdentity {
+                stable_id,
+                info,
+                kind,
+            }
         })
         .collect()
 }

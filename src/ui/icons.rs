@@ -131,6 +131,25 @@ pub enum Icon {
     TriangleAlert,
     /// Re-enumerate the connected monitors (status strip).
     RefreshCw,
+    /// Built-in laptop display (status-strip monitor icon).
+    Laptop,
+    /// Tablet used as a display (status-strip monitor icon).
+    Tablet,
+    /// Virtual/indirect display (status-strip monitor icon).
+    MonitorDot,
+}
+
+/// The status-strip icon for a monitor's classified kind — the single
+/// place that maps `MonitorKind` to a glyph.
+pub fn monitor_icon(kind: crate::capture::MonitorKind) -> Icon {
+    match kind {
+        crate::capture::MonitorKind::BuiltIn => Icon::Laptop,
+        crate::capture::MonitorKind::Tablet => Icon::Tablet,
+        crate::capture::MonitorKind::Virtual => Icon::MonitorDot,
+        crate::capture::MonitorKind::External | crate::capture::MonitorKind::Unknown => {
+            Icon::Monitor
+        }
+    }
 }
 
 /// One styled icon ready for egui's image loaders: white-stroked SVG bytes

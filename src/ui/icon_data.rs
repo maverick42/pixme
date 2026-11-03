@@ -15,6 +15,21 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/monitor.svg"),
     ),
     (
+        Icon::Laptop,
+        "laptop",
+        include_bytes!("../../assets/icons/laptop.svg"),
+    ),
+    (
+        Icon::Tablet,
+        "tablet",
+        include_bytes!("../../assets/icons/tablet.svg"),
+    ),
+    (
+        Icon::MonitorDot,
+        "monitor-dot",
+        include_bytes!("../../assets/icons/monitor-dot.svg"),
+    ),
+    (
         Icon::SquareDashed,
         "square-dashed",
         include_bytes!("../../assets/icons/square-dashed.svg"),
