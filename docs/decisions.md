@@ -1847,3 +1847,112 @@ Format: date — context — decision — consequences.
 - **Consequences**: the flash is a Windows shell artifact outside
   PixMe's control. Any screenshot/capture tool showing a
   screen-covering overlay triggers the same toggle.
+
+## 2026-11-03 — Viewer-centered UI: the floating capture bar is replaced by the viewer's vbar
+
+- **Context**: the app had two mutually-exclusive windows — a floating
+  capture bar (`AppState::Bar`) and the tabbed viewer — each with its own
+  viewport, geometry plumbing and OS integration. The `docs/audit/ui-overhaul.md`
+  plan makes the viewer the single home of the app.
+- **Decision**: `Bar` removed from the lifecycle (`Idle | Capturing |
+  Viewer`). Capture controls now live in a fixed 36 pt `egui::Panel::right`
+  inside the viewer ("vbar"): the five capture modes plus delay and
+  options popups, always visible in Tabs and Mosaic modes, gated by the
+  shared `is_command_enabled` table. Captures dispatch through
+  `Shared::push_capture`; `global-hotkey` (declared, never used) and the
+  dead capture/export stubs went out with the bar.
+- **Consequences**: one fewer window, no bar geometry/focus/state code;
+  all user capture entries funnel through one place. Manual drag of the
+  viewer was removed with the move lock (next entries) so the vbar is
+  always one strip away.
+
+## 2026-11-03 — Monitor inventory: OS-stable ids, per-monitor prefs, status-strip row
+
+- **Context**: the viewer needed per-monitor names and geometry; xcap
+  monitor ids are unstable (Windows ids are pointer handles, macOS ids
+  are per-session).
+- **Decision**: `platform::MonitorIdentity { stable_id, info }` —
+  `CGDisplayCreateUUIDFromDisplayID` on macOS, `EnumDisplayDevicesW` +
+  `EDD_GET_DEVICE_INTERFACE_NAME` (PNP DeviceID) on Windows, a
+  `rect:{x},{y},{w}x{h}` key as fallback. `Settings::monitors` persists
+  `{ name?, rect_native? }` per stable id in `prefs.json`; entries are
+  never dropped on disconnect — disconnected monitors stay listed greyed
+  until clicked once (visual dismissal only). The inventory is a
+  snapshot refreshed at startup and by the status strip's ↻ button —
+  never re-enumerated per frame.
+- **Consequences**: monitor state survives reconnects/reboots; the
+  DeviceID is port-dependent on Windows (documented limitation — the
+  rect key covers it poorly). `monitor_rows` is a pure function, unit
+  tested.
+
+## 2026-11-03 — Viewer move lock + per-monitor geometry restore
+
+- **Context**: once monitor buttons become the relocation mechanism,
+  the viewer itself must not be user-draggable (otherwise both paths
+  fight and persisted rects go stale).
+- **Decision**: `platform::viewer_move_lock` — macOS applies
+  `setMovable(false)` on the "PixMe"-titled normal-level NSWindow;
+  Windows subclasses the viewer HWND (`GWLP_WNDPROC`) swallowing
+  `WM_NCLBUTTONDOWN`/`HTCAPTION` and `WM_SYSCOMMAND`/`SC_MOVE`. Borders
+  stay resizable; programmatic moves are unaffected. Re-applied on every
+  `enter(Viewer)` since the deferred viewport is destroyed/recreated.
+  `viewer_target` carries `{ monitor, native_rect }` — `SelectMonitor`
+  and the post-capture landing both go through `viewer_target_for` and a
+  dedicated `ViewportSync` ledger (dedup on requested, never reported,
+  geometry). `viewer_geo_settle` skips persisting the reported rect for
+  2 frames after a move; `rect_native` writes are debounced to one
+  `prefs.json` flush per half-second (flushed in `quit_now` too).
+- **Consequences**: parity semantics on both OSes; the saved rect is
+  OUTER so `InnerSize` subtracts the measured decoration delta. The
+  Windows subclass is written but not compiled on macOS — needs a
+  Windows build check.
+
+## 2026-11-03 — Capture starts on the session monitor; Windows re-focus during Capturing
+
+- **Context**: the overlay opened under the cursor; with a monitor
+  "selected" in the viewer the user's intent is the viewer's monitor.
+- **Decision**: `push_capture` records `viewer_monitor` directly;
+  `begin_capture` and `warm_freeze` rank session monitor → remembered
+  fixed-region rect → cursor → primary (tried in a loop so a stale id
+  can't strand the overlay). While `Capturing`, `pump` re-issues
+  `ViewportCommand::Focus` on the overlay every frame on Windows
+  (`platform::refocus_capture_overlay`, best-effort vs Alt+Tab); the
+  macOS kiosk needs nothing (no-op).
+- **Consequences**: cursor roaming unchanged (the overlay still follows
+  the cursor across monitors until a selection starts). Re-focus is
+  best-effort: `SetForegroundWindow` can be refused — Esc then hits
+  another app until a click; Win key / Ctrl+Alt+Del are never
+  suppressible (documented limit, no `WH_KEYBOARD_LL` by choice).
+
+## 2026-11-03 — Resident icon: ToggleViewer on left click, open/settings/quit menu, dock reopen
+
+- **Context**: the tray/status item used to only open the viewer;
+  the audit makes it a pure open/settings/quit surface.
+- **Decision**: `Command::ToggleViewer` — `OpenViewer` from `Idle`,
+  `ViewerClosed` when open — fired on `TrayIconEvent::Click` (left-down)
+  with `with_menu_on_left_click(false)` (menu stays on right click).
+  Both OSes get the same menu: Open PixMe / Settings… / Check for
+  updates (disabled placeholder, no updater) / Close PixMe. macOS Dock
+  clicks queue `OpenViewer` via `applicationShouldHandleReopen:
+  hasVisibleWindows:` — `class_addMethod` when nothing answers it, else
+  `method_setImplementation` wrapped onto winit's impl (original runs
+  first). Windows taskbar unchanged: viewer keeps its native button,
+  the 1×1 anchor keeps `taskbar(false)`.
+- **Consequences**: captures can never start behind the user's back
+  from the resident icon. The Dock hook swizzles the winit delegate —
+  re-check after a winit/eframe bump.
+
+## 2026-11-03 — Windows anchor white ring: hidden creation + unconditional empty region
+
+- **Context**: Windows 11 DWM drew a rounded border + accent line on the
+  1×1 anchor (§2.7): the window was created visible before the strip
+  guard could clip it (startup race), and `SWP_FRAMECHANGED` reset the
+  region without changing `(w,h)` so the ring reappeared.
+- **Decision**: root viewport created `with_visible(false)` — the strip
+  guard applies the empty region before the first `ShowWindow`; and
+  `SetWindowRgn` is reapplied for `Role::Anchor` on EVERY pass (free on
+  1×1) instead of only on style/size change. The ≤8 px guard stays so
+  recycled HWNDs can't be blanked.
+- **Consequences**: verified on macOS that an invisible root viewport
+  keeps the event pump alive. Windows-side: needs a build/launch check
+  on the Windows box.
