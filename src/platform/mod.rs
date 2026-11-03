@@ -1,9 +1,9 @@
 //! OS-specific services: one implementation per OS, selected at compile time.
 //! All `#[cfg(target_os)]` code lives here — nowhere else in the crate.
 //!
-//! Both OSes present a resident icon whose menu carries the same two actions
-//! ("Take a capture", "Open PixMe"): the macOS menu-bar status item and the
-//! Windows notification-area tray icon. Menu clicks on either OS are pushed
+//! Both OSes present a resident icon whose menu carries "Open PixMe" (and
+//! "Quit" on Windows): the macOS menu-bar status item and the Windows
+//! notification-area tray icon. Menu clicks on either OS are pushed
 //! into [`PENDING`] and drained by [`crate::app::Shared::pump`] on the next UI
 //! pass. macOS additionally installs the native application menus.
 
@@ -128,7 +128,6 @@ pub(crate) fn take_pending_commands() -> Vec<Command> {
 /// item + app menus and the Windows tray menu.
 pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
     Some(match id {
-        "take_capture" => Command::ShowBar,
         "open_viewer" => Command::OpenViewer,
         "settings" => Command::OpenSettings,
         "import_clipboard" => Command::ImportClipboard,
@@ -142,7 +141,6 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
         "file.delete" => Command::DeleteFileActive,
         "file.open_last_dir" => Command::OpenLastDir,
         "file.print" => Command::PrintActive,
-        "capture.launch" => Command::ShowBar,
         "quit" => Command::Quit,
         id if id.starts_with("recent:") => {
             Command::OpenPath(std::path::PathBuf::from(&id["recent:".len()..]))

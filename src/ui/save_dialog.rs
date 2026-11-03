@@ -96,8 +96,9 @@ pub fn show(ui: &mut Ui, state: &mut SaveDialog) -> Outcome {
     let t = theme::tokens(ui.ctx());
     let mut outcome = Outcome::Open;
 
-    // Explicit fill: the app-wide clear color is transparent (the anchor
-    // and the floating bar need it), so windows must paint their own.
+    // Explicit fill: the app-wide clear color is transparent (the anchor,
+    // countdown and pinned windows need it), so windows must paint
+    // their own.
     egui::CentralPanel::default()
         .frame(
             egui::Frame::default()

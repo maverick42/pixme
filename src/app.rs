@@ -2,23 +2,21 @@
 //! path and the eframe event loop.
 //!
 //! One shared machine, identical on both OSes: `Idle` (no visible window —
-//! the app is resident in the macOS menu bar / Windows tray), `Bar` (floating
-//! capture bar), `Capturing` (selection in progress) and `Viewer` (tabbed
-//! session window). `Bar` and `Viewer` are strictly exclusive. Every user
-//! action is a [`Command`] — from bar buttons, the resident-icon menu, the
-//! app menus, the viewer, or later global hotkeys — queued and dispatched at
-//! the top of whichever viewport pass runs.
+//! the app is resident in the macOS menu bar / Windows tray), `Capturing`
+//! (selection in progress) and `Viewer` (tabbed session window, home of the
+//! capture controls). Every user action is a [`Command`] — from the viewer's
+//! capture bar, the resident-icon menu or the app menus — queued and
+//! dispatched at the top of whichever viewport pass runs.
 //!
 //! Viewport topology: egui/winit never repaints a window that was never
 //! shown, so the root viewport is a permanent 1×1 transparent "anchor"
 //! window (`taskbar(false)`, no decorations) that keeps the pump alive.
-//! The real windows — bar, viewer, settings — are deferred child viewports
+//! The real windows — viewer, settings — are deferred child viewports
 //! registered each frame while their state requires them.
 //!
-//! Launch shows no window (`Idle`): the user picks "Take a capture" or "Open
-//! PixMe" from the resident-icon menu. Closing the bar opens the viewer when
-//! the session has captures, else returns to `Idle`. Closing the viewer
-//! returns to `Idle` (session kept). Quitting only happens through the menu.
+//! Launch opens the viewer directly (it restores the persisted session).
+//! Closing the viewer returns to `Idle` (session kept). Quitting only
+//! happens through the menu.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,7 +29,6 @@ use crate::config::Settings;
 use crate::editor::Document;
 use crate::i18n::{self, Language};
 use crate::ui::capture_overlay::OverlaySession;
-use crate::ui::toolbar::Toolbar;
 use crate::ui::viewer::Viewer;
 use crate::{platform, ui};
 
@@ -41,8 +38,6 @@ pub enum AppState {
     /// No visible window — the app is resident in the menu bar / tray.
     #[default]
     Idle,
-    /// The floating capture bar is on screen.
-    Bar,
     /// A capture/selection is in progress (phase 3 fills this state in).
     Capturing,
     /// The tabbed session viewer is the visible window.
@@ -50,8 +45,8 @@ pub enum AppState {
 }
 
 /// Which capture the user asked for. Distinct from [`crate::capture`]'s
-/// backend contract: these are the *commands* the bar, the Capture menu and
-/// future hotkeys dispatch; the pipeline maps them to `xcap` calls.
+/// backend contract: these are the *commands* the viewer's capture bar
+/// dispatches; the pipeline maps them to `xcap` calls.
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureMode {
     /// The frontmost window.
@@ -79,12 +74,8 @@ pub enum Command {
     ConfirmCapture,
     /// The capture overlay was cancelled (Esc / window close).
     CancelCapture,
-    /// Show the floating bar (icon menu, app menu, viewer's "+").
-    ShowBar,
     /// Show the viewer (icon menu's "Open PixMe").
     OpenViewer,
-    /// The bar's X was clicked: viewer if the session has captures, else `Idle`.
-    CloseBar,
     /// The viewer window's close was requested.
     ViewerClosed,
     /// Open the settings window.
@@ -213,8 +204,7 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         | Command::CancelCapture
         | Command::ClosePin(_)
         | Command::CopyPin(_)
-        | Command::ViewerClosed
-        | Command::CloseBar => true,
+        | Command::ViewerClosed => true,
         // Draw owns its document: its undo/redo/copy apply there; the
         // viewer's copies must not act behind the modal.
         Command::UndoActive | Command::RedoActive | Command::CopyActive => {
@@ -230,7 +220,6 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         | Command::DeleteFileActive
         | Command::Capture(_)
         | Command::CaptureNow(_)
-        | Command::ShowBar
         | Command::ImportClipboard
         | Command::OpenFile
         | Command::OpenPath(_)
@@ -249,9 +238,6 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
 
 /// `egui::ViewportId` of the child windows (`from_hash_of` is not a const fn
 /// in egui 0.36, hence the functions).
-fn bar_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("pixme.bar")
-}
 fn viewer_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.viewer")
 }
@@ -281,7 +267,6 @@ fn draw_id() -> egui::ViewportId {
 pub fn wake_viewports(ctx: &egui::Context) {
     ctx.request_repaint_of(egui::ViewportId::ROOT);
     ctx.repaint_if_live(viewer_id());
-    ctx.repaint_if_live(bar_id());
     ctx.repaint_if_live(draw_id());
 }
 
@@ -335,18 +320,9 @@ pub struct Shared {
     /// Monitor the viewer must appear on when it next opens (set after a
     /// capture confirms so the viewer lands on the captured screen).
     pub viewer_target_monitor: Mutex<Option<MonitorInfo>>,
-    /// The floating toolbar's transient state.
-    pub toolbar: Mutex<Toolbar>,
-    /// Last on-screen position of the bar viewport (restored on reopen).
-    pub bar_pos: Mutex<Option<egui::Pos2>>,
-    /// Last on-screen outer rect of the bar viewport — the countdown card
-    /// anchors below it and follows its drags.
-    pub bar_rect: Mutex<Option<egui::Rect>>,
-    /// Monitor the floating bar currently sits on — resolved in NATIVE
-    /// units at write time (bar's own ppp), so the countdown never has to
+    /// Monitor the viewer currently sits on — resolved in NATIVE units at
+    /// write time (the viewer's own ppp), so the countdown never has to
     /// mix two windows' point spaces (mixed-DPI safe).
-    pub bar_monitor: Mutex<Option<MonitorInfo>>,
-    /// Monitor the viewer currently sits on — same role as `bar_monitor`.
     pub viewer_monitor: Mutex<Option<MonitorInfo>>,
     /// winit `available_monitors()` placements `(x, y, w, h)` in physical
     /// pixels, snapshotted for the overlay's `with_monitor`/`SetMonitor`
@@ -370,10 +346,10 @@ pub struct Shared {
     /// size and position on that monitor.
     pub last_fixed_region: Mutex<Option<(u32, egui::Rect)>>,
     /// The monitor the pending capture was launched from — set by
-    /// [`Shared::push_capture`] when a window (the bar, the viewer) starts
-    /// a capture, consumed by `begin_capture`. `None` for resident-icon
-    /// launches (no window): `begin_capture` falls back to the monitor
-    /// under the cursor, then the primary monitor.
+    /// [`Shared::push_capture`] when the viewer starts a capture, consumed
+    /// by `begin_capture`. `None` for window-less launches (dev hooks):
+    /// `begin_capture` falls back to the monitor under the cursor, then
+    /// the primary monitor.
     capture_start_monitor: Mutex<Option<MonitorInfo>>,
     /// Pinned captures — autonomous always-on-top windows, each backed
     /// by a deferred viewport. They outlive every state transition and
@@ -480,11 +456,11 @@ impl Shared {
     }
 
     /// Queues a capture command and records the monitor the request came
-    /// from — the visible window (the bar, the viewer) under the cursor —
-    /// so the overlay opens on "the screen where the zone starts". The
-    /// record survives the capture delay: `begin_capture` may run later,
-    /// from the anchor's pass. Resident-icon launches (no window) leave
-    /// the slot empty and `begin_capture` falls back to the primary.
+    /// from — the viewer window the capture bar lives in — so the overlay
+    /// opens on "the screen where the zone starts". The record survives
+    /// the capture delay: `begin_capture` may run later, from the anchor's
+    /// pass. Window-less launches (dev hooks) leave the slot empty and
+    /// `begin_capture` falls back to the monitor under the cursor.
     pub fn push_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
         *lock(&self.capture_start_monitor) = monitor_under(ctx);
         self.push(Command::Capture(mode));
@@ -640,7 +616,6 @@ impl Shared {
             platform::sync_menu_enabled(modal, has_doc, has_file, has_last_dir);
             ctx.request_repaint_of(egui::ViewportId::ROOT);
             ctx.repaint_if_live(viewer_id());
-            ctx.repaint_if_live(bar_id());
         }
         // Recent files change without a modal transition (open/save
         // succeeds, history cleared): the macOS File menu is native and
@@ -733,7 +708,7 @@ impl Shared {
             return;
         }
         // Every user action is one Command through this funnel — logging
-        // it here covers the bar, the menus, the tray and the viewer.
+        // it here covers the menus, the tray and the viewer.
         tracing::info!(command = %command_desc(&command), "command");
         match command {
             Command::Capture(mode) => {
@@ -752,55 +727,6 @@ impl Shared {
             Command::CaptureNow(mode) => self.begin_capture(mode, ctx),
             Command::ConfirmCapture => self.confirm_capture(ctx),
             Command::CancelCapture => self.cancel_capture(ctx),
-            Command::ShowBar => {
-                // The bar reopens where the user last dragged it — but
-                // only while PixMe still lives on that monitor. The
-                // anchor is the visible window's monitor (the viewer's,
-                // or the bar's own when the bar is re-invoked); with no
-                // window up it is the monitor under the mouse. A
-                // remembered spot on another monitor is stale — the bar
-                // re-centres on the anchor instead of popping up where
-                // the user is not looking.
-                let anchor = match *lock(&self.state) {
-                    AppState::Viewer => lock(&self.viewer_monitor).clone(),
-                    AppState::Bar => lock(&self.bar_monitor).clone(),
-                    _ => None,
-                }
-                .or_else(|| {
-                    platform::cursor_position()
-                        .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
-                })
-                .or_else(|| monitor_under(ctx))
-                .or_else(|| crate::capture::screen::primary_monitor().ok());
-                let monitors = crate::capture::screen::monitors().unwrap_or_default();
-                let spot_on_anchor = (*lock(&self.bar_pos))
-                    .zip(anchor.as_ref())
-                    .is_some_and(|(pos, a)| ui_pos_on_anchor(pos, &monitors, a));
-                // `place_on_monitor` asks `sync_viewport` to re-centre the
-                // bar on that monitor next frame — only wanted on the
-                // fallback path, never over a remembered spot.
-                if !spot_on_anchor {
-                    *lock(&self.bar_pos) = None;
-                    if let Some(m) = anchor {
-                        let scale = m.scale_factor.max(1.0);
-                        let origin = platform::native_to_ui(
-                            egui::pos2(m.rect.x as f32, m.rect.y as f32),
-                            scale,
-                        );
-                        let size = platform::native_to_ui(
-                            egui::pos2(m.rect.width as f32, m.rect.height as f32),
-                            scale,
-                        )
-                        .to_vec2();
-                        *lock(&self.bar_pos) = Some(egui::pos2(
-                            origin.x + (size.x - 340.0) / 2.0,
-                            origin.y + size.y * 0.12,
-                        ));
-                        lock(&self.toolbar).place_on_monitor(m);
-                    }
-                }
-                self.enter(AppState::Bar, ctx);
-            }
             Command::OpenViewer => {
                 self.enter(AppState::Viewer, ctx);
                 // Re-invoking while the window is already open (behind
@@ -816,18 +742,6 @@ impl Shared {
                 ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
                 self.request_focus(viewer_id());
                 ctx.repaint_if_live(viewer_id());
-            }
-            Command::CloseBar => {
-                // Back where the user came from: the viewer when the session
-                // has captures, the resident icon otherwise. The guard is
-                // bound out of the `if` scrutinee: `enter(Viewer)` re-locks
-                // `viewer` and a live scrutinee guard would deadlock.
-                let empty = lock(&self.viewer).tabs.is_empty();
-                if empty {
-                    self.enter(AppState::Idle, ctx);
-                } else {
-                    self.enter(AppState::Viewer, ctx);
-                }
             }
             Command::ViewerClosed => {
                 if lock(&self.draw).is_some() {
@@ -1329,17 +1243,10 @@ impl Shared {
                 platform::capture_chrome_exit();
             }
             // The viewer is a real application window: bring it to the
-            // front. The bar is a palette — `always_on_top`, never focus.
+            // front.
             if next == AppState::Viewer {
                 self.request_focus(viewer_id());
             }
-        }
-        if next == AppState::Bar {
-            // The bar's HWND is destroyed when the viewport deregisters and
-            // rebuilt on re-entry — clear the geometry ledger so size and
-            // position commands are resent (a stale ledger dedupes them and
-            // the new window keeps the builder's clipped default size).
-            lock(&self.toolbar).reset_sync();
         }
         // Restoring runs on EVERY viewer entry (guarded to once): a
         // same-state re-entry after reset must not skip the load.
@@ -1400,8 +1307,8 @@ impl Shared {
     }
 
     /// Starts `mode`: region modes spawn the selection overlay over the
-    /// frozen monitor, full-screen arms an instant capture (the bar must be
-    /// torn down first — one warm-up frame inside the overlay/anchor pass).
+    /// frozen monitor, full-screen arms an instant capture (the viewer must
+    /// be torn down first — one warm-up frame inside the overlay/anchor pass).
     /// `Pin` lands in a later phase.
     fn begin_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
         // Chained capture (menu/hotkey while a session is live): Esc must
@@ -1866,25 +1773,6 @@ fn monitor_under(ctx: &egui::Context) -> Option<MonitorInfo> {
     .and_then(|c| crate::capture::screen::monitor_at(c.x, c.y))
 }
 
-/// Whether `pos` (egui ui points) lands on `anchor`'s monitor, hit-tested
-/// against `monitors` — each candidate converts `pos` with its own scale
-/// (mixed-DPI safe). Monitors compare by rect, not id: xcap ids are not
-/// stable across enumerations on Windows.
-fn ui_pos_on_anchor(pos: egui::Pos2, monitors: &[MonitorInfo], anchor: &MonitorInfo) -> bool {
-    monitors
-        .iter()
-        .find(|m| {
-            let scale = m.scale_factor.max(1.0);
-            let native = platform::ui_to_native(pos, scale);
-            let r = &m.rect;
-            native.x >= r.x as f32
-                && native.x < r.x as f32 + r.width as f32
-                && native.y >= r.y as f32
-                && native.y < r.y as f32 + r.height as f32
-        })
-        .is_some_and(|m| m.rect == anchor.rect)
-}
-
 /// Root application state, created once in [`eframe::App::ui`]'s setup.
 pub struct PixMeApp {
     /// Everything the deferred-viewport callbacks reach.
@@ -1952,10 +1840,6 @@ impl PixMeApp {
                 viewer: Mutex::new(Viewer::default()),
                 viewer_rect: Mutex::new(None),
                 viewer_target_monitor: Mutex::new(None),
-                toolbar: Mutex::new(Toolbar::default()),
-                bar_pos: Mutex::new(None),
-                bar_rect: Mutex::new(None),
-                bar_monitor: Mutex::new(None),
                 viewer_monitor: Mutex::new(None),
                 winit_placements: Mutex::new(Vec::new()),
                 settings_open: AtomicBool::new(false),
@@ -2005,11 +1889,7 @@ impl PixMeApp {
         };
         // Launch lands on the viewer, not resident-idle: it restores
         // the persisted session and gives a visible landing point.
-        // Any viewport left open by eframe's persisted state (e.g. the
-        // capture bar showing at a previous quit) is closed explicitly.
         app.shared.enter(AppState::Viewer, &cc.egui_ctx);
-        cc.egui_ctx
-            .cmd_if_live(bar_id(), egui::ViewportCommand::Close);
         app.tap_debug_capture(&cc.egui_ctx, debug_capture)
     }
 
@@ -2038,8 +1918,8 @@ impl PixMeApp {
 }
 
 impl eframe::App for PixMeApp {
-    /// Transparent clear: the anchor and the bar are transparent windows, and
-    /// child viewports paint their whole surface anyway.
+    /// Transparent clear: the anchor, countdown and pinned windows are
+    /// transparent, and child viewports paint their whole surface anyway.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
@@ -2057,28 +1937,6 @@ impl eframe::App for PixMeApp {
         // (a fullscreen confirm deadlocked exactly this way).
         let state = *lock(&self.shared.state);
         match state {
-            AppState::Bar => {
-                let shared = Arc::clone(&self.shared);
-                let builder = bar_builder(*lock(&shared.bar_pos));
-                ctx.show_viewport_deferred(bar_id(), builder, move |ui, _class| {
-                    let ctx = ui.ctx().clone();
-                    shared.pump(&ctx);
-                    shared.maybe_focus(&ctx, bar_id());
-                    ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
-                    if let Some(pos) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
-                        *lock(&shared.bar_pos) = Some(pos);
-                    }
-                    if ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                        && lock(&shared.countdown).is_some()
-                    {
-                        *lock(&shared.countdown) = None;
-                        ctx.request_repaint_of(egui::ViewportId::ROOT);
-                    }
-                    let mut toolbar = lock(&shared.toolbar);
-                    let mut settings = lock(&shared.settings);
-                    toolbar.show(ui, &mut settings, &shared);
-                });
-            }
             AppState::Viewer => {
                 let shared = Arc::clone(&self.shared);
                 // If a capture just landed on a specific monitor, make sure
@@ -2294,7 +2152,7 @@ impl eframe::App for PixMeApp {
             }
             AppState::Capturing => {
                 // The freeze happens here, before any capture window exists:
-                // two anchor frames let the bar tear down, then the screen is
+                // anchor frames let the viewer tear down, then the screen is
                 // captured — registering the overlay only *after* the freeze
                 // keeps it out of the photograph.
                 enum Step {
@@ -2368,8 +2226,8 @@ impl eframe::App for PixMeApp {
         }
 
         // The capture-delay countdown: like the pins it lives outside the
-        // state machine — it can run on top of the bar, the viewer or an
-        // empty desktop. It repaints itself to zero, then fires CaptureNow.
+        // state machine — it can run on top of the viewer or an empty
+        // desktop. It repaints itself to zero, then fires CaptureNow.
         if lock(&self.shared.countdown).is_some() {
             let shared = Arc::clone(&self.shared);
             ctx.show_viewport_deferred(countdown_id(), countdown_builder(), move |ui, _class| {
@@ -2382,15 +2240,10 @@ impl eframe::App for PixMeApp {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                     return;
                 }
-                // The countdown parks on the monitor PixMe lives on: the
-                // floating bar's when it is up, the viewer's otherwise —
-                // resolved in native units by the owner window, so no two
-                // windows' point spaces are ever mixed here.
-                let anchor = if *lock(&shared.state) == AppState::Bar {
-                    lock(&shared.bar_monitor).clone()
-                } else {
-                    lock(&shared.viewer_monitor).clone()
-                };
+                // The countdown parks on the viewer's monitor — resolved
+                // in native units by the owner window, so no two windows'
+                // point spaces are ever mixed here.
+                let anchor = lock(&shared.viewer_monitor).clone();
                 let running = lock(&shared.countdown)
                     .as_mut()
                     .is_some_and(|c| c.show(ui, anchor));
@@ -2579,32 +2432,6 @@ fn notice_window(ctx: &egui::Context, id: &'static str, slot: &Mutex<Option<Stri
     }
 }
 
-/// The floating bar: borderless, transparent, always on top, sized to its
-/// content; position restored across hide/show cycles.
-fn bar_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
-    let builder = egui::ViewportBuilder::default()
-        .with_title("PixMe Bar")
-        .with_icon(ui::icons::app_icon_data())
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_resizable(false)
-        .with_always_on_top()
-        .with_has_shadow(false)
-        .with_taskbar(false)
-        // Accessory apps stay inert until a window asks for focus.
-        .with_active(true)
-        .with_inner_size([340.0, 48.0]);
-    #[cfg(target_os = "windows")]
-    // winit forces WS_CAPTION at creation — created hidden; the pump's
-    // `strip_undecorated_frame` ShowWindow's it once chrome-free (egui's
-    // `Visible(true)` would re-apply the caption via winit's apply_diff).
-    let builder = builder.with_visible(false);
-    match position {
-        Some(pos) => builder.with_position(pos),
-        None => builder,
-    }
-}
-
 /// The viewer window: decorated, resizable, the app's real home.
 fn viewer_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
@@ -2721,7 +2548,8 @@ fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
         .with_inner_size(size + egui::vec2(0.0, crate::ui::pin::TOP_MARGIN))
         .with_position(origin - egui::vec2(0.0, crate::ui::pin::TOP_MARGIN));
     #[cfg(target_os = "windows")]
-    // Hidden until `strip_undecorated_frame` shows it (see `bar_builder`).
+    // Hidden until `strip_undecorated_frame` shows it — winit forces
+    // WS_CAPTION at creation; `egui`'s `Visible(true)` would re-apply it.
     let builder = builder.with_visible(false);
     builder
 }
@@ -2742,7 +2570,8 @@ fn countdown_builder() -> egui::ViewportBuilder {
         .with_active(false)
         .with_inner_size([140.0, 140.0]);
     #[cfg(target_os = "windows")]
-    // Hidden until `strip_undecorated_frame` shows it (see `bar_builder`).
+    // Hidden until `strip_undecorated_frame` shows it — winit forces
+    // WS_CAPTION at creation; `egui`'s `Visible(true)` would re-apply it.
     let builder = builder.with_visible(false);
     builder
 }
@@ -2812,7 +2641,6 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn chromeless_viewports_start_hidden() {
-        assert_eq!(bar_builder(None).visible, Some(false));
         assert_eq!(
             pin_builder(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0)).visible,
             Some(false)
@@ -2826,15 +2654,11 @@ mod tests {
 
     fn harness() -> (Shared, egui::Context) {
         let shared = Shared {
-            state: Mutex::new(AppState::Bar),
+            state: Mutex::new(AppState::Idle),
             settings: Mutex::new(Settings::default()),
             viewer: Mutex::new(Viewer::default()),
             viewer_rect: Mutex::new(None),
             viewer_target_monitor: Mutex::new(None),
-            toolbar: Mutex::new(Toolbar::default()),
-            bar_pos: Mutex::new(None),
-            bar_rect: Mutex::new(None),
-            bar_monitor: Mutex::new(None),
             viewer_monitor: Mutex::new(None),
             winit_placements: Mutex::new(Vec::new()),
             settings_open: AtomicBool::new(false),
@@ -2913,26 +2737,13 @@ mod tests {
     fn capture_enters_the_capturing_state() {
         // Region capture arms the selection overlay — the viewer only opens
         // after the overlay confirms. On a headless runner monitor
-        // enumeration may fail instead: the machine must then stay in `Bar`.
+        // enumeration may fail instead: the machine must then stay in `Idle`.
         let (shared, ctx) = harness();
         let state = drive(&shared, &ctx, Command::Capture(CaptureMode::Region));
         assert!(
-            matches!(state, AppState::Capturing | AppState::Bar),
+            matches!(state, AppState::Capturing | AppState::Idle),
             "unexpected state {state:?}"
         );
-    }
-
-    #[test]
-    fn closing_bar_with_empty_session_returns_to_idle() {
-        let (shared, ctx) = harness();
-        assert_eq!(drive(&shared, &ctx, Command::CloseBar), AppState::Idle);
-    }
-
-    #[test]
-    fn closing_bar_with_captures_opens_viewer() {
-        let (shared, ctx) = harness();
-        lock(&shared.viewer).push_stub("capture 1");
-        assert_eq!(drive(&shared, &ctx, Command::CloseBar), AppState::Viewer);
     }
 
     #[test]
@@ -3165,16 +2976,6 @@ mod tests {
         assert!(lock(&shared.viewer).tabs.is_empty());
     }
 
-    #[test]
-    fn bar_and_viewer_are_never_shown_together() {
-        // Exclusivity is enforced structurally: the state machine holds one
-        // active window at a time and only that viewport is registered.
-        let (shared, ctx) = harness();
-        drive(&shared, &ctx, Command::OpenViewer);
-        assert_eq!(drive(&shared, &ctx, Command::ShowBar), AppState::Bar);
-        assert_eq!(drive(&shared, &ctx, Command::OpenViewer), AppState::Viewer);
-    }
-
     /// Every `Command` variant, one instance each. `is_command_enabled`
     /// matches exhaustively (no wildcard arm), so a new variant added here
     /// without a ruling in the table fails to compile — and forgetting to
@@ -3185,9 +2986,7 @@ mod tests {
             Command::CaptureNow(CaptureMode::Region),
             Command::ConfirmCapture,
             Command::CancelCapture,
-            Command::ShowBar,
             Command::OpenViewer,
-            Command::CloseBar,
             Command::ViewerClosed,
             Command::OpenSettings,
             Command::CloseSettings,
@@ -3249,9 +3048,7 @@ mod tests {
             ),
             (Command::ConfirmCapture, true, true, true, true),
             (Command::CancelCapture, true, true, true, true),
-            (Command::ShowBar, false, false, false, false),
             (Command::OpenViewer, true, false, false, false),
-            (Command::CloseBar, true, true, true, true),
             (Command::ViewerClosed, true, true, true, true),
             (Command::OpenSettings, true, false, false, false),
             (Command::CloseSettings, true, true, true, true),
@@ -3328,7 +3125,6 @@ mod tests {
                     | Command::ClosePin(_)
                     | Command::CopyPin(_)
                     | Command::ViewerClosed
-                    | Command::CloseBar
             );
             assert_eq!(
                 is_command_enabled(&command, ModalState::Capturing),
@@ -3551,50 +3347,5 @@ mod tests {
                 "ClosePin(7) was not queued after clicking at {press_pos:?}"
             );
         }
-    }
-
-    /// `ShowBar` restores the remembered bar spot only while it lands on
-    /// the anchor monitor — a spot from a since-moved viewer is stale.
-    #[test]
-    fn remembered_bar_spot_must_share_the_anchor_monitor() {
-        fn monitor(x: i32, y: i32) -> MonitorInfo {
-            MonitorInfo {
-                id: x as u32,
-                name: "m".into(),
-                rect: crate::capture::PhysicalRect {
-                    x,
-                    y,
-                    width: 1000,
-                    height: 800,
-                },
-                // scale 1.0 keeps `ui_to_native` an identity on both
-                // OSes so the hit test is deterministic.
-                scale_factor: 1.0,
-                is_primary: false,
-            }
-        }
-        let sidecar = monitor(-1133, 819);
-        let main5k = monitor(0, 0);
-        let monitors = vec![sidecar.clone(), main5k];
-        // On the Sidecar display, a spot on it restores.
-        assert!(ui_pos_on_anchor(
-            egui::pos2(-700.0, 900.0),
-            &monitors,
-            &sidecar
-        ));
-        // …but a spot remembered on the BenQ does not.
-        assert!(!ui_pos_on_anchor(
-            egui::pos2(500.0, 300.0),
-            &monitors,
-            &sidecar
-        ));
-        // A spot outside every monitor is stale too.
-        assert!(!ui_pos_on_anchor(
-            egui::pos2(9999.0, 9999.0),
-            &monitors,
-            &sidecar
-        ));
-        // No monitors enumerated (xcap failure): nothing restores.
-        assert!(!ui_pos_on_anchor(egui::pos2(-700.0, 900.0), &[], &sidecar));
     }
 }

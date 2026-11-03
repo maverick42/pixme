@@ -88,8 +88,8 @@ pub struct OverlaySession {
     /// crosshair exists, stamped onto the final crop at the click point
     /// (`None` when `include_pointer` is off or the cursor is hidden).
     pub(crate) cursor: Option<crate::platform::CursorSnapshot>,
-    /// Frames painted before the screenshot is taken — the bar's window must
-    /// be torn down first or it would photograph itself.
+    /// Frames painted before the screenshot is taken — the viewer's window
+    /// must be torn down first or it would photograph itself.
     warm_frames: u8,
     /// All monitors frozen up front so the crosshair can follow the cursor
     /// across screens until a selection starts.
@@ -258,7 +258,7 @@ impl OverlaySession {
     }
 
     /// Freeze warm-up, called by the **anchor** pass while no capture window
-    /// exists yet: two anchor frames let the floating bar finish tearing
+    /// exists yet: two anchor frames let the viewer finish tearing
     /// down, then every connected monitor is photographed at once. Crucially
     /// this runs *before* the overlay viewport is created — capturing while
     /// it is on screen would photograph the overlay's own veil. Returns

@@ -1,12 +1,10 @@
-//! Screen capture: monitor enumeration and the three capture kinds.
+//! Screen capture: monitor enumeration and the capture kinds.
 //!
-//! Contract only — implementations land in phase 3 on top of `xcap`. All OS
-//! details (Screen Recording permission on macOS, per-monitor DPI on Windows)
-//! stay behind this module and `crate::platform`.
+//! All OS details (Screen Recording permission on macOS, per-monitor DPI on
+//! Windows) stay behind this module and `crate::platform`.
 
 use serde::{Deserialize, Serialize};
 
-pub mod region;
 pub mod screen;
 pub mod window;
 
@@ -87,13 +85,4 @@ pub enum CaptureError {
     /// Code path not implemented yet.
     #[error("not implemented: {0}")]
     Unsupported(&'static str),
-}
-
-/// The capture back-end contract. One implementation per OS family, obtained
-/// from [`crate::platform`].
-pub trait Capturer: Send + Sync {
-    /// All connected monitors.
-    fn monitors(&self) -> Result<Vec<MonitorInfo>, CaptureError>;
-    /// Captures `kind` on `monitor`.
-    fn capture(&self, kind: CaptureKind, monitor: &MonitorInfo) -> Result<Capture, CaptureError>;
 }

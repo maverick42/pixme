@@ -27,7 +27,7 @@ const ZOOMS: [f32; 3] = [0.5, 1.0, 2.0];
 const ROUNDING: f32 = 10.0;
 /// Transparent margin above the image: on Windows the native region
 /// clip (2px) that removes the DWM top accent line eats into it
-/// instead of cropping the image — the bar's SHADOW_MARGIN pattern.
+/// instead of cropping the image — the countdown's SHADOW_MARGIN pattern.
 pub const TOP_MARGIN: f32 = 2.0;
 /// Dark scoop hugging the top-left corner behind the close dot.
 const HALO: f32 = 34.0;

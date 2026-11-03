@@ -39,7 +39,7 @@ pub struct WindowInfo {
 }
 
 /// All on-screen pickable windows, front-to-back — minus minimized, tiny,
-/// OS-chrome-layer and PixMe's own windows (the bar and the overlay must
+/// OS-chrome-layer and PixMe's own windows (the overlay and pins must
 /// never be capturable).
 pub fn windows() -> Result<Vec<WindowInfo>, CaptureError> {
     let own_pid = std::process::id();

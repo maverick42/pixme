@@ -2,7 +2,6 @@
 
 use super::ExportError;
 use crate::capture::Capture;
-use crate::editor::Document;
 
 /// Puts `capture`'s raw RGBA pixels on the OS clipboard — used by pinned
 /// windows and by the quick-copy option.
@@ -38,11 +37,6 @@ pub fn clipboard_image() -> Result<Option<image::RgbaImage>, ExportError> {
         Err(arboard::Error::ContentNotAvailable) => Ok(None),
         Err(e) => Err(ExportError::Failed(e.to_string())),
     }
-}
-
-/// Renders `doc` and puts the RGBA pixels on the OS clipboard. Phase 4.
-pub fn copy(_doc: &Document) -> Result<(), ExportError> {
-    Err(ExportError::Failed("not implemented".into()))
 }
 
 #[cfg(test)]

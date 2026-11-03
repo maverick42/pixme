@@ -1,5 +1,5 @@
-//! Everything the user sees: theme (single source of visual truth), icons,
-//! reusable widgets and the floating toolbar.
+//! Everything the user sees: theme (single source of visual truth), icons
+//! and reusable widgets.
 //!
 //! Rule: no hard-coded colour, radius, spacing or font outside `theme.rs` and
 //! `widgets/` — everything reads [`theme::tokens`].
@@ -12,7 +12,6 @@ pub mod pin;
 pub mod save_dialog;
 pub mod settings;
 pub mod theme;
-pub mod toolbar;
 pub mod viewer;
 pub mod viewport_sync;
 pub mod widgets;

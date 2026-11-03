@@ -90,7 +90,7 @@ pub struct Tokens {
     pub radius_sm: u8,
     /// Medium radius (buttons, fields, menus).
     pub radius_md: u8,
-    /// Large radius (windows, panels, the floating bar).
+    /// Large radius (windows, panels).
     pub radius_lg: u8,
 }
 

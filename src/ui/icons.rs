@@ -47,7 +47,7 @@ pub enum Icon {
     Plus,
     /// Viewfinder frame (menu-bar status item glyph).
     Scan,
-    /// Drag handle on the left edge of the floating bar.
+    /// Drag handle (pinned captures, mosaic tile drag anchor).
     GripVertical,
     /// Copy to clipboard (overlapping rectangles).
     Copy,

@@ -1,10 +1,10 @@
 //! The session viewer — PixMe's main window.
 //!
-//! One tab per capture of the session, a "+" action that hands back to the
-//! floating bar for a new capture, and the translated Save/Discard/Cancel
-//! confirmation when a dirty session would be lost. On Windows the viewer
-//! also draws the application's menu strip (no global menu bar exists);
-//! on macOS the same actions live in the native PixMe/Capture/File menus.
+//! One tab per capture of the session, a vertical capture bar starting new
+//! captures, and the translated Save/Discard/Cancel confirmation when a
+//! dirty session would be lost. On Windows the viewer also draws the
+//! application's menu strip (no global menu bar exists); on macOS the same
+//! actions live in the native PixMe/File/Edit/Window menus.
 //! The toolbar carries the file/edit actions (open, save, select, zoom,
 //! resize, clipboard, print, close); Draw lands in the next phase.
 
@@ -1798,8 +1798,9 @@ impl Viewer {
                 ctx.request_repaint();
             }
         }
-        // Explicit fill: the app-wide clear color is transparent (the anchor
-        // and the floating bar need it), so windows must paint their own.
+        // Explicit fill: the app-wide clear color is transparent (the anchor,
+        // countdown and pinned windows need it), so windows must paint
+        // their own.
         let t = theme::tokens(&ctx);
         egui::Panel::bottom("viewer.status")
             .frame(
@@ -2493,18 +2494,6 @@ impl Viewer {
                             shared.command_enabled(&Command::CopyActive),
                         );
                     });
-                    menu_button(ui, t!("menu.capture").as_ref(), |ui| {
-                        // Single entry: show the floating bar (same as the "+"
-                        // tab button) — the mode picker lives on the bar.
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::ShowBar,
-                            t!("menu.capture.launch").as_ref(),
-                            Some(Icon::Plus),
-                            shared.command_enabled(&Command::ShowBar),
-                        );
-                    });
                     menu_button(ui, t!("settings.title").as_ref(), |ui| {
                         menu_item(
                             ui,
@@ -2539,10 +2528,10 @@ impl Viewer {
 
     /// The capture tab strip: one selectable label per capture — red
     /// diamond when unsaved-or-modified, padlock when protected, a close
-    /// cross, and the right-click options menu — then "+".
+    /// cross, and the right-click options menu.
     /// The capture tab strip: chips in a wheel-scrollable area (no
-    /// scrollbar — the reference's behaviour), overflow arrows and "+"
-    /// pinned at the right edge.
+    /// scrollbar — the reference's behaviour), overflow arrows pinned
+    /// at the right edge.
     fn tab_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         egui::Frame::default()
             .inner_margin(Margin::symmetric(8, 6))
@@ -2555,8 +2544,7 @@ impl Viewer {
                     // ◀ ▶ only exist while the chips overflow; max_width
                     // keeps the scroll area from pushing them off-screen.
                     let step = widgets::BUTTON_SIZE + 4.0;
-                    let right_w =
-                        widgets::BUTTON_SIZE + if self.tabs_overflow { 2.0 * step } else { 0.0 };
+                    let right_w = if self.tabs_overflow { 2.0 * step } else { 0.0 };
                     let strip_w = (ui.available_width() - right_w).max(60.0);
                     let mut area = egui::ScrollArea::horizontal()
                         .id_salt("pixme-tabs")
@@ -2591,12 +2579,6 @@ impl Viewer {
                                 self.tab_scroll_to = Some(self.tab_scroll_pos + 160.0);
                             }
                         });
-                    }
-                    if widgets::icon_button(ui, Icon::Plus, false)
-                        .on_hover_text(t!("viewer.new_capture.tooltip"))
-                        .clicked()
-                    {
-                        shared.push(Command::ShowBar);
                     }
                 });
             });
@@ -2915,10 +2897,10 @@ impl Viewer {
         }
     }
 
-    /// The mosaic grid: one thumbnail tile per capture plus a trailing
-    /// "new capture" tile, in a vertical scroll area whose column count
-    /// adapts to the available width. Enter on the active tile opens it
-    /// in Tabs mode (same as a double-click).
+    /// The mosaic grid: one thumbnail tile per capture, in a vertical
+    /// scroll area whose column count adapts to the available width.
+    /// Enter on the active tile opens it in Tabs mode (same as a
+    /// double-click).
     fn mosaic_content(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let t = theme::tokens(ui.ctx());
         let avail = ui.available_rect_before_wrap();
@@ -2949,17 +2931,12 @@ impl Viewer {
                 // the window edge.
                 ui.add_space(spacing);
                 let cols = (ui.available_width() / (tile_w + spacing)).floor().max(1.0) as usize;
-                let total = self.tabs.len() + 1; // one tile per tab + the "+" tile
-                for row in (0..total).step_by(cols) {
+                for row in (0..self.tabs.len()).step_by(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = spacing;
                         ui.add_space(spacing);
-                        for cell in row..(row + cols).min(total) {
-                            if cell < self.tabs.len() {
-                                self.mosaic_tile(ui, cell, shared, tile_w, tile_h);
-                            } else {
-                                self.mosaic_new_tile(ui, shared, tile_w, tile_h);
-                            }
+                        for cell in row..(row + cols).min(self.tabs.len()) {
+                            self.mosaic_tile(ui, cell, shared, tile_w, tile_h);
                         }
                     });
                 }
@@ -3177,50 +3154,6 @@ impl Viewer {
             ui.set_min_width(200.0);
             self.tab_menu(ui, index, shared);
         });
-    }
-
-    /// The trailing "new capture" tile — the mosaic's twin of the tab
-    /// strip's "+": clicking it brings the floating bar back.
-    fn mosaic_new_tile(&mut self, ui: &mut egui::Ui, shared: &Shared, w: f32, h: f32) {
-        let t = theme::tokens(ui.ctx());
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
-        let hovered = resp.hovered();
-        ui.painter().rect(
-            rect,
-            CornerRadius::same(t.radius_md),
-            if hovered { t.hover } else { t.card },
-            Stroke::new(
-                1.0,
-                if hovered {
-                    t.accent_border
-                } else {
-                    t.card_border
-                },
-            ),
-            StrokeKind::Inside,
-        );
-        let plus = Rect::from_center_size(
-            Pos2::new(rect.center().x, rect.center().y - 10.0),
-            Vec2::splat(24.0),
-        );
-        icons::paint(
-            ui,
-            plus,
-            Icon::Plus,
-            24.0,
-            if hovered { t.accent } else { t.icon },
-        );
-        ui.painter().text(
-            Pos2::new(rect.center().x, rect.max.y - 22.0),
-            egui::Align2::CENTER_CENTER,
-            t!("viewer.new_capture.tooltip"),
-            theme::medium(10.5),
-            t.text_dim,
-        );
-        let resp = resp.on_hover_text(t!("viewer.new_capture.tooltip"));
-        if resp.clicked() {
-            shared.push(Command::ShowBar);
-        }
     }
 
     /// The tile's caption band: an always-visible dark strip with the

@@ -84,7 +84,6 @@ pub fn install_ui(ctx: &egui::Context) {
 
     let menu = Menu::new();
     let mut items = Vec::new();
-    add(&menu, &mut items, "take_capture", "menubar.take_capture");
     add(&menu, &mut items, "open_viewer", "menubar.open_viewer");
     if let Err(err) = menu.append(&PredefinedMenuItem::separator()) {
         tracing::warn!("cannot append tray menu separator: {err}");
@@ -199,9 +198,9 @@ pub fn sync_menu_enabled(
 ///    *"Enabling the shadow causes a thin 1px line to appear on the top of the window"*).
 ///    Applying a native Win32 window region (`SetWindowRgn`) tells DWM the true
 ///    geometry of the window so nothing is drawn outside it:
-///    - For the floating bar and countdown (`"PixMe Bar"`, `"PixMe Countdown"`):
-///      both carry a 14 pt transparent `SHADOW_MARGIN`, so clipping y=0..2
-///      removes the DWM line without touching the card or its soft shadow.
+///    - For the countdown (`"PixMe Countdown"`): it carries a 14 pt
+///      transparent `SHADOW_MARGIN`, so clipping y=0..2 removes the DWM
+///      line without touching the card or its soft shadow.
 ///    - For pinned captures (`"PixMe Pin"`): sets a rounded-rect region (`16 px`),
 ///      matching the card's rounded corners and preserving the full border stroke.
 ///
@@ -266,7 +265,6 @@ pub fn strip_undecorated_frame() {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Role {
-        Bar,
         Countdown,
         Pin,
         Overlay,
@@ -296,12 +294,6 @@ pub fn strip_undecorated_frame() {
             let mut m = roles.borrow_mut();
             if let Some(&r) = m.get(&hwnd) {
                 (Some(r), false)
-            } else if title == "PixMe Bar" {
-                m.insert(hwnd, Role::Bar);
-                // Clear the window title text in Win32 so DefWindowProc on WM_NCACTIVATE
-                // (fired when focus shifts to countdown) never draws title text.
-                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                (Some(Role::Bar), true)
             } else if title == "PixMe Countdown" {
                 m.insert(hwnd, Role::Countdown);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
@@ -377,7 +369,7 @@ pub fn strip_undecorated_frame() {
 
                 if need_reapply_region || size_changed {
                     let rgn = match role {
-                        Role::Bar | Role::Countdown => {
+                        Role::Countdown => {
                             // Clip the top 2 pixels of empty transparent margin to eliminate
                             // the DWM top accent line.
                             unsafe { CreateRectRgn(0, 2, w + 1, h + 1) }

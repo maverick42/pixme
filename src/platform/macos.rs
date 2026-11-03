@@ -183,16 +183,10 @@ pub fn install_ui(ctx: &egui::Context) {
 
     let mut labels = Labels::default();
 
-    // Status item: the same two actions the Windows tray menu carries.
-    // Quitting lives exclusively in the PixMe application menu.
+    // Status item: opening the viewer is the one resident action —
+    // captures start from the viewer's own capture bar. Quitting lives
+    // exclusively in the PixMe application menu.
     let status_menu = Menu::new();
-    item(
-        &mut labels,
-        &status_menu,
-        "take_capture",
-        "menubar.take_capture",
-        None,
-    );
     item(
         &mut labels,
         &status_menu,
@@ -328,19 +322,6 @@ pub fn install_ui(ctx: &egui::Context) {
     separator(&edit);
     item(&mut labels, &edit, "edit.copy", "menu.edit.copy", None);
     append(&app_menu, &edit);
-
-    // The viewer's Capture menu — a single launch action, like the "+"
-    // tab: the mode picker lives on the floating bar.
-    let capture = Submenu::new(t!("menu.capture").as_ref(), true);
-    labels.subs.push((capture.clone(), "menu.capture"));
-    item(
-        &mut labels,
-        &capture,
-        "capture.launch",
-        "menu.capture.launch",
-        None,
-    );
-    append(&app_menu, &capture);
 
     let window = Submenu::new(t!("menu.window").as_ref(), true);
     labels.subs.push((window.clone(), "menu.window"));
@@ -881,7 +862,7 @@ pub fn cursor_snapshot(scale_factor: f32) -> Option<super::CursorSnapshot> {
             cursor = send_id(cls, sel_registerName(c"currentCursor".as_ptr()));
         }
         // The pointer may sit over another app's window (a delayed capture,
-        // or right after the bar tore down): both "current" cursors are
+        // or right after the viewer tore down): both "current" cursors are
         // then NULL — fall back to the standard arrow so the stamp always
         // has an image when the user asked for the pointer in captures.
         if cursor.is_null() {
