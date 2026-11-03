@@ -292,40 +292,50 @@ pub fn strip_undecorated_frame() {
         let n = unsafe { GetWindowTextW(hwnd, title_buf.as_mut_ptr(), 64) as usize };
         let title = String::from_utf16_lossy(&title_buf[..n]);
 
-        let role = ROLES.with(|roles| {
+        let (role, first_seen) = ROLES.with(|roles| {
             let mut m = roles.borrow_mut();
             if let Some(&r) = m.get(&hwnd) {
-                Some(r)
+                (Some(r), false)
             } else if title == "PixMe Bar" {
                 m.insert(hwnd, Role::Bar);
                 // Clear the window title text in Win32 so DefWindowProc on WM_NCACTIVATE
                 // (fired when focus shifts to countdown) never draws title text.
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::Bar)
+                (Some(Role::Bar), true)
             } else if title == "PixMe Countdown" {
                 m.insert(hwnd, Role::Countdown);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::Countdown)
+                (Some(Role::Countdown), true)
             } else if title == "PixMe Pin" {
                 m.insert(hwnd, Role::Pin);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::Pin)
+                (Some(Role::Pin), true)
             } else if title == "PixMe Overlay" {
                 m.insert(hwnd, Role::Overlay);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::Overlay)
+                (Some(Role::Overlay), true)
             } else if title == "PixMe" {
                 m.insert(hwnd, Role::Anchor);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                Some(Role::Anchor)
+                (Some(Role::Anchor), true)
             } else {
-                None
+                (None, false)
             }
         });
 
         let Some(role) = role else {
             return 1;
         };
+
+        if role == Role::Overlay && first_seen {
+            // The taskbar is itself TOPMOST: a later-created topmost
+            // window wins the band anyway, but re-asserting precedence
+            // here guarantees the frozen frame stays selectable edge to
+            // edge (the capture must reach the taskbar's clock).
+            unsafe {
+                SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+            }
+        }
 
         let mut need_reapply_region = false;
         if (style & WS_CHROME) != 0 {
@@ -783,6 +793,19 @@ pub fn cursor_position() -> Option<(f32, f32)> {
     }
 }
 
+/// Whether the left mouse button is currently held — `GetAsyncKeyState`
+/// reads the physical state, not window-delivered events, so a press the
+/// OS edge zones eat (e.g. the taskbar's own hit band) still registers.
+/// The overlay polls this for drags started at the screen edge.
+pub fn left_mouse_down() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    const VK_LBUTTON: i32 = 0x01;
+    unsafe { GetAsyncKeyState(VK_LBUTTON) & 0x8000u16 as i16 != 0 }
+}
+
 /// One short tick — a soft click synthesized once in memory and played
 /// through `PlaySoundW` (`SND_MEMORY` keeps it file-free and independent
 /// of the user's sound scheme). `MessageBeep` falls back if playback
@@ -1097,5 +1120,14 @@ pub fn dismiss_active_menus() -> bool {
 }
 
 /// No-op on Windows (`with_always_on_top()` already places the overlay at
-/// `HWND_TOPMOST`).
+/// `HWND_TOPMOST`; `strip_undecorated_frame` re-asserts it above the
+/// taskbar on creation).
 pub fn elevate_overlay() {}
+
+/// No-op on Windows — there is no system chrome to hide during a
+/// capture: the taskbar is simply covered by the topmost overlay (its
+/// frozen pixels stay selectable underneath).
+pub fn capture_chrome_enter() {}
+
+/// No-op on Windows (see [`capture_chrome_enter`]).
+pub fn capture_chrome_exit() {}

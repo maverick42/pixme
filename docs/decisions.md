@@ -1761,6 +1761,39 @@ Format: date — context — decision — consequences.
   frame changes (re-stripped next pump). Guarded by the
   `chromeless_viewports_start_hidden` test.
 
+## 2026-11-02 — Capture kiosk: real menu bar + Dock hidden during selection; overlay covers them
+
+- **Context**: rectangular and window-pick captures could not reach the
+  macOS menu bar or Dock (and the Windows taskbar): macOS clamps
+  `setFrame` to the screen's `visibleFrame` (menu bar / Dock excluded),
+  so the overlay never covered those strips even at
+  `kCGScreenSaverWindowLevel`, and the Windows taskbar is itself
+  TOPMOST. iScreenShot-style tools get past this by disabling the real
+  chrome outright during capture — the user's explicit reference.
+- **Decision**: while a non-instant capture is live (the frozen frames
+  are already safe), enter a capture kiosk —
+  `NSApplication.presentationOptions = HideDock | HideMenuBar |
+  DisableProcessSwitching | DisableHideApplication`. The REAL chrome
+  disappears (menu bar cannot be clicked or revealed, Cmd+Tab is dead);
+  its pixels live on in the frozen frame painted by the overlay, so
+  every screen strip stays selectable but unclickable. Because the
+  visibleFrame clamp only releases as the hide animates (~0.3 s), the
+  overlay re-sends `OuterPosition`/`InnerSize` every frame until the
+  window covers the monitor's true frame, capped at 150 tries — the
+  existing `screen_offset` mapping keeps image↔screen exact throughout.
+  `enter()` calls `capture_chrome_exit()` on every transition out of
+  `Capturing` (process exit also restores the options automatically).
+  Windows needs no hiding: the overlay is topmost + borderless
+  fullscreen over the taskbar — `strip_undecorated_frame` additionally
+  re-asserts `HWND_TOPMOST` on the overlay at creation so the taskbar's
+  own topmost band can never win.
+- **Consequences**: region/fixed/pin captures can select over the menu
+  bar, Dock and taskbar (their clock included — the user's stated goal);
+  menus are truly inert during selection, matching iScreenShoter.
+  Instant fullscreen captures never enter the kiosk (no flicker). If
+  the kiosk hide ever fails, the overlay simply stays clamped below the
+  menu bar as before — `screen_offset` keeps the capture correct.
+
 ## 2026-11-02 — Anchor gets an empty window region; bar geometry ledger resets on re-entry
 
 - **Context**: two Windows-only artifacts reported together. (1) A

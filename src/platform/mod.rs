@@ -388,11 +388,19 @@ pub use windows::cursor_snapshot;
 /// (the OS composites the cursor on its own). Counter-based — always pair
 /// with `unhide_cursor`.
 #[cfg(target_os = "macos")]
-pub use macos::{dismiss_active_menus, elevate_overlay, hide_cursor, unhide_cursor};
+pub use macos::{
+    capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay, hide_cursor,
+    left_mouse_down, unhide_cursor,
+};
 /// Hides / unhides the OS cursor and dismisses active popup menus around a
-/// capture (see above).
+/// capture (see above). `capture_chrome_*` arms/disarms the capture kiosk
+/// (menu bar + Dock hidden on macOS; no-op on Windows). `left_mouse_down`
+/// polls the physical button so edge-swallowed presses still drag.
 #[cfg(target_os = "windows")]
-pub use windows::{dismiss_active_menus, elevate_overlay, hide_cursor, unhide_cursor};
+pub use windows::{
+    capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay, hide_cursor,
+    left_mouse_down, unhide_cursor,
+};
 
 #[cfg(test)]
 mod tests {

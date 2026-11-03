@@ -1315,14 +1315,19 @@ impl Shared {
     /// still replaces sub-state (e.g. a new capture session over a live
     /// one) that the anchor pass must re-evaluate.
     fn enter(&self, next: AppState, ctx: &egui::Context) {
-        let changed = {
+        let (prev, changed) = {
             let mut state = lock(&self.state);
-            let changed = *state != next;
+            let prev = *state;
             *state = next;
-            changed
+            (prev, prev != next)
         };
         if changed {
             tracing::info!(state = ?next, "lifecycle");
+            if prev == AppState::Capturing {
+                // Leaving the capture kiosk: the real menu bar and Dock
+                // slide back in (the overlay hid them — no-op on Windows).
+                platform::capture_chrome_exit();
+            }
             // The viewer is a real application window: bring it to the
             // front. The bar is a palette — `always_on_top`, never focus.
             if next == AppState::Viewer {

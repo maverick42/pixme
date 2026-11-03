@@ -41,6 +41,11 @@ const COPIED_SECS: f32 = 1.2;
 /// one `dismiss_active_menus` posted — covers the overlay's whole
 /// create-window-and-become-key path (~100-300 ms observed).
 const SYNTHETIC_ESC_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
+/// Frames spent re-placing the window while macOS's visibleFrame clamp
+/// expands (menu bar / Dock hiding animates over ~0.3 s) — bounded so a
+/// failed kiosk can never spin the viewport command pump forever.
+#[cfg(not(target_os = "windows"))]
+const MAX_NUDGE_TRIES: u8 = 150;
 
 /// One of the eight resize handles.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,6 +114,18 @@ pub struct OverlaySession {
     /// Whether the post-creation fullscreen nudge was sent (macOS clamps at
     /// init; a programmatic setFrame may escape it).
     nudged: bool,
+    /// Re-placement attempts sent while macOS's `visibleFrame` clamp
+    /// expands during the kiosk's hide animation — capped by
+    /// [`MAX_NUDGE_TRIES`]. Read only off Windows.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    nudge_tries: u8,
+    /// The live drag began via an OS-eaten press (egui never saw it) —
+    /// its release may be re-delivered as a synthetic click.
+    blind_drag: bool,
+    /// Fresh presses are ignored until this instant: after a blind drag,
+    /// the OS replays the gesture's release as a click at the drop point,
+    /// which would otherwise restart a selection where it ended.
+    suppress_press_until: Option<std::time::Instant>,
     /// Freeze failed permanently (permission, window gone) — cancel out.
     pub failed: bool,
     /// Pick mode (`WindowOrObject`): the on-screen window list, enumerated
@@ -167,6 +184,9 @@ impl OverlaySession {
                 || (matches!(mode, CaptureMode::FixedRegion) && remembered.is_some()),
             screen_offset: Vec2::ZERO,
             nudged: false,
+            nudge_tries: 0,
+            blind_drag: false,
+            suppress_press_until: None,
             failed: false,
             window_list: None,
             picked_window_id: None,
@@ -206,6 +226,7 @@ impl OverlaySession {
         self.frozen = Some(frame);
         self.texture = None;
         self.nudged = false;
+        self.nudge_tries = 0;
         self.screen_offset = Vec2::ZERO;
         // If a remembered selection belonged to a different monitor than the
         // one we ended up on, drop it (in FixedRegion, let the frame ride the
@@ -285,6 +306,15 @@ impl OverlaySession {
                     if let Some(id) = initial_id {
                         self.activate_monitor(id);
                     }
+                    if !self.instant && self.frozen.is_some() {
+                        // The frozen frames are safe: hide the REAL menu
+                        // bar and Dock now (capture kiosk) so their frozen
+                        // image under the overlay is all that remains —
+                        // selectable, unclickable (iScreenShot behaviour).
+                        // Instant captures show no overlay: skip the
+                        // pointless chrome flicker.
+                        crate::platform::capture_chrome_enter();
+                    }
                     if let Some(frame) = &self.frozen {
                         // Dev hook: PIXME_DUMP_FROZEN=/path.png dumps the frozen frame.
                         if let Some(path) = std::env::var_os("PIXME_DUMP_FROZEN") {
@@ -316,7 +346,15 @@ impl OverlaySession {
             shared.push(Command::CancelCapture);
             return;
         }
-        let rect = ui.max_rect();
+        // The whole window, not `ui.max_rect()`: the deferred-viewport
+        // callback is wrapped in a default CentralPanel whose ~8 pt inner
+        // margin shrinks the interact area — presses in the outer 8 px of
+        // the screen (the (0,0) corner, the menu-bar strip edge) never
+        // reached the selection. `screen_rect` is the viewport's real
+        // bounds, so painting AND input cover the monitor edge to edge.
+        let rect = ctx
+            .input(|i| i.viewport().inner_rect)
+            .unwrap_or_else(|| ui.max_rect());
         let t = theme::tokens(&ctx);
         ui.painter().rect_filled(rect, 0.0, t.dock);
 
@@ -419,16 +457,23 @@ impl OverlaySession {
                     }
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                 }
-                #[cfg(not(target_os = "windows"))]
-                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
-                    m.rect.x as f32,
-                    m.rect.y as f32,
-                )));
-                #[cfg(not(target_os = "windows"))]
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
-                    m.rect.width as f32,
-                    m.rect.height as f32,
-                )));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // macOS constrains `setFrame` to the screen's visibleFrame
+                // (menu bar and Dock excluded). While the capture kiosk
+                // hides that chrome the visible frame keeps expanding
+                // (~0.3 s) and the clamped window lags behind — keep
+                // re-placing until it covers the monitor's real frame,
+                // capped so a failed kiosk can never spin.
+                let want = egui::vec2(m.rect.width as f32, m.rect.height as f32);
+                let aligned = (outer.min - origin).abs().max_elem() <= 1.0
+                    && (outer.size() - want).abs().max_elem() <= 1.0;
+                if !aligned && self.nudge_tries < MAX_NUDGE_TRIES {
+                    self.nudge_tries += 1;
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(origin));
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
+                }
             }
         }
 
@@ -477,7 +522,21 @@ impl OverlaySession {
 
         // -- input ---------------------------------------------------------
         let resp = ui.interact(rect, ui.id().with("overlay"), Sense::click_and_drag());
-        let cursor = self.cursor_pos(&ctx);
+        let os_down = crate::platform::left_mouse_down();
+        // A press swallowed by an OS edge zone never reaches egui — and
+        // the window never got clicked, so it is not key either (Esc and
+        // Enter would go to the previous app). Reclaim focus during the
+        // blind drag and track the OS cursor (egui's `latest_pos` is
+        // stale for the crosshair and loupe too).
+        let blind = os_down && !ctx.input(|i| i.pointer.primary_down());
+        if blind {
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+        let cursor = if blind {
+            self.os_cursor_pos(&ctx)
+        } else {
+            self.cursor_pos(&ctx)
+        };
         if matches!(self.mode, CaptureMode::WindowOrObject) {
             self.pick_window(&ctx, cursor);
         } else {
@@ -487,12 +546,22 @@ impl OverlaySession {
                     self.selection =
                         Some(slide_inside(Rect::from_center_size(pos, FIXED_SIZE), rect));
                 }
-                if resp.drag_started() || resp.clicked() {
+                if resp.drag_started()
+                    || resp.clicked()
+                    || (os_down && cursor.is_some_and(|p| rect.contains(p)))
+                {
                     self.placed = true;
                 }
             }
-            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                self.handle_drag(pos, &resp, rect);
+            // Feed the drag from the real button state, not only egui's
+            // pointer events: OS edge zones (the 1 px top strip on macOS)
+            // swallow mouseDown before delivery, so a press starting at
+            // the screen edge never reaches `resp` — but the held button
+            // and the cursor are still ours.
+            let pos = cursor
+                .filter(|_| os_down || self.drag.is_some() || resp.is_pointer_button_down_on());
+            if let Some(pos) = pos {
+                self.handle_drag(pos, &resp, rect, os_down);
             }
         }
         if resp.double_clicked() && self.selection.is_some() {
@@ -511,6 +580,13 @@ impl OverlaySession {
         if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
             return Some(pos);
         }
+        self.os_cursor_pos(ctx)
+    }
+
+    /// Cursor position from the OS only (no egui pointer state) — the
+    /// reliable path when egui cannot see the drag because the press was
+    /// swallowed by an OS edge zone.
+    fn os_cursor_pos(&self, ctx: &egui::Context) -> Option<Pos2> {
         let (cx, cy) = crate::platform::cursor_position()?;
         let m = self.monitor.as_ref()?;
         let native_scale = ctx
@@ -552,10 +628,17 @@ impl OverlaySession {
     /// Pointer input: hit-test handles → inside → outside, update selection.
     /// The selection never leaves `bounds` (the window = the visible monitor
     /// area): out-of-window drags stop at the edges instead of overrunning
-    /// the menu bar or the screen borders.
-    fn handle_drag(&mut self, pos: Pos2, resp: &egui::Response, bounds: Rect) {
+    /// the menu bar or the screen borders. `os_down` is the physical left
+    /// button — a press eaten by an OS edge zone (`resp.drag_started`
+    /// never fired) still starts a drag while the cursor sits in bounds.
+    fn handle_drag(&mut self, pos: Pos2, resp: &egui::Response, bounds: Rect, os_down: bool) {
+        let in_bounds = bounds.contains(pos);
         let pos = clamp_pos(pos, bounds);
-        if resp.drag_started() {
+        let synthetic = self
+            .suppress_press_until
+            .is_some_and(|until| std::time::Instant::now() < until);
+        if self.drag.is_none() && !synthetic && (resp.drag_started() || (os_down && in_bounds)) {
+            self.blind_drag = !resp.drag_started();
             self.drag = Some(if let Some(sel) = self.selection {
                 if let Some(h) = hit_handle(sel, pos) {
                     Drag::Resize(h)
@@ -598,8 +681,17 @@ impl OverlaySession {
                 }
             }
         }
-        if resp.drag_stopped() {
+        if resp.drag_stopped() || (!os_down && self.drag.is_some()) {
+            let was_blind = self.blind_drag;
             self.drag = None;
+            self.blind_drag = false;
+            if was_blind {
+                // The OS replays the gesture's release as a synthetic
+                // click at the drop point — do not let it restart a
+                // selection where this one ended.
+                self.suppress_press_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+            }
             if let Some(sel) = self.selection {
                 // Shrink-to-nothing counts as no selection.
                 if sel.width() < 2.0 || sel.height() < 2.0 {
