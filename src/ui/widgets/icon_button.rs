@@ -19,13 +19,21 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool) -> Response {
     let t = theme::tokens(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BUTTON_SIZE), Sense::click());
 
+    let icon_tint = if !ui.is_enabled() {
+        t.text_faint
+    } else if response.hovered() {
+        // Hover pops like `tool_button`: accent icon.
+        t.accent
+    } else {
+        t.icon
+    };
     if ui.is_rect_visible(rect) {
         let (fill, stroke) = if response.is_pointer_button_down_on() {
             (t.pressed, Stroke::NONE)
         } else if selected {
             (t.accent_soft, Stroke::new(1.0, t.accent_border))
         } else if response.hovered() {
-            (t.hover, Stroke::NONE)
+            (t.hover, Stroke::new(1.0, t.accent_soft))
         } else {
             (Color32::TRANSPARENT, Stroke::NONE)
         };
@@ -36,7 +44,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool) -> Response {
             stroke,
             StrokeKind::Inside,
         );
-        icons::paint(ui, rect, icon, ICON_SIZE, t.icon);
+        icons::paint(ui, rect, icon, ICON_SIZE, icon_tint);
     }
 
     response
