@@ -2158,11 +2158,6 @@ impl Viewer {
                 ui.label(egui::RichText::new(label).color(t.text_dim).size(10.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .color(t.text_faint)
-                        .size(10.0),
-                );
                 // Monitor group, right-aligned next to the version: ↻
                 // refresh, then one button per known monitor — connected
                 // entries select the viewer's monitor (right-click
