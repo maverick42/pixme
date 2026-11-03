@@ -1281,3 +1281,11 @@ pub(crate) fn viewer_move_lock() -> bool {
     }
     FOUND.with(|f| f.get()) != 0
 }
+
+/// Re-grabs the capture overlay's focus while `Capturing` — Alt+Tab (or
+/// any OS mechanism) can steal it, then Esc would hit another app.
+/// Best-effort: Windows may refuse the raise (`SetForegroundWindow`
+/// rules), but clicks anywhere still reach the fullscreen overlay.
+pub fn refocus_capture_overlay(ctx: &egui::Context, id: egui::ViewportId) {
+    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+}

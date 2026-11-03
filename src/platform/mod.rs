@@ -451,6 +451,15 @@ pub(crate) use macos::viewer_move_lock;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::viewer_move_lock;
 
+/// Re-grabs the capture overlay's focus while `Capturing` — Windows
+/// only: Alt+Tab can steal it and Esc would then hit another app. The
+/// macOS capture kiosk already locks the session, making this a no-op.
+#[cfg(target_os = "macos")]
+pub use macos::refocus_capture_overlay;
+/// Re-grabs the capture overlay's focus while `Capturing` (see above).
+#[cfg(target_os = "windows")]
+pub use windows::refocus_capture_overlay;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1326,3 +1326,8 @@ pub(crate) fn viewer_move_lock() -> bool {
     }
     false
 }
+
+/// No-op on macOS: the capture kiosk (`presentationOptions` +
+/// screensaver-level overlay) already keeps the session's focus —
+/// there is nothing to hand back.
+pub fn refocus_capture_overlay(_ctx: &egui::Context, _id: egui::ViewportId) {}

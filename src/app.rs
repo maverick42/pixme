@@ -503,7 +503,12 @@ impl Shared {
     /// pass. Window-less launches (dev hooks) leave the slot empty and
     /// `begin_capture` falls back to the monitor under the cursor.
     pub fn push_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
-        *lock(&self.capture_start_monitor) = monitor_under(ctx);
+        // The session monitor — the monitor the viewer sits on — is the
+        // capture's start monitor (§2.5); the asking viewport's monitor
+        // is the fallback (dev hooks, tests with no live viewer).
+        *lock(&self.capture_start_monitor) = lock(&self.viewer_monitor)
+            .clone()
+            .or_else(|| monitor_under(ctx));
         self.push(Command::Capture(mode));
     }
 
@@ -623,6 +628,12 @@ impl Shared {
                 // evaluated, or the app deadlocks with modal=Saving.
                 ctx.request_repaint();
             }
+        }
+        // Windows: Alt+Tab (or any OS mechanism) can steal the overlay's
+        // focus mid-capture and Esc would then hit another app — keep
+        // handing it back while `Capturing`. No-op on macOS (kiosk).
+        if *lock(&self.state) == AppState::Capturing {
+            platform::refocus_capture_overlay(ctx, overlay_id());
         }
         let commands: Vec<Command> = platform::take_pending_commands()
             .into_iter()
@@ -1443,12 +1454,17 @@ impl Shared {
             | CaptureMode::FullScreen
             | CaptureMode::WindowOrObject
             | CaptureMode::Pin => {
-                // The overlay initially opens on the screen under the cursor
-                // (or where the capture was asked for), then follows the
-                // cursor across monitors until the user starts a selection.
-                let monitor = platform::cursor_position()
-                    .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
-                    .or_else(|| lock(&self.capture_start_monitor).take())
+                // The overlay initially opens on the SESSION monitor —
+                // the viewer's own monitor, recorded by `push_capture`
+                // — then the cursor's, the asking viewport's, or the
+                // primary's. It still follows the cursor across
+                // monitors until a selection starts.
+                let monitor = lock(&self.capture_start_monitor)
+                    .take()
+                    .or_else(|| {
+                        platform::cursor_position()
+                            .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
+                    })
                     .or_else(|| monitor_under(ctx))
                     .or_else(|| crate::capture::screen::primary_monitor().ok());
                 let Some(monitor) = monitor else {

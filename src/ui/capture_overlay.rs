@@ -284,27 +284,31 @@ impl OverlaySession {
                         self.swallow_esc_until =
                             Some(std::time::Instant::now() + SYNTHETIC_ESC_GRACE);
                     }
-                    // Pick the monitor under the cursor right now; fall back
-                    // to the pre-selected monitor or the primary/first frame.
+                    // The session monitor — the viewer's, recorded by
+                    // `push_capture` — is the start monitor (§2.5). A
+                    // remembered fixed-region rect's own monitor is next
+                    // (it reopens where it was), then the cursor's, then
+                    // the primary/first frame; each candidate is tried
+                    // in order so a stale monitor id can never strand
+                    // the overlay without a frame.
                     let cursor_mon = crate::platform::cursor_position()
                         .and_then(|(x, y)| screen::monitor_at(x, y))
                         .map(|m| m.id);
-                    // For FixedRegion/Pin with a remembered rect on a known
-                    // monitor, open on that monitor initially unless the
-                    // cursor is elsewhere.
-                    let initial_id = cursor_mon
-                        .or_else(|| self.restore_sel.map(|(id, _)| id))
-                        .or_else(|| self.monitor.as_ref().map(|m| m.id))
-                        .or_else(|| {
-                            frames
-                                .iter()
-                                .find(|c| c.monitor.is_primary)
-                                .or_else(|| frames.first())
-                                .map(|c| c.monitor.id)
-                        });
+                    let candidates = [
+                        self.monitor.as_ref().map(|m| m.id),
+                        self.restore_sel.map(|(id, _)| id),
+                        cursor_mon,
+                        frames
+                            .iter()
+                            .find(|c| c.monitor.is_primary)
+                            .or_else(|| frames.first())
+                            .map(|c| c.monitor.id),
+                    ];
                     self.frozen_all = frames;
-                    if let Some(id) = initial_id {
-                        self.activate_monitor(id);
+                    for id in candidates.into_iter().flatten() {
+                        if self.activate_monitor(id) {
+                            break;
+                        }
                     }
                     if !self.instant && self.frozen.is_some() {
                         // The frozen frames are safe: hide the REAL menu
