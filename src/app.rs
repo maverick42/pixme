@@ -2885,7 +2885,8 @@ mod tests {
     }
 
     /// The resident icon's left click toggles: opens the viewer from
-    /// Idle, closes it back to the resident icon when it is up.
+    /// Idle, closes it back to the resident icon when it is up and
+    /// focused.
     #[test]
     fn toggle_viewer_opens_and_closes() {
         let (shared, ctx) = harness();
@@ -2893,7 +2894,26 @@ mod tests {
             drive(&shared, &ctx, Command::ToggleViewer),
             AppState::Viewer
         );
+        // The viewer reports itself focused — the click closes it.
+        ctx.input_mut(|i| {
+            i.raw.viewports.entry(viewer_id()).or_default().focused = Some(true);
+        });
         assert_eq!(drive(&shared, &ctx, Command::ToggleViewer), AppState::Idle);
+    }
+
+    /// Up but merely behind another app — the click raises it (open
+    /// semantics), never closes it into `Idle`.
+    #[test]
+    fn toggle_viewer_behind_raises_instead_of_closing() {
+        let (shared, ctx) = harness();
+        drive(&shared, &ctx, Command::OpenViewer);
+        ctx.input_mut(|i| {
+            i.raw.viewports.entry(viewer_id()).or_default().focused = Some(false);
+        });
+        assert_eq!(
+            drive(&shared, &ctx, Command::ToggleViewer),
+            AppState::Viewer
+        );
     }
 
     /// Closing the viewer window just returns the resident app to
