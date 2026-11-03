@@ -2554,11 +2554,19 @@ impl Viewer {
             ui.add_space(2.0);
             widgets::hairline(ui);
             ui.add_space(2.0);
-            // Accent border + soft fill while a delay is armed — the
-            // "small blue frame" marker.
+            // An armed delay paints the clock red — the "armed" marker.
             let delay_btn = ui
                 .add_enabled_ui(!shared.modal_child_open(), |ui| {
-                    widgets::icon_button(ui, Icon::Clock, settings.capture_delay_secs > 0)
+                    if settings.capture_delay_secs > 0 {
+                        widgets::icon_button_tinted(
+                            ui,
+                            Icon::Clock,
+                            false,
+                            theme::tokens(ui.ctx()).danger,
+                        )
+                    } else {
+                        widgets::icon_button(ui, Icon::Clock, false)
+                    }
                 })
                 .inner
                 .on_hover_text(t!("toolbar.delay.tooltip"));
