@@ -16,8 +16,8 @@ use egui::{
 };
 use rust_i18n::t;
 
-use crate::app::{Command, Shared};
-use crate::config::TabSort;
+use crate::app::{CaptureMode, Command, Shared};
+use crate::config::{Settings, TabSort};
 use crate::editor::Document;
 use crate::editor::history::AnnoEdit;
 use crate::ui::icons::{self, Icon};
@@ -1802,6 +1802,22 @@ impl Viewer {
         // countdown and pinned windows need it), so windows must paint
         // their own.
         let t = theme::tokens(&ctx);
+        // The vertical capture bar: a fixed strip on the right edge,
+        // always visible in both view modes — the only place a capture
+        // starts from. Registered before the status strip so it owns the
+        // full window height; its left separator line is the built-in
+        // panel one (the theme's `separator` token via `bg_stroke`).
+        egui::Panel::right("viewer.vbar")
+            .resizable(false)
+            .exact_size(36.0)
+            .frame(
+                egui::Frame::default()
+                    .inner_margin(Margin::symmetric(5, 8))
+                    .fill(t.dock),
+            )
+            .show(ui, |ui| {
+                self.vbar(ui, shared);
+            });
         egui::Panel::bottom("viewer.status")
             .frame(
                 egui::Frame::default()
@@ -2342,6 +2358,146 @@ impl Viewer {
                     }
                 });
             });
+    }
+
+    /// The vertical capture bar: the five capture modes, then the delay
+    /// and capture-options dropdowns — the only place a capture starts
+    /// from. Capture buttons read the shared command table so they grey
+    /// out under modals exactly like the menu entries.
+    fn vbar(&mut self, ui: &mut egui::Ui, shared: &Shared) {
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
+            for (icon, tip, mode) in [
+                (
+                    Icon::SquareDashedMousePointer,
+                    "toolbar.window.tooltip",
+                    CaptureMode::WindowOrObject,
+                ),
+                (
+                    Icon::SquareDashed,
+                    "toolbar.region.tooltip",
+                    CaptureMode::Region,
+                ),
+                (
+                    Icon::Monitor,
+                    "toolbar.fullscreen.tooltip",
+                    CaptureMode::FullScreen,
+                ),
+                (
+                    Icon::Crop,
+                    "toolbar.fixed_region.tooltip",
+                    CaptureMode::FixedRegion,
+                ),
+                (Icon::Pin, "toolbar.pin.tooltip", CaptureMode::Pin),
+            ] {
+                if ui
+                    .add_enabled_ui(shared.command_enabled(&Command::Capture(mode)), |ui| {
+                        widgets::icon_button(ui, icon, false)
+                    })
+                    .inner
+                    .on_hover_text(t!(tip))
+                    .clicked()
+                {
+                    shared.push_capture(mode, ui.ctx());
+                }
+            }
+            let mut settings = shared.lock_settings();
+            ui.add_space(2.0);
+            widgets::hairline(ui);
+            ui.add_space(2.0);
+            // Accent border + soft fill while a delay is armed — the
+            // "small blue frame" marker.
+            let delay_btn = ui
+                .add_enabled_ui(!shared.modal_child_open(), |ui| {
+                    widgets::icon_button(ui, Icon::Clock, settings.capture_delay_secs > 0)
+                })
+                .inner
+                .on_hover_text(t!("toolbar.delay.tooltip"));
+            Self::delay_menu(&delay_btn, &mut settings);
+            ui.add_space(2.0);
+            widgets::hairline(ui);
+            ui.add_space(2.0);
+            let opts_btn = ui
+                .add_enabled_ui(!shared.modal_child_open(), |ui| {
+                    widgets::icon_button(ui, Icon::Settings, false)
+                })
+                .inner
+                .on_hover_text(t!("toolbar.options.tooltip"));
+            Self::options_menu(&opts_btn, &mut settings);
+        });
+    }
+
+    /// Dropdown on the clock button: delay in seconds before a capture.
+    /// The chosen delay is session state — it survives between captures
+    /// but is never saved to disk.
+    fn delay_menu(btn: &egui::Response, settings: &mut Settings) {
+        let before = settings.capture_delay_secs;
+        egui::Popup::menu(btn).show(|ui| {
+            ui.selectable_value(&mut settings.capture_delay_secs, 0, t!("delay.none"));
+            // A quick 5-second pick, then the full 1–9 s range below a
+            // separator.
+            ui.selectable_value(
+                &mut settings.capture_delay_secs,
+                5,
+                t!("delay.seconds", count = 5),
+            );
+            ui.separator();
+            for secs in 1..=9u32 {
+                let key = if secs == 1 {
+                    "delay.second"
+                } else {
+                    "delay.seconds"
+                };
+                ui.selectable_value(
+                    &mut settings.capture_delay_secs,
+                    secs,
+                    t!(key, count = secs),
+                );
+            }
+        });
+        if before != settings.capture_delay_secs {
+            tracing::info!(
+                setting = "capture_delay_secs",
+                value = settings.capture_delay_secs,
+                "settings_changed"
+            );
+        }
+    }
+
+    /// Menu on the gear button: capture-related toggles only — application
+    /// settings live in the settings UI, never in the capture bar.
+    fn options_menu(btn: &egui::Response, settings: &mut Settings) {
+        let before_pointer = settings.include_pointer;
+        let before_clip = settings.copy_to_clipboard;
+        let mut changed = false;
+        egui::Popup::menu(btn).show(|ui| {
+            changed |= ui
+                .checkbox(&mut settings.include_pointer, t!("options.include_pointer"))
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut settings.copy_to_clipboard,
+                    t!("options.copy_to_clipboard"),
+                )
+                .changed();
+        });
+        if changed {
+            if before_pointer != settings.include_pointer {
+                tracing::info!(
+                    setting = "include_pointer",
+                    value = settings.include_pointer,
+                    "settings_changed"
+                );
+            }
+            if before_clip != settings.copy_to_clipboard {
+                tracing::info!(
+                    setting = "copy_to_clipboard",
+                    value = settings.copy_to_clipboard,
+                    "settings_changed"
+                );
+            }
+            settings.save();
+        }
     }
 
     /// The zoom button's caption — the live factor as a percent (first
