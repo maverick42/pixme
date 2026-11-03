@@ -13,8 +13,8 @@ use std::cell::RefCell;
 use std::path::Path;
 
 use rust_i18n::t;
-use tray_icon::TrayIcon;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
 
 use super::PlatformServices;
 use crate::capture::CaptureError;
@@ -68,6 +68,20 @@ pub fn install_ui(ctx: &egui::Context) {
             crate::app::wake_viewports(&repaint_ctx);
         }
     }));
+    let tray_ctx = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        // Left click toggles the viewer; the menu stays on the right
+        // click (`with_menu_on_left_click(false)` below).
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Down,
+            ..
+        } = event
+        {
+            super::queue_menu_command(crate::app::Command::ToggleViewer);
+            crate::app::wake_viewports(&tray_ctx);
+        }
+    }));
 
     fn add(
         menu: &Menu,
@@ -85,6 +99,20 @@ pub fn install_ui(ctx: &egui::Context) {
     let menu = Menu::new();
     let mut items = Vec::new();
     add(&menu, &mut items, "open_viewer", "menubar.open_viewer");
+    add(&menu, &mut items, "settings", "menu.app.preferences");
+    {
+        // Greyed until an updater exists — its id maps to no command.
+        let item = MenuItem::with_id(
+            "check_updates",
+            t!("menubar.check_updates").as_ref(),
+            false,
+            None,
+        );
+        if let Err(err) = menu.append(&item) {
+            tracing::warn!("cannot append tray menu item: {err}");
+        }
+        items.push((item, "menubar.check_updates", "check_updates"));
+    }
     if let Err(err) = menu.append(&PredefinedMenuItem::separator()) {
         tracing::warn!("cannot append tray menu separator: {err}");
     }
@@ -92,7 +120,9 @@ pub fn install_ui(ctx: &egui::Context) {
 
     let mut builder = TrayIcon::builder()
         .with_menu(Box::new(menu.clone()))
-        .with_menu_on_left_click(true)
+        // Left click toggles the viewer (TrayIconEvent); the menu is
+        // for the right click.
+        .with_menu_on_left_click(false)
         .with_tooltip("PixMe");
     // The Windows tray has no template mode: use the full-colour artwork
     // (readable on light and dark taskbars alike).

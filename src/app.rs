@@ -76,6 +76,9 @@ pub enum Command {
     CancelCapture,
     /// Show the viewer (icon menu's "Open PixMe").
     OpenViewer,
+    /// Left click on the status item / tray icon: open the viewer from
+    /// `Idle`, close it back to the resident icon when it is up.
+    ToggleViewer,
     /// The viewer window's close was requested.
     ViewerClosed,
     /// Open the settings window.
@@ -220,7 +223,7 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         // re-opening. When the SETTINGS modal is up the same menu click
         // brings it forward.
         Command::OpenSettings | Command::OpenAbout => modal == ModalState::Settings,
-        Command::OpenViewer => modal == ModalState::Settings,
+        Command::OpenViewer | Command::ToggleViewer => modal == ModalState::Settings,
         // Everything else is blocked while a modal owns the UI.
         Command::DeleteActive
         | Command::DeleteFileActive
@@ -812,6 +815,17 @@ impl Shared {
                 // Idle — the session stays in memory and nothing is
                 // lost, so the dirty warning is Quit-only.
                 self.enter(AppState::Idle, ctx);
+            }
+            Command::ToggleViewer => {
+                // The resident icon's left click: open the viewer from
+                // Idle (with the same bring-to-front as `OpenViewer`),
+                // close it back when it is up — `ViewerClosed` carries
+                // the Draw guard, so this just forwards.
+                if *lock(&self.state) == AppState::Viewer {
+                    self.dispatch(Command::ViewerClosed, ctx);
+                } else {
+                    self.dispatch(Command::OpenViewer, ctx);
+                }
             }
             Command::OpenAbout => {
                 // macOS keeps its native About panel in the PixMe menu;
@@ -2978,6 +2992,18 @@ mod tests {
         assert_eq!(lock(&shared.viewer).tabs.len(), 1);
     }
 
+    /// The resident icon's left click toggles: opens the viewer from
+    /// Idle, closes it back to the resident icon when it is up.
+    #[test]
+    fn toggle_viewer_opens_and_closes() {
+        let (shared, ctx) = harness();
+        assert_eq!(
+            drive(&shared, &ctx, Command::ToggleViewer),
+            AppState::Viewer
+        );
+        assert_eq!(drive(&shared, &ctx, Command::ToggleViewer), AppState::Idle);
+    }
+
     /// Closing the viewer window just returns the resident app to
     /// Idle — the session lives in memory, nothing is lost, no dialog.
     #[test]
@@ -3210,6 +3236,7 @@ mod tests {
             Command::ConfirmCapture,
             Command::CancelCapture,
             Command::OpenViewer,
+            Command::ToggleViewer,
             Command::ViewerClosed,
             Command::OpenSettings,
             Command::CloseSettings,
@@ -3275,6 +3302,7 @@ mod tests {
             (Command::ConfirmCapture, true, true, true, true),
             (Command::CancelCapture, true, true, true, true),
             (Command::OpenViewer, true, false, false, false),
+            (Command::ToggleViewer, true, false, false, false),
             (Command::ViewerClosed, true, true, true, true),
             (Command::OpenSettings, true, false, false, false),
             (Command::CloseSettings, true, true, true, true),

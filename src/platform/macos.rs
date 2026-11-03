@@ -17,9 +17,9 @@
 use std::cell::RefCell;
 
 use rust_i18n::t;
-use tray_icon::TrayIcon;
 use tray_icon::menu::accelerator::{Accelerator, Code, Modifiers};
 use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
 
 use super::PlatformServices;
 use crate::capture::CaptureError;
@@ -180,12 +180,27 @@ pub fn install_ui(ctx: &egui::Context) {
             crate::app::wake_viewports(&repaint_ctx);
         }
     }));
+    let tray_ctx = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        // Left click toggles the viewer; the menu stays on the right
+        // click (`with_menu_on_left_click(false)` below).
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Down,
+            ..
+        } = event
+        {
+            super::queue_menu_command(crate::app::Command::ToggleViewer);
+            crate::app::wake_viewports(&tray_ctx);
+        }
+    }));
 
     let mut labels = Labels::default();
 
-    // Status item: opening the viewer is the one resident action —
-    // captures start from the viewer's own capture bar. Quitting lives
-    // exclusively in the PixMe application menu.
+    // Status item (the resident surface — left click toggles the
+    // viewer, right click opens this menu): Open, Settings, a greyed
+    // Check for updates (placeholder — no updater yet), Quit. Captures
+    // start only from the viewer's own capture bar.
     let status_menu = Menu::new();
     item(
         &mut labels,
@@ -194,7 +209,27 @@ pub fn install_ui(ctx: &egui::Context) {
         "menubar.open_viewer",
         None,
     );
+    item(
+        &mut labels,
+        &status_menu,
+        "settings",
+        "menu.app.preferences",
+        None,
+    );
+    let updates = MenuItem::with_id(
+        "check_updates",
+        t!("menubar.check_updates").as_ref(),
+        false,
+        None,
+    );
+    append(&status_menu, &updates);
+    labels
+        .items
+        .push((updates, "menubar.check_updates", "check_updates".to_owned()));
+    separator(&status_menu);
+    item(&mut labels, &status_menu, "quit", "menubar.quit", None);
     let tray = install_status_item(status_menu);
+    install_dock_reopen_hook();
 
     // Application menu bar (system menu bar, always present).
     let app_menu = Menu::new();
@@ -463,7 +498,9 @@ pub fn sync_recent_menu(recents: &[std::path::PathBuf]) {
 fn install_status_item(menu: Menu) -> Option<TrayIcon> {
     let mut builder = TrayIcon::builder()
         .with_menu(Box::new(menu))
-        .with_menu_on_left_click(true)
+        // Left click toggles the viewer (TrayIconEvent); the menu is
+        // for the right click.
+        .with_menu_on_left_click(false)
         .with_tooltip("PixMe");
     match tray_icon::Icon::from_rgba(icons::menubar_icon_rgba(), STATUS_ICON_PX, STATUS_ICON_PX) {
         Ok(icon) => builder = builder.with_icon_templated(icon),
@@ -1331,3 +1368,92 @@ pub(crate) fn viewer_move_lock() -> bool {
 /// screensaver-level overlay) already keeps the session's focus —
 /// there is nothing to hand back.
 pub fn refocus_capture_overlay(_ctx: &egui::Context, _id: egui::ViewportId) {}
+
+/// A Dock-icon click queues `OpenViewer` — the arm un-minimizes and
+/// focuses the viewer without moving it. `applicationShouldHandleReopen:
+/// hasVisibleWindows:` is added on the app delegate when nothing answers
+/// it, or swizzled onto winit's implementation (which still runs first).
+fn install_dock_reopen_hook() {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ORIG: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn on_reopen(
+        this: *mut c_void,
+        sel: *mut c_void,
+        sender: *mut c_void,
+        has_visible: bool,
+    ) -> bool {
+        let orig = ORIG.load(Ordering::Relaxed) as *const c_void;
+        let result = if orig.is_null() {
+            true
+        } else {
+            type Orig = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, bool) -> bool;
+            unsafe {
+                let f: Orig = std::mem::transmute(orig);
+                f(this, sel, sender, has_visible)
+            }
+        };
+        // Queue, don't act — the delegate callback runs mid-event and
+        // the command is pumped on the next pass.
+        super::queue_menu_command(crate::app::Command::OpenViewer);
+        result
+    }
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+        fn object_getClass(obj: *mut c_void) -> *mut c_void;
+        fn class_addMethod(
+            cls: *mut c_void,
+            sel: *mut c_void,
+            imp: *const c_void,
+            types: *const std::ffi::c_char,
+        ) -> bool;
+        fn class_getInstanceMethod(cls: *mut c_void, sel: *mut c_void) -> *mut c_void;
+        fn method_getImplementation(m: *mut c_void) -> *const c_void;
+        fn method_setImplementation(m: *mut c_void, imp: *const c_void) -> *const c_void;
+    }
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendBoolSel = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool_sel: MsgSendBoolSel = std::mem::transmute(objc_msgSend as *const ());
+        let app = send_id(
+            objc_getClass(c"NSApplication".as_ptr()),
+            sel_registerName(c"sharedApplication".as_ptr()),
+        );
+        if app.is_null() {
+            return;
+        }
+        let delegate = send_id(app, sel_registerName(c"delegate".as_ptr()));
+        if delegate.is_null() {
+            return;
+        }
+        let sel = sel_registerName(c"applicationShouldHandleReopen:hasVisibleWindows:".as_ptr());
+        if send_bool_sel(
+            delegate,
+            sel_registerName(c"respondsToSelector:".as_ptr()),
+            sel,
+        ) {
+            // winit implements it (it turns the call into an event eframe
+            // ignores): wrap — the original still runs first.
+            let m = class_getInstanceMethod(object_getClass(delegate), sel);
+            ORIG.store(method_getImplementation(m) as usize, Ordering::Relaxed);
+            method_setImplementation(m, on_reopen as *const c_void);
+        } else {
+            // No existing handler: ours is the whole answer (YES = the
+            // app may reopen — the queued OpenViewer does the real work).
+            class_addMethod(
+                object_getClass(delegate),
+                sel,
+                on_reopen as *const c_void,
+                c"B@:@B".as_ptr(),
+            );
+        }
+    }
+}
