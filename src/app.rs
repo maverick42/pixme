@@ -1329,6 +1329,13 @@ impl Shared {
                 self.request_focus(viewer_id());
             }
         }
+        if next == AppState::Bar {
+            // The bar's HWND is destroyed when the viewport deregisters and
+            // rebuilt on re-entry — clear the geometry ledger so size and
+            // position commands are resent (a stale ledger dedupes them and
+            // the new window keeps the builder's clipped default size).
+            lock(&self.toolbar).reset_sync();
+        }
         // Restoring runs on EVERY viewer entry (guarded to once): a
         // same-state re-entry after reset must not skip the load.
         if next == AppState::Viewer {

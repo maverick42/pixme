@@ -56,6 +56,15 @@ impl Toolbar {
         self.target_monitor = Some(monitor);
     }
 
+    /// Clears the geometry ledger when the machine (re)enters Bar: the
+    /// deferred viewport's HWND is destroyed on deregistration, so the
+    /// recreated window needs its size/position commands resent — a stale
+    /// ledger dedupes them and the new window keeps the builder's clipped
+    /// default size.
+    pub fn reset_sync(&mut self) {
+        self.sync = ViewportSync::new("PixMe Bar");
+    }
+
     /// Draws the toolbar for this frame. Actions are pushed as [`Command`]s
     /// on `shared` — the state machine dispatches them.
     pub fn show(&mut self, ui: &mut egui::Ui, settings: &mut Settings, shared: &Shared) {

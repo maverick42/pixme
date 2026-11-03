@@ -1761,6 +1761,38 @@ Format: date — context — decision — consequences.
   frame changes (re-stripped next pump). Guarded by the
   `chromeless_viewports_start_hidden` test.
 
+## 2026-11-02 — Anchor gets an empty window region; bar geometry ledger resets on re-entry
+
+- **Context**: two Windows-only artifacts reported together. (1) A
+  small persistent ring floating on the desktop, sitting where the old
+  console window's icon used to be — the invisible 1×1 root anchor is a
+  real `WS_EX_TOPMOST` window with winit-forced `WS_CAPTION`, so
+  Windows 11's DWM rounded border + top accent line draw around its
+  degenerate rect as a small ring. `strip_undecorated_frame` clipped
+  every floating window except the anchor (its "PixMe" title had no
+  role). (2) The floating bar painted correctly on first show but was
+  clipped on every re-show: eframe destroys a deferred viewport's HWND
+  when it is not emitted (`remove_viewports_not_in` drops the `Viewport`
+  → `Window::drop` → `destroy_window`) and rebuilds it at the builder's
+  default `340×48` on re-entry — while `Toolbar.sync` (the
+  `ViewportSync` ledger) survives in `Shared`, deduping the
+  `InnerSize`/`OuterPosition` resend forever.
+- **Decision**: (1) give the anchor its own `Role::Anchor` — title
+  match "PixMe" + `WS_EX_TOPMOST` (the viewer is not topmost, so no
+  other "PixMe" window can match), its title cleared, `WS_CHROME`
+  stripped like the other floating windows, and an **empty**
+  `SetWindowRgn` clipped so nothing can draw (a `w<=8 && h<=8` guard
+  keeps a recycled hwnd from ever being blanked). (2)
+  `Toolbar::reset_sync()` clears the ledger on every `enter(Bar)` — a
+  recreated window gets its geometry commands resent, exactly like the
+  first show.
+- **Consequences**: the anchor can no longer draw anything (it paints
+  nothing by design). Bar re-shows send size+position once, then the
+  ledger dedupes normally — no resize feedback loops. If a small ring
+  persists after this, it is an explorer/touch artifact (cf. the
+  `EdgeUiInputTopWndClass` entry) outside PixMe's control, not our
+  window.
+
 ## 2026-11-02 — The "empty title bar at the top of the screen" is explorer's edge-UI strip, not a PixMe window
 
 - **Context**: a full-width empty strip at the top of the screen

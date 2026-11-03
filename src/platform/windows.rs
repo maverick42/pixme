@@ -270,6 +270,9 @@ pub fn strip_undecorated_frame() {
         Countdown,
         Pin,
         Overlay,
+        /// The invisible 1×1 root anchor ("PixMe" + WS_EX_TOPMOST — the
+        /// viewer is not topmost, so no other "PixMe" window qualifies).
+        Anchor,
     }
 
     thread_local! {
@@ -311,6 +314,10 @@ pub fn strip_undecorated_frame() {
                 m.insert(hwnd, Role::Overlay);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
                 Some(Role::Overlay)
+            } else if title == "PixMe" {
+                m.insert(hwnd, Role::Anchor);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
+                Some(Role::Anchor)
             } else {
                 None
             }
@@ -372,6 +379,20 @@ pub fn strip_undecorated_frame() {
                             // no image pixel is cropped.
                             unsafe { CreateRoundRectRgn(0, 2, w + 1, h + 1, 16, 16) }
                         }
+                        Role::Anchor => {
+                            // Empty region: Windows 11 draws a rounded DWM
+                            // border + top accent line on borderless windows,
+                            // which on this degenerate 1×1 window shows as a
+                            // small ring floating on the desktop. The anchor
+                            // paints nothing — clip everything away. The size
+                            // guard keeps a recycled hwnd (Windows does reuse
+                            // them) from ever being blanked.
+                            if w <= 8 && h <= 8 {
+                                unsafe { CreateRectRgn(0, 0, 0, 0) }
+                            } else {
+                                0
+                            }
+                        }
                         Role::Overlay => 0,
                     };
                     if rgn != 0 {
@@ -393,7 +414,7 @@ pub fn strip_undecorated_frame() {
         // fullscreen flag makes that path caption-free.
         if role != Role::Overlay && unsafe { IsWindowVisible(hwnd) } == 0 {
             let cmd = match role {
-                Role::Countdown => SW_SHOWNOACTIVATE, // .with_active(false)
+                Role::Countdown | Role::Anchor => SW_SHOWNOACTIVATE, // .with_active(false)
                 _ => SW_SHOW,
             };
             unsafe {
