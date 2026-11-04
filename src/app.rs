@@ -355,6 +355,13 @@ pub struct Shared {
     /// Last topology-pin pull-back — throttled so a per-frame push
     /// can't create a position feedback storm with egui/winit.
     pub viewer_pin_last: Mutex<Option<std::time::Instant>>,
+    /// Last reported viewer outer rect — sampled each frame to spot
+    /// user move/resize gestures in flight.
+    pub viewer_last_outer: Mutex<Option<egui::Rect>>,
+    /// Last observed outer-rect change: a gesture is settled 250 ms
+    /// after the last change, and a settle on another monitor becomes
+    /// a relocation to that monitor's saved geometry.
+    pub viewer_move_at: Mutex<Option<std::time::Instant>>,
 
     /// The viewer's native rect changed on its current monitor —
     /// `prefs.monitors[id].rect_native` is stale and `pump` flushes a
@@ -891,12 +898,32 @@ impl Shared {
                 self.enter(AppState::Idle, ctx);
             }
             Command::ToggleViewer => {
-                // The resident icon's left click: open the viewer from
-                // Idle, minimized in the Dock/taskbar, or simply sitting
-                // behind another app (with the same bring-to-front as
-                // `OpenViewer`) — close it back only when it is up AND
-                // focused. `ViewerClosed` carries the Draw guard, so
-                // this just forwards.
+                // The resident icon's left click acts like a taskbar
+                // button PER MONITOR: each display's menu bar (macOS)
+                // / taskbar (Windows) carries it, so the click's cursor
+                // position picks the monitor the action applies to.
+                let clicked = platform::cursor_position().and_then(|(cx, cy)| {
+                    lock(&self.monitors)
+                        .iter()
+                        .find(|id| {
+                            let r = &id.info.rect;
+                            let (x0, y0) = (r.x as f32, r.y as f32);
+                            let (x1, y1) = (
+                                (r.x + r.width as i32) as f32,
+                                (r.y + r.height as i32) as f32,
+                            );
+                            cx >= x0 && cx < x1 && cy >= y0 && cy < y1
+                        })
+                        .map(|id| id.stable_id.clone())
+                });
+                if let Some(stable_id) = clicked {
+                    // SelectMonitor holds the taskbar semantics: shown on
+                    // that monitor → hide; anything else → show there.
+                    self.dispatch(Command::SelectMonitor(stable_id), ctx);
+                    return;
+                }
+                // Cursor off every known display (or position read
+                // failed): plain toggle on the current monitor.
                 let (minimized, focused) = ctx.input(|i| {
                     let v = i.raw.viewports.get(&viewer_id());
                     (
@@ -991,11 +1018,32 @@ impl Shared {
                     .find(|m| m.stable_id == stable_id)
                     .map(|m| m.info.clone());
                 if let Some(m) = target {
-                    // The viewer pass applies it: the saved native rect
-                    // when prefs hold one, centred otherwise.
+                    // Taskbar semantics, shared by the strip buttons and
+                    // the resident icon: clicking the monitor the viewer
+                    // is SHOWN and FOCUSED on hides it; anything else
+                    // (other monitor, hidden, minimized, behind another
+                    // app) brings it up on the clicked monitor's saved
+                    // rect.
+                    let (minimized, focused) = ctx.input(|i| {
+                        let v = i.raw.viewports.get(&viewer_id());
+                        (
+                            v.and_then(|v| v.minimized).unwrap_or(false),
+                            v.and_then(|v| v.focused).unwrap_or(false),
+                        )
+                    });
+                    let minimized = minimized || platform::viewer_is_minimized();
+                    let on_target =
+                        lock(&self.viewer_monitor).as_ref().map(|v| v.rect) == Some(m.rect);
+                    if *lock(&self.state) == AppState::Viewer && !minimized && focused && on_target
+                    {
+                        self.dispatch(Command::ViewerClosed, ctx);
+                        return;
+                    }
+                    // The viewer pass applies the saved native rect (or
+                    // the centred default); `OpenViewer` also opens from
+                    // Idle, un-minimizes, and raises a behind window.
                     *lock(&self.viewer_target) = Some(self.viewer_target_for(m));
-                    ctx.repaint_if_live(viewer_id());
-                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    self.dispatch(Command::OpenViewer, ctx);
                 }
             }
             Command::RefreshMonitors => {
@@ -2095,6 +2143,8 @@ impl PixMeApp {
                 viewer_geo_settle: Mutex::new(0),
                 viewer_topology_pin: Mutex::new(None),
                 viewer_pin_last: Mutex::new(None),
+                viewer_last_outer: Mutex::new(None),
+                viewer_move_at: Mutex::new(None),
 
                 monitor_geom_dirty_at: Mutex::new(None),
                 winit_placements: Mutex::new(Vec::new()),
@@ -2249,15 +2299,15 @@ impl eframe::App for PixMeApp {
                             *settle -= 1;
                         } else {
                             let ppp = platform::window_ppp(&ctx, 1.0);
-                            // The viewer is freely draggable WITHIN its
-                            // monitor but never beyond its limits —
-                            // crossing to another monitor is the status
-                            // strip's buttons' job. When the reported
-                            // rect pokes past the current monitor's
-                            // bounds, clamp it back inside and push it
-                            // via the geometry ledger. A stale current
-                            // monitor (disconnected) falls back to the
-                            // monitor under the centre.
+                            // The viewer is freely draggable — across
+                            // monitors too. A move that settles on a
+                            // DIFFERENT monitor becomes a relocation:
+                            // that monitor's memorized rect (or the
+                            // centred fallback) is applied through the
+                            // same target path as `SelectMonitor`. A
+                            // stale current monitor (disconnected)
+                            // falls back to the monitor under the
+                            // centre.
                             let centre = platform::ui_to_native(outer.center(), ppp);
                             // Cached-inventory hit-test, never a fresh xcap
                             // enumeration: `monitor_at` calls Monitor::all()
@@ -2288,45 +2338,113 @@ impl eframe::App for PixMeApp {
                                     .iter()
                                     .any(|id| id.info.rect == c.rect)
                             });
-                            // `cur.or(hit)` can both fail: a disconnected
-                            // monitor's window is dumped OFF every screen
-                            // (only a corner shows — `monitor_at` returns
-                            // None), leaving bounds empty and no restore
-                            // ever armed; on replug the dumped centre can
-                            // also land inside the *reconnected* display
-                            // and steal the window onto it. Fall back to
-                            // the primary/live monitor so the restore
-                            // path always has somewhere to go.
-                            let bounds = cur.or(hit).or_else(|| {
+                            // Topology pin window: macOS re-shuffles the
+                            // window asynchronously after a plug/unplug.
+                            // The saved rect is pushed DIRECTLY here (not
+                            // via viewer_target — that path's settle
+                            // counter pauses this loop for two frames and
+                            // would let a late shuffle stick).
+                            let pinned = lock(&shared.viewer_topology_pin)
+                                .is_some_and(|until| std::time::Instant::now() < until);
+                            // The hosting monitor: the one under the
+                            // window centre in normal time — the viewer
+                            // drags freely and follows wherever it is
+                            // dropped. While the pin owns corrections
+                            // (topology turbulence), the PREVIOUS host is
+                            // preferred so a mid-shuffle centre dumped
+                            // onto another display can't steal the
+                            // window. `or(cur)` plus the primary/live
+                            // fallback cover a centre landing in a
+                            // monitor gap or the host being gone.
+                            let bounds = if pinned {
+                                cur.clone().or_else(|| hit.clone())
+                            } else {
+                                hit.clone().or_else(|| cur.clone())
+                            }
+                            .or_else(|| {
                                 let inv = lock(&shared.monitors);
                                 inv.iter()
                                     .find(|id| id.info.is_primary)
                                     .or_else(|| inv.first())
                                     .map(|id| id.info.clone())
                             });
-                            // The hosting monitor vanished (unplug): the
-                            // OS dumps the window wherever (bottom-left
-                            // here) — run the same target path as
-                            // `SelectMonitor` so the new monitor's saved
-                            // rect is restored instead. And do NOT persist
-                            // the dumped rect this frame: it would poison
-                            // `rect_native` before the restore applies.
-                            let monitor_changed = bounds.as_ref().is_some_and(|m| {
-                                lock(&shared.viewer_monitor).as_ref().map(|v| v.rect)
-                                    != Some(m.rect)
-                            });
-                            // Topology pin window: macOS re-shuffles the
-                            // window asynchronously after a plug/unplug.
-                            // The saved rect is pushed DIRECTLY here (not
-                            // via viewer_target — the settle counter that
-                            // path arms would skip the clamp below, leaving
-                            // the window free to cross monitors for the
-                            // whole pin).
-                            let pinned = lock(&shared.viewer_topology_pin)
-                                .is_some_and(|until| std::time::Instant::now() < until);
+                            // The hosting monitor VANISHED (unplug): the
+                            // OS dumps the window wherever — run the same
+                            // target path as `SelectMonitor` so the new
+                            // monitor's saved rect is restored. Gated on
+                            // `cur` being gone: a normal cross-monitor
+                            // drop changes `bounds` too but must NOT
+                            // relocate — free drag wins, and its landing
+                            // rect is persisted on settle below.
+                            let monitor_changed = cur.is_none()
+                                && bounds.as_ref().is_some_and(|m| {
+                                    lock(&shared.viewer_monitor).as_ref().map(|v| v.rect)
+                                        != Some(m.rect)
+                                });
                             if monitor_changed && let Some(m) = &bounds {
                                 *lock(&shared.viewer_target) =
                                     Some(shared.viewer_target_for(m.clone()));
+                            }
+                            // Gesture tracking: every reported-rect
+                            // change restarts a 250 ms quiet timer —
+                            // a move/resize is "done" once it settles.
+                            // While the pin owns corrections (topology
+                            // shuffle), no gesture is tracked.
+                            let moved =
+                                lock(&shared.viewer_last_outer).replace(outer) != Some(outer);
+                            if pinned {
+                                *lock(&shared.viewer_move_at) = None;
+                            } else if moved {
+                                *lock(&shared.viewer_move_at) = Some(std::time::Instant::now());
+                            }
+                            // Copy the Option OUT first: keeping the
+                            // scrutinee guard alive through the `if`
+                            // body self-deadlocks the clear below.
+                            let move_at = *lock(&shared.viewer_move_at);
+                            if !pinned && let Some(t) = move_at {
+                                if t.elapsed() >= std::time::Duration::from_millis(250) {
+                                    *lock(&shared.viewer_move_at) = None;
+                                    // Gesture over — the ONE geometry
+                                    // write (nothing persists mid-drag):
+                                    // the dropped rect goes under the
+                                    // monitor the window ACTUALLY sits
+                                    // on, so the monitor buttons always
+                                    // switch to the last real position
+                                    // of each display. Skipped while an
+                                    // unplug restore is armed — the
+                                    // dumped rect is transient.
+                                    if !monitor_changed
+                                        && let Some(m) = hit.clone().or_else(|| cur.clone())
+                                        && let Some(id) = shared.monitor_stable_id(&m)
+                                    {
+                                        let n_min = platform::ui_to_native(outer.min, ppp);
+                                        let n_max = platform::ui_to_native(outer.max, ppp);
+                                        let rect = [
+                                            n_min.x as i32,
+                                            n_min.y as i32,
+                                            (n_max.x - n_min.x) as i32,
+                                            (n_max.y - n_min.y) as i32,
+                                        ];
+                                        let mut s = lock(&shared.settings);
+                                        let prefs = s.monitors.entry(id.clone()).or_default();
+                                        let mut dirty = prefs.rect_native != Some(rect);
+                                        if dirty {
+                                            prefs.rect_native = Some(rect);
+                                        }
+                                        if s.last_monitor.as_deref() != Some(id.as_str()) {
+                                            s.last_monitor = Some(id);
+                                            dirty = true;
+                                        }
+                                        if dirty {
+                                            *lock(&shared.monitor_geom_dirty_at) =
+                                                Some(std::time::Instant::now());
+                                        }
+                                    }
+                                } else {
+                                    // Poll so the settle check still runs
+                                    // once the OS stops sending move events.
+                                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                                }
                             }
                             let mut eff = outer;
                             if let Some(m) = &bounds {
@@ -2369,72 +2487,20 @@ impl eframe::App for PixMeApp {
                                         }
                                     }
                                 }
-                                let cl =
-                                    clamp_rect_inside(outer, platform::monitor_ui_rect(m, ppp));
-                                if cl != outer {
-                                    eff = cl;
-                                    // Direct command, NOT the deduping
-                                    // ledger: request_outer_position
-                                    // compares to the last *requested*
-                                    // position, so after the first clamp
-                                    // it never re-asserts the boundary
-                                    // while the window is dragged past it.
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                                        eff.min,
-                                    ));
-                                }
                             }
                             *lock(&shared.viewer_monitor) = bounds;
-                            // last_monitor tracks the hosting monitor
-                            // INDEPENDENT of the rect: a switch to a
-                            // monitor with an identical rect would
-                            // otherwise leave it stale (and the next
-                            // launch would land on the wrong screen).
-                            if let Some(m) = lock(&shared.viewer_monitor).clone()
-                                && let Some(id) = shared.monitor_stable_id(&m)
-                            {
-                                let mut s = lock(&shared.settings);
-                                if s.last_monitor.as_deref() != Some(id.as_str()) {
-                                    s.last_monitor = Some(id);
-                                    *lock(&shared.monitor_geom_dirty_at) =
-                                        Some(std::time::Instant::now());
-                                }
-                            }
+                            // `last_monitor` is written in the settle
+                            // persist above — NOT per frame: tracking
+                            // the physical host mid-drag would flag it
+                            // as the "last" monitor before the gesture
+                            // even ends.
+                            // `viewer_rect` tracks the reported rect —
+                            // per-monitor `rect_native` persistence does
+                            // NOT happen here: it is written exactly
+                            // once, when the move/resize gesture settles
+                            // (the `viewer_move_at` quiet check above).
                             if *lock(&shared.viewer_rect) != Some(eff) {
                                 *lock(&shared.viewer_rect) = Some(eff);
-                                // Persist the rect on the current monitor
-                                // — debounced: a move/resize gesture
-                                // floods, one flush per half-second caps
-                                // it (the last write lands at the end of
-                                // the gesture).
-                                if let Some(m) = lock(&shared.viewer_monitor).clone()
-                                    && let Some(id) = shared.monitor_stable_id(&m)
-                                {
-                                    let n_min = platform::ui_to_native(eff.min, ppp);
-                                    let n_max = platform::ui_to_native(eff.max, ppp);
-                                    let rect = [
-                                        n_min.x as i32,
-                                        n_min.y as i32,
-                                        (n_max.x - n_min.x) as i32,
-                                        (n_max.y - n_min.y) as i32,
-                                    ];
-                                    let mut s = lock(&shared.settings);
-                                    let prefs = s.monitors.entry(id.clone()).or_default();
-                                    // Never persist the transient OS-shuffled
-                                    // position during the pin window (or a
-                                    // monitor switch): it would poison the
-                                    // saved rect.
-                                    let pinned = lock(&shared.viewer_topology_pin)
-                                        .is_some_and(|until| std::time::Instant::now() < until);
-                                    if !monitor_changed
-                                        && !pinned
-                                        && prefs.rect_native != Some(rect)
-                                    {
-                                        prefs.rect_native = Some(rect);
-                                        *lock(&shared.monitor_geom_dirty_at) =
-                                            Some(std::time::Instant::now());
-                                    }
-                                }
                             }
                         }
                     }
@@ -2800,25 +2866,6 @@ fn target_ui_rect(t: &ViewerTarget, current: Option<egui::Rect>, ppp: f32) -> eg
     }
 }
 
-/// `r` clamped inside `mon` (both in the same UI space): keeps the size
-/// unless `r` is already bigger than the monitor — then it shrinks to
-/// fit. The viewer can be dragged anywhere within its monitor but never
-/// beyond its limits (crossing monitors is the buttons' job).
-fn clamp_rect_inside(r: egui::Rect, mon: egui::Rect) -> egui::Rect {
-    let size = r.size().min(mon.size());
-    let min_x = if size.x >= mon.width() {
-        mon.min.x
-    } else {
-        r.min.x.clamp(mon.min.x, mon.max.x - size.x)
-    };
-    let min_y = if size.y >= mon.height() {
-        mon.min.y
-    } else {
-        r.min.y.clamp(mon.min.y, mon.max.y - size.y)
-    };
-    egui::Rect::from_min_size(egui::pos2(min_x, min_y), size)
-}
-
 /// The capture overlay: a borderless always-on-top window covering the
 /// monitor being captured. `MonitorInfo.rect` is in the OS-native display
 /// space (physical px on Windows, points on macOS) — it is converted to
@@ -3012,6 +3059,8 @@ mod tests {
             viewer_geo_settle: Mutex::new(0),
             viewer_topology_pin: Mutex::new(None),
             viewer_pin_last: Mutex::new(None),
+            viewer_last_outer: Mutex::new(None),
+            viewer_move_at: Mutex::new(None),
 
             monitor_geom_dirty_at: Mutex::new(None),
             winit_placements: Mutex::new(Vec::new()),

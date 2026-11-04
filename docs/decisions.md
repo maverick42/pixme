@@ -1977,3 +1977,49 @@ Format: date — context — decision — consequences.
   boundary is a rubber wall (one frame of lag). The macOS/Windows
   lock implementations were deleted — nothing platform-specific
   remains to verify for this.
+
+## 2026-11-04 — Free cross-monitor drag; geometry written once at gesture settle
+
+- **Context**: the monitor-boundary clamp made the viewer unmovable past
+  its monitor's edge. An intermediate design snapped the window to the
+  target monitor's memorized rect on drop — rejected by the user: a
+  move must stay completely normal, only persistence reacts.
+- **Decision**: `clamp_rect_inside` and its per-frame boundary push are
+  removed — the OS moves the window, PixMe never interferes. The
+  hosting monitor follows the window's physical position (centre
+  hit-test on the cached inventory) in normal time; during the topology
+  pin the PREVIOUS host is preferred so a mid-shuffle dump onto a
+  reconnected display can't steal the window. `rect_native` and
+  `last_monitor` are written exactly ONCE per gesture — when the
+  reported `outer_rect` has been quiet for 250 ms (`viewer_move_at`,
+  polled via `request_repaint_after`) — under the monitor the window
+  actually sits on, so the status-strip monitor buttons always land on
+  each display's last real position. The unplug restore (`viewer_target`
+  arm) is gated on the previous host being disconnected — a normal
+  drop never relocates.
+- **Consequences**: dragging works like any OS window; prefs stay clean
+  (single write per gesture, still disk-flushed via the existing
+  `monitor_geom_dirty_at` debounce). Two self-deadlock traps documented
+  for this loop: `if let` scrutinee `MutexGuard`s live through the
+  whole body — never re-lock the same `Shared` mutex inside such a
+  body.
+
+## 2026-11-04 — Taskbar semantics for monitor buttons and the resident icon
+
+- **Context**: the status-strip monitor buttons only relocated the
+  viewer, and the resident icon's left click was a plain open/close
+  toggle — the user wants per-monitor taskbar behavior (each macOS
+  display carries its own menu bar / each Windows display its taskbar).
+- **Decision**: `SelectMonitor` gained toggle semantics — clicking the
+  monitor the viewer is shown AND focused on hides it (`ViewerClosed`);
+  every other case (other monitor, viewer hidden in Idle, minimized,
+  or behind another app) arms `viewer_target` for that monitor's saved
+  rect and dispatches `OpenViewer` (which also un-minimizes and raises).
+  `ToggleViewer` (resident icon left click) resolves the display under
+  the cursor at click time via `platform::cursor_position` and forwards
+  to `SelectMonitor` — falling back to the previous plain toggle when
+  the cursor sits off every known display. Shared by the strip buttons:
+  clicking the selected monitor's button now hides the viewer too.
+- **Consequences**: one consistent gesture — "click the display's icon
+  to summon PixMe there, click again to dismiss". Windows gets the same
+  behavior through the shared command path.
