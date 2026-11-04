@@ -347,6 +347,15 @@ pub struct Shared {
     /// set after a programmatic move so a transient mid-DPI rect is
     /// never persisted.
     pub viewer_geo_settle: Mutex<u8>,
+    /// Topology-change pin window: while set, the geometry loop
+    /// re-applies the saved rect every frame (macOS re-shuffles
+    /// windows asynchronously after a plug/unplug — one restore is
+    /// not enough) and nothing is persisted.
+    pub viewer_topology_pin: Mutex<Option<std::time::Instant>>,
+    /// Last topology-pin pull-back — throttled so a per-frame push
+    /// can't create a position feedback storm with egui/winit.
+    pub viewer_pin_last: Mutex<Option<std::time::Instant>>,
+
     /// The viewer's native rect changed on its current monitor —
     /// `prefs.monitors[id].rect_native` is stale and `pump` flushes a
     /// debounced `settings.save()`.
@@ -401,6 +410,11 @@ pub struct Shared {
     /// can block for a long time (RDP, indirect displays) — and `pump`
     /// swaps the list in when the reply lands.
     pub monitors_rx: Mutex<Option<std::sync::mpsc::Receiver<Vec<platform::MonitorIdentity>>>>,
+    /// The hot-plug poll: last seen display count + last poll instant —
+    /// a change pushes `RefreshMonitors` so a disconnected monitor's
+    /// viewer anchoring re-clamps instead of stranding the window.
+    pub display_poll: Mutex<(u32, std::time::Instant)>,
+
     /// When the quit flush was requested — bounds the wait.
     quit_started: Mutex<Option<std::time::Instant>>,
     /// The in-flight "Tout enregistrer" batch: the worker owns the tabs
@@ -694,8 +708,28 @@ impl Shared {
         match refresh {
             Some(Ok(list)) => {
                 tracing::info!(count = list.len(), "monitors_refreshed");
-                *lock(&self.monitors) = list;
+                // A failed enumeration (mid reconfiguration) yields an
+                // EMPTY list — never swap it in: it would purge the
+                // inventory, empty `bounds`, and disable the viewer's
+                // clamping. Keep the previous list on zero.
+                if !list.is_empty() {
+                    *lock(&self.monitors) = list;
+                } else {
+                    tracing::warn!(
+                        "monitor refresh returned no monitors — keeping the previous inventory"
+                    );
+                }
                 *lock(&self.monitors_rx) = None;
+                // A plug/unplug shuffles windows at the OS level, and
+                // macOS re-applies its own placement asynchronously —
+                // a single restore races it and loses. Arm a ~2 s pin
+                // window: the geometry loop re-applies the saved rect
+                // every frame until the OS settles (and persists
+                // nothing meanwhile).
+                if *lock(&self.state) == AppState::Viewer {
+                    *lock(&self.viewer_topology_pin) =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                }
                 ctx.repaint_if_live(viewer_id());
             }
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
@@ -706,6 +740,30 @@ impl Shared {
             }
             Some(Err(std::sync::mpsc::TryRecvError::Empty)) => ctx.request_repaint(),
             None => {}
+        }
+        // Monitor hot-(un)plug: poll the OS display count ~1/s — a
+        // disconnect leaves a stale monitor in the cached inventory,
+        // and the geometry clamp would keep anchoring the viewer to a
+        // screen that no longer exists (window stranded off-screen).
+        {
+            let mut last = lock(&self.display_poll);
+            if last.1.elapsed() >= std::time::Duration::from_secs(1) {
+                last.1 = std::time::Instant::now();
+                let n = platform::display_count();
+                if last.0 != n {
+                    last.0 = n;
+                    drop(last);
+                    // Arm the pin NOW, not when the async refresh lands:
+                    // macOS starts shuffling the window immediately, and
+                    // the stale inventory (iPad still listed for ~1 s)
+                    // would otherwise persist the transient position into
+                    // the dying monitor's rect_native.
+                    *lock(&self.viewer_topology_pin) =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                    self.push(Command::RefreshMonitors);
+                    ctx.request_repaint();
+                }
+            }
         }
         // A background save-all finished: the tabs come back into the
         // viewer; a ConfirmSave batch then closes the (now clean)
@@ -2035,6 +2093,9 @@ impl PixMeApp {
                 monitors: Mutex::new(inventory),
                 viewer_sync: Mutex::new(ui::viewport_sync::ViewportSync::new("PixMe Viewer")),
                 viewer_geo_settle: Mutex::new(0),
+                viewer_topology_pin: Mutex::new(None),
+                viewer_pin_last: Mutex::new(None),
+
                 monitor_geom_dirty_at: Mutex::new(None),
                 winit_placements: Mutex::new(Vec::new()),
                 settings_open: AtomicBool::new(false),
@@ -2062,6 +2123,8 @@ impl PixMeApp {
                 restore_rx: Mutex::new(None),
                 quit_rx: Mutex::new(None),
                 monitors_rx: Mutex::new(None),
+                display_poll: Mutex::new((platform::display_count(), std::time::Instant::now())),
+
                 quit_started: Mutex::new(None),
                 save_all: Mutex::new(None),
                 save_one: Mutex::new(None),
@@ -2196,23 +2259,147 @@ impl eframe::App for PixMeApp {
                             // monitor (disconnected) falls back to the
                             // monitor under the centre.
                             let centre = platform::ui_to_native(outer.center(), ppp);
-                            let hit = crate::capture::screen::monitor_at(centre.x, centre.y);
+                            // Cached-inventory hit-test, never a fresh xcap
+                            // enumeration: `monitor_at` calls Monitor::all()
+                            // EVERY FRAME on the main thread — during a
+                            // display reconfiguration (iPad plug/unplug)
+                            // that blocks and freezes the UI. The async
+                            // refresh keeps the inventory current instead.
+                            let hit_rect = {
+                                let inv = lock(&shared.monitors);
+                                inv.iter()
+                                    .find(|id| {
+                                        let r = &id.info.rect;
+                                        let (x0, y0) = (r.x as f32, r.y as f32);
+                                        let (x1, y1) = (
+                                            (r.x + r.width as i32) as f32,
+                                            (r.y + r.height as i32) as f32,
+                                        );
+                                        centre.x >= x0
+                                            && centre.x < x1
+                                            && centre.y >= y0
+                                            && centre.y < y1
+                                    })
+                                    .map(|id| id.info.clone())
+                            };
+                            let hit = hit_rect.clone();
                             let cur = lock(&shared.viewer_monitor).clone().filter(|c| {
                                 lock(&shared.monitors)
                                     .iter()
                                     .any(|id| id.info.rect == c.rect)
                             });
-                            let bounds = cur.or(hit);
+                            // `cur.or(hit)` can both fail: a disconnected
+                            // monitor's window is dumped OFF every screen
+                            // (only a corner shows — `monitor_at` returns
+                            // None), leaving bounds empty and no restore
+                            // ever armed; on replug the dumped centre can
+                            // also land inside the *reconnected* display
+                            // and steal the window onto it. Fall back to
+                            // the primary/live monitor so the restore
+                            // path always has somewhere to go.
+                            let bounds = cur.or(hit).or_else(|| {
+                                let inv = lock(&shared.monitors);
+                                inv.iter()
+                                    .find(|id| id.info.is_primary)
+                                    .or_else(|| inv.first())
+                                    .map(|id| id.info.clone())
+                            });
+                            // The hosting monitor vanished (unplug): the
+                            // OS dumps the window wherever (bottom-left
+                            // here) — run the same target path as
+                            // `SelectMonitor` so the new monitor's saved
+                            // rect is restored instead. And do NOT persist
+                            // the dumped rect this frame: it would poison
+                            // `rect_native` before the restore applies.
+                            let monitor_changed = bounds.as_ref().is_some_and(|m| {
+                                lock(&shared.viewer_monitor).as_ref().map(|v| v.rect)
+                                    != Some(m.rect)
+                            });
+                            // Topology pin window: macOS re-shuffles the
+                            // window asynchronously after a plug/unplug.
+                            // The saved rect is pushed DIRECTLY here (not
+                            // via viewer_target — the settle counter that
+                            // path arms would skip the clamp below, leaving
+                            // the window free to cross monitors for the
+                            // whole pin).
+                            let pinned = lock(&shared.viewer_topology_pin)
+                                .is_some_and(|until| std::time::Instant::now() < until);
+                            if monitor_changed && let Some(m) = &bounds {
+                                *lock(&shared.viewer_target) =
+                                    Some(shared.viewer_target_for(m.clone()));
+                            }
                             let mut eff = outer;
                             if let Some(m) = &bounds {
+                                // Topology pin: macOS re-shuffles the
+                                // window asynchronously after a plug/
+                                // unplug — often WITHIN the same monitor
+                                // (it dumps the window at bottom-left).
+                                // Pull it back whenever the reported
+                                // rect deviates from the saved one,
+                                // throttled to 300 ms: a per-frame push
+                                // created a position feedback storm
+                                // (egui/winit fight → full freeze).
+                                if pinned {
+                                    let saved = target_ui_rect(
+                                        &shared.viewer_target_for(m.clone()),
+                                        *lock(&shared.viewer_rect),
+                                        ppp,
+                                    );
+                                    // Sliding pin: macOS re-shuffles
+                                    // asynchronously for several seconds
+                                    // after a replug. Detection runs
+                                    // EVERY frame (unthrottled) so the
+                                    // window can't expire while it is
+                                    // still displaced; only the push is
+                                    // throttled to 200 ms.
+                                    if saved.min.distance(outer.min) > 0.5 {
+                                        *lock(&shared.viewer_topology_pin) = Some(
+                                            std::time::Instant::now()
+                                                + std::time::Duration::from_secs(2),
+                                        );
+                                        if lock(&shared.viewer_pin_last).as_ref().is_none_or(|t| {
+                                            t.elapsed() >= std::time::Duration::from_millis(200)
+                                        }) {
+                                            *lock(&shared.viewer_pin_last) =
+                                                Some(std::time::Instant::now());
+                                            ctx.send_viewport_cmd(
+                                                egui::ViewportCommand::OuterPosition(saved.min),
+                                            );
+                                            eff = saved;
+                                        }
+                                    }
+                                }
                                 let cl =
                                     clamp_rect_inside(outer, platform::monitor_ui_rect(m, ppp));
                                 if cl != outer {
                                     eff = cl;
-                                    lock(&shared.viewer_sync).request_outer_position(&ctx, eff.min);
+                                    // Direct command, NOT the deduping
+                                    // ledger: request_outer_position
+                                    // compares to the last *requested*
+                                    // position, so after the first clamp
+                                    // it never re-asserts the boundary
+                                    // while the window is dragged past it.
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                        eff.min,
+                                    ));
                                 }
                             }
                             *lock(&shared.viewer_monitor) = bounds;
+                            // last_monitor tracks the hosting monitor
+                            // INDEPENDENT of the rect: a switch to a
+                            // monitor with an identical rect would
+                            // otherwise leave it stale (and the next
+                            // launch would land on the wrong screen).
+                            if let Some(m) = lock(&shared.viewer_monitor).clone()
+                                && let Some(id) = shared.monitor_stable_id(&m)
+                            {
+                                let mut s = lock(&shared.settings);
+                                if s.last_monitor.as_deref() != Some(id.as_str()) {
+                                    s.last_monitor = Some(id);
+                                    *lock(&shared.monitor_geom_dirty_at) =
+                                        Some(std::time::Instant::now());
+                                }
+                            }
                             if *lock(&shared.viewer_rect) != Some(eff) {
                                 *lock(&shared.viewer_rect) = Some(eff);
                                 // Persist the rect on the current monitor
@@ -2233,13 +2420,17 @@ impl eframe::App for PixMeApp {
                                     ];
                                     let mut s = lock(&shared.settings);
                                     let prefs = s.monitors.entry(id.clone()).or_default();
-                                    if prefs.rect_native != Some(rect) {
+                                    // Never persist the transient OS-shuffled
+                                    // position during the pin window (or a
+                                    // monitor switch): it would poison the
+                                    // saved rect.
+                                    let pinned = lock(&shared.viewer_topology_pin)
+                                        .is_some_and(|until| std::time::Instant::now() < until);
+                                    if !monitor_changed
+                                        && !pinned
+                                        && prefs.rect_native != Some(rect)
+                                    {
                                         prefs.rect_native = Some(rect);
-                                        *lock(&shared.monitor_geom_dirty_at) =
-                                            Some(std::time::Instant::now());
-                                    }
-                                    if s.last_monitor.as_deref() != Some(id.as_str()) {
-                                        s.last_monitor = Some(id);
                                         *lock(&shared.monitor_geom_dirty_at) =
                                             Some(std::time::Instant::now());
                                     }
@@ -2819,6 +3010,9 @@ mod tests {
             monitors: Mutex::new(Vec::new()),
             viewer_sync: Mutex::new(ui::viewport_sync::ViewportSync::new("PixMe Viewer")),
             viewer_geo_settle: Mutex::new(0),
+            viewer_topology_pin: Mutex::new(None),
+            viewer_pin_last: Mutex::new(None),
+
             monitor_geom_dirty_at: Mutex::new(None),
             winit_placements: Mutex::new(Vec::new()),
             settings_open: AtomicBool::new(false),
@@ -2838,6 +3032,8 @@ mod tests {
             restore_rx: Mutex::new(None),
             quit_rx: Mutex::new(None),
             monitors_rx: Mutex::new(None),
+            display_poll: Mutex::new((platform::display_count(), std::time::Instant::now())),
+
             quit_started: Mutex::new(None),
             save_all: Mutex::new(None),
             save_one: Mutex::new(None),

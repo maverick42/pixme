@@ -131,6 +131,13 @@ pub(crate) use macos::monitor_kind;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::monitor_kind;
 
+/// Connected-display count, for the hot-plug poll.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::display_count;
+/// Connected-display count (see above).
+#[cfg(target_os = "windows")]
+pub(crate) use windows::display_count;
+
 /// The connected monitors with their stable identities, for the status
 /// strip's monitor row. Enumeration failures yield an empty list (the
 /// strip simply shows no monitor buttons).

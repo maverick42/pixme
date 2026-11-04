@@ -1421,3 +1421,14 @@ pub(crate) fn monitor_kind(info: &crate::capture::MonitorInfo) -> crate::capture
     }
     MonitorKind::Unknown
 }
+
+/// The number of connected displays — polled to detect monitor
+/// hot-(un)plug so the viewer can re-anchor off a vanished screen.
+pub fn display_count() -> u32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    // SM_CMONITORS = 80.
+    unsafe { GetSystemMetrics(80) as u32 }
+}

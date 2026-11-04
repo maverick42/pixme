@@ -1345,6 +1345,13 @@ pub(crate) fn monitor_kind(info: &crate::capture::MonitorInfo) -> crate::capture
 /// `NSScreen.localizedName` for `id` — Sidecar iPads report their
 /// device name ("iPad") there even when no IOKit transport exists.
 pub(crate) fn ns_localized_name(id: u32) -> String {
+    // NSScreen is main-thread-only AppKit: the async monitor-refresh
+    // worker calls this off the main thread, which can wedge the app.
+    // Callers on a background thread get the xcap name instead — the
+    // main-thread refresh (startup, SelectMonitor) still enriches it.
+    if !main_thread() {
+        return String::new();
+    }
     use std::ffi::{c_char, c_void};
     #[link(name = "objc", kind = "dylib")]
     unsafe extern "C" {
@@ -1500,4 +1507,25 @@ fn install_dock_reopen_hook(ctx: egui::Context) {
             );
         }
     }
+}
+
+/// The number of connected displays — polled to detect monitor
+/// hot-(un)plug so the viewer can re-anchor off a vanished screen.
+pub fn display_count() -> u32 {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    }
+    let mut n = 0u32;
+    unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &mut n) };
+    n
+}
+
+/// True when running on the main thread (pthread_main_np).
+fn main_thread() -> bool {
+    #[link(name = "c")]
+    unsafe extern "C" {
+        fn pthread_main_np() -> i32;
+    }
+    unsafe { pthread_main_np() == 1 }
 }
