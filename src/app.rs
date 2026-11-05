@@ -2462,12 +2462,35 @@ impl eframe::App for PixMeApp {
                                     {
                                         let n_min = platform::ui_to_native(outer.min, ppp);
                                         let n_max = platform::ui_to_native(outer.max, ppp);
-                                        let rect = [
-                                            n_min.x as i32,
-                                            n_min.y as i32,
-                                            (n_max.x - n_min.x) as i32,
-                                            (n_max.y - n_min.y) as i32,
-                                        ];
+                                        // Clamp to the host monitor: during a
+                                        // mixed-DPI transition `outer` and `ppp`
+                                        // can be mismatched (old points × new
+                                        // scale), persisting a rect inflated by
+                                        // the ratio — re-applied on the next
+                                        // relocation it compounds (the window
+                                        // grows at every cross-DPI move). The
+                                        // real rect is always inside the host's
+                                        // native bounds, so a clamped write is
+                                        // never lossy here.
+                                        let mon = &m.rect;
+                                        let w = (n_max.x - n_min.x).clamp(100.0, mon.width as f32);
+                                        let h = (n_max.y - n_min.y).clamp(100.0, mon.height as f32);
+                                        let x = n_min.x.clamp(
+                                            mon.x as f32,
+                                            mon.x as f32 + mon.width as f32 - w,
+                                        );
+                                        let y = n_min.y.clamp(
+                                            mon.y as f32,
+                                            mon.y as f32 + mon.height as f32 - h,
+                                        );
+                                        let rect = [x as i32, y as i32, w as i32, h as i32];
+                                        tracing::debug!(
+                                            monitor = m.name.as_str(),
+                                            ppp,
+                                            outer = ?outer,
+                                            rect = ?rect,
+                                            "monitor_geometry_persist"
+                                        );
                                         let mut s = lock(&shared.settings);
                                         let prefs = s.monitors.entry(id.clone()).or_default();
                                         let mut dirty = prefs.rect_native != Some(rect);
@@ -2903,6 +2926,13 @@ fn target_ui_rect(t: &ViewerTarget, current: Option<egui::Rect>, ppp: f32) -> eg
         Some([x, y, w, h]) => {
             let min = platform::native_to_ui(egui::pos2(x as f32, y as f32), ppp);
             let size = platform::native_to_ui(egui::pos2(w as f32, h as f32), ppp).to_vec2();
+            // Defensive clamp: a stale/corrupt persisted rect (written
+            // during a mixed-DPI transition) must never land the window
+            // larger than the monitor or off-screen. The real rect is
+            // persisted on the next settle, so the entry self-heals.
+            let mon = platform::monitor_ui_rect(&t.monitor, ppp);
+            let size = size.min(mon.size()).max(egui::vec2(100.0, 100.0));
+            let min = min.clamp(mon.min, mon.max - size);
             egui::Rect::from_min_size(min, size)
         }
         None => place_viewer_on_monitor(current, &t.monitor, ppp),
