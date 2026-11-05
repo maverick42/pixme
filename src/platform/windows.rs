@@ -212,48 +212,48 @@ pub fn sync_menu_enabled(
     });
 }
 
-/// Strips `WS_CAPTION` and shapes undecorated floating windows (#2246).
-///
-/// ## Known Upstream Bugs (winit / DWM)
-///
-/// 1. **Content offset (31 px down)**: `winit` 0.30 forces `WS_CAPTION | WS_BORDER`
-///    on all windows, even with `decorations: false`, and relies on `WM_NCCALCSIZE`
-///    to hide them. On Windows with Intel graphics drivers or OpenGL, the desktop
-///    compositor still reserves space for the caption, shifting content ~31 px
-///    down and clipping it at the window bottom (emilk/egui#2770, libsdl#12105).
-///    This reproduces the fix from PhotoCraft (`window_frame.rs`, issue #2246):
-///    stripping `WS_CHROME` removes the non-client area so no offset occurs.
-///
-/// 2. **DWM 1 px top line**: on Windows 11, DWM draws an accent line at y=0 on
-///    borderless windows (documented in `winit::platform::windows::WindowExtWindows::set_undecorated_shadow`:
-///    *"Enabling the shadow causes a thin 1px line to appear on the top of the window"*).
-///    Applying a native Win32 window region (`SetWindowRgn`) tells DWM the true
-///    geometry of the window so nothing is drawn outside it:
-///    - For the countdown (`"PixMe Countdown"`): it carries a 14 pt
-///      transparent `SHADOW_MARGIN`, so clipping y=0..2 removes the DWM
-///      line without touching the card or its soft shadow.
-///    - For pinned captures (`"PixMe Pin"`): sets a rounded-rect region (`16 px`),
-///      matching the card's rounded corners and preserving the full border stroke.
-///    - For the capture overlay (`"PixMe Overlay"`): clipping is impossible —
-///      the top pixel rows carry real frozen-frame content that must stay
-///      visible and selectable. `DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE`
-///      suppresses the border itself instead (Windows 11; ignored elsewhere).
-///
-/// 3. **Ghost window in the frozen frame**: xcap grabs the screen with a GDI
-///    `BitBlt` of the composed desktop. On slower machines the composition can
-///    still hold a PixMe window's pixels when the freeze fires ~2 frames after
-///    its viewport is torn down — the viewer then appears as a watermark under
-///    the dim veil. `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` redacts
-///    PixMe windows from the readback — but it is toggled TRANSIENTLY, only
-///    for the capture's duration (see [`capture_exclusion`]): a permanent
-///    exclusion hid PixMe from Teams and every other capture tool. Every role
-///    is excluded EXCEPT the pins: a pinned capture is meant to be screen
-///    content and must photograph. Best-effort — `WDA_EXCLUDEFROMCAPTURE`
-///    needs Windows 10 2004+; the call fails harmlessly on older builds.
-///
-/// Note: whenever winit touches window flags (focus change, new child window),
-/// it triggers `SWP_FRAMECHANGED` which resets the window region. The guard
-/// reapplies `SetWindowRgn` whenever styles are stripped or dimensions change.
+// Strips `WS_CAPTION` and shapes undecorated floating windows (#2246).
+//
+// ## Known Upstream Bugs (winit / DWM)
+//
+// 1. **Content offset (31 px down)**: `winit` 0.30 forces `WS_CAPTION | WS_BORDER`
+//    on all windows, even with `decorations: false`, and relies on `WM_NCCALCSIZE`
+//    to hide them. On Windows with Intel graphics drivers or OpenGL, the desktop
+//    compositor still reserves space for the caption, shifting content ~31 px
+//    down and clipping it at the window bottom (emilk/egui#2770, libsdl#12105).
+//    This reproduces the fix from PhotoCraft (`window_frame.rs`, issue #2246):
+//    stripping `WS_CHROME` removes the non-client area so no offset occurs.
+//
+// 2. **DWM 1 px top line**: on Windows 11, DWM draws an accent line at y=0 on
+//    borderless windows (documented in `winit::platform::windows::WindowExtWindows::set_undecorated_shadow`:
+//    *"Enabling the shadow causes a thin 1px line to appear on the top of the window"*).
+//    Applying a native Win32 window region (`SetWindowRgn`) tells DWM the true
+//    geometry of the window so nothing is drawn outside it:
+//    - For the countdown (`"PixMe Countdown"`): it carries a 14 pt
+//      transparent `SHADOW_MARGIN`, so clipping y=0..2 removes the DWM
+//      line without touching the card or its soft shadow.
+//    - For pinned captures (`"PixMe Pin"`): sets a rounded-rect region (`16 px`),
+//      matching the card's rounded corners and preserving the full border stroke.
+//    - For the capture overlay (`"PixMe Overlay"`): clipping is impossible —
+//      the top pixel rows carry real frozen-frame content that must stay
+//      visible and selectable. `DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE`
+//      suppresses the border itself instead (Windows 11; ignored elsewhere).
+//
+// 3. **Ghost window in the frozen frame**: xcap grabs the screen with a GDI
+//    `BitBlt` of the composed desktop. On slower machines the composition can
+//    still hold a PixMe window's pixels when the freeze fires ~2 frames after
+//    its viewport is torn down — the viewer then appears as a watermark under
+//    the dim veil. `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` redacts
+//    PixMe windows from the readback — but it is toggled TRANSIENTLY, only
+//    for the capture's duration (see [`capture_exclusion`]): a permanent
+//    exclusion hid PixMe from Teams and every other capture tool. Every role
+//    is excluded EXCEPT the pins: a pinned capture is meant to be screen
+//    content and must photograph. Best-effort — `WDA_EXCLUDEFROMCAPTURE`
+//    needs Windows 10 2004+; the call fails harmlessly on older builds.
+//
+// Note: whenever winit touches window flags (focus change, new child window),
+// it triggers `SWP_FRAMECHANGED` which resets the window region. The guard
+// reapplies `SetWindowRgn` whenever styles are stripped or dimensions change.
 thread_local! {
     /// Hwnds classified as pins — they represent screen content and
     /// must stay capturable. Populated by the window pass in
@@ -273,7 +273,7 @@ fn set_capture_exclusion(exclude: bool) -> u32 {
     const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
     const WDA_NONE: u32 = 0;
     #[link(name = "user32")]
-    extern "system" {
+    unsafe extern "system" {
         fn SetWindowDisplayAffinity(hwnd: isize, affinity: u32) -> i32;
         fn EnumThreadWindows(
             id_thread: u32,
@@ -333,7 +333,7 @@ pub fn capture_exclusion() -> CaptureExclusionGuard {
     let hwnds = set_capture_exclusion(true);
     let flush_t = std::time::Instant::now();
     #[link(name = "dwmapi")]
-    extern "system" {
+    unsafe extern "system" {
         fn DwmFlush() -> i32;
     }
     let hr = unsafe { DwmFlush() };
@@ -358,7 +358,7 @@ impl Drop for CaptureExclusionGuard {
 }
 
 pub fn strip_undecorated_frame() {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     const GWL_STYLE: i32 = -16;
     const GWL_EXSTYLE: i32 = -20;
@@ -438,7 +438,6 @@ pub fn strip_undecorated_frame() {
     thread_local! {
         static REGIONS: RefCell<HashMap<isize, (i32, i32)>> = RefCell::new(HashMap::new());
         static ROLES: RefCell<HashMap<isize, Role>> = RefCell::new(HashMap::new());
-        /// File-level registry (`CAPTURE_EXCLUDABLE`) collects them.
     }
 
     unsafe extern "system" fn visit(hwnd: isize, _lp: isize) -> i32 {
