@@ -1155,6 +1155,23 @@ impl Viewer {
         self.reset_view();
     }
 
+    /// ⌘ (macOS) / Alt (Windows) +←/→ tab navigation: `self.tabs` IS
+    /// the display order — `sort_tabs`
+    /// physically reorders it, so ±1 lands on the visible neighbour
+    /// in the strip and the mosaic alike. Clamped at the ends — no
+    /// wrap-around. `set_active` carries the full click semantics
+    /// (protected tabs re-lock, selection scrolls into view).
+    fn cycle_tab(&mut self, step: isize) {
+        let n = self.tabs.len() as isize;
+        if n < 2 {
+            return;
+        }
+        let next = (self.active_index().unwrap_or(0) as isize + step).clamp(0, n - 1);
+        if next != self.active_index().unwrap_or(0) as isize {
+            self.set_active(next as usize);
+        }
+    }
+
     /// Whether `index` is a protected tab still waiting for its password.
     fn is_locked(&self, index: usize) -> bool {
         self.tabs
@@ -1892,6 +1909,12 @@ impl Viewer {
                 ctx.request_repaint();
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
                 shared.push(Command::Quit);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(CYCLE_TAB_MOD, egui::Key::ArrowLeft)) {
+                self.cycle_tab(-1);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(CYCLE_TAB_MOD, egui::Key::ArrowRight)) {
+                self.cycle_tab(1);
                 ctx.request_repaint();
             }
         }
@@ -4222,6 +4245,13 @@ fn tool_popup(
             add(ui);
         });
 }
+
+/// Modifier for the ←/→ tab-cycle shortcut: ⌘ on macOS, Alt on
+/// Windows — the convention the user picked per platform.
+#[cfg(target_os = "macos")]
+const CYCLE_TAB_MOD: egui::Modifiers = egui::Modifiers::COMMAND;
+#[cfg(target_os = "windows")]
+const CYCLE_TAB_MOD: egui::Modifiers = egui::Modifiers::ALT;
 
 /// One popup-menu row: a leading Lucide icon + label, full-width hover
 /// and click — every caret-menu row carries an icon for scannability.
