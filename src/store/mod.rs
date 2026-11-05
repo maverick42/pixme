@@ -163,9 +163,6 @@ pub struct MetaRow {
 /// must never fail to launch over a store problem).
 pub struct Store {
     conn: Option<Connection>,
-    /// Deletions happened since open — a `VACUUM` at drop reclaims the
-    /// pages `secure_delete` already zeroed.
-    needs_vacuum: bool,
 }
 
 impl Store {
@@ -180,10 +177,7 @@ impl Store {
     pub fn open_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("sqlite memory db");
         migrate(&conn).expect("migrate memory db");
-        Self {
-            conn: Some(conn),
-            needs_vacuum: false,
-        }
+        Self { conn: Some(conn) }
     }
 
     /// Opens (and migrates) the database at `path`. A file that fails to
@@ -198,10 +192,7 @@ impl Store {
         match try_open(&path) {
             Ok(conn) => {
                 prune_old_backup(&path);
-                Self {
-                    conn: Some(conn),
-                    needs_vacuum: false,
-                }
+                Self { conn: Some(conn) }
             }
             Err(first) => {
                 let bak = bak_path(&path);
@@ -217,19 +208,13 @@ impl Store {
                             "session db rebuilt ({first:#}); old file parked at {}",
                             crate::paths::file_name(&bak)
                         );
-                        Self {
-                            conn: Some(conn),
-                            needs_vacuum: false,
-                        }
+                        Self { conn: Some(conn) }
                     }
                     Err(second) => {
                         tracing::warn!(
                             "session db unusable ({first:#} then {second:#}) — persistence off"
                         );
-                        Self {
-                            conn: None,
-                            needs_vacuum: false,
-                        }
+                        Self { conn: None }
                     }
                 }
             }
@@ -289,10 +274,9 @@ impl Store {
                 tracing::warn!(%id, "cannot delete stored capture: {err}");
             }
         }
-        // Content is already zeroed by secure_delete; the VACUUM that
-        // reclaims the freed pages runs at drop — rewriting the whole
-        // file on every tab close would be wasteful.
-        self.needs_vacuum |= !ids.is_empty();
+        // Content is already zeroed by secure_delete; the freed pages
+        // are reclaimed by the measured VACUUM at drop — rewriting the
+        // whole file on every tab close would be wasteful.
     }
 
     /// How many captures the store currently holds — the settings
@@ -324,7 +308,6 @@ impl Store {
                 {
                     tracing::warn!("session clear failed: {err}");
                 }
-                self.needs_vacuum = false;
                 return;
             }
             R::Today => conn
@@ -336,7 +319,6 @@ impl Store {
         };
         if removed > 0 {
             tracing::info!(removed, "retention pruned old captures");
-            self.needs_vacuum = true;
         }
     }
 
@@ -488,7 +470,6 @@ impl Store {
         for id in stored {
             if !live.contains(id.as_str()) {
                 conn.execute("DELETE FROM documents WHERE doc_id = ?1", params![id])?;
-                self.needs_vacuum = true;
             }
         }
         Ok(())
@@ -505,21 +486,62 @@ impl Store {
         {
             tracing::warn!("session clear failed: {err}");
         }
-        self.needs_vacuum = false;
+    }
+}
+
+impl Store {
+    /// Reclaims space freed by deletions — MEASURED, not flagged: the
+    /// VACUUM only runs when the freelist holds > 32 MiB AND > 50 % of
+    /// the file. Called on the writer thread at quit (after the queue
+    /// drained, outside any transaction); failures log and never block
+    /// the exit.
+    pub fn vacuum_if_needed(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        let sizes = |conn: &Connection| -> (i64, i64, i64) {
+            let get = |p: &str| -> i64 {
+                conn.pragma_query_value(None, p, |r| r.get::<_, i64>(0))
+                    .unwrap_or(0)
+            };
+            (get("page_count"), get("freelist_count"), get("page_size"))
+        };
+        let (pages, free, psize) = sizes(&conn);
+        if free * psize <= 32 * 1024 * 1024 || free * 2 <= pages {
+            return;
+        }
+        tracing::info!(
+            bytes = pages * psize,
+            free_bytes = free * psize,
+            "session db vacuum"
+        );
+        if let Err(err) = conn.execute_batch("VACUUM") {
+            tracing::warn!("session vacuum failed: {err}");
+            return;
+        }
+        // In WAL a VACUUM can leave the reclaimed space parked in the
+        // -wal side file: truncate it back.
+        let wal = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+            .is_ok_and(|m| m.eq_ignore_ascii_case("wal"));
+        if wal && let Err(err) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+            tracing::warn!("session wal checkpoint failed: {err}");
+        }
+        let (pages, free, psize) = sizes(&conn);
+        tracing::info!(
+            bytes = pages * psize,
+            free_bytes = free * psize,
+            "session db vacuumed"
+        );
+        self.conn = Some(conn);
     }
 }
 
 impl Drop for Store {
-    /// Reclaims the pages freed by per-tab deletions (`secure_delete`
-    /// already zeroed their content) — skipped when nothing was
-    /// deleted, so a plain quit does not rewrite the file.
+    /// Safety net when the writer thread exits normally — a no-op once
+    /// `vacuum_if_needed` already ran (the freelist is empty then).
     fn drop(&mut self) {
-        if self.needs_vacuum
-            && let Some(conn) = self.conn.take()
-            && let Err(err) = conn.execute_batch("VACUUM")
-        {
-            tracing::warn!("session vacuum failed: {err}");
-        }
+        self.vacuum_if_needed();
     }
 }
 

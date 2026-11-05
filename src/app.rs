@@ -2118,6 +2118,9 @@ impl Shared {
             )
         };
         self.writer.finalize(rows, live, active, next_title);
+        // The measured VACUUM rides the queue behind Finalize: it runs
+        // inside the bounded quit wait, not in a Drop the exit may skip.
+        self.writer.vacuum();
         *lock(&self.quit_rx) = Some(self.writer.flush());
         *lock(&self.quit_started) = Some(std::time::Instant::now());
         ctx.repaint_if_live(viewer_id());
@@ -2387,6 +2390,55 @@ impl eframe::App for PixMeApp {
     /// transparent, and child viewports paint their whole surface anyway.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
+    /// Last code that runs on every quit path — winit calls
+    /// `process::exit` right after, before any destructor, so the
+    /// measured session-db VACUUM cannot ride `Store::drop`. Queue it
+    /// behind the pending writes on the store thread and wait for the
+    /// drain with the same bound the quit veil uses.
+    /// Last code that runs on every quit path — winit calls
+    /// `process::exit` right after, before any destructor, so quit-time
+    /// work cannot ride `Drop` or `Command::Quit` alone (Cmd+Q and the
+    /// window cross never dispatch it). Replays `begin_quit`'s tail:
+    /// pending-Draw commit, Finalize (meta refresh + stale-row prune),
+    /// then the measured session-db VACUUM on the store thread, all
+    /// inside one bounded flush wait.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut draw) = lock(&self.shared.draw).take() {
+            draw.finalize_pending();
+            lock(&self.shared.viewer).commit_draw(draw.tab, draw.doc, draw.undo, draw.redo);
+        }
+        let (rows, live, active, next_title) = {
+            let viewer = lock(&self.shared.viewer);
+            (
+                viewer
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(ord, t)| t.to_meta_row(ord))
+                    .collect::<Vec<_>>(),
+                viewer
+                    .tabs
+                    .iter()
+                    .map(|t| t.doc.meta.id.clone())
+                    .collect::<Vec<_>>(),
+                viewer.active_index().unwrap_or(0),
+                viewer.next_title(),
+            )
+        };
+        self.shared.writer.finalize(rows, live, active, next_title);
+        self.shared.writer.vacuum();
+        match self.shared.writer.flush().recv_timeout(QUIT_FLUSH_TIMEOUT) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+                "session flush exceeded {}s — quitting anyway",
+                QUIT_FLUSH_TIMEOUT.as_secs()
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!("store writer died before the quit flush")
+            }
+        }
     }
 
     /// The anchor pass: dispatch queued commands, then (de)register child
