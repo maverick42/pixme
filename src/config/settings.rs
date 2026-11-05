@@ -272,6 +272,11 @@ pub struct MonitorPrefs {
     /// — applied when the monitor is re-selected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rect_native: Option<[i32; 4]>,
+    /// The Draw editor window's rect on this monitor `[x, y, w, h]`,
+    /// same native units — applied when Draw reopens on this monitor
+    /// (`None` = centre it there).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draw_rect_native: Option<[i32; 4]>,
 }
 
 /// The complete persisted settings file.
@@ -561,6 +566,7 @@ mod tests {
             MonitorPrefs {
                 name: Some("Dell bureau".into()),
                 rect_native: Some([0, 0, 2560, 1440]),
+                draw_rect_native: Some([100, 50, 1100, 700]),
             },
         );
         s.monitors.insert(
@@ -568,6 +574,7 @@ mod tests {
             MonitorPrefs {
                 name: Some("Side".into()),
                 rect_native: None,
+                draw_rect_native: None,
             },
         );
         let json = serde_json::to_string(&s).unwrap();

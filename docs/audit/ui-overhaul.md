@@ -181,7 +181,8 @@ geometry that survives disconnect/reconnect:
 "monitors": {
   "<stable_id>": {
     "name": "Dell bureau",
-    "rect_native": [x, y, w, h]
+    "rect_native": [x, y, w, h],
+    "draw_rect_native": [x, y, w, h]
   }
 }
 ```
@@ -190,7 +191,8 @@ geometry that survives disconnect/reconnect:
 Windows, points on macOS), independent of any window ppp — conversion happens
 at apply time with the receiving window's own scale (`monitor_ui_rect`).
 This removes the whole class of mixed-DPI move bugs: nothing volatile is ever
-stored.
+stored. `draw_rect_native` is the same convention for the Draw editor window
+(`None`/absent = centred on its monitor at open).
 
 **Status-strip monitor row**: one `icon_button` (`Icon::Monitor`) per known
 monitor, active state = the viewer's current monitor; tooltip = custom or OS

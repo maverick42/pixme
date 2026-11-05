@@ -5017,6 +5017,7 @@ mod tests {
             crate::config::MonitorPrefs {
                 name: Some("Bureau".into()),
                 rect_native: None,
+                draw_rect_native: None,
             },
         );
         prefs.insert(
@@ -5024,6 +5025,7 @@ mod tests {
             crate::config::MonitorPrefs {
                 name: Some("Ancien".into()),
                 rect_native: None,
+                draw_rect_native: None,
             },
         );
         let rows = monitor_rows(&inventory, &prefs, &std::collections::HashSet::new());

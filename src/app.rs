@@ -368,9 +368,30 @@ pub struct Shared {
     /// a relocation to that monitor's saved geometry.
     pub viewer_move_at: Mutex<Option<std::time::Instant>>,
 
-    /// The viewer's native rect changed on its current monitor —
-    /// `prefs.monitors[id].rect_native` is stale and `pump` flushes a
-    /// debounced `settings.save()`.
+    /// Pending landing target for the Draw editor — stashed by
+    /// `OpenDraw` (the viewer's monitor + that monitor's saved
+    /// `draw_rect_native`, if any), consumed by the draw viewport's
+    /// first pass. Reuses the viewer's monitor+rect container.
+    draw_target: Mutex<Option<ViewerTarget>>,
+    /// The monitor the Draw window currently sits on — the host its
+    /// settled geometry is persisted under when the window's centre
+    /// lands outside every known display.
+    draw_monitor: Mutex<Option<MonitorInfo>>,
+    /// Last reported Draw outer rect — sampled each frame to spot a
+    /// user move/resize gesture in flight (mirrors `viewer_last_outer`).
+    draw_last_outer: Mutex<Option<egui::Rect>>,
+    /// Last observed Draw outer-rect change: a gesture is settled
+    /// 250 ms after the last change, then `draw_rect_native` is
+    /// written under the host monitor (mirrors `viewer_move_at`).
+    draw_move_at: Mutex<Option<std::time::Instant>>,
+    /// Frames to skip settle tracking after the programmatic
+    /// placement — the reported rect lies while the move lands
+    /// (same convention as `viewer_geo_settle`).
+    draw_geo_settle: Mutex<u8>,
+
+    /// A window's native rect changed on its current monitor —
+    /// `prefs.monitors[id].rect_native`/`draw_rect_native` is stale and
+    /// `pump` flushes a debounced `settings.save()`.
     pub monitor_geom_dirty_at: Mutex<Option<std::time::Instant>>,
     /// winit `available_monitors()` placements `(x, y, w, h)` in physical
     /// pixels, snapshotted for the overlay's `with_monitor`/`SetMonitor`
@@ -478,9 +499,10 @@ pub struct Shared {
     pub startup_notice: Mutex<Option<String>>,
 }
 
-/// Where the viewer must land: `monitor` plus the persisted outer rect
+/// Where a window must land: `monitor` plus the persisted outer rect
 /// in the monitor's NATIVE units when prefs hold one (`None` = centre
-/// the window on that monitor with its current size).
+/// the window on that monitor with its current size). Used by the
+/// viewer (`viewer_target`) and the Draw editor (`draw_target`).
 #[derive(Clone, Debug)]
 pub struct ViewerTarget {
     /// The destination monitor.
@@ -1282,6 +1304,25 @@ impl Shared {
                     *lock(&self.draw) = Some(crate::ui::draw::DrawSession::open(
                         doc, tab, title, undo, redo, &prefs,
                     ));
+                    // The editor opens on the viewer's monitor — its
+                    // saved `draw_rect_native` when prefs hold one,
+                    // centred there otherwise. Stale gesture tracking
+                    // from a previous session must not persist early.
+                    let monitor = lock(&self.viewer_monitor)
+                        .clone()
+                        .or_else(|| monitor_under(ctx))
+                        .or_else(|| crate::capture::screen::primary_monitor().ok());
+                    if let Some(m) = monitor {
+                        let native_rect = self.monitor_stable_id(&m).and_then(|id| {
+                            prefs.monitors.get(&id).and_then(|p| p.draw_rect_native)
+                        });
+                        *lock(&self.draw_target) = Some(ViewerTarget {
+                            monitor: m,
+                            native_rect,
+                        });
+                    }
+                    *lock(&self.draw_last_outer) = None;
+                    *lock(&self.draw_move_at) = None;
                     self.request_focus(draw_id());
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
@@ -2218,6 +2259,11 @@ impl PixMeApp {
                 viewer_pin_last: Mutex::new(None),
                 viewer_last_outer: Mutex::new(None),
                 viewer_move_at: Mutex::new(None),
+                draw_target: Mutex::new(None),
+                draw_monitor: Mutex::new(None),
+                draw_last_outer: Mutex::new(None),
+                draw_move_at: Mutex::new(None),
+                draw_geo_settle: Mutex::new(0),
 
                 monitor_geom_dirty_at: Mutex::new(None),
                 winit_placements: Mutex::new(Vec::new()),
@@ -2491,30 +2537,8 @@ impl eframe::App for PixMeApp {
                                         && let Some(m) = hit.clone().or_else(|| cur.clone())
                                         && let Some(id) = shared.monitor_stable_id(&m)
                                     {
-                                        let n_min = platform::ui_to_native(outer.min, ppp);
-                                        let n_max = platform::ui_to_native(outer.max, ppp);
-                                        // Clamp to the host monitor: during a
-                                        // mixed-DPI transition `outer` and `ppp`
-                                        // can be mismatched (old points × new
-                                        // scale), persisting a rect inflated by
-                                        // the ratio — re-applied on the next
-                                        // relocation it compounds (the window
-                                        // grows at every cross-DPI move). The
-                                        // real rect is always inside the host's
-                                        // native bounds, so a clamped write is
-                                        // never lossy here.
-                                        let mon = &m.rect;
-                                        let w = (n_max.x - n_min.x).clamp(100.0, mon.width as f32);
-                                        let h = (n_max.y - n_min.y).clamp(100.0, mon.height as f32);
-                                        let x = n_min.x.clamp(
-                                            mon.x as f32,
-                                            mon.x as f32 + mon.width as f32 - w,
-                                        );
-                                        let y = n_min.y.clamp(
-                                            mon.y as f32,
-                                            mon.y as f32 + mon.height as f32 - h,
-                                        );
-                                        let rect = [x as i32, y as i32, w as i32, h as i32];
+                                        let rect =
+                                            clamped_native_rect(outer, ppp, &m.rect);
                                         tracing::debug!(
                                             monitor = m.name.as_str(),
                                             ppp,
@@ -2778,6 +2802,100 @@ impl eframe::App for PixMeApp {
                 shared.pump(&ctx);
                 shared.maybe_focus(&ctx, draw_id());
                 ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                // Geometry, same convention as the viewer: the stashed
+                // target is applied once at open (saved `draw_rect_native`
+                // or centred on the host monitor), then a 250 ms quiet
+                // after the last reported-rect change settles a gesture
+                // into the host monitor's persisted rect.
+                let target = lock(&shared.draw_target).take();
+                if let Some(t) = target {
+                    let ppp = platform::window_ppp(&ctx, t.monitor.scale_factor.max(1.0));
+                    let rect = match t.native_rect {
+                        Some(_) => target_ui_rect(&t, None, ppp),
+                        // Nothing persisted for this monitor: centre the
+                        // window on it at its current (or builder's) size.
+                        None => {
+                            let mon = platform::monitor_ui_rect(&t.monitor, ppp);
+                            let size = ctx
+                                .input(|i| i.viewport().outer_rect)
+                                .map(|r| r.size())
+                                .unwrap_or(egui::vec2(1100.0, 700.0))
+                                .min(mon.size());
+                            egui::Rect::from_center_size(mon.center(), size)
+                        }
+                    };
+                    // `rect` is the OUTER rect: `InnerSize` needs the
+                    // decoration delta (outer − inner reported last
+                    // frame; zero until measured).
+                    let deco = ctx.input(|i| {
+                        match (i.viewport().outer_rect, i.viewport().inner_rect) {
+                            (Some(o), Some(n)) => o.size() - n.size(),
+                            _ => egui::Vec2::ZERO,
+                        }
+                    });
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(rect.min));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        (rect.size() - deco).max(egui::vec2(100.0, 100.0)),
+                    ));
+                    *lock(&shared.draw_monitor) = Some(t.monitor);
+                    // The reported rect lies for a frame or two while the
+                    // move settles — never persist it.
+                    *lock(&shared.draw_geo_settle) = 2;
+                } else if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                    let mut settle = lock(&shared.draw_geo_settle);
+                    if *settle > 0 {
+                        *settle -= 1;
+                    } else {
+                        drop(settle);
+                        let moved =
+                            lock(&shared.draw_last_outer).replace(outer) != Some(outer);
+                        if moved {
+                            *lock(&shared.draw_move_at) = Some(std::time::Instant::now());
+                        }
+                        let move_at = *lock(&shared.draw_move_at);
+                        if let Some(t) = move_at {
+                            if t.elapsed() >= std::time::Duration::from_millis(250) {
+                                *lock(&shared.draw_move_at) = None;
+                                // Gesture over — the ONE geometry write:
+                                // persisted under the monitor the window's
+                                // centre actually sits on (free cross-monitor
+                                // drag, same rule as the viewer).
+                                let ppp = platform::window_ppp(&ctx, 1.0);
+                                let centre = platform::ui_to_native(outer.center(), ppp);
+                                let host = {
+                                    let inv = lock(&shared.monitors);
+                                    inv.iter()
+                                        .find(|id| {
+                                            let r = &id.info.rect;
+                                            centre.x >= r.x as f32
+                                                && centre.x < (r.x + r.width as i32) as f32
+                                                && centre.y >= r.y as f32
+                                                && centre.y < (r.y + r.height as i32) as f32
+                                        })
+                                        .map(|id| id.info.clone())
+                                        .or_else(|| lock(&shared.draw_monitor).clone())
+                                };
+                                if let Some(m) = host
+                                    && let Some(id) = shared.monitor_stable_id(&m)
+                                {
+                                    *lock(&shared.draw_monitor) = Some(m.clone());
+                                    let rect = clamped_native_rect(outer, ppp, &m.rect);
+                                    let mut s = lock(&shared.settings);
+                                    let prefs = s.monitors.entry(id).or_default();
+                                    if prefs.draw_rect_native != Some(rect) {
+                                        prefs.draw_rect_native = Some(rect);
+                                        *lock(&shared.monitor_geom_dirty_at) =
+                                            Some(std::time::Instant::now());
+                                    }
+                                }
+                            } else {
+                                // Poll so the settle check still runs
+                                // once the OS stops sending move events.
+                                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                            }
+                        }
+                    }
+                }
                 if ctx.input(|i| i.viewport().close_requested()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     // The session decides: quit silently when clean, or
@@ -2991,6 +3109,33 @@ fn target_ui_rect(t: &ViewerTarget, current: Option<egui::Rect>, ppp: f32) -> eg
     }
 }
 
+/// The reported `outer` rect converted to the monitor's native units and
+/// clamped inside `mon`'s bounds — shared by the per-monitor geometry
+/// persistence of every window role (viewer `rect_native`, Draw editor
+/// `draw_rect_native`). The clamp is the DPI-transition guard: during a
+/// mixed-DPI transition `outer` and `ppp` can be mismatched (old points
+/// × new scale), persisting a rect inflated by the ratio — re-applied on
+/// the next relocation it compounds (the window grows at every
+/// cross-DPI move). The real rect is always inside the host's native
+/// bounds, so a clamped write is never lossy here.
+fn clamped_native_rect(
+    outer: egui::Rect,
+    ppp: f32,
+    mon: &crate::capture::PhysicalRect,
+) -> [i32; 4] {
+    let n_min = platform::ui_to_native(outer.min, ppp);
+    let n_max = platform::ui_to_native(outer.max, ppp);
+    let w = (n_max.x - n_min.x).clamp(100.0, mon.width as f32);
+    let h = (n_max.y - n_min.y).clamp(100.0, mon.height as f32);
+    let x = n_min
+        .x
+        .clamp(mon.x as f32, mon.x as f32 + mon.width as f32 - w);
+    let y = n_min
+        .y
+        .clamp(mon.y as f32, mon.y as f32 + mon.height as f32 - h);
+    [x as i32, y as i32, w as i32, h as i32]
+}
+
 /// The capture overlay: a borderless always-on-top window covering the
 /// monitor being captured. `MonitorInfo.rect` is in the OS-native display
 /// space (physical px on Windows, points on macOS) — it is converted to
@@ -3186,6 +3331,11 @@ mod tests {
             viewer_pin_last: Mutex::new(None),
             viewer_last_outer: Mutex::new(None),
             viewer_move_at: Mutex::new(None),
+            draw_target: Mutex::new(None),
+            draw_monitor: Mutex::new(None),
+            draw_last_outer: Mutex::new(None),
+            draw_move_at: Mutex::new(None),
+            draw_geo_settle: Mutex::new(0),
 
             monitor_geom_dirty_at: Mutex::new(None),
             winit_placements: Mutex::new(Vec::new()),

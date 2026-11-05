@@ -2144,3 +2144,25 @@ Format: date — context — decision — consequences.
   (harmless); the early arm is a no-op guard there. The transient
   exclusion's coverage is unchanged: still lifted the moment the frozen
   frames are taken, pins still photograph themselves.
+
+## 2026-11-05 — Per-monitor Draw editor geometry (`draw_rect_native`)
+
+- **Context**: the Draw editor always opened at egui's default placement;
+  the user wants its position/size remembered per monitor across
+  openings and sessions — centred on the monitor when nothing is saved,
+  cleared by "Reset monitors" like the rest of the per-monitor state.
+- **Decision**: `MonitorPrefs` gains `draw_rect_native` (same native-units
+  `[x, y, w, h]` convention as `rect_native`). `OpenDraw` stashes a
+  `draw_target` (the viewer's monitor + its saved rect, reused
+  `ViewerTarget` shape); the draw viewport pass applies it once —
+  saved rect through `target_ui_rect`'s clamped path, else centred via
+  `monitor_ui_rect` — then tracks user moves with the viewer's
+  last-outer/250 ms-quiet settle before writing the clamped rect under
+  the monitor under the window's centre (`clamped_native_rect`, the
+  DPI-inflation guard extracted from the viewer's inline block).
+  `ResetMonitors` needs no extra code: `monitors.clear()` wipes the
+  field with its entry.
+- **Consequences**: draw geometry survives restarts and follows the
+  display it lives on; the gesture settle reuses the debounced
+  `monitor_geom_dirty_at` flush, no new save path. Shared code (works
+  identically on macOS).
