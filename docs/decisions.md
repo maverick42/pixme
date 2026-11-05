@@ -1420,7 +1420,6 @@ Format: date — context — decision — consequences.
   even with slight trackpad drift; dragging the image body or the centre grip
   pill still moves the window.
 
-
 ## 2026-10-30 — Lossy stdout writer for `tracing-subscriber` and panic-log-first hook
 
 - **Context**: a macOS crash report (`pixme-2026-10-30-185600.ips`) after the
@@ -1682,7 +1681,6 @@ Format: date — context — decision — consequences.
     Windows with zero visual artifacts.
   - macOS version is 100% unaffected (`strip_undecorated_frame` is an inlined
     no-op on macOS in `src/platform/mod.rs`).
-
 
 ## 2026-11-01 — Session store: eager write-through on a dedicated writer thread
 
