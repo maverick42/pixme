@@ -2278,9 +2278,12 @@ impl Viewer {
     fn toolbar_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let has_doc = self.active_index().is_some();
         // Read once up-front — the Ouvrir menu's last item greys without it.
-        let has_last_dir = {
+        let (has_last_dir, icon_style) = {
             let s = shared.lock_settings();
-            s.last_open_dir.is_some() || s.last_save_dir.is_some()
+            (
+                s.last_open_dir.is_some() || s.last_save_dir.is_some(),
+                s.icon_style,
+            )
         };
         egui::Frame::default()
             .inner_margin(Margin::symmetric(8, 4))
@@ -2310,13 +2313,14 @@ impl Viewer {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
                             // Ouvrir ▾ — file picker on the main click.
-                            let r = widgets::tool_button(
+                            let r = widgets::tool_button_styled(
                                 ui,
                                 Icon::FolderOpen,
                                 &t!("vbar.open.label"),
                                 true,
                                 false,
                                 true,
+                                icon_style,
                             );
                             let menu_clicked = r.clicked() && widgets::caret_hit(&r, true);
                             if r.clicked() && !menu_clicked {
@@ -2325,13 +2329,14 @@ impl Viewer {
                             // Menus render every frame, forced open on the
                             // caret-click frame — see `tool_popup`.
                             open_menu(ui, &r, shared, has_last_dir, menu_clicked);
-                            let r = widgets::tool_button(
+                            let r = widgets::tool_button_styled(
                                 ui,
                                 Icon::Save,
                                 &t!("vbar.save.label"),
                                 true,
                                 false,
                                 has_doc,
+                                icon_style,
                             );
                             let save_clicked = r.clicked() && widgets::caret_hit(&r, true);
                             if r.clicked() && !save_clicked {
@@ -2339,13 +2344,14 @@ impl Viewer {
                             }
                             save_menu(ui, &r, shared, has_doc, save_clicked);
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::ZoomIn,
                                 &t!("vbar.zoom_in.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
@@ -2356,13 +2362,14 @@ impl Viewer {
                                         ZoomMode::Factor((self.scale_for_step() * 1.25).min(8.0));
                                 }
                             }
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::ZoomOut,
                                 &t!("vbar.zoom_out.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
@@ -2376,13 +2383,14 @@ impl Viewer {
                             // The zoom button shows the live percent; its caret
                             // opens the mode/preset menu, main click = 100%.
                             let zoom_label = self.zoom_label();
-                            let r = widgets::tool_button(
+                            let r = widgets::tool_button_styled(
                                 ui,
                                 Icon::Scan,
                                 &zoom_label,
                                 true,
                                 false,
                                 has_doc,
+                                icon_style,
                             );
                             let menu_clicked = r.clicked() && widgets::caret_hit(&r, true);
                             if r.clicked() && !menu_clicked {
@@ -2416,32 +2424,36 @@ impl Viewer {
                             } else {
                                 (Icon::LayoutGrid, t!("viewer.mode.mosaic"))
                             };
-                            if widgets::tool_button(ui, icon, &label, false, mosaic, true)
-                                .on_hover_text(tip)
-                                .clicked()
+                            if widgets::tool_button_styled(
+                                ui, icon, &label, false, mosaic, true, icon_style,
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
                             {
                                 self.toggle_view_mode();
                             }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Pencil,
                                 &t!("vbar.draw.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
                                 shared.push(crate::app::Command::OpenDraw);
                             }
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Scaling,
                                 &t!("vbar.resize.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                                 && let Some(i) = self.active_index()
@@ -2461,38 +2473,41 @@ impl Viewer {
                                 });
                             }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Copy,
                                 &t!("vbar.copy.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
                                 shared.push(Command::CopyActive);
                             }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Printer,
                                 &t!("vbar.print.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
                                 shared.push(Command::PrintActive);
                             }
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Settings,
                                 &t!("vbar.settings.label"),
                                 false,
                                 false,
                                 shared.command_enabled(&Command::OpenSettings),
+                                icon_style,
                             )
                             .clicked()
                             {
@@ -2524,6 +2539,8 @@ impl Viewer {
     /// from. Capture buttons read the shared command table so they grey
     /// out under modals exactly like the menu entries.
     fn vbar(&mut self, ui: &mut egui::Ui, shared: &Shared) {
+        let mut settings = shared.lock_settings();
+        let icon_style = settings.icon_style;
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
             for (icon, tip, mode) in [
@@ -2551,7 +2568,7 @@ impl Viewer {
             ] {
                 if ui
                     .add_enabled_ui(shared.command_enabled(&Command::Capture(mode)), |ui| {
-                        widgets::icon_button(ui, icon, false)
+                        widgets::icon_button_styled(ui, icon, false, icon_style, None)
                     })
                     .inner
                     .on_hover_text(t!(tip))
@@ -2560,23 +2577,19 @@ impl Viewer {
                     shared.push_capture(mode, ui.ctx());
                 }
             }
-            let mut settings = shared.lock_settings();
             ui.add_space(2.0);
             widgets::hairline(ui);
             ui.add_space(2.0);
             // An armed delay paints the clock red — the "armed" marker.
             let delay_btn = ui
                 .add_enabled_ui(!shared.modal_child_open(), |ui| {
-                    if settings.capture_delay_secs > 0 {
-                        widgets::icon_button_tinted(
-                            ui,
-                            Icon::Clock,
-                            false,
-                            theme::tokens(ui.ctx()).danger,
-                        )
-                    } else {
-                        widgets::icon_button(ui, Icon::Clock, false)
-                    }
+                    widgets::icon_button_styled(
+                        ui,
+                        Icon::Clock,
+                        false,
+                        icon_style,
+                        (settings.capture_delay_secs > 0).then(|| theme::tokens(ui.ctx()).danger),
+                    )
                 })
                 .inner
                 .on_hover_text(t!("toolbar.delay.tooltip"));
@@ -2586,7 +2599,7 @@ impl Viewer {
             ui.add_space(2.0);
             let opts_btn = ui
                 .add_enabled_ui(!shared.modal_child_open(), |ui| {
-                    widgets::icon_button(ui, Icon::Settings, false)
+                    widgets::icon_button_styled(ui, Icon::Settings, false, icon_style, None)
                 })
                 .inner
                 .on_hover_text(t!("toolbar.options.tooltip"));

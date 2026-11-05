@@ -5,6 +5,7 @@
 
 use egui::{Color32, CornerRadius, Response, Sense, Stroke, StrokeKind, Ui, Vec2};
 
+use crate::config::IconStyle;
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme;
 
@@ -16,23 +17,36 @@ pub const ICON_SIZE: f32 = 16.0;
 /// A clickable icon button. `selected` draws the accent-soft fill and border
 /// used for active tools.
 pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool) -> Response {
-    icon_button_styled(ui, icon, selected, None)
+    icon_button_impl(ui, icon, selected, None, IconStyle::Standard)
 }
 
-/// Same as [`icon_button`] but the icon is painted in `tint` while enabled
-/// (e.g. the danger marker on an armed capture delay).
-pub fn icon_button_tinted(ui: &mut Ui, icon: Icon, selected: bool, tint: Color32) -> Response {
-    icon_button_styled(ui, icon, selected, Some(tint))
+/// Same button honouring `style`: `Color` paints the glyph in its own
+/// hue, `Duotone` swaps in the Phosphor two-tone glyph. `tint` (the
+/// armed-delay marker) and the disabled state still override the style.
+pub fn icon_button_styled(
+    ui: &mut Ui,
+    icon: Icon,
+    selected: bool,
+    style: IconStyle,
+    tint: Option<Color32>,
+) -> Response {
+    icon_button_impl(ui, icon, selected, tint, style)
 }
 
-fn icon_button_styled(ui: &mut Ui, icon: Icon, selected: bool, tint: Option<Color32>) -> Response {
+fn icon_button_impl(
+    ui: &mut Ui,
+    icon: Icon,
+    selected: bool,
+    tint: Option<Color32>,
+    style: IconStyle,
+) -> Response {
     let t = theme::tokens(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(BUTTON_SIZE), Sense::click());
 
-    let icon_tint = if !ui.is_enabled() {
+    // The widget-state tint: disabled and explicit overrides beat the
+    // hover accent, which beats the resting icon colour.
+    let state_tint = if !ui.is_enabled() {
         t.text_faint
-    } else if let Some(tint) = tint {
-        tint
     } else if response.hovered() {
         // Hover pops like `tool_button`: accent icon.
         t.accent
@@ -56,7 +70,15 @@ fn icon_button_styled(ui: &mut Ui, icon: Icon, selected: bool, tint: Option<Colo
             stroke,
             StrokeKind::Inside,
         );
-        icons::paint(ui, rect, icon, ICON_SIZE, icon_tint);
+        // Disabled and explicit overrides beat the style's own hue,
+        // which beats the widget-state tint.
+        let icon_tint = if !ui.is_enabled() {
+            t.text_faint
+        } else {
+            tint.or_else(|| icons::hue(icon, style))
+                .unwrap_or(state_tint)
+        };
+        icons::styled_paint(ui, rect, icon, ICON_SIZE, style, icon_tint);
     }
 
     response

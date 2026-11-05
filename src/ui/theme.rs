@@ -3,8 +3,8 @@
 //! name and number across themes (enforced by exhaustive literals; `docs/
 //! theme.md` is the prose source of truth).
 //!
-//! Theme-independent colours (region-selection scrim, annotation palette) are
-//! fixed constants at the bottom of this file.
+//! Theme-independent colours (region-selection scrim, annotation palette,
+//! capture-bar icon hues) are fixed constants at the bottom of this file.
 
 use egui::{
     Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id, Margin,
@@ -216,6 +216,46 @@ pub mod pin_chrome {
 
 /// Dim veil drawn over the frozen screen during region selection.
 pub const REGION_SCRIM: Color32 = Color32::from_black_alpha(110);
+
+/// Fixed per-icon colours for the `Color` and `Duotone` icon styles —
+/// theme-independent like the annotation palette: these mid-tone hues
+/// stay readable on both the dark and the light `dock`. Applies to the
+/// capture bar and the horizontal toolbar; every other surface keeps
+/// the theme-tinted glyphs.
+pub mod icon_hue {
+    use egui::Color32;
+
+    /// Window-or-object capture (dashed frame + pointer).
+    pub const WINDOW: Color32 = Color32::from_rgb(0xA3, 0x8B, 0xF0);
+    /// Rectangular-region capture.
+    pub const REGION: Color32 = Color32::from_rgb(0x4C, 0x9A, 0xFF);
+    /// Full-screen capture.
+    pub const FULLSCREEN: Color32 = Color32::from_rgb(0x3E, 0xBB, 0x8A);
+    /// Fixed-size region capture.
+    pub const FIXED_REGION: Color32 = Color32::from_rgb(0xF0, 0x8A, 0x3C);
+    /// Pin to screen.
+    pub const PIN: Color32 = Color32::from_rgb(0xE5, 0x6A, 0x8F);
+    /// Delay before capture.
+    pub const DELAY: Color32 = Color32::from_rgb(0xE5, 0xB4, 0x3C);
+    /// Capture options / app settings (neutral — menus, not modes).
+    pub const OPTIONS: Color32 = Color32::from_rgb(0x9A, 0xA5, 0xB1);
+    /// Open a file (classic folder amber).
+    pub const OPEN: Color32 = Color32::from_rgb(0xE5, 0xB4, 0x3C);
+    /// Save.
+    pub const SAVE: Color32 = Color32::from_rgb(0x4C, 0x9A, 0xFF);
+    /// Zoom group (in / out / 100 % — one functional group, one hue).
+    pub const ZOOM: Color32 = Color32::from_rgb(0x5B, 0xC0, 0xDE);
+    /// View-mode toggles (tabs strip / mosaic — view chrome, neutral).
+    pub const VIEW: Color32 = Color32::from_rgb(0x9A, 0xA5, 0xB1);
+    /// Draw / edit mode.
+    pub const EDIT: Color32 = Color32::from_rgb(0xF0, 0x8A, 0x3C);
+    /// Resize.
+    pub const RESIZE: Color32 = Color32::from_rgb(0x3E, 0xBB, 0x8A);
+    /// Copy to clipboard.
+    pub const COPY: Color32 = Color32::from_rgb(0xE5, 0x6A, 0x8F);
+    /// Print (utility — neutral).
+    pub const PRINT: Color32 = Color32::from_rgb(0x9A, 0xA5, 0xB1);
+}
 
 /// Fixed colours for the mosaic tiles' overlays: the caption band and
 /// the drag anchor stay dark (white text) over arbitrary captures, in

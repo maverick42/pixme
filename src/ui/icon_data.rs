@@ -316,3 +316,102 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/refresh-cw.svg"),
     ),
 ];
+
+/// `(icon, name, raw SVG bytes)` for the `Duotone` style: Phosphor
+/// two-tone glyphs (`assets/icons-duotone/`, MIT — see
+/// `LICENSE-phosphor.txt`). Covers the capture bar and the horizontal
+/// toolbar; `timer` stands in for `Clock`, `app-window` for
+/// `SquareDashedMousePointer` (window-or-object) and `rows` for
+/// `PanelTop` (the tab-strip view it switches back to).
+pub(crate) const DUOTONE_DATA: &[(Icon, &str, &[u8])] = &[
+    (
+        Icon::FolderOpen,
+        "folder-open",
+        include_bytes!("../../assets/icons-duotone/folder-open.svg"),
+    ),
+    (
+        Icon::Save,
+        "floppy-disk",
+        include_bytes!("../../assets/icons-duotone/floppy-disk.svg"),
+    ),
+    (
+        Icon::ZoomIn,
+        "magnifying-glass-plus",
+        include_bytes!("../../assets/icons-duotone/magnifying-glass-plus.svg"),
+    ),
+    (
+        Icon::ZoomOut,
+        "magnifying-glass-minus",
+        include_bytes!("../../assets/icons-duotone/magnifying-glass-minus.svg"),
+    ),
+    (
+        Icon::Scan,
+        "scan",
+        include_bytes!("../../assets/icons-duotone/scan.svg"),
+    ),
+    (
+        Icon::PanelTop,
+        "rows",
+        include_bytes!("../../assets/icons-duotone/rows.svg"),
+    ),
+    (
+        Icon::LayoutGrid,
+        "squares-four",
+        include_bytes!("../../assets/icons-duotone/squares-four.svg"),
+    ),
+    (
+        Icon::Pencil,
+        "pencil-simple",
+        include_bytes!("../../assets/icons-duotone/pencil-simple.svg"),
+    ),
+    (
+        Icon::Scaling,
+        "arrows-out-simple",
+        include_bytes!("../../assets/icons-duotone/arrows-out-simple.svg"),
+    ),
+    (
+        Icon::Copy,
+        "copy",
+        include_bytes!("../../assets/icons-duotone/copy.svg"),
+    ),
+    (
+        Icon::Printer,
+        "printer",
+        include_bytes!("../../assets/icons-duotone/printer.svg"),
+    ),
+    (
+        Icon::SquareDashedMousePointer,
+        "app-window",
+        include_bytes!("../../assets/icons-duotone/app-window.svg"),
+    ),
+    (
+        Icon::SquareDashed,
+        "selection",
+        include_bytes!("../../assets/icons-duotone/selection.svg"),
+    ),
+    (
+        Icon::Monitor,
+        "monitor",
+        include_bytes!("../../assets/icons-duotone/monitor.svg"),
+    ),
+    (
+        Icon::Crop,
+        "crop",
+        include_bytes!("../../assets/icons-duotone/crop.svg"),
+    ),
+    (
+        Icon::Pin,
+        "push-pin",
+        include_bytes!("../../assets/icons-duotone/push-pin.svg"),
+    ),
+    (
+        Icon::Clock,
+        "timer",
+        include_bytes!("../../assets/icons-duotone/timer.svg"),
+    ),
+    (
+        Icon::Settings,
+        "gear-six",
+        include_bytes!("../../assets/icons-duotone/gear-six.svg"),
+    ),
+];

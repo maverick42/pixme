@@ -177,6 +177,19 @@ buttons for the five capture modes plus delay and options popups. It is
 always visible in Tabs and Mosaic modes, gated by the shared command
 table like menu entries.
 
+The vbar and the horizontal toolbar honour the persisted `icon_style`
+setting: `standard` (the reference look above), `color` (same Lucide
+glyphs in per-icon hues) or `duotone` (Phosphor two-tone SVGs, MIT,
+`assets/icons-duotone/`, restyled white then tinted like Lucide so the
+fill layer lands at 20 % of the hue). The per-icon palette lives in
+`theme::icon_hue` — theme-independent constants like the annotation
+colours: window/object violet `#A38BF0`, region `#4C9AFF`, full screen
+`#3EBB8A`, fixed region `#F08A3C`, pin `#E56A8F`, delay `#E5B43C`,
+options `#9AA5B1`; toolbar hues: open `#E5B43C`, save `#4C9AFF`, zoom
+group `#5BC0DE`, view toggles `#9AA5B1`, draw `#F08A3C`, resize
+`#3EBB8A`, copy `#E56A8F`, print `#9AA5B1`. Widget-state overrides
+still win (disabled → `text_faint`, armed delay → `danger`).
+
 ## Contrast guarantees (tests ported)
 
 WCAG 2 contrast helper from `theme.rs` tests; floors: body `text` ≥ 4.5:1,

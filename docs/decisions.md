@@ -2089,3 +2089,28 @@ Format: date — context — decision — consequences.
 - **Consequences**: PixMe windows are only invisible for the grab's
   duration (ms) — imperceptible to Teams/others; macOS unchanged
   (no-op guard). `windows.rs` still compiles only on Windows.
+
+## 2026-11-05 — Capture-bar icon styles (Standard / Color / Duotone)
+
+- **Context**: the vbar's monochrome Lucide set read as austere; the user
+  asked for a more colourful, modern look selectable in Settings.
+- **Decision**: a persisted `icon_style` setting (`standard | color |
+  duotone`, default `standard`) on the General page, applying to the
+  vertical capture bar AND the horizontal toolbar (`tool_button`s) —
+  the draw tools, tabs, menus and status strip keep the standard
+  theme-tinted Lucide glyphs so the visual reference remains the
+  identity. `Color` reuses the Lucide SVGs with a fixed per-icon hue
+  (`theme::icon_hue`, theme-independent like the annotation palette);
+  `Duotone` swaps in eighteen embedded Phosphor duotone SVGs (MIT,
+  `assets/icons-duotone/`) — `timer` stands in for `Clock`,
+  `app-window` for `SquareDashedMousePointer`, `rows` for `PanelTop`.
+  Both coloured styles keep the widget-state overrides: disabled greys
+  out, the armed delay marker stays `danger`. (First cut covered the
+  vbar only; the user meant the horizontal toolbar — scope widened to
+  both the same day.)
+- **Consequences**: one more asset directory + licence
+  (`LICENSE-phosphor.txt`), a `DUOTONE_DATA` table beside `DATA` in
+  `icon_data.rs`, and `icons::styled_paint` + `icons::hue` behind
+  `widgets::icon_button_styled` / `widgets::tool_button_styled` as the
+  style-aware render path. Adding a fourth style means a new asset
+  table plus a hue entry per styled icon.

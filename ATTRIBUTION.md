@@ -9,6 +9,7 @@ next to the assets.
 | --- | --- | --- | --- | --- |
 | `assets/fonts/Inter-*.ttf` | Inter (Regular, Medium, SemiBold) | Rasmus Andersson | https://rsms.me/inter/ | SIL OFL 1.1 (`assets/fonts/OFL-Inter.txt`) |
 | `assets/icons/*.svg` | Lucide icon set (subset: monitor, square-dashed, app-window, square-dashed-mouse-pointer, crop, pin, clock, folder, settings, x, chevron-down, chevron-left, chevron-right, check, plus, scan, grip-vertical, copy, download, folder-open, save, zoom-in, zoom-out, pencil, braces, scaling, clipboard-paste, printer, mouse-pointer, message-square, message-circle, type, info, arrow-up-right, eraser, square, circle, highlighter, undo-2, redo-2, layout-grid, panel-top, pipette, lock, align-left, align-center, align-right, align-justify, align-start-vertical, align-center-vertical, align-end-vertical) — `square-fill`, `circle-fill`, `pixelate` and `blur` are original Lucide-style glyphs drawn for PixMe | Lucide contributors | https://lucide.dev | ISC (`assets/icons/LICENSE-lucide.txt`) |
+| `assets/icons-duotone/*.svg` | Phosphor icon set, duotone weight (subset: app-window, selection, monitor, crop, push-pin, timer, gear-six, folder-open, floppy-disk, magnifying-glass-plus, magnifying-glass-minus, scan, rows, squares-four, pencil-simple, arrows-out-simple, copy, printer — the `Duotone` icon style of the capture bar and toolbar) | Phosphor Icons | https://phosphoricons.com | MIT (`assets/icons-duotone/LICENSE-phosphor.txt`) |
 
 ## Adapted code
 

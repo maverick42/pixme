@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use rust_i18n::t;
 
 use crate::app::{Shared, lock};
-use crate::config::{Appearance, DbRetention, Settings};
+use crate::config::{Appearance, DbRetention, IconStyle, Settings};
 use crate::i18n::Language;
 use crate::ui::icons::Icon;
 use crate::ui::{theme, widgets};
@@ -124,6 +124,10 @@ fn general_page(ui: &mut egui::Ui, draft: &mut Settings) {
         widgets::hairline(ui);
         row(ui, &t!("settings.appearance.label"), |ui| {
             appearance_picker(ui, draft);
+        });
+        widgets::hairline(ui);
+        row(ui, &t!("settings.icon_style.label"), |ui| {
+            icon_style_picker(ui, draft);
         });
         widgets::hairline(ui);
         row(ui, &t!("settings.db_retention.label"), |ui| {
@@ -385,9 +389,10 @@ fn apply(ctx: &egui::Context, shared: &Shared) {
 /// deliberately left out (they churn silently on every save).
 fn log_changes(old: &Settings, new: &Settings) {
     type Field = (&'static str, fn(&Settings) -> String);
-    let fields: [Field; 8] = [
+    let fields: [Field; 9] = [
         ("language", |s| format!("{:?}", s.language)),
         ("appearance", |s| format!("{:?}", s.appearance)),
+        ("icon_style", |s| format!("{:?}", s.icon_style)),
         ("copy_to_clipboard", |s| s.copy_to_clipboard.to_string()),
         ("db_retention", |s| format!("{:?}", s.db_retention)),
         ("db_status", |s| s.db_status.to_string()),
@@ -547,6 +552,23 @@ fn appearance_picker(ui: &mut egui::Ui, draft: &mut Settings) {
             (Appearance::Light, t!("settings.appearance.light")),
         ] {
             ui.selectable_value(&mut draft.appearance, value, label);
+        }
+    });
+}
+
+/// Capture-bar icon-style dropdown: Lucide monochrome (the reference
+/// look), the same glyphs in per-icon colours, or Phosphor two-tones.
+fn icon_style_picker(ui: &mut egui::Ui, draft: &mut Settings) {
+    let label = |s: IconStyle| match s {
+        IconStyle::Standard => t!("settings.icon_style.standard"),
+        IconStyle::Color => t!("settings.icon_style.color"),
+        IconStyle::Duotone => t!("settings.icon_style.duotone"),
+    };
+    let current = label(draft.icon_style);
+    let btn = widgets::dropdown_button(ui, &current);
+    egui::Popup::menu(&btn).show(|ui| {
+        for value in [IconStyle::Standard, IconStyle::Color, IconStyle::Duotone] {
+            ui.selectable_value(&mut draft.icon_style, value, label(value));
         }
     });
 }

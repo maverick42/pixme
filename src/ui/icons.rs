@@ -8,7 +8,10 @@ use std::sync::OnceLock;
 
 use egui::{Color32, ImageSource, Rect, Ui, Vec2, load::SizedTexture};
 
+use crate::config::IconStyle;
+
 use super::icon_data;
+use super::theme;
 
 /// Every icon PixMe bundles (see `icon_data.rs` for the byte table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -187,6 +190,60 @@ pub fn exists(icon: Icon) -> bool {
     styled_icons().contains_key(&icon)
 }
 
+/// The `Duotone` set (Phosphor two-tone glyphs, restyled to white so
+/// the per-icon tint colours both layers).
+fn duotone_icons() -> &'static HashMap<Icon, StyledIcon> {
+    static MAP: OnceLock<HashMap<Icon, StyledIcon>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        icon_data::DUOTONE_DATA
+            .iter()
+            .map(|&(icon, name, raw)| {
+                let mut svg = String::from_utf8_lossy(raw).into_owned();
+                svg = svg.replace("currentColor", "#ffffff");
+                (
+                    icon,
+                    StyledIcon {
+                        uri: Box::leak(
+                            format!("bytes://icons-duotone/{name}.svg").into_boxed_str(),
+                        ),
+                        bytes: egui::load::Bytes::from(svg.into_bytes()),
+                    },
+                )
+            })
+            .collect()
+    })
+}
+
+/// The fixed hue `icon` takes under `style` — `None` under `Standard`,
+/// and `None` for icons with no dedicated hue (callers fall back to the
+/// widget-state tint, like `Standard`).
+pub fn hue(icon: Icon, style: IconStyle) -> Option<Color32> {
+    if style == IconStyle::Standard {
+        return None;
+    }
+    use theme::icon_hue as c;
+    Some(match icon {
+        // Capture bar.
+        Icon::SquareDashedMousePointer => c::WINDOW,
+        Icon::SquareDashed => c::REGION,
+        Icon::Monitor => c::FULLSCREEN,
+        Icon::Crop => c::FIXED_REGION,
+        Icon::Pin => c::PIN,
+        Icon::Clock => c::DELAY,
+        Icon::Settings => c::OPTIONS,
+        // Horizontal toolbar.
+        Icon::FolderOpen => c::OPEN,
+        Icon::Save => c::SAVE,
+        Icon::ZoomIn | Icon::ZoomOut | Icon::Scan => c::ZOOM,
+        Icon::PanelTop | Icon::LayoutGrid => c::VIEW,
+        Icon::Pencil => c::EDIT,
+        Icon::Scaling => c::RESIZE,
+        Icon::Copy => c::COPY,
+        Icon::Printer => c::PRINT,
+        _ => return None,
+    })
+}
+
 /// Embedded application icons (original artwork — see
 /// `assets/app/README.md`). The window/taskbar icon is the Windows variant
 /// (`pixme-window-256.png`, full-bleed); the macOS Dock icon uses
@@ -285,6 +342,23 @@ pub fn paint(ui: &Ui, rect: Rect, icon: Icon, size: f32, tint: Color32) {
     image(icon, size, tint).paint_at(ui, r);
 }
 
+/// Paints `icon` centred in `rect` under `style`: `Duotone` swaps in the
+/// Phosphor glyph (falling back to Lucide when the icon has no duotone
+/// twin); `tint` is the caller-resolved colour (see [`hue`]).
+pub fn styled_paint(ui: &Ui, rect: Rect, icon: Icon, size: f32, style: IconStyle, tint: Color32) {
+    let styled = match style {
+        IconStyle::Duotone => duotone_icons().get(&icon).unwrap_or(&styled_icons()[&icon]),
+        IconStyle::Standard | IconStyle::Color => &styled_icons()[&icon],
+    };
+    egui::Image::new(ImageSource::Bytes {
+        uri: styled.uri.into(),
+        bytes: styled.bytes.clone(),
+    })
+    .fit_to_exact_size(Vec2::splat(size))
+    .tint(tint)
+    .paint_at(ui, Rect::from_center_size(rect.center(), Vec2::splat(size)));
+}
+
 /// Rasterizes `icon` at `size` px — used by tests, offscreen rendering and
 /// OS surfaces that need pixel data (status item icon).
 fn rasterize(icon: Icon, size: u32) -> egui::ColorImage {
@@ -333,6 +407,31 @@ mod tests {
             assert!(exists(icon), "{name} missing from map");
             let img = rasterize(icon, 16);
             assert_eq!(img.size, [16, 16], "{name} wrong size");
+            assert!(
+                img.pixels.iter().any(|p| p.a() > 0),
+                "{name} rasterized fully transparent"
+            );
+        }
+    }
+
+    #[test]
+    fn every_duotone_icon_rasterizes_and_has_a_hue() {
+        for &(icon, name, raw) in icon_data::DUOTONE_DATA {
+            assert!(duotone_icons().contains_key(&icon), "{name} missing");
+            assert!(
+                hue(icon, IconStyle::Duotone).is_some(),
+                "{name} has no colour — it would render unstyled"
+            );
+            let img = egui_extras::image::load_svg_bytes_with_size(
+                raw,
+                egui::load::SizeHint::Size {
+                    width: 16,
+                    height: 16,
+                    maintain_aspect_ratio: true,
+                },
+                &Default::default(),
+            )
+            .unwrap_or_else(|_| panic!("{name} failed to rasterize"));
             assert!(
                 img.pixels.iter().any(|p| p.a() > 0),
                 "{name} rasterized fully transparent"

@@ -11,5 +11,5 @@ pub use filename::expand_template;
 // `Appearance` is re-exported for the settings UI (phase 2).
 #[allow(unused_imports)]
 pub use settings::{
-    Appearance, DbRetention, DrawOptions, MonitorPrefs, Settings, TabSort, ToolStyle,
+    Appearance, DbRetention, DrawOptions, IconStyle, MonitorPrefs, Settings, TabSort, ToolStyle,
 };

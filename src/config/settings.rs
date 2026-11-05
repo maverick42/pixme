@@ -48,6 +48,22 @@ impl Appearance {
     }
 }
 
+/// How the capture-bar icons are drawn — the "Style des icônes" setting.
+/// Applies to the vertical capture bar only; every other surface keeps
+/// the standard monochrome glyphs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IconStyle {
+    /// Lucide line icons tinted with the theme tokens — the reference look.
+    #[default]
+    Standard,
+    /// The same Lucide glyphs, each in its own fixed colour.
+    Color,
+    /// Phosphor two-tone glyphs (`assets/icons-duotone/`), each in its
+    /// own fixed colour.
+    Duotone,
+}
+
 /// How long captures persist in the session database — the
 /// "Sauvegarde base de données" setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +282,9 @@ pub struct Settings {
     pub language: Language,
     /// Theme preference: `auto` follows the OS appearance.
     pub appearance: Appearance,
+    /// Capture-bar icon style (see [`IconStyle`]).
+    #[serde(default)]
+    pub icon_style: IconStyle,
     /// Include the mouse pointer in captures. Session-only by user
     /// decision: it survives between captures but is never written to
     /// disk — every launch starts without the pointer.
@@ -349,6 +368,7 @@ impl Default for Settings {
         Self {
             language: Language::default(),
             appearance: Appearance::default(),
+            icon_style: IconStyle::default(),
             draw_opts: DrawOptions::default(),
             include_pointer: false,
             copy_to_clipboard: false,
