@@ -1923,6 +1923,7 @@ impl Viewer {
             )
             .show(ui, |ui| {
                 self.status_strip(ui, shared);
+                widgets::paint_toasts_above(ui.ctx(), 34.0);
             });
         CentralPanel::default()
             .frame(
@@ -3638,6 +3639,11 @@ impl Viewer {
             match resolved {
                 Some((w, h)) => {
                     self.resize_active(w, h, state.anti_alias);
+                    widgets::toast(
+                        ctx,
+                        widgets::ToastKind::Success,
+                        t!("viewer.toast.resized").to_string(),
+                    );
                     applied = true;
                 }
                 None => state.invalid = true,

@@ -814,6 +814,7 @@ impl Shared {
             .and_then(|j| j.rx.try_recv().ok());
         if let Some((tabs, saved_paths)) = save_done {
             let job = lock(&self.save_all).take().expect("save-all job");
+            let saved_count = saved_paths.len();
             {
                 let mut s = lock(&self.settings);
                 for path in saved_paths {
@@ -825,6 +826,19 @@ impl Shared {
                 let mut viewer = lock(&self.viewer);
                 viewer.tabs = tabs;
                 viewer.recompute_dirty();
+            }
+            if saved_count == job.total {
+                crate::ui::widgets::toast(
+                    ctx,
+                    crate::ui::widgets::ToastKind::Success,
+                    t!("viewer.toast.saved_all", count = saved_count).to_string(),
+                );
+            } else {
+                crate::ui::widgets::toast(
+                    ctx,
+                    crate::ui::widgets::ToastKind::Error,
+                    t!("viewer.toast.save_failed").to_string(),
+                );
             }
             if job.then_confirm {
                 if lock(&self.viewer).dirty {
@@ -857,6 +871,11 @@ impl Shared {
                     s.push_recent(job.path);
                     s.save();
                     *lock(&self.save_dialog) = None;
+                    crate::ui::widgets::toast(
+                        ctx,
+                        crate::ui::widgets::ToastKind::Success,
+                        t!("viewer.toast.saved").to_string(),
+                    );
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
                 Err(e) => {
@@ -1279,8 +1298,22 @@ impl Shared {
             Command::CopyActive => {
                 if let Some(img) = lock(&self.viewer).copy_image() {
                     match crate::export::clipboard::copy_image(&img) {
-                        Ok(()) => tracing::info!("clipboard_copy"),
-                        Err(e) => tracing::warn!("copy failed: {e}"),
+                        Ok(()) => {
+                            tracing::info!("clipboard_copy");
+                            crate::ui::widgets::toast(
+                                ctx,
+                                crate::ui::widgets::ToastKind::Success,
+                                t!("viewer.toast.copied").to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("copy failed: {e}");
+                            crate::ui::widgets::toast(
+                                ctx,
+                                crate::ui::widgets::ToastKind::Error,
+                                t!("viewer.toast.copy_failed").to_string(),
+                            );
+                        }
                     }
                 }
             }
