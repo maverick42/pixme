@@ -68,8 +68,9 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
     }
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(PAGE_KEY), page));
-    widgets::hairline(ui);
-    ui.add_space(4.0);
+    // Footer pinned to the window's bottom edge: the remaining space
+    // above is consumed first, so the row never moves between pages.
+    ui.add_space((ui.available_height() - 28.0).max(0.0));
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         // An empty template could never produce a file name — OK stays
         // greyed until the field is usable again.
