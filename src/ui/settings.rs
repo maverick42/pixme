@@ -385,16 +385,16 @@ fn apply(ctx: &egui::Context, shared: &Shared) {
 /// deliberately left out (they churn silently on every save).
 fn log_changes(old: &Settings, new: &Settings) {
     type Field = (&'static str, fn(&Settings) -> String);
-    let fields: [Field; 10] = [
+    let fields: [Field; 8] = [
         ("language", |s| format!("{:?}", s.language)),
         ("appearance", |s| format!("{:?}", s.appearance)),
         ("copy_to_clipboard", |s| s.copy_to_clipboard.to_string()),
         ("db_retention", |s| format!("{:?}", s.db_retention)),
         ("db_status", |s| s.db_status.to_string()),
         ("tab_sort", |s| format!("{:?}", s.tab_sort)),
-        ("text_color", |s| format!("{:?}", s.text_color)),
-        ("text_font", |s| s.text_font.clone()),
-        ("text_size", |s| s.text_size.to_string()),
+        ("draw_opts", |s| {
+            format!("{:?}", s.draw_opts.tools.keys().count())
+        }),
         ("filename_template", |s| s.filename_template.clone()),
     ];
     for (name, f) in fields {

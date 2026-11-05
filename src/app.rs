@@ -2749,6 +2749,10 @@ impl eframe::App for PixMeApp {
                     && let Some(mut session) = lock(&shared.draw).take()
                 {
                     tracing::info!("draw_closed");
+                    // The user's last tool styling survives to the next
+                    // Draw session — same convention as the text_*
+                    // fields, whichever way the window closed.
+                    session.persist_opts(&shared);
                     // The modal closed: the viewer gets focus back.
                     ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
                     if outcome == crate::ui::draw::Outcome::Ok {

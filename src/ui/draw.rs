@@ -28,8 +28,10 @@ use crate::ui::icons::{self, Icon};
 use crate::ui::{theme, widgets};
 
 /// One drawable tool of the strip (two-column grid).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tool {
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
+pub enum Tool {
     Select,
     /// The marquee: frames a region for cut/copy/paste/delete/blur/fill.
     SelectArea,
@@ -188,28 +190,122 @@ struct Opts {
     /// Last side the user dragged an emoji to, image px — reused by the
     /// next click placement (session memory, not persisted).
     emoji_size: Option<f32>,
+    /// Per-tool style banks: every tool owns its own copy of the
+    /// shared style fields above (colour, width, dash, opacity…), so
+    /// tweaking the arrow never leaks into the pencil. Swapped on
+    /// tool switch by [`DrawSession::set_tool`].
+    styles: std::collections::BTreeMap<Tool, crate::config::ToolStyle>,
 }
 
 impl Opts {
-    /// Seeds the text defaults from `prefs.json` so the user's last
-    /// text styling survives across sessions.
+    /// Seeds the per-tool option banks from `prefs.json`'s `draw_opts`
+    /// — the live fields start at factory defaults; each tool adopts
+    /// its own bank on first use.
     fn from_settings(p: &crate::config::Settings) -> Self {
-        let [r, g, b] = p.text_color;
-        let [or, og, ob] = p.text_outline_color;
         Self {
-            color: Color32::from_rgb(r, g, b),
-            font: if p.text_font.is_empty() {
-                "Arial".to_owned()
-            } else {
-                p.text_font.clone()
-            },
-            font_size: (p.text_size.clamp(8, 72)) as f32,
-            bold: p.text_bold,
-            italic: p.text_italic,
-            outline_w: (p.text_outline.min(10)) as f32,
-            outline_color: Color32::from_rgb(or, og, ob),
+            styles: p.draw_opts.tools.clone(),
             ..Self::default()
         }
+    }
+
+    /// Snapshots ALL live option fields into a [`ToolStyle`].
+    fn style(&self) -> crate::config::ToolStyle {
+        let c = |k: Color32| [k.r(), k.g(), k.b()];
+        crate::config::ToolStyle {
+            color: c(self.color),
+            fill_color: c(self.fill_color),
+            width: self.width,
+            dash: self.dash,
+            shadow: self.shadow,
+            opacity: self.opacity,
+            line_start: self.line_start,
+            line_end: self.line_end,
+            outline: self.outline,
+            line_outline_color: c(self.line_outline_color),
+            line_shadow: self.line_shadow,
+            radius: self.radius,
+            tip: self.tip,
+            brace_kind: self.brace_kind,
+            shape: self.shape,
+            hl_opacity: self.hl_opacity,
+            eraser_color: c(self.eraser_color),
+            eraser_size: self.eraser_size,
+            eraser_mode: self.eraser_mode,
+            blur_style: self.blur_style,
+            blur_strength: self.blur_strength,
+            font: self.font.clone(),
+            font_size: self.font_size,
+            bold: self.bold,
+            italic: self.italic,
+            text_outline: self.outline_w,
+            text_outline_color: c(self.outline_color),
+            align: self.align,
+            step_mode: self.step_mode,
+            step_style: self.step_style,
+            step_size: self.step_size,
+            step_next_num: self.step_next_num,
+            step_next_let: self.step_next_let,
+            step_bg: c(self.step_bg),
+            step_fg: c(self.step_fg),
+            step_ring: self.step_ring,
+            step_ring_color: c(self.step_ring_color),
+            step_shadow: self.step_shadow,
+            step_lower: self.step_lower,
+            emoji_id: self.emoji_id,
+            emoji_size: self.emoji_size,
+        }
+    }
+
+    /// Writes a [`ToolStyle`] into ALL live option fields.
+    fn adopt(&mut self, s: &crate::config::ToolStyle) {
+        let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
+        self.color = rgb(s.color);
+        self.fill_color = rgb(s.fill_color);
+        self.width = s.width;
+        self.dash = s.dash;
+        self.shadow = s.shadow;
+        self.opacity = s.opacity;
+        self.line_start = s.line_start;
+        self.line_end = s.line_end;
+        self.outline = s.outline;
+        self.line_outline_color = rgb(s.line_outline_color);
+        self.line_shadow = s.line_shadow;
+        self.radius = s.radius;
+        self.tip = s.tip;
+        self.brace_kind = s.brace_kind;
+        self.shape = s.shape;
+        self.hl_opacity = s.hl_opacity;
+        self.eraser_color = rgb(s.eraser_color);
+        self.eraser_size = s.eraser_size;
+        self.eraser_mode = s.eraser_mode;
+        self.blur_style = s.blur_style;
+        self.blur_strength = s.blur_strength;
+        self.font = s.font.clone();
+        self.font_size = s.font_size;
+        self.bold = s.bold;
+        self.italic = s.italic;
+        self.outline_w = s.text_outline;
+        self.outline_color = rgb(s.text_outline_color);
+        self.align = s.align;
+        self.step_mode = s.step_mode;
+        self.step_style = s.step_style;
+        self.step_size = s.step_size;
+        self.step_next_num = s.step_next_num;
+        self.step_next_let = s.step_next_let;
+        self.step_bg = rgb(s.step_bg);
+        self.step_fg = rgb(s.step_fg);
+        self.step_ring = s.step_ring;
+        self.step_ring_color = rgb(s.step_ring_color);
+        self.step_shadow = s.step_shadow;
+        self.step_lower = s.step_lower;
+        self.emoji_id = s.emoji_id;
+        self.emoji_size = s.emoji_size;
+    }
+
+    /// `tool`'s style bank, created on demand from the live fields.
+    fn bank_mut(&mut self, tool: Tool) -> &mut crate::config::ToolStyle {
+        let live = self.style();
+        self.styles.entry(tool).or_insert(live)
     }
 }
 
@@ -257,6 +353,7 @@ impl Default for Opts {
             step_shadow: true,
             step_lower: false,
             emoji_id: 0x1F449, // 👉 — a good annotation default
+            styles: std::collections::BTreeMap::new(),
             emoji_size: None,
         }
     }
@@ -1040,7 +1137,7 @@ impl DrawSession {
                 self.sel_area = None;
             } else if self.tool == Tool::Emoji {
                 // Esc leaves the sticky emoji tool (back to Select).
-                self.tool = Tool::Select;
+                self.set_tool(Tool::Select);
             } else {
                 self.request_cancel();
             }
@@ -1158,9 +1255,27 @@ impl DrawSession {
         });
     }
 
+    /// Switches the armed tool: the current tool's live style fields
+    /// are stashed into its bank, then the new tool's bank is adopted
+    /// (factory defaults on first use) — every tool keeps its own
+    /// styling instead of sharing one `opts` bundle.
+    fn set_tool(&mut self, tool: Tool) {
+        if tool == self.tool {
+            return;
+        }
+        let cur = self.opts.style();
+        self.opts.styles.insert(self.tool, cur);
+        if let Some(s) = self.opts.styles.get(&tool).cloned() {
+            self.opts.adopt(&s);
+        } else {
+            self.opts.adopt(&crate::config::ToolStyle::default());
+        }
+        self.tool = tool;
+    }
+
     /// Handles a tool click.
     fn pick_tool(&mut self, tool: Tool, ctx: &egui::Context) {
-        self.tool = tool;
+        self.set_tool(tool);
         self.sel_area = None;
         self.selected = None;
         self.close_text_panel();
@@ -1221,7 +1336,7 @@ impl DrawSession {
         }));
         // One shot per pick: after a placement the tool drops back to
         // Select — placing again means arming another emoji below.
-        self.tool = Tool::Select;
+        self.set_tool(Tool::Select);
     }
 
     /// Largest emoji side this document allows, image px: 2× the 128 px
@@ -1401,7 +1516,7 @@ impl DrawSession {
         // The pasted object is meant to be moved right away — hand the
         // pointer tool over so a drag grabs it instead of framing a new
         // marquee.
-        self.tool = Tool::Select;
+        self.set_tool(Tool::Select);
         let (w, h) = (img.width(), img.height());
         let (x, y) = pos.unwrap_or((
             ((doc_w - w as i32) / 2).max(0),
@@ -1445,7 +1560,7 @@ impl DrawSession {
         }));
         // Continue the press as a plain object move on the new picture;
         // after release the pointer tool keeps it re-grabbable.
-        self.tool = Tool::Select;
+        self.set_tool(Tool::Select);
         if let Some(id) = self.selected
             && let Some(before) = self.doc.annotation(id).cloned()
         {
@@ -2181,7 +2296,7 @@ impl DrawSession {
         let one_shot = matches!(kind, AnnotationKind::Emoji(_));
         self.add(kind);
         if one_shot {
-            self.tool = Tool::Select;
+            self.set_tool(Tool::Select);
         }
     }
 
@@ -3267,6 +3382,19 @@ impl DrawSession {
         }
     }
 
+    /// Mirrors the session's tool options into `prefs.json` — the next
+    /// Draw opens with the user's last styling, not factory defaults.
+    /// Called on Draw close, whichever way it ends.
+    pub fn persist_opts(&self, shared: &Shared) {
+        // Stash the live fields under the armed tool so its bank is
+        // fresh before writing the map.
+        let mut tools = self.opts.styles.clone();
+        tools.insert(self.tool, self.opts.style());
+        let mut s = shared.lock_settings();
+        s.draw_opts.tools = tools;
+        s.save();
+    }
+
     /// Mirrors text style changes into `self.opts` + `prefs.json`.
     #[allow(clippy::too_many_arguments)]
     fn save_text_prefs(
@@ -3287,15 +3415,17 @@ impl DrawSession {
         self.opts.italic = italic;
         self.opts.outline_w = f32::from(outline);
         self.opts.outline_color = outline_color;
-        let mut s = shared.lock_settings();
-        s.text_color = [color.r(), color.g(), color.b()];
-        s.text_font = font;
-        s.text_size = size;
-        s.text_bold = bold;
-        s.text_italic = italic;
-        s.text_outline = outline;
-        s.text_outline_color = [outline_color.r(), outline_color.g(), outline_color.b()];
-        s.save();
+        // The text tool's bank follows the panel — it is the source
+        // of truth persisted on close.
+        let bank = self.opts.bank_mut(Tool::Text);
+        bank.color = [color.r(), color.g(), color.b()];
+        bank.font = font;
+        bank.font_size = f32::from(size);
+        bank.bold = bold;
+        bank.italic = italic;
+        bank.text_outline = f32::from(outline);
+        bank.text_outline_color = [outline_color.r(), outline_color.g(), outline_color.b()];
+        self.persist_opts(shared);
     }
 
     /// Title of the bottom tab: the selected object's kind when one is
@@ -3955,9 +4085,10 @@ impl DrawSession {
                         &mut o.shape,
                         &mut o.opacity,
                     ) {
-                        self.opts.color = o.color;
-                        self.opts.shape = o.shape;
-                        self.opts.hl_opacity = o.opacity;
+                        let bank = self.opts.bank_mut(Tool::HighlightArea);
+                        bank.color = [o.color.r(), o.color.g(), o.color.b()];
+                        bank.shape = o.shape;
+                        bank.hl_opacity = o.opacity;
                         changed = true;
                     }
                 }
@@ -4084,9 +4215,10 @@ impl DrawSession {
                 }
                 AnnotationKind::Blur(o) => {
                     if blur_options_row(ui, &mut o.style, &mut o.strength, &mut o.shape) {
-                        self.opts.blur_style = o.style;
-                        self.opts.blur_strength = o.strength;
-                        self.opts.shape = o.shape;
+                        let bank = self.opts.bank_mut(Tool::Blur);
+                        bank.blur_style = o.style;
+                        bank.blur_strength = o.strength;
+                        bank.shape = o.shape;
                         changed = true;
                     }
                 }
@@ -4105,7 +4237,7 @@ impl DrawSession {
                         &mut sh_on,
                     ) {
                         o.shadow = if sh_on { 3.0 } else { 0.0 };
-                        self.opts.brace_kind = o.kind;
+                        self.opts.bank_mut(Tool::Brace).brace_kind = o.kind;
                         changed = true;
                     }
                 }
