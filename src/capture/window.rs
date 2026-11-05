@@ -81,6 +81,9 @@ pub fn capture_window(id: u32) -> Result<Capture, CaptureError> {
     // Same reasoning as `screen::capture_all_monitors`: the OS composites
     // the cursor into the frame — hide it for the grab.
     crate::platform::hide_cursor();
+    // Same as `screen::`: PixMe windows are excluded only for the
+    // guard's scope, not permanently — Teams keeps seeing them.
+    let _excl = crate::platform::capture_exclusion();
     let image_result = w.capture_image();
     crate::platform::unhide_cursor();
     let image = image_result.map_err(|e| CaptureError::Failed(e.to_string()))?;

@@ -243,16 +243,120 @@ pub fn sync_menu_enabled(
 ///    `BitBlt` of the composed desktop. On slower machines the composition can
 ///    still hold a PixMe window's pixels when the freeze fires ~2 frames after
 ///    its viewport is torn down — the viewer then appears as a watermark under
-///    the dim veil. `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` removes
-///    every PixMe window from screen readback permanently, making the teardown
-///    timing irrelevant. Every role is excluded EXCEPT the pins: a pinned
-///    capture is meant to be screen content and must photograph. Best-effort —
-///    `WDA_EXCLUDEFROMCAPTURE` needs Windows 10 2004+; the call fails
-///    harmlessly on older builds.
+///    the dim veil. `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` redacts
+///    PixMe windows from the readback — but it is toggled TRANSIENTLY, only
+///    for the capture's duration (see [`capture_exclusion`]): a permanent
+///    exclusion hid PixMe from Teams and every other capture tool. Every role
+///    is excluded EXCEPT the pins: a pinned capture is meant to be screen
+///    content and must photograph. Best-effort — `WDA_EXCLUDEFROMCAPTURE`
+///    needs Windows 10 2004+; the call fails harmlessly on older builds.
 ///
 /// Note: whenever winit touches window flags (focus change, new child window),
 /// it triggers `SWP_FRAMECHANGED` which resets the window region. The guard
 /// reapplies `SetWindowRgn` whenever styles are stripped or dimensions change.
+thread_local! {
+    /// Hwnds classified as pins — they represent screen content and
+    /// must stay capturable. Populated by the window pass in
+    /// [`strip_undecorated_frame`]; a pin not yet classified (created
+    /// since the last pass) is still skipped by its live "PixMe Pin"
+    /// title in [`set_capture_exclusion`].
+    static PIN_HWNDS: std::cell::RefCell<std::collections::HashSet<isize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Enables/disables `WDA_EXCLUDEFROMCAPTURE` on every PixMe window
+/// except pins, by enumerating this thread's windows LIVE — a window
+/// created since the last `strip_undecorated_frame` pass is covered
+/// too (no registry staleness). Returns how many hwnds were toggled.
+/// Best-effort: ignored on Windows builds before 10 2004.
+fn set_capture_exclusion(exclude: bool) -> u32 {
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
+    const WDA_NONE: u32 = 0;
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowDisplayAffinity(hwnd: isize, affinity: u32) -> i32;
+        fn EnumThreadWindows(
+            id_thread: u32,
+            lpfn: unsafe extern "system" fn(isize, isize) -> i32,
+            lparam: isize,
+        ) -> i32;
+        fn GetCurrentThreadId() -> u32;
+        fn GetWindowTextW(hwnd: isize, s: *mut u16, n: i32) -> i32;
+    }
+    struct Ctx {
+        affinity: u32,
+        applied: u32,
+    }
+    unsafe extern "system" fn visit(hwnd: isize, lp: isize) -> i32 {
+        let ctx = unsafe { &mut *(lp as *mut Ctx) };
+        let pinned = PIN_HWNDS.with(|s| s.borrow().contains(&hwnd)) || {
+            // A pin created since the last classification pass still
+            // carries its live title — skip it the same way.
+            let mut buf = [0u16; 64];
+            let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), 64) } as usize;
+            String::from_utf16_lossy(&buf[..n]) == "PixMe Pin"
+        };
+        if !pinned {
+            unsafe { SetWindowDisplayAffinity(hwnd, ctx.affinity) };
+            ctx.applied += 1;
+        }
+        1
+    }
+    let mut ctx = Ctx {
+        affinity: if exclude {
+            WDA_EXCLUDEFROMCAPTURE
+        } else {
+            WDA_NONE
+        },
+        applied: 0,
+    };
+    unsafe {
+        EnumThreadWindows(GetCurrentThreadId(), visit, &mut ctx as *mut Ctx as isize);
+    }
+    ctx.applied
+}
+
+/// RAII guard armed by [`capture_exclusion`]: the exclusion lifts on
+/// drop — error and panic paths included.
+pub struct CaptureExclusionGuard {
+    armed_at: std::time::Instant,
+}
+
+/// Activates `WDA_EXCLUDEFROMCAPTURE` on every PixMe window except
+/// pins, then waits out one DWM composition (`DwmFlush`) so the flag
+/// is guaranteed effective before the caller's `BitBlt` — GDI reads
+/// the composed frame, so a still-tearing-down viewer would otherwise
+/// ghost into the freeze. The exclusion lifts when the returned guard
+/// drops: screen sharing and other capture tools keep seeing PixMe.
+pub fn capture_exclusion() -> CaptureExclusionGuard {
+    let armed_at = std::time::Instant::now();
+    let hwnds = set_capture_exclusion(true);
+    let flush_t = std::time::Instant::now();
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmFlush() -> i32;
+    }
+    let hr = unsafe { DwmFlush() };
+    tracing::debug!(
+        hwnds,
+        flush_ms = flush_t.elapsed().as_secs_f64() * 1e3,
+        flush_hr = hr,
+        "capture_exclusion_armed"
+    );
+    CaptureExclusionGuard { armed_at }
+}
+
+impl Drop for CaptureExclusionGuard {
+    fn drop(&mut self) {
+        let lifted = set_capture_exclusion(false);
+        tracing::debug!(
+            active_ms = self.armed_at.elapsed().as_secs_f64() * 1e3,
+            lifted_hwnds = lifted,
+            "capture_exclusion_lifted"
+        );
+    }
+}
+
 pub fn strip_undecorated_frame() {
     use std::collections::{HashMap, HashSet};
 
@@ -298,7 +402,6 @@ pub fn strip_undecorated_frame() {
         fn IsWindowVisible(hwnd: isize) -> i32;
         fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
         fn GetCurrentThreadId() -> u32;
-        fn SetWindowDisplayAffinity(hwnd: isize, affinity: u32) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -316,8 +419,8 @@ pub fn strip_undecorated_frame() {
     const DWMWA_BORDER_COLOR: u32 = 34;
     /// `DWMWA_COLOR_NONE`: suppresses the DWM border entirely.
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
-    /// Excludes the window from every screen capture (Windows 10 2004+).
-    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
+    /// `SetWindowDisplayAffinity` is declared in the file-level
+    /// [`set_capture_exclusion`] — the exclusion is transient now.
 
     const SW_SHOWNOACTIVATE: i32 = 4;
     const SW_SHOW: i32 = 5;
@@ -335,7 +438,7 @@ pub fn strip_undecorated_frame() {
     thread_local! {
         static REGIONS: RefCell<HashMap<isize, (i32, i32)>> = RefCell::new(HashMap::new());
         static ROLES: RefCell<HashMap<isize, Role>> = RefCell::new(HashMap::new());
-        static AFFINITIZED: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
+        /// File-level registry (`CAPTURE_EXCLUDABLE`) collects them.
     }
 
     unsafe extern "system" fn visit(hwnd: isize, _lp: isize) -> i32 {
@@ -380,15 +483,13 @@ pub fn strip_undecorated_frame() {
             }
         });
 
-        // Exclude every PixMe window but the pins from screen captures:
-        // GDI `BitBlt` reads the DWM composition, which can still hold a
-        // torn-down viewer's pixels at freeze time — affinity removes it
-        // from the readback whatever the teardown timing. Once per hwnd.
-        if role != Some(Role::Pin) {
-            AFFINITIZED.with(|s| {
-                if s.borrow_mut().insert(hwnd) {
-                    unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
-                }
+        // Pins represent screen content: registered so the transient
+        // capture exclusion always skips them (the live title check
+        // inside `set_capture_exclusion` covers a pin not yet
+        // classified).
+        if role == Some(Role::Pin) {
+            PIN_HWNDS.with(|s| {
+                s.borrow_mut().insert(hwnd);
             });
         }
 

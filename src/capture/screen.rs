@@ -85,6 +85,10 @@ pub fn capture_monitor(id: u32) -> Result<Capture, CaptureError> {
         .find(|m| m.id().ok() == Some(id))
         .ok_or(CaptureError::Failed("monitor disappeared".into()))?;
     let info = monitor_info(&monitor)?;
+    // PixMe windows are excluded from captures only for the guard's
+    // scope — a still-tearing-down viewer can't ghost the frame, but
+    // screen sharing keeps seeing PixMe (see `platform::`).
+    let _excl = crate::platform::capture_exclusion();
     let image = monitor
         .capture_image()
         .map_err(|e| CaptureError::Failed(e.to_string()))?;
@@ -120,6 +124,7 @@ pub fn capture_all_monitors(
     // cursor-free — the stamp, when wanted, comes from `cursor` at the
     // selection's click point.
     crate::platform::hide_cursor();
+    let _excl = crate::platform::capture_exclusion();
     for m in list {
         let Ok(info) = monitor_info(&m) else {
             continue;

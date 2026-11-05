@@ -2051,3 +2051,41 @@ Format: date — context — decision — consequences.
   API). The macOS nudge loop retries harder against the visibleFrame
   clamp — still capped by `MAX_NUDGE_TRIES`. `windows.rs` compiles only
   on Windows: verified on this branch's Windows build, not on macOS.
+  **Superseded**: the permanent exclusion made PixMe invisible to Teams
+  screen sharing and every other capture tool — replaced by the
+  transient guard below (same day).
+
+## 2026-11-04 — Transient capture exclusion around the freeze (+ DwmFlush)
+
+- **Context**: the permanent `WDA_EXCLUDEFROMCAPTURE` above hid every
+  PixMe window from ALL capture tools — Teams screen sharing and
+  third-party screenshooters could no longer see the viewer.
+- **Decision**: the flag is now armed only for the capture `BitBlt`'s
+  duration, via `platform::capture_exclusion()` — an RAII
+  `CaptureExclusionGuard` that (a) toggles the flag on every PixMe hwnd
+  except pins by LIVE `EnumThreadWindows` enumeration (a window created
+  since the last `strip_undecorated_frame` pass is covered — no registry
+  staleness; pins are skipped via a `PIN_HWNDS` registry plus a live
+  "PixMe Pin" title check for not-yet-classified pins), (b) calls
+  `DwmFlush()` so the affinity change is inside the composed frame
+  before the readback, and (c) lifts the exclusion on drop — error and
+  panic paths included. The same guard is shared by all three capture
+  sites (`screen::capture`, `capture_all_monitors`, `window::capture`).
+- **Unverified assumptions — to validate on a Windows build**:
+  1. `DwmFlush` lands early enough for DWM to honour the affinity change
+     before xcap's `BitBlt` (DWM applies affinity at its own cadence).
+  2. `BitBlt` being synchronous, the guard scope still covers the whole
+     xcap grab on every path.
+  Instrumented at debug level (`capture_exclusion_armed` /
+  `capture_exclusion_lifted`: hwnd count, `DwmFlush` duration, active
+  duration) — validate with `RUST_LOG=pixme=debug` on the laptop that
+  showed the ghost.
+- **Fallback**: if the ghost reappears despite `DwmFlush`, the next step
+  is decided WITH the user — not implemented unilaterally.
+- **WGC note**: Windows.Graphics.Capture also honours
+  `WDA_EXCLUDEFROMCAPTURE` and cannot express "everything except my
+  windows" — it does not solve this problem. Any WGC evaluation
+  (latency, HDR, mixed-DPI monitors) is a separate track.
+- **Consequences**: PixMe windows are only invisible for the grab's
+  duration (ms) — imperceptible to Teams/others; macOS unchanged
+  (no-op guard). `windows.rs` still compiles only on Windows.

@@ -239,6 +239,27 @@ pub use windows::strip_undecorated_frame;
 #[inline]
 pub fn strip_undecorated_frame() {}
 
+/// Arms transient capture exclusion for the returned guard's lifetime:
+/// PixMe windows (except pins) get `WDA_EXCLUDEFROMCAPTURE`, one DWM
+/// composition is flushed so the flag is effective, and the exclusion
+/// lifts on drop — error and panic paths included. This keeps a
+/// still-tearing-down viewer out of the frozen frame without hiding
+/// PixMe from screen sharing or other capture tools.
+/// No-op on macOS (CGWindowList captures already exclude us by flag).
+#[cfg(target_os = "windows")]
+pub use windows::capture_exclusion;
+/// No-op on macOS (see above) — a unit guard keeps the call sites
+/// identical on both OSes.
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn capture_exclusion() -> CaptureExclusionGuard {
+    CaptureExclusionGuard
+}
+/// The macOS no-op guard returned by [`capture_exclusion`].
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct CaptureExclusionGuard;
+
 /// Reveals a file selected in the OS file manager after saving.
 #[cfg(target_os = "macos")]
 pub use macos::reveal_in_file_manager;
