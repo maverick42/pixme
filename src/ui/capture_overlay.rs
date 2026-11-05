@@ -472,8 +472,11 @@ impl OverlaySession {
                 // re-placing until it covers the monitor's real frame,
                 // capped so a failed kiosk can never spin.
                 let want = egui::vec2(m.rect.width as f32, m.rect.height as f32);
-                let aligned = (outer.min - origin).abs().max_elem() <= 1.0
-                    && (outer.size() - want).abs().max_elem() <= 1.0;
+                // Tolerance under 0.25 pt (half a physical px on Retina):
+                // a 1-pt gap leaves a real undimmed strip along the
+                // monitor's top edge — uncovered, unselectable.
+                let aligned = (outer.min - origin).abs().max_elem() <= 0.25
+                    && (outer.size() - want).abs().max_elem() <= 0.25;
                 if !aligned && self.nudge_tries < MAX_NUDGE_TRIES {
                     self.nudge_tries += 1;
                     ctx.send_viewport_cmd(ViewportCommand::OuterPosition(origin));

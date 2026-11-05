@@ -2023,3 +2023,31 @@ Format: date — context — decision — consequences.
 - **Consequences**: one consistent gesture — "click the display's icon
   to summon PixMe there, click again to dismiss". Windows gets the same
   behavior through the shared command path.
+
+## 2026-11-04 — Windows capture-overlay chrome: DWM border suppression + capture exclusion
+
+- **Context**: three field reports on the region overlay. (a) Windows:
+  a white line along the screen's top edge on every PC (also via RDP) —
+  the DWM accent line drawn on borderless windows; the existing
+  `SetWindowRgn` fix used by the countdown/pins cannot apply to the
+  overlay (it would clip real frozen-frame pixels). (b) Both OSes: the
+  crosshair/veil stops ~1 px short of the top edge — on Windows the DWM
+  line covers that row, on macOS the nudge loop's 1 pt tolerance could
+  leave a genuinely uncovered strip. (c) One Windows laptop: the torn-down
+  viewer still appears as a watermark in the frozen frame — xcap reads
+  the DWM composition via GDI `BitBlt`, and ~2 warm-up frames are not
+  always enough for the composition to drop the window's pixels.
+- **Decision**: in `strip_undecorated_frame`, the overlay gets
+  `DwmSetWindowAttribute(DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE)` (Windows
+  11; harmless elsewhere) instead of a window region. Every enumerated
+  PixMe window EXCEPT the pins gets
+  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` — viewer, overlay,
+  countdown, dialogs can never photograph themselves, whatever the
+  teardown timing. Pins stay capturable: a pinned capture is screen
+  content. On macOS the overlay-alignment tolerance tightens from 1.0 pt
+  to 0.25 pt so the window must actually reach the monitor's top edge.
+- **Consequences**: PixMe's own UI is now invisible to ALL screen capture
+  tools on Windows 10 2004+, not only its own (the designed use of the
+  API). The macOS nudge loop retries harder against the visibleFrame
+  clamp — still capped by `MAX_NUDGE_TRIES`. `windows.rs` compiles only
+  on Windows: verified on this branch's Windows build, not on macOS.

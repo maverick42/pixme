@@ -228,12 +228,27 @@ pub fn sync_menu_enabled(
 ///      line without touching the card or its soft shadow.
 ///    - For pinned captures (`"PixMe Pin"`): sets a rounded-rect region (`16 px`),
 ///      matching the card's rounded corners and preserving the full border stroke.
+///    - For the capture overlay (`"PixMe Overlay"`): clipping is impossible —
+///      the top pixel rows carry real frozen-frame content that must stay
+///      visible and selectable. `DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE`
+///      suppresses the border itself instead (Windows 11; ignored elsewhere).
+///
+/// 3. **Ghost window in the frozen frame**: xcap grabs the screen with a GDI
+///    `BitBlt` of the composed desktop. On slower machines the composition can
+///    still hold a PixMe window's pixels when the freeze fires ~2 frames after
+///    its viewport is torn down — the viewer then appears as a watermark under
+///    the dim veil. `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` removes
+///    every PixMe window from screen readback permanently, making the teardown
+///    timing irrelevant. Every role is excluded EXCEPT the pins: a pinned
+///    capture is meant to be screen content and must photograph. Best-effort —
+///    `WDA_EXCLUDEFROMCAPTURE` needs Windows 10 2004+; the call fails
+///    harmlessly on older builds.
 ///
 /// Note: whenever winit touches window flags (focus change, new child window),
 /// it triggers `SWP_FRAMECHANGED` which resets the window region. The guard
 /// reapplies `SetWindowRgn` whenever styles are stripped or dimensions change.
 pub fn strip_undecorated_frame() {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     const GWL_STYLE: i32 = -16;
     const GWL_EXSTYLE: i32 = -20;
@@ -277,6 +292,7 @@ pub fn strip_undecorated_frame() {
         fn IsWindowVisible(hwnd: isize) -> i32;
         fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
         fn GetCurrentThreadId() -> u32;
+        fn SetWindowDisplayAffinity(hwnd: isize, affinity: u32) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -284,6 +300,18 @@ pub fn strip_undecorated_frame() {
         fn CreateRectRgn(x1: i32, y1: i32, x2: i32, y2: i32) -> isize;
         fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, cx: i32, cy: i32) -> isize;
     }
+
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(hwnd: isize, attr: u32, value: *const u32, size: u32) -> i32;
+    }
+
+    /// `DWMWA_BORDER_COLOR` (dwmapi.h).
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    /// `DWMWA_COLOR_NONE`: suppresses the DWM border entirely.
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    /// Excludes the window from every screen capture (Windows 10 2004+).
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
 
     const SW_SHOWNOACTIVATE: i32 = 4;
     const SW_SHOW: i32 = 5;
@@ -301,13 +329,12 @@ pub fn strip_undecorated_frame() {
     thread_local! {
         static REGIONS: RefCell<HashMap<isize, (i32, i32)>> = RefCell::new(HashMap::new());
         static ROLES: RefCell<HashMap<isize, Role>> = RefCell::new(HashMap::new());
+        static AFFINITIZED: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
     }
 
     unsafe extern "system" fn visit(hwnd: isize, _lp: isize) -> i32 {
         let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-        if (exstyle & WS_EX_TOPMOST) == 0 {
-            return 1;
-        }
+        let topmost = (exstyle & WS_EX_TOPMOST) != 0;
 
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
 
@@ -318,8 +345,15 @@ pub fn strip_undecorated_frame() {
         let (role, first_seen) = ROLES.with(|roles| {
             let mut m = roles.borrow_mut();
             if let Some(&r) = m.get(&hwnd) {
-                (Some(r), false)
-            } else if title == "PixMe Countdown" {
+                return (Some(r), false);
+            }
+            // Only topmost windows get a role: the viewer shares the
+            // "PixMe" title with the anchor but is NOT topmost — letting
+            // it through the title switch would tag it Anchor.
+            if !topmost {
+                return (None, false);
+            }
+            if title == "PixMe Countdown" {
                 m.insert(hwnd, Role::Countdown);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
                 (Some(Role::Countdown), true)
@@ -340,6 +374,22 @@ pub fn strip_undecorated_frame() {
             }
         });
 
+        // Exclude every PixMe window but the pins from screen captures:
+        // GDI `BitBlt` reads the DWM composition, which can still hold a
+        // torn-down viewer's pixels at freeze time — affinity removes it
+        // from the readback whatever the teardown timing. Once per hwnd.
+        if role != Some(Role::Pin) {
+            AFFINITIZED.with(|s| {
+                if s.borrow_mut().insert(hwnd) {
+                    unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
+                }
+            });
+        }
+
+        if !topmost {
+            return 1;
+        }
+
         let Some(role) = role else {
             return 1;
         };
@@ -351,6 +401,20 @@ pub fn strip_undecorated_frame() {
             // edge (the capture must reach the taskbar's clock).
             unsafe {
                 SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+            }
+        }
+
+        if role == Role::Overlay && (first_seen || (style & WS_CHROME) != 0) {
+            // Suppress DWM's 1 px accent line at the window's top edge —
+            // SetWindowRgn (the countdown/pin fix) would clip real
+            // frozen-frame rows. Best-effort: Windows 11 only.
+            unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    &DWMWA_COLOR_NONE,
+                    std::mem::size_of::<u32>() as u32,
+                );
             }
         }
 
