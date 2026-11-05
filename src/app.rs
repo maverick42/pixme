@@ -1200,7 +1200,9 @@ impl Shared {
             }
             Command::OpenAllRecent => {
                 let paths = lock(&self.settings).recent_files.clone();
-                let opened = paths.iter().any(|p| self.open_one(p));
+                // `|`, not `||` — `any` short-circuits at the first
+                // success and only one file would open.
+                let opened = paths.iter().fold(false, |acc, p| self.open_one(p) | acc);
                 if opened {
                     self.enter(AppState::Viewer, ctx);
                 }

@@ -4217,26 +4217,74 @@ fn tool_popup(
         });
 }
 
+/// One popup-menu row: a leading Lucide icon + label, full-width hover
+/// and click — every caret-menu row carries an icon for scannability.
+fn menu_row(ui: &mut egui::Ui, icon: Icon, text: impl Into<String>, enabled: bool) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(width, 24.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if enabled && resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(t.radius_sm), t.hover);
+    }
+    let tint = if enabled { t.icon } else { t.text_faint };
+    let text_col = if enabled { t.text } else { t.text_faint };
+    icons::paint(
+        ui,
+        Rect::from_center_size(
+            rect.left_center() + egui::vec2(14.0, 0.0),
+            egui::Vec2::splat(16.0),
+        ),
+        icon,
+        14.0,
+        tint,
+    );
+    ui.painter().text(
+        rect.left_center() + egui::vec2(32.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text.into(),
+        egui::FontId::proportional(12.0),
+        text_col,
+    );
+    resp
+}
+
 /// Ouvrir's menu: New / Open / Import from clipboard / last used folder
 /// (greyed until a folder has been used once).
 fn open_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_last_dir: bool, open: bool) {
     tool_popup(ui, resp, "open-menu", open, |ui| {
-        for (key, cmd) in [
-            ("menu.file.open", Command::OpenFile),
-            ("menu.app.import_clipboard", Command::ImportClipboard),
+        for (key, icon, cmd) in [
+            ("menu.file.open", Icon::FolderOpen, Command::OpenFile),
+            (
+                "menu.app.import_clipboard",
+                Icon::ClipboardPaste,
+                Command::ImportClipboard,
+            ),
         ] {
-            if ui.button(t!(key)).clicked() {
+            if menu_row(ui, icon, t!(key).to_string(), true).clicked() {
                 shared.push(cmd);
                 ui.close();
             }
         }
         ui.separator();
-        ui.add_enabled_ui(has_last_dir, |ui| {
-            if ui.button(t!("vbar.open.last_dir")).clicked() {
-                shared.push(Command::OpenLastDir);
-                ui.close();
-            }
-        });
+        if menu_row(
+            ui,
+            Icon::Folder,
+            t!("vbar.open.last_dir").to_string(),
+            has_last_dir,
+        )
+        .clicked()
+        {
+            shared.push(Command::OpenLastDir);
+            ui.close();
+        }
         recent_menu_items(ui, shared);
     });
 }
@@ -4245,12 +4293,13 @@ fn open_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_last_dir: bool
 /// entry point left with the menus gone.
 fn save_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_doc: bool, open: bool) {
     tool_popup(ui, resp, "save-menu", open, |ui| {
-        if ui
-            .add_enabled(
-                has_doc && shared.command_enabled(&Command::SaveAll),
-                egui::Button::new(t!("menu.file.save_all")),
-            )
-            .clicked()
+        if menu_row(
+            ui,
+            Icon::Download,
+            t!("menu.file.save_all").to_string(),
+            has_doc && shared.command_enabled(&Command::SaveAll),
+        )
+        .clicked()
         {
             shared.push(Command::SaveAll);
             ui.close();
@@ -4274,24 +4323,24 @@ fn recent_menu_items(ui: &mut egui::Ui, shared: &Shared) {
             .unwrap_or_else(|| path.display().to_string());
         let command = Command::OpenPath(path.clone());
         let enabled = shared.command_enabled(&command);
-        let resp = ui
-            .add_enabled(enabled, egui::Button::new(name))
-            .on_hover_text(path.display().to_string());
+        let resp =
+            menu_row(ui, Icon::Clock, name, enabled).on_hover_text(path.display().to_string());
         if resp.clicked() {
             shared.push(command);
             ui.close();
         }
     }
     ui.separator();
-    for (command, key) in [
-        (Command::OpenAllRecent, "menu.file.open_all_recent"),
-        (Command::ClearRecent, "menu.file.clear_recent"),
+    for (command, key, icon) in [
+        (
+            Command::OpenAllRecent,
+            "menu.file.open_all_recent",
+            Icon::FolderOpen,
+        ),
+        (Command::ClearRecent, "menu.file.clear_recent", Icon::X),
     ] {
         let enabled = shared.command_enabled(&command);
-        if ui
-            .add_enabled(enabled, egui::Button::new(t!(key).as_ref()))
-            .clicked()
-        {
+        if menu_row(ui, icon, t!(key).to_string(), enabled).clicked() {
             shared.push(command);
             ui.close();
         }
