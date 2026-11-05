@@ -8,7 +8,8 @@ use super::{Capture, CaptureError, MonitorInfo, PhysicalRect};
 
 /// All connected monitors as [`MonitorInfo`] — `rect` in OS-native
 /// display units (physical px on Windows, points on macOS; see
-/// `platform::NATIVE_SPACE`).
+/// `platform::NATIVE_SPACE`). Returned in spatial order
+/// ([`super::sort_monitors_by_position`]), not raw enumeration order.
 pub fn monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
     let list = Monitor::all().map_err(|e| CaptureError::Failed(e.to_string()))?;
     let mut out = Vec::with_capacity(list.len());
@@ -32,6 +33,7 @@ pub fn monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
                 .map_err(|e| CaptureError::Failed(e.to_string()))?,
         });
     }
+    super::sort_monitors_by_position(&mut out);
     Ok(out)
 }
 

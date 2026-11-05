@@ -491,8 +491,9 @@ struct MonitorRow {
     kind: crate::capture::MonitorKind,
 }
 
-/// The status strip's monitor rows: connected monitors in enumeration
-/// order, then persisted-but-absent entries (unless the user dismissed
+/// The status strip's monitor rows: connected monitors in spatial order
+/// (the inventory is sorted by `capture::sort_monitors_by_position`), then
+/// persisted-but-absent entries (unless the user dismissed
 /// them this run — dismissal is visual only, prefs are never dropped).
 fn monitor_rows(
     inventory: &[crate::platform::MonitorIdentity],

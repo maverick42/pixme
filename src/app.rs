@@ -1695,13 +1695,15 @@ impl Shared {
         // the stashed origin — not the countdown's `Idle` — is where Esc
         // lands. No stash: the live state decides (a chained capture
         // keeps the original session's destination).
-        let return_to = lock(&self.capture_return_to).take().unwrap_or(match current {
-            AppState::Capturing => lock(&self.capture)
-                .as_ref()
-                .map(|s| s.return_to)
-                .unwrap_or(AppState::Idle),
-            state => state,
-        });
+        let return_to = lock(&self.capture_return_to)
+            .take()
+            .unwrap_or(match current {
+                AppState::Capturing => lock(&self.capture)
+                    .as_ref()
+                    .map(|s| s.return_to)
+                    .unwrap_or(AppState::Idle),
+                state => state,
+            });
         match mode {
             CaptureMode::Region
             | CaptureMode::FixedRegion
@@ -2537,8 +2539,7 @@ impl eframe::App for PixMeApp {
                                         && let Some(m) = hit.clone().or_else(|| cur.clone())
                                         && let Some(id) = shared.monitor_stable_id(&m)
                                     {
-                                        let rect =
-                                            clamped_native_rect(outer, ppp, &m.rect);
+                                        let rect = clamped_native_rect(outer, ppp, &m.rect);
                                         tracing::debug!(
                                             monitor = m.name.as_str(),
                                             ppp,
@@ -2827,12 +2828,13 @@ impl eframe::App for PixMeApp {
                     // `rect` is the OUTER rect: `InnerSize` needs the
                     // decoration delta (outer − inner reported last
                     // frame; zero until measured).
-                    let deco = ctx.input(|i| {
-                        match (i.viewport().outer_rect, i.viewport().inner_rect) {
-                            (Some(o), Some(n)) => o.size() - n.size(),
-                            _ => egui::Vec2::ZERO,
-                        }
-                    });
+                    let deco =
+                        ctx.input(
+                            |i| match (i.viewport().outer_rect, i.viewport().inner_rect) {
+                                (Some(o), Some(n)) => o.size() - n.size(),
+                                _ => egui::Vec2::ZERO,
+                            },
+                        );
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(rect.min));
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
                         (rect.size() - deco).max(egui::vec2(100.0, 100.0)),
@@ -2847,8 +2849,7 @@ impl eframe::App for PixMeApp {
                         *settle -= 1;
                     } else {
                         drop(settle);
-                        let moved =
-                            lock(&shared.draw_last_outer).replace(outer) != Some(outer);
+                        let moved = lock(&shared.draw_last_outer).replace(outer) != Some(outer);
                         if moved {
                             *lock(&shared.draw_move_at) = Some(std::time::Instant::now());
                         }

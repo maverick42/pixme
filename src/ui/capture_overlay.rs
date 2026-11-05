@@ -280,8 +280,7 @@ impl OverlaySession {
         self.warm_frames = self.warm_frames.saturating_add(1);
         // A viewport id stuck in `raw.viewports` must not stall the
         // capture forever — after ~2 s take the frame, ghost or not.
-        let wait = !viewer_gone
-            && self.started_at.elapsed() < std::time::Duration::from_secs(2);
+        let wait = !viewer_gone && self.started_at.elapsed() < std::time::Duration::from_secs(2);
         if self.warm_frames < 2 || wait {
             return false;
         }
