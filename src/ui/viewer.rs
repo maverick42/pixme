@@ -2266,23 +2266,43 @@ impl Viewer {
                         }
                     }
                 }
-                if shared.lock_settings().db_status {
-                    let writing = shared.writer.pending_writes() > 0;
-                    let reading = shared.writer.is_reading();
-                    if writing || reading {
-                        // Activity flags only flip while frames run —
-                        // schedule the green-side repaint so an idle
-                        // queue never leaves a stale red dot.
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(250));
+                // Read the two flags under a short-lived guard — the
+                // strip must not hold the settings lock while other
+                // code needs it.
+                let (db_status, db_off) = {
+                    let s = shared.lock_settings();
+                    (
+                        s.db_status,
+                        s.db_retention == crate::config::DbRetention::Never,
+                    )
+                };
+                if db_status {
+                    if db_off {
+                        // Session persistence is off — say so instead of
+                        // lamps that could never light.
+                        ui.label(
+                            egui::RichText::new(t!("vbar.status.db_off").to_string())
+                                .color(t.text_faint)
+                                .size(10.0),
+                        );
+                    } else {
+                        let writing = shared.writer.pending_writes() > 0;
+                        let reading = shared.writer.is_reading();
+                        if writing || reading {
+                            // Activity flags only flip while frames run —
+                            // schedule the green-side repaint so an idle
+                            // queue never leaves a stale red dot.
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(250));
+                        }
+                        db_dot(ui, &t!("vbar.status.write"), writing, &t);
+                        db_dot(ui, &t!("vbar.status.read"), reading, &t);
+                        ui.label(
+                            egui::RichText::new(t!("vbar.status.db").to_string())
+                                .color(t.text_faint)
+                                .size(10.0),
+                        );
                     }
-                    db_dot(ui, &t!("vbar.status.write"), writing, &t);
-                    db_dot(ui, &t!("vbar.status.read"), reading, &t);
-                    ui.label(
-                        egui::RichText::new(t!("vbar.status.db").to_string())
-                            .color(t.text_faint)
-                            .size(10.0),
-                    );
                 }
             });
         });
