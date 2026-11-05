@@ -2498,18 +2498,6 @@ impl Viewer {
                             {
                                 shared.push(Command::OpenSettings);
                             }
-                            if widgets::tool_button(
-                                ui,
-                                Icon::X,
-                                &t!("vbar.close.label"),
-                                false,
-                                false,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                shared.push(Command::ViewerClosed);
-                            }
                         });
                     });
                     self.tool_scroll_pos = out.state.offset.x;
