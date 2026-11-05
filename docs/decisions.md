@@ -2114,3 +2114,33 @@ Format: date — context — decision — consequences.
   `widgets::icon_button_styled` / `widgets::tool_button_styled` as the
   style-aware render path. Adding a fourth style means a new asset
   table plus a hue entry per styled icon.
+
+## 2026-11-05 — Ghost fallback: early exclusion, real-teardown gate, countdown hides the viewer
+
+- **Context**: the ghost reappeared on the user's fastest PC — the torn-down
+  viewer watermarking the frozen frame, exactly the fallback case the
+  2026-11-04 entry reserved for a user decision. Root cause confirmed: the
+  BitBlt-time arming loses two races on a fast machine — a dead hwnd can't
+  be flagged at all, and two warm frames can fit inside one DWM
+  composition so `DwmFlush` returns before the flag/demolition is visible
+  to the readback. With a capture delay the viewer additionally stayed
+  mounted for the whole countdown and was destroyed at `CaptureNow`, a
+  few frames before the freeze.
+- **Decision** (agreed with the user — their own hypothesis confirmed):
+  1. `begin_capture` arms `WDA_EXCLUDEFROMCAPTURE` while the displaced
+     windows are still alive (`OverlaySession::early_excl`), held until
+     the freeze lands — the flag is inside the composed stream before any
+     teardown begins.
+  2. `warm_freeze` no longer counts blind frames only: the freeze waits
+     until `viewer_id`/`countdown_id` leave `raw.viewports` (winit-acked
+     native teardown), with a ~2 s escape hatch against a stuck entry.
+  3. Arming a delayed capture hides the viewer immediately
+     (`Command::Capture` → `enter(Idle)` when the state is `Viewer` and no
+     Draw modal is up); the origin is stashed in `capture_return_to` so a
+     cancelled countdown restores it and a cancelled capture still lands
+     back on the viewer.
+- **Consequences**: shared-code change — macOS gets the same
+  hide-at-arm behaviour (desirable anyway) and the teardown gate
+  (harmless); the early arm is a no-op guard there. The transient
+  exclusion's coverage is unchanged: still lifted the moment the frozen
+  frames are taken, pins still photograph themselves.

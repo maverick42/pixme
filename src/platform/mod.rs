@@ -247,7 +247,7 @@ pub fn strip_undecorated_frame() {}
 /// PixMe from screen sharing or other capture tools.
 /// No-op on macOS (CGWindowList captures already exclude us by flag).
 #[cfg(target_os = "windows")]
-pub use windows::capture_exclusion;
+pub use windows::{CaptureExclusionGuard, capture_exclusion};
 /// No-op on macOS (see above) — a unit guard keeps the call sites
 /// identical on both OSes.
 #[cfg(target_os = "macos")]

@@ -160,6 +160,14 @@ pub struct OverlaySession {
     pub capture_id: u64,
     /// When the capture started — the `ms` field of `capture_finished`.
     pub started_at: std::time::Instant,
+    /// `WDA_EXCLUDEFROMCAPTURE` armed by `begin_capture` while the windows
+    /// this capture displaces are still alive — a dead hwnd can't be
+    /// flagged, and DWM honours the affinity at its own cadence, so
+    /// arming at BitBlt time loses the race on fast machines (the
+    /// "ghost" watermark). Held until the freeze lands — the selection
+    /// phase must not hide PixMe from screen shares — or dropped with
+    /// the session on cancel/confirm. No-op on macOS.
+    pub early_excl: Option<crate::platform::CaptureExclusionGuard>,
 }
 
 impl OverlaySession {
@@ -202,6 +210,7 @@ impl OverlaySession {
             swallow_esc_until: None,
             capture_id: 0,
             started_at: std::time::Instant::now(),
+            early_excl: None,
         }
     }
 
@@ -259,13 +268,21 @@ impl OverlaySession {
 
     /// Freeze warm-up, called by the **anchor** pass while no capture window
     /// exists yet: two anchor frames let the viewer finish tearing
-    /// down, then every connected monitor is photographed at once. Crucially
-    /// this runs *before* the overlay viewport is created — capturing while
-    /// it is on screen would photograph the overlay's own veil. Returns
-    /// `true` once frozen.
-    pub fn warm_freeze(&mut self) -> bool {
-        self.warm_frames += 1;
-        if self.warm_frames < 2 {
+    /// down, then every connected monitor is photographed at once — but
+    /// only once `viewer_gone` reports the displaced windows' real
+    /// teardown: on a fast machine two frames fit inside one DWM
+    /// composition, and the BitBlt would still read the dying viewer's
+    /// pixels (the "ghost" watermark). Crucially this runs *before* the
+    /// overlay viewport is created — capturing while it is on screen
+    /// would photograph the overlay's own veil. Returns `true` once
+    /// frozen.
+    pub fn warm_freeze(&mut self, viewer_gone: bool) -> bool {
+        self.warm_frames = self.warm_frames.saturating_add(1);
+        // A viewport id stuck in `raw.viewports` must not stall the
+        // capture forever — after ~2 s take the frame, ghost or not.
+        let wait = !viewer_gone
+            && self.started_at.elapsed() < std::time::Duration::from_secs(2);
+        if self.warm_frames < 2 || wait {
             return false;
         }
         if self.frozen.is_none() && !self.failed {
@@ -274,7 +291,12 @@ impl OverlaySession {
                 // menus so an open menu remains pickable in the frozen frame.
                 self.window_list = window::windows().ok();
             }
-            match screen::capture_all_monitors(self.include_pointer) {
+            let result = screen::capture_all_monitors(self.include_pointer);
+            // The early exclusion's job ends with the freeze — holding it
+            // through the selection phase would hide PixMe from screen
+            // sharing for minutes. Dropping lifts every live window's flag.
+            self.early_excl = None;
+            match result {
                 Ok((frames, cursor)) => {
                     self.cursor = cursor;
                     if !self.instant && crate::platform::dismiss_active_menus() {

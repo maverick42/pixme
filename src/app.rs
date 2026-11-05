@@ -397,6 +397,13 @@ pub struct Shared {
     /// `begin_capture` falls back to the monitor under the cursor, then
     /// the primary monitor.
     capture_start_monitor: Mutex<Option<MonitorInfo>>,
+    /// The state a delayed capture was launched from: arming the
+    /// countdown hides the viewer right away (a live viewer rides the
+    /// whole wait on screen, then its teardown races the freeze — the
+    /// "ghost" watermark), so `begin_capture` reads the real origin here
+    /// instead of the by-then-`Idle` state — and the countdown's Esc
+    /// restores it.
+    capture_return_to: Mutex<Option<AppState>>,
     /// Pinned captures — autonomous always-on-top windows, each backed
     /// by a deferred viewport. They outlive every state transition and
     /// die with the app.
@@ -865,6 +872,16 @@ impl Shared {
                     // The delay is session state: it persists between
                     // captures but is never saved to disk.
                     *lock(&self.countdown) = Some(ui::countdown::Countdown::new(mode, delay));
+                    // The viewer hides NOW, not at countdown zero: a live
+                    // viewer would ride the whole wait on screen, and its
+                    // teardown at `CaptureNow` would race the freeze (the
+                    // "ghost" watermark). The origin is stashed so a
+                    // cancelled capture still lands back here. Skipped
+                    // while Draw is modal — the editor can't float alone.
+                    if *lock(&self.state) == AppState::Viewer && lock(&self.draw).is_none() {
+                        *lock(&self.capture_return_to) = Some(AppState::Viewer);
+                        self.enter(AppState::Idle, ctx);
+                    }
                 } else {
                     self.begin_capture(mode, ctx);
                 }
@@ -1633,13 +1650,17 @@ impl Shared {
         // is never a return destination. Snapshot the state first: a
         // scrutinee-held guard would live for the whole match.
         let current = *lock(&self.state);
-        let return_to = match current {
+        // A delayed capture hid the viewer when its countdown was armed:
+        // the stashed origin — not the countdown's `Idle` — is where Esc
+        // lands. No stash: the live state decides (a chained capture
+        // keeps the original session's destination).
+        let return_to = lock(&self.capture_return_to).take().unwrap_or(match current {
             AppState::Capturing => lock(&self.capture)
                 .as_ref()
                 .map(|s| s.return_to)
                 .unwrap_or(AppState::Idle),
             state => state,
-        };
+        });
         match mode {
             CaptureMode::Region
             | CaptureMode::FixedRegion
@@ -1677,6 +1698,13 @@ impl Shared {
                 session.include_pointer = lock(&self.settings).include_pointer;
                 let _span = session.span().entered();
                 tracing::info!(mode = ?mode, "capture_start");
+                // WDA_EXCLUDEFROMCAPTURE while the windows this capture
+                // displaces (viewer, countdown card) still exist — a dead
+                // hwnd can't be flagged and DWM honours the affinity at
+                // its own cadence, so arming at BitBlt time loses the
+                // race on fast machines. `warm_freeze` lifts it once the
+                // frames are frozen; no-op on macOS.
+                session.early_excl = Some(crate::platform::capture_exclusion());
                 let instant = session.instant;
                 *lock(&self.capture) = Some(session);
                 self.enter(AppState::Capturing, ctx);
@@ -1796,6 +1824,8 @@ impl Shared {
 
     /// Cancel leaves the session untouched and returns where capture began.
     fn cancel_capture(&self, ctx: &egui::Context) {
+        // A stray countdown stash must not leak into the next capture.
+        *lock(&self.capture_return_to) = None;
         let return_to = {
             let mut slot = lock(&self.capture);
             if let Some(s) = slot.as_ref() {
@@ -2197,6 +2227,7 @@ impl PixMeApp {
                 countdown: Mutex::new(None),
                 last_fixed_region: Mutex::new(None),
                 capture_start_monitor: Mutex::new(None),
+                capture_return_to: Mutex::new(None),
                 pins: Mutex::new(Vec::new()),
                 next_pin_id: Mutex::new(0),
                 save_dialog: Mutex::new(None),
@@ -2608,7 +2639,19 @@ impl eframe::App for PixMeApp {
                         None => Step::Gone,
                         Some(s) if s.failed => Step::Cancel,
                         Some(s) if s.frozen.is_none() => {
-                            s.warm_freeze();
+                            // The freeze waits for the REAL teardown of
+                            // the windows the capture displaced — a fast
+                            // machine counts two warm frames inside one
+                            // DWM composition and the BitBlt still reads
+                            // the dying viewer's pixels (the "ghost"
+                            // watermark). The viewport id leaves
+                            // `raw.viewports` once winit confirms the
+                            // native window is gone.
+                            let gone = ctx.input(|i| {
+                                !i.raw.viewports.contains_key(&viewer_id())
+                                    && !i.raw.viewports.contains_key(&countdown_id())
+                            });
+                            s.warm_freeze(gone);
                             Step::Freeze
                         }
                         Some(s) if s.instant => Step::Confirm,
@@ -2677,6 +2720,11 @@ impl eframe::App for PixMeApp {
                 // Esc cancels the pending capture.
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     *lock(&shared.countdown) = None;
+                    // The countdown hid the viewer on arm — cancelling
+                    // puts it back.
+                    if let Some(state) = lock(&shared.capture_return_to).take() {
+                        shared.enter(state, &ctx);
+                    }
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                     return;
                 }
@@ -3147,6 +3195,7 @@ mod tests {
             countdown: Mutex::new(None),
             last_fixed_region: Mutex::new(None),
             capture_start_monitor: Mutex::new(None),
+            capture_return_to: Mutex::new(None),
             pins: Mutex::new(Vec::new()),
             next_pin_id: Mutex::new(0),
             save_dialog: Mutex::new(None),
