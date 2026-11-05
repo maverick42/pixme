@@ -108,6 +108,12 @@ pub fn install_ui(ctx: &egui::Context) {
         }
         items.push((item, "menubar.check_updates", "check_updates"));
     }
+    add(
+        &menu,
+        &mut items,
+        "reset_monitors",
+        "menubar.reset_monitors",
+    );
     if let Err(err) = menu.append(&PredefinedMenuItem::separator()) {
         tracing::warn!("cannot append tray menu separator: {err}");
     }

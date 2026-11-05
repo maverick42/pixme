@@ -183,6 +183,13 @@ pub fn install_ui(ctx: &egui::Context) {
     labels
         .items
         .push((visit, "menu.help.visit_site", "visit_site".to_owned()));
+    item(
+        &mut labels,
+        &app,
+        "reset_monitors",
+        "menubar.reset_monitors",
+        None,
+    );
     separator(&app);
     item(
         &mut labels,

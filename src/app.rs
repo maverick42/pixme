@@ -137,6 +137,10 @@ pub enum Command {
     RefreshMonitors,
     /// Open the monitor-rename prompt (status strip right-click).
     RenameMonitor(String),
+    /// Forget every saved per-monitor preference (names + window
+    /// geometry) and re-centre the viewer on the primary display —
+    /// the resident menu's "Reset monitors" escape hatch.
+    ResetMonitors,
     /// Close a pinned capture window.
     ClosePin(u32),
     /// Copy a pinned capture's image to the clipboard.
@@ -244,6 +248,7 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         | Command::SelectMonitor(_)
         | Command::RefreshMonitors
         | Command::RenameMonitor(_)
+        | Command::ResetMonitors
         | Command::SavePin(_) => false,
     }
 }
@@ -1074,6 +1079,36 @@ impl Shared {
                     })
                     .unwrap_or_else(|| stable_id.clone());
                 lock(&self.viewer).open_monitor_rename(stable_id, name);
+            }
+            Command::ResetMonitors => {
+                // Back to first-launch monitor state: every per-monitor
+                // entry (custom names AND saved geometry) plus the
+                // last-host marker, flushed to prefs.json right away.
+                {
+                    let mut s = lock(&self.settings);
+                    s.monitors.clear();
+                    s.last_monitor = None;
+                    s.save();
+                }
+                // Re-land like a fresh install: centred on the primary
+                // display at the default size. Clearing `viewer_rect`
+                // stops `place_viewer_on_monitor` from keeping the
+                // current rect when its centre is already inside.
+                let primary = {
+                    let inv = lock(&self.monitors);
+                    inv.iter()
+                        .find(|id| id.info.is_primary)
+                        .or_else(|| inv.first())
+                        .map(|id| id.info.clone())
+                };
+                if let Some(m) = primary {
+                    *lock(&self.viewer_rect) = None;
+                    *lock(&self.viewer_target) = Some(ViewerTarget {
+                        monitor: m,
+                        native_rect: None,
+                    });
+                    self.dispatch(Command::OpenViewer, ctx);
+                }
             }
             Command::ClosePin(id) => {
                 // Deregistering the viewport next pass destroys the window.
