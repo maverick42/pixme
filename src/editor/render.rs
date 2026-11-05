@@ -2834,7 +2834,11 @@ mod tests {
     }
 
     pub(super) fn anno(id: u64, kind: AnnotationKind) -> Annotation {
-        Annotation { id, kind }
+        Annotation {
+            id,
+            kind,
+            tool: None,
+        }
     }
 
     pub(super) fn doc_with(annos: Vec<Annotation>) -> Document {
@@ -3510,6 +3514,7 @@ pub(super) mod bench {
                     opacity: 1.0,
                     shadow: 3.0,
                 }),
+                tool: None,
             });
             id += 1;
             doc.annotations.push(Annotation {
@@ -3529,6 +3534,7 @@ pub(super) mod bench {
                     opacity: 1.0,
                     shadow: 0.0,
                 }),
+                tool: None,
             });
             id += 1;
             doc.annotations.push(Annotation {
@@ -3542,6 +3548,7 @@ pub(super) mod bench {
                     },
                     id: 0x1F449,
                 }),
+                tool: None,
             });
             id += 1;
             doc.annotations.push(Annotation {
@@ -3557,6 +3564,7 @@ pub(super) mod bench {
                     shape: AreaShape::Rect,
                     strength: 50,
                 }),
+                tool: None,
             });
             id += 1;
         }

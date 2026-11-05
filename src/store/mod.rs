@@ -31,7 +31,7 @@ use crate::ui::viewer::Tab;
 
 /// Current layout — a file carrying another version is wiped clean
 /// rather than migrated (the session is a convenience, not an archive).
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Days a `.bak` recovery copy survives a rebuild — the captures it
 /// contains must not linger forever.
@@ -901,6 +901,7 @@ mod tests {
                 opacity: 0.5,
                 shadow: 3.0,
             }),
+            tool: None,
         }
     }
 
@@ -1128,6 +1129,7 @@ mod tests {
                     shadow: 1.5,
                     lower: false,
                 }),
+                tool: None,
             },
             Annotation {
                 id: 3,
@@ -1140,6 +1142,7 @@ mod tests {
                     },
                     id: 0x1F449,
                 }),
+                tool: None,
             },
         ];
         let undo: Vec<AnnoEdit> = vec![
@@ -1170,30 +1173,7 @@ mod tests {
     }
 
     /// See `postcard_layout_is_golden`.
-    const EXPECTED: &str = "03010002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404002070000f04000000841030001020a141effffffffff00000040ffffffff0000403f0000c03f00030b14283030c9e8070200040002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400202050002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f00004040060002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400101070002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404000";
-
-    /// Sessions written BEFORE the Emoji variant existed must still
-    /// restore — postcard encodes variant indices and `Emoji` was
-    /// appended last, so every older blob keeps decoding. This blob is
-    /// the pre-Emoji golden layout (annotations + undo + redo).
-    #[test]
-    fn pre_emoji_session_blob_still_deserializes() {
-        const PRE_EMOJI: &str = "02010002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404002070000f04000000841030001020a141effffffffff00000040ffffffff0000403f0000c03f000200040002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400202050002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f00004040060002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400101070002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404000";
-        let bytes: Vec<u8> = (0..PRE_EMOJI.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&PRE_EMOJI[i..i + 2], 16).unwrap())
-            .collect();
-        let mut rest: &[u8] = &bytes;
-        let (annos, r) = postcard::take_from_bytes::<Vec<Annotation>>(rest).unwrap();
-        rest = r;
-        let (undo, r) = postcard::take_from_bytes::<Vec<AnnoEdit>>(rest).unwrap();
-        rest = r;
-        let (redo, r) = postcard::take_from_bytes::<Vec<AnnoEdit>>(rest).unwrap();
-        assert!(r.is_empty(), "trailing bytes after redo stack");
-        assert_eq!(annos.len(), 2);
-        assert_eq!(undo.len(), 2);
-        assert_eq!(redo.len(), 1);
-    }
+    const EXPECTED: &str = "03010002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400002070000f04000000841030001020a141effffffffff00000040ffffffff0000403f0000c03f0000030b14283030c9e807000200040002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f00004040000202050002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f0000404000060002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f00004040000101070002040304ff0000ff0000004001010000ffff0000804000000000ffffffff0000003f000040400000";
 
     /// An emoji annotation survives a full session save/load — the doc
     /// stores the id only, pixels come back from the embedded set.
@@ -1213,6 +1193,7 @@ mod tests {
                 },
                 id: 0x1F525,
             }),
+            tool: None,
         });
         save(&mut store, &viewer);
         let restored = store.load_session();

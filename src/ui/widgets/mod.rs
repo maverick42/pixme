@@ -11,6 +11,7 @@ mod elided_label;
 mod icon_button;
 mod modal;
 mod separator;
+mod toast;
 mod tool_button;
 
 pub use button::{primary_button, secondary_button};
@@ -20,4 +21,5 @@ pub use elided_label::elided_label;
 pub use icon_button::{BUTTON_SIZE, icon_button, icon_button_styled};
 pub use modal::{close_cross, modal_buttons, modal_frame};
 pub use separator::{hairline, vline};
+pub use toast::{ToastKind, paint_toasts, paint_toasts_above, toast};
 pub use tool_button::{TOOL_H, caret_hit, tool_button, tool_button_styled};

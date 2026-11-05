@@ -27,36 +27,10 @@ use crate::editor::render;
 use crate::ui::icons::{self, Icon};
 use crate::ui::{theme, widgets};
 
-/// One drawable tool of the strip (two-column grid).
-#[derive(
-    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
-)]
-pub enum Tool {
-    Select,
-    /// The marquee: frames a region for cut/copy/paste/delete/blur/fill.
-    SelectArea,
-    TextBoxRect,
-    TextBoxOval,
-    Text,
-    Step,
-    Arrow,
-    Pencil,
-    Brace,
-    Eraser,
-    Rect,
-    RectFill,
-    Ellipse,
-    EllipseFill,
-    HighlightArea,
-    Blur,
-    /// Colour eyedropper: the loupe follows the cursor, a click picks
-    /// the pixel's colour, `C` copies its `#RRGGBB`.
-    Pipette,
-    /// Emoji sticker: click places it at the remembered/default size,
-    /// dragging frames a free square. Sticky — Esc or another tool
-    /// leaves it.
-    Emoji,
-}
+/// `Tool` lives in the document model (annotations memorize the tool
+/// that created them); re-exported so `crate::ui::draw::Tool` — the
+/// `draw_opts` map key in `prefs.json` — keeps resolving.
+pub use crate::editor::document::Tool;
 
 impl Tool {
     /// The strip grid in display order (row-major, two columns).
@@ -823,7 +797,11 @@ impl DrawSession {
     /// Adds a finished object and selects it.
     fn add(&mut self, kind: AnnotationKind) {
         let id = self.doc.alloc_id();
-        let anno = Annotation { id, kind };
+        let anno = Annotation {
+            id,
+            kind,
+            tool: Some(self.tool),
+        };
         let index = self.doc.annotations.len();
         self.apply(AnnoEdit::Add { anno, index });
         self.selected = Some(id);
@@ -928,9 +906,11 @@ impl DrawSession {
             .resizable(false)
             .exact_size(62.0)
             .show(ui, |ui| self.options_bar(ui, shared));
-        egui::CentralPanel::default().show(ui, |ui| self.canvas(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.canvas(ui, shared));
         self.text_panel_window(ui.ctx(), shared);
         self.quit_dialog(ui.ctx());
+        // 62 px bottom option bar + a small gap.
+        widgets::paint_toasts_above(ui.ctx(), 70.0);
     }
 
     /// The unsaved-changes warning — Discard drops the whole clone,
@@ -1439,6 +1419,7 @@ impl DrawSession {
                     opacity: 1.0,
                     shadow: 0.0,
                 }),
+                tool: Some(self.tool),
             },
             index,
         });
@@ -1494,6 +1475,7 @@ impl DrawSession {
                     shape: AreaShape::Rect,
                     strength: pct,
                 }),
+                tool: Some(self.tool),
             },
             index,
         });
@@ -1575,7 +1557,7 @@ impl DrawSession {
     }
 
     /// The canvas: composited texture + interaction overlay.
-    fn canvas(&mut self, ui: &mut Ui) {
+    fn canvas(&mut self, ui: &mut Ui, shared: &Shared) {
         // Re-render only on revision changes — one path for display and
         // export.
         if self.rendered_rev != self.doc.revision {
@@ -1640,6 +1622,21 @@ impl DrawSession {
                     }
                     if ui.button(t!("draw.ctx.back").to_string()).clicked() {
                         self.reorder(id, false);
+                        ui.close();
+                    }
+                    ui.separator();
+                    let fixable = self
+                        .doc
+                        .annotation(id)
+                        .is_some_and(|a| fix_bank_tool(a).is_some());
+                    if ui
+                        .add_enabled(
+                            fixable,
+                            egui::Button::new(t!("draw.ctx.fix_options").to_string()),
+                        )
+                        .clicked()
+                    {
+                        self.fix_options(id, shared, ui.ctx());
                         ui.close();
                     }
                 });
@@ -2273,6 +2270,7 @@ impl DrawSession {
                         opacity: o.opacity,
                         shadow: o.shadow,
                     }),
+                    tool: Some(self.tool),
                 };
                 let index = self.doc.annotations.len();
                 self.apply(AnnoEdit::Add { anno, index });
@@ -2374,6 +2372,7 @@ impl DrawSession {
                         opacity: self.opts.opacity,
                         shadow: self.opts.shadow,
                     }),
+                    tool: Some(self.tool),
                 };
                 let index = self.doc.annotations.len();
                 self.apply(AnnoEdit::Add { anno, index });
@@ -2417,6 +2416,7 @@ impl DrawSession {
                         shadow: if self.opts.step_shadow { 3.0 } else { 0.0 },
                         lower: self.opts.step_lower,
                     }),
+                    tool: Some(self.tool),
                 };
                 let index = self.doc.annotations.len();
                 self.apply(AnnoEdit::Add { anno, index });
@@ -3118,7 +3118,7 @@ impl DrawSession {
     /// colour, outline `*`, font, size, B/I, alignment, outline
     /// width+colour, and the multi-line edit with its Enter note.
     /// Edits land on the object live; closing commits one Replace.
-    fn text_panel_window(&mut self, ctx: &egui::Context, shared: &Shared) {
+    fn text_panel_window(&mut self, ctx: &egui::Context, _shared: &Shared) {
         let Some(panel) = &self.text_panel else {
             return;
         };
@@ -3173,7 +3173,6 @@ impl DrawSession {
             .as_mut()
             .map(|p| std::mem::take(&mut p.focus_pending))
             .unwrap_or(false);
-        let mut persist: Option<(Color32, String, u8, bool, bool, u8, Color32)> = None;
         let mut win = egui::Window::new(t!("draw.text.title").to_string())
             .id(egui::Id::new(("draw.text.win", id)))
             .open(&mut open)
@@ -3228,7 +3227,6 @@ impl DrawSession {
                 ),
                 _ => return,
             };
-            let mut style_changed = false;
             // 1) Couleur · 2) Fonte · 3) Taille (menu 8..72) ·
             // 4) Bold · 5) Italic · 6) Contour (0..10) · 7) Couleur contour.
             ui.allocate_ui_with_layout(
@@ -3238,7 +3236,6 @@ impl DrawSession {
                     ui.spacing_mut().interact_size.y = 22.0;
                     if color_btn(ui, color).changed() {
                         rev = true;
-                        style_changed = true;
                     }
                     if let Some(font) = &mut font {
                         let prev = (**font).clone();
@@ -3252,20 +3249,16 @@ impl DrawSession {
                             });
                         if **font != prev {
                             rev = true;
-                            style_changed = true;
                         }
                     }
                     if font_size_combo(ui, "draw.tp.size", size) {
                         rev = true;
-                        style_changed = true;
                     }
                     if ui.toggle_value(bold, "B").clicked() {
                         rev = true;
-                        style_changed = true;
                     }
                     if ui.toggle_value(italic, "I").clicked() {
                         rev = true;
-                        style_changed = true;
                     }
                     // Boxes only: justification + vertical alignment
                     // icons on the same row, right after Italic.
@@ -3321,13 +3314,11 @@ impl DrawSession {
                         && outline_combo(ui, "draw.tp.outline", outline)
                     {
                         rev = true;
-                        style_changed = true;
                     }
                     if let Some(oc) = &mut outline_color
                         && color_btn(ui, oc).changed()
                     {
                         rev = true;
-                        style_changed = true;
                     }
                 },
             );
@@ -3344,17 +3335,6 @@ impl DrawSession {
                 rev = true;
             }
             ui.label(t!("draw.text.note"));
-            if style_changed && let AnnotationKind::Text(o) = &a.kind {
-                persist = Some((
-                    o.color,
-                    o.font.clone(),
-                    o.size.round().clamp(8.0, 72.0) as u8,
-                    o.bold,
-                    o.italic,
-                    o.outline.round().clamp(0.0, 10.0) as u8,
-                    o.outline_color,
-                ));
-            }
             if rev {
                 if let AnnotationKind::Text(o) = &mut a.kind {
                     let (nw, _) = render::text_extent(o);
@@ -3374,9 +3354,6 @@ impl DrawSession {
                 self.doc.revision += 1;
             }
         });
-        if let Some((c, font, sz, b, it, out, oc)) = persist {
-            self.save_text_prefs(shared, c, font, sz, b, it, out, oc);
-        }
         if !open {
             self.close_text_panel();
         }
@@ -3393,6 +3370,40 @@ impl DrawSession {
         let mut s = shared.lock_settings();
         s.draw_opts.tools = tools;
         s.save();
+    }
+
+    /// "Set as default options" (object context menu): the object's
+    /// style becomes the persisted default of the tool that created it.
+    /// Objects no tool owns (Picture, Emoji) never reach this — the menu
+    /// item is disabled for them.
+    fn fix_options(&mut self, id: AnnotationId, shared: &Shared, ctx: &egui::Context) {
+        let Some(a) = self.doc.annotation(id) else {
+            return;
+        };
+        let Some(tool) = fix_bank_tool(a) else {
+            return;
+        };
+        {
+            let bank = self.opts.styles.entry(tool).or_default();
+            bank_from_obj(bank, &a.kind);
+        }
+        // Fixing the armed tool's own bank also means adopting it live —
+        // otherwise `persist_opts` would stash the stale live style back
+        // over the fixed bank. The step counters are NOT part of "fixed
+        // options": they keep counting from where the session is.
+        if tool == self.tool {
+            let (num, letter) = (self.opts.step_next_num, self.opts.step_next_let);
+            let bank = self.opts.styles[&tool].clone();
+            self.opts.adopt(&bank);
+            self.opts.step_next_num = num;
+            self.opts.step_next_let = letter;
+        }
+        self.persist_opts(shared);
+        widgets::toast(
+            ctx,
+            widgets::ToastKind::Success,
+            t!("draw.options_fixed", tool = tool.tip().as_ref()).to_string(),
+        );
     }
 
     /// Mirrors text style changes into `self.opts` + `prefs.json`.
@@ -3991,13 +4002,12 @@ impl DrawSession {
     }
 
     /// Style options of the SELECTED object (re-editable, FS-style).
-    fn selected_options(&mut self, ui: &mut Ui, shared: &Shared) {
+    fn selected_options(&mut self, ui: &mut Ui, _shared: &Shared) {
         let Some(id) = self.selected else { return };
         let Some(before) = self.doc.annotation(id).cloned() else {
             return;
         };
         let mut changed = false;
-        let mut persist: Option<(Color32, String, u8, bool, bool, u8, Color32)> = None;
         if let Some(a) = self.doc.annotation_mut(id) {
             match &mut a.kind {
                 AnnotationKind::Rect(o) => {
@@ -4085,10 +4095,6 @@ impl DrawSession {
                         &mut o.shape,
                         &mut o.opacity,
                     ) {
-                        let bank = self.opts.bank_mut(Tool::HighlightArea);
-                        bank.color = [o.color.r(), o.color.g(), o.color.b()];
-                        bank.shape = o.shape;
-                        bank.hl_opacity = o.opacity;
                         changed = true;
                     }
                 }
@@ -4096,64 +4102,38 @@ impl DrawSession {
                     // 1) Couleurs · 2) Taille (8..72) · 3) Bold · 4) Italic ·
                     // 5) Contour (0..10) · 6) Couleur contour · 7) Opacité ·
                     // 8) Case Ombre (9=OK, 10=Annuler are on the bar's right).
-                    let mut style_ch = false;
-                    let mut sc = ui
+                    changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.color"));
                             color_btn(ui, &mut o.color).changed()
                         })
                         .inner;
-                    changed |= sc;
-                    style_ch |= sc;
-                    sc = ui
+                    changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.size"));
                             font_size_combo(ui, "draw.sel.tsize", &mut o.size)
                         })
                         .inner;
-                    changed |= sc;
-                    style_ch |= sc;
-                    if ui
+                    changed |= ui
                         .toggle_value(&mut o.bold, "B")
                         .on_hover_text(t!("draw.opt.bold"))
-                        .changed()
-                    {
-                        changed = true;
-                        style_ch = true;
-                    }
-                    if ui
+                        .changed();
+                    changed |= ui
                         .toggle_value(&mut o.italic, "I")
                         .on_hover_text(t!("draw.opt.italic"))
-                        .changed()
-                    {
-                        changed = true;
-                        style_ch = true;
-                    }
-                    sc = ui
+                        .changed();
+                    changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.outline"));
                             outline_combo(ui, "draw.sel.toutline", &mut o.outline)
                                 | color_btn(ui, &mut o.outline_color).changed()
                         })
                         .inner;
-                    changed |= sc;
-                    style_ch |= sc;
                     changed |= opacity_pct_slider(ui, &mut o.opacity);
                     let mut sh_on = o.shadow > 0.0;
                     if ui.checkbox(&mut sh_on, t!("draw.opt.shadow")).changed() {
                         o.shadow = if sh_on { 3.0 } else { 0.0 };
                         changed = true;
-                    }
-                    if style_ch {
-                        persist = Some((
-                            o.color,
-                            o.font.clone(),
-                            o.size.round().clamp(8.0, 72.0) as u8,
-                            o.bold,
-                            o.italic,
-                            o.outline.round().clamp(0.0, 10.0) as u8,
-                            o.outline_color,
-                        ));
                     }
                 }
                 AnnotationKind::TextBox(o) => {
@@ -4215,10 +4195,6 @@ impl DrawSession {
                 }
                 AnnotationKind::Blur(o) => {
                     if blur_options_row(ui, &mut o.style, &mut o.strength, &mut o.shape) {
-                        let bank = self.opts.bank_mut(Tool::Blur);
-                        bank.blur_style = o.style;
-                        bank.blur_strength = o.strength;
-                        bank.shape = o.shape;
                         changed = true;
                     }
                 }
@@ -4237,14 +4213,10 @@ impl DrawSession {
                         &mut sh_on,
                     ) {
                         o.shadow = if sh_on { 3.0 } else { 0.0 };
-                        self.opts.bank_mut(Tool::Brace).brace_kind = o.kind;
                         changed = true;
                     }
                 }
             }
-        }
-        if let Some((c, f, sz, b, it, out, oc)) = persist {
-            self.save_text_prefs(shared, c, f, sz, b, it, out, oc);
         }
         if changed && let Some(after) = self.doc.annotation(id).cloned() {
             self.apply(AnnoEdit::Replace { before, after });
@@ -5475,6 +5447,146 @@ fn step_options_row(
     changed
 }
 
+/// The tool bank a "Set as default options" click writes into — the
+/// object's memorized origin tool for kinds several tools produce
+/// (rect/ellipse fills, freehand, text boxes), the kind's own tool for
+/// the rest. `None` = nothing to fix (Picture, Emoji).
+fn fix_bank_tool(a: &Annotation) -> Option<Tool> {
+    let own =
+        |valid: &[Tool], fallback: Tool| a.tool.filter(|t| valid.contains(t)).unwrap_or(fallback);
+    Some(match &a.kind {
+        AnnotationKind::Rect(_) => own(&[Tool::Rect, Tool::RectFill], Tool::Rect),
+        AnnotationKind::Ellipse(_) => own(&[Tool::Ellipse, Tool::EllipseFill], Tool::Ellipse),
+        AnnotationKind::Freehand(_) => own(&[Tool::Pencil, Tool::Eraser], Tool::Pencil),
+        AnnotationKind::TextBox(_) => {
+            own(&[Tool::TextBoxRect, Tool::TextBoxOval], Tool::TextBoxRect)
+        }
+        AnnotationKind::Line(_) => Tool::Arrow,
+        AnnotationKind::Brace(_) => Tool::Brace,
+        AnnotationKind::Text(_) => Tool::Text,
+        AnnotationKind::Step(_) => Tool::Step,
+        AnnotationKind::HighlightArea(_) => Tool::HighlightArea,
+        AnnotationKind::Blur(_) => Tool::Blur,
+        AnnotationKind::Picture(_) | AnnotationKind::Emoji(_) => return None,
+    })
+}
+
+/// Copies `kind`'s style fields into `bank` — the inverse of what the
+/// tool's option strip seeds at creation. Only the fields the kind
+/// carries are touched; the bank keeps its other entries.
+fn bank_from_obj(bank: &mut crate::config::ToolStyle, kind: &AnnotationKind) {
+    let rgb = |c: Color32| [c.r(), c.g(), c.b()];
+    match kind {
+        AnnotationKind::Rect(o) => {
+            bank.color = rgb(o.stroke);
+            if let Some(f) = o.fill {
+                bank.fill_color = rgb(f);
+            }
+            bank.width = o.stroke_w;
+            bank.dash = o.dash;
+            bank.outline = o.outline;
+            bank.line_outline_color = rgb(o.outline_color);
+            bank.radius = o.radius;
+            bank.opacity = o.opacity;
+            bank.line_shadow = o.shadow > 0.0;
+        }
+        AnnotationKind::Ellipse(o) => {
+            bank.color = rgb(o.stroke);
+            if let Some(f) = o.fill {
+                bank.fill_color = rgb(f);
+            }
+            bank.width = o.stroke_w;
+            bank.dash = o.dash;
+            bank.outline = o.outline;
+            bank.line_outline_color = rgb(o.outline_color);
+            bank.opacity = o.opacity;
+            bank.line_shadow = o.shadow > 0.0;
+        }
+        AnnotationKind::Line(o) => {
+            bank.color = rgb(o.color);
+            bank.width = o.width;
+            bank.dash = o.dash;
+            bank.line_start = o.start;
+            bank.line_end = o.end;
+            bank.outline = o.outline;
+            bank.line_outline_color = rgb(o.outline_color);
+            bank.opacity = o.opacity;
+            bank.line_shadow = o.shadow > 0.0;
+        }
+        AnnotationKind::Freehand(o) => {
+            bank.color = rgb(o.color);
+            bank.width = o.width;
+            bank.tip = o.tip;
+            bank.dash = o.dash;
+            bank.outline = o.outline;
+            bank.line_outline_color = rgb(o.outline_color);
+            bank.opacity = o.opacity;
+            bank.line_shadow = o.shadow > 0.0;
+            bank.eraser_color = rgb(o.color);
+            bank.eraser_size = o.width;
+            bank.eraser_mode = o.eraser_mode;
+        }
+        AnnotationKind::HighlightArea(o) => {
+            bank.color = rgb(o.color);
+            bank.shape = o.shape;
+            bank.hl_opacity = o.opacity;
+        }
+        AnnotationKind::Blur(o) => {
+            bank.blur_style = o.style;
+            bank.blur_strength = o.strength;
+            bank.shape = o.shape;
+        }
+        AnnotationKind::Text(o) => {
+            bank.color = rgb(o.color);
+            bank.font = o.font.clone();
+            bank.font_size = o.size;
+            bank.bold = o.bold;
+            bank.italic = o.italic;
+            bank.text_outline = o.outline;
+            bank.text_outline_color = rgb(o.outline_color);
+            bank.align = o.align;
+            bank.opacity = o.opacity;
+            bank.shadow = o.shadow;
+        }
+        AnnotationKind::TextBox(o) => {
+            bank.color = rgb(o.border);
+            bank.fill_color = rgb(o.bg);
+            bank.text_outline_color = rgb(o.fg);
+            bank.width = o.border_w;
+            bank.radius = o.radius;
+            bank.font_size = o.size;
+            bank.bold = o.bold;
+            bank.italic = o.italic;
+            bank.align = o.align;
+            bank.opacity = o.opacity;
+            bank.shadow = o.shadow;
+        }
+        AnnotationKind::Step(o) => {
+            bank.step_mode = o.mode;
+            bank.step_style = o.style;
+            bank.step_size = o.size;
+            bank.step_bg = rgb(o.bg);
+            bank.step_fg = rgb(o.fg);
+            bank.step_ring = o.ring;
+            bank.step_ring_color = rgb(o.ring_color);
+            bank.step_shadow = o.shadow > 0.0;
+            bank.step_lower = o.lower;
+            bank.opacity = o.opacity;
+        }
+        AnnotationKind::Brace(o) => {
+            bank.brace_kind = o.kind;
+            bank.color = rgb(o.color);
+            bank.width = o.width;
+            bank.dash = o.dash;
+            bank.outline = o.outline;
+            bank.line_outline_color = rgb(o.outline_color);
+            bank.opacity = o.opacity;
+            bank.line_shadow = o.shadow > 0.0;
+        }
+        AnnotationKind::Picture(_) | AnnotationKind::Emoji(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5729,6 +5841,7 @@ mod live_drag_tests {
                 opacity: 1.0,
                 shadow: 0.0,
             }),
+            tool: None,
         });
         s.doc.revision += 1;
         s.rendered_rev = s.doc.revision;
@@ -5849,6 +5962,7 @@ mod live_drag_tests {
                 shape: AreaShape::Rect,
                 strength: 60,
             }),
+            tool: None,
         });
         s.doc.revision += 1;
         s.rendered_img = Some(crate::editor::render::render_to_image(&s.doc));
@@ -5889,6 +6003,7 @@ mod live_drag_tests {
                 shape: AreaShape::Rect,
                 strength: 40,
             }),
+            tool: None,
         });
         s.doc.revision += 1;
         s.rendered_img = Some(crate::editor::render::render_to_image(&s.doc));
@@ -5948,5 +6063,17 @@ mod live_drag_tests {
             _ => unreachable!(),
         };
         assert_eq!(x_after_undo_nudge, 100);
+    }
+
+    /// The "Set as default options" toast: `%{tool}` must substitute —
+    /// guards against the `{tool}` literal regressing (rust-i18n only
+    /// expands `%{name}` markers).
+    #[test]
+    fn options_fixed_toast_substitutes_tool_name() {
+        let s = t!("draw.options_fixed", tool = "Surligneur").to_string();
+        assert!(
+            !s.contains('{') && s.contains("Surligneur"),
+            "unsubstituted placeholder: {s}"
+        );
     }
 }

@@ -3949,6 +3949,7 @@ mod tests {
                         shadow: 0.0,
                     },
                 ),
+                tool: None,
             });
             viewer.push_capture_document(doc, "dup".to_owned());
             viewer.push_capture_document(

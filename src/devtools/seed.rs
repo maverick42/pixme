@@ -288,7 +288,11 @@ fn seed_annotations(doc: &mut Document, seed: u64) {
     let mut rng = Rng(seed ^ 0xC0FF_EE11);
     let push = |doc: &mut Document, kind| {
         let id = doc.alloc_id();
-        doc.annotations.push(Annotation { id, kind });
+        doc.annotations.push(Annotation {
+            id,
+            kind,
+            tool: None,
+        });
     };
     let (rx, ry) = (rng.below(W - 1400), rng.below(H - 900));
     push(

@@ -1764,6 +1764,7 @@ impl Viewer {
                             lower: false,
                         },
                     ),
+                    tool: None,
                 });
                 self.commit_draw(
                     i,
@@ -4756,6 +4757,7 @@ mod tests {
                 shadow: 0.0,
                 lower: false,
             }),
+            tool: None,
         };
         session.doc.annotations.push(anno.clone());
         session.undo.push_back(AnnoEdit::Add { anno, index: 0 });
@@ -4974,6 +4976,7 @@ mod tests {
                 shadow: 0.0,
                 lower: false,
             }),
+            tool: None,
         });
         v.commit_draw(
             0,
