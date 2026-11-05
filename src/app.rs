@@ -878,20 +878,7 @@ impl Shared {
                 // other apps, or minimized in the Dock) must still bring
                 // it forward: `enter` only requests focus on a state
                 // CHANGE, so de-minimize and focus explicitly here.
-                ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
-                // macOS: `Focus`/`Minimized` viewport commands do not
-                // activate the application — without `NSApp activate`
-                // the viewer stays behind the frontmost app (dock
-                // reopen needed two clicks).
-                platform::activate_app();
-                // The direct Focus command both wakes the (possibly
-                // sleeping) viewport and, on macOS, activates the app
-                // (`activateIgnoringOtherApps` + `makeKeyAndOrderFront`)
-                // — a mere in-app focus request would do nothing while
-                // another application is frontmost.
-                ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
-                self.request_focus(viewer_id());
-                ctx.repaint_if_live(viewer_id());
+                self.bring_viewer_forward(ctx);
             }
             Command::ViewerClosed => {
                 if lock(&self.draw).is_some() {
@@ -952,22 +939,19 @@ impl Shared {
             Command::OpenSettings => {
                 if self.settings_open.load(Ordering::Relaxed) {
                     // Already open: re-invocation brings the existing
-                    // modal to the front rather than re-opening it.
-                    ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
-                    self.request_focus(viewer_id());
-                    ctx.repaint_if_live(viewer_id());
+                    // modal's host viewer to the front rather than
+                    // re-opening it.
+                    self.bring_viewer_forward(ctx);
                     return;
                 }
                 self.settings_open.store(true, Ordering::Relaxed);
                 // The window edits a draft: changes apply on OK only.
                 *lock(&self.settings_draft) = Some(lock(&self.settings).clone());
-                // The settings are a modal of the viewer: make sure the
-                // viewer exists (and is restored) before it shows.
+                // The settings are a modal of the viewer: the viewer must
+                // exist AND come forward — a minimized/background window
+                // would swallow the modal.
                 self.enter(AppState::Viewer, ctx);
-                // The modal lives in the VIEWER's pass — repainting the
-                // anchor alone would leave an idle viewer asleep and the
-                // modal would wait for the next input event.
-                ctx.repaint_if_live(viewer_id());
+                self.bring_viewer_forward(ctx);
             }
             Command::CloseSettings => {
                 self.settings_open.store(false, Ordering::Relaxed);
@@ -1584,6 +1568,30 @@ impl Shared {
         } else {
             self.enter(AppState::Idle, ctx);
         }
+    }
+
+    /// Restores and raises the viewer: un-minimizes, activates the app
+    /// and requests focus until it lands. Shared by `OpenViewer` and
+    /// every command whose surface lives inside the viewer (settings,
+    /// monitor selection) — `enter(Viewer)` alone never brings an
+    /// already-open window forward.
+    fn bring_viewer_forward(&self, ctx: &egui::Context) {
+        ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
+        // macOS: `Focus`/`Minimized` viewport commands do not activate the
+        // application — without `NSApp activate` the viewer stays behind
+        // the frontmost app (dock reopen needed two clicks).
+        platform::activate_app();
+        // The direct Focus command both wakes the (possibly sleeping)
+        // viewport and, on macOS, activates the app
+        // (`activateIgnoringOtherApps` + `makeKeyAndOrderFront`) — a
+        // mere in-app focus request would do nothing while another
+        // application is frontmost.
+        ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
+        self.request_focus(viewer_id());
+        // The modal lives in the VIEWER's pass — repainting the anchor
+        // alone would leave an idle viewer asleep and the modal would
+        // wait for the next input event.
+        ctx.repaint_if_live(viewer_id());
     }
 
     /// Marks `id` for focus grabbing: the child callback re-sends `Focus`
