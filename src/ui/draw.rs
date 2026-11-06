@@ -557,7 +557,7 @@ impl DrawSession {
         prefs: &crate::config::Settings,
     ) -> Self {
         let open_snapshot = postcard::to_allocvec(&doc.annotations).unwrap_or_default();
-        Self {
+        let mut session = Self {
             doc,
             tab,
             title,
@@ -595,7 +595,17 @@ impl DrawSession {
             preview_dirty: false,
             drag_region: None,
             nudge: None,
-        }
+        };
+        // Numbering follows the document, not the persisted bank: one
+        // past the highest marker per mode — 1/A on an empty canvas,
+        // and letters keep counting past Z (the renderer wraps to A).
+        // Written into the Step bank: the armed Select tool keeps its
+        // live fields, and arming Step adopts these counters.
+        let (num, letter) = next_step_counters(&session.doc);
+        let bank = session.opts.bank_mut(Tool::Step);
+        bank.step_next_num = num;
+        bank.step_next_let = letter;
+        session
     }
 
     /// The resolved end-of-session, if any.
@@ -5544,6 +5554,22 @@ fn step_options_row(
     changed
 }
 
+/// The next step counters for `doc` — one past the highest marker in
+/// each mode (1 / A on an empty canvas). Letters keep counting past
+/// 26: `step_label` wraps Z→A, matching the counter's own increment.
+fn next_step_counters(doc: &Document) -> (u32, u32) {
+    let (mut num, mut letter) = (0u32, 0u32);
+    for a in &doc.annotations {
+        if let AnnotationKind::Step(o) = &a.kind {
+            match o.mode {
+                StepMode::Numbers => num = num.max(o.count),
+                StepMode::Letters => letter = letter.max(o.count),
+            }
+        }
+    }
+    (num + 1, letter + 1)
+}
+
 /// The tool bank a "Set as default options" click writes into — the
 /// object's memorized origin tool for kinds several tools produce
 /// (rect/ellipse fills, freehand, text boxes), the kind's own tool for
@@ -6205,5 +6231,103 @@ mod live_drag_tests {
             !s.contains('{') && s.contains("Surligneur"),
             "unsubstituted placeholder: {s}"
         );
+    }
+
+    /// `next_step_counters`: empty → (1, A); else max+1 per mode —
+    /// letters keep counting past 26 (the renderer wraps Z→A).
+    #[test]
+    fn next_step_counters_scan_the_document() {
+        let mut doc = Document::new(Capture {
+            image: std::sync::Arc::new(image::RgbaImage::new(4, 4)),
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect::default(),
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        });
+        assert_eq!(next_step_counters(&doc), (1, 1));
+        for (count, mode) in [(3, StepMode::Numbers), (26, StepMode::Letters)] {
+            let id = doc.alloc_id();
+            doc.annotations.push(Annotation {
+                id,
+                kind: AnnotationKind::Step(StepObj {
+                    pos: pos2(1.0, 1.0),
+                    count,
+                    mode,
+                    style: StepStyle::Circle,
+                    size: StepSize::Medium,
+                    bg: Color32::RED,
+                    fg: Color32::WHITE,
+                    ring: 0.0,
+                    ring_color: Color32::WHITE,
+                    opacity: 1.0,
+                    shadow: 0.0,
+                    lower: false,
+                }),
+                tool: Some(Tool::Step),
+            });
+        }
+        assert_eq!(next_step_counters(&doc), (4, 27));
+    }
+
+    /// Entering Draw seeds the Step bank from the document, so arming
+    /// the tool continues numbering at max+1 — even when the persisted
+    /// bank remembers something else.
+    #[test]
+    fn step_counters_follow_the_document_at_open() {
+        let mut doc = Document::new(Capture {
+            image: std::sync::Arc::new(image::RgbaImage::new(4, 4)),
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect::default(),
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        });
+        for (count, mode) in [(3, StepMode::Numbers), (26, StepMode::Letters)] {
+            let id = doc.alloc_id();
+            doc.annotations.push(Annotation {
+                id,
+                kind: AnnotationKind::Step(StepObj {
+                    pos: pos2(1.0, 1.0),
+                    count,
+                    mode,
+                    style: StepStyle::Circle,
+                    size: StepSize::Medium,
+                    bg: Color32::RED,
+                    fg: Color32::WHITE,
+                    ring: 0.0,
+                    ring_color: Color32::WHITE,
+                    opacity: 1.0,
+                    shadow: 0.0,
+                    lower: false,
+                }),
+                tool: Some(Tool::Step),
+            });
+        }
+        let mut prefs = crate::config::Settings::default();
+        let bank = crate::config::ToolStyle {
+            step_next_num: 99,
+            step_next_let: 99,
+            ..crate::config::ToolStyle::default()
+        };
+        prefs.draw_opts.tools.insert(Tool::Step, bank);
+        let mut s = DrawSession::open(
+            doc,
+            0,
+            "t".to_owned(),
+            VecDeque::new(),
+            VecDeque::new(),
+            &prefs,
+        );
+        s.set_tool(Tool::Step);
+        // The document wins over the persisted 99s.
+        assert_eq!(s.opts.step_next_num, 4);
+        assert_eq!(s.opts.step_next_let, 27);
     }
 }
