@@ -967,9 +967,36 @@ impl Shared {
                         .map(|id| id.stable_id.clone())
                 });
                 if let Some(stable_id) = clicked {
-                    // SelectMonitor holds the taskbar semantics: shown on
-                    // that monitor → hide; anything else → show there.
-                    self.dispatch(Command::SelectMonitor(stable_id), ctx);
+                    // The resident icon keeps REAL taskbar semantics:
+                    // shown+focused on that monitor → hide; anything
+                    // else → show there. (The status-strip button
+                    // re-centres instead — see SelectMonitor.)
+                    let m = lock(&self.monitors)
+                        .iter()
+                        .find(|id| id.stable_id == stable_id)
+                        .map(|id| id.info.clone());
+                    if let Some(m) = m {
+                        let (minimized, focused) = ctx.input(|i| {
+                            let v = i.raw.viewports.get(&viewer_id());
+                            (
+                                v.and_then(|v| v.minimized).unwrap_or(false),
+                                v.and_then(|v| v.focused).unwrap_or(false),
+                            )
+                        });
+                        let minimized = minimized || platform::viewer_is_minimized();
+                        let on_target =
+                            lock(&self.viewer_monitor).as_ref().map(|v| v.rect) == Some(m.rect);
+                        if *lock(&self.state) == AppState::Viewer
+                            && !minimized
+                            && focused
+                            && on_target
+                        {
+                            self.dispatch(Command::ViewerClosed, ctx);
+                        } else {
+                            *lock(&self.viewer_target) = Some(self.viewer_target_for(m));
+                            self.dispatch(Command::OpenViewer, ctx);
+                        }
+                    }
                     return;
                 }
                 // Cursor off every known display (or position read
@@ -1087,11 +1114,15 @@ impl Shared {
                         // Fresh-install landing on the clicked monitor:
                         // no saved rect and no live rect → centred at
                         // the default size (same path as ResetMonitors).
+                        // The target only lands at window BUILD time —
+                        // a live viewport ignores it — so the window is
+                        // torn down and rebuilt, like every relocation.
                         *lock(&self.viewer_rect) = None;
                         *lock(&self.viewer_target) = Some(ViewerTarget {
                             monitor: m,
                             native_rect: None,
                         });
+                        self.dispatch(Command::ViewerClosed, ctx);
                         self.dispatch(Command::OpenViewer, ctx);
                         return;
                     }
