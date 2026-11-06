@@ -2611,7 +2611,11 @@ impl DrawSession {
                 }
                 Tool::HighlightArea => {
                     let r = Rect::from_two_pos(ca, cb);
-                    let fill_col = o.color.gamma_multiply(o.hl_opacity);
+                    // Zone-definition preview, NOT the result: the real
+                    // highlight is a multiply that can never read as a
+                    // solid wall — a 12% tint + accent outline keeps the
+                    // zone (and its colour) visible at any opacity.
+                    let fill_col = o.color.gamma_multiply(0.12);
                     if o.shape == AreaShape::Rect {
                         painter.rect_filled(r, CornerRadius::ZERO, fill_col);
                         painter.rect_stroke(
