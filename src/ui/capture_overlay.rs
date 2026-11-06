@@ -604,7 +604,7 @@ impl OverlaySession {
             let pos = cursor
                 .filter(|_| os_down || self.drag.is_some() || resp.is_pointer_button_down_on());
             if let Some(pos) = pos {
-                self.handle_drag(pos, &resp, rect, os_down);
+                self.handle_drag(pos, &resp, rect, os_down, shared);
             }
         }
         if resp.double_clicked() && self.selection.is_some() {
@@ -674,7 +674,14 @@ impl OverlaySession {
     /// the menu bar or the screen borders. `os_down` is the physical left
     /// button — a press eaten by an OS edge zone (`resp.drag_started`
     /// never fired) still starts a drag while the cursor sits in bounds.
-    fn handle_drag(&mut self, pos: Pos2, resp: &egui::Response, bounds: Rect, os_down: bool) {
+    fn handle_drag(
+        &mut self,
+        pos: Pos2,
+        resp: &egui::Response,
+        bounds: Rect,
+        os_down: bool,
+        shared: &Shared,
+    ) {
         let pos = clamp_pos(pos, bounds);
         let synthetic = self
             .suppress_press_until
@@ -732,6 +739,7 @@ impl OverlaySession {
         }
         if resp.drag_stopped() || (!os_down && self.drag.is_some()) {
             let was_blind = self.blind_drag;
+            let ended = self.drag;
             self.drag = None;
             self.blind_drag = false;
             if was_blind {
@@ -745,6 +753,10 @@ impl OverlaySession {
                 // Shrink-to-nothing counts as no selection.
                 if sel.width() < 2.0 || sel.height() < 2.0 {
                     self.selection = None;
+                } else if matches!(ended, Some(Drag::Create(_) | Drag::Place)) {
+                    // Release commits: no adjustable-selection step —
+                    // drawing a zone captures it straight away.
+                    shared.push(Command::ConfirmCapture);
                 }
             }
         }
