@@ -3177,7 +3177,7 @@ fn viewer_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
         .with_icon(ui::icons::app_icon_data())
         .with_app_id("pixme")
         .with_inner_size([860.0, 560.0])
-        .with_min_inner_size([420.0, 280.0])
+        .with_min_inner_size([580.0, 420.0])
         .with_active(true);
     match position {
         Some(pos) => builder.with_position(pos),
