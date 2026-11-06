@@ -1067,7 +1067,8 @@ impl Shared {
                 if let Some(m) = target {
                     // Taskbar semantics, shared by the strip buttons and
                     // the resident icon: clicking the monitor the viewer
-                    // is SHOWN and FOCUSED on hides it; anything else
+                    // is SHOWN and FOCUSED on re-centres it at the
+                    // default size (the no-prefs landing); anything else
                     // (other monitor, hidden, minimized, behind another
                     // app) brings it up on the clicked monitor's saved
                     // rect.
@@ -1083,7 +1084,15 @@ impl Shared {
                         lock(&self.viewer_monitor).as_ref().map(|v| v.rect) == Some(m.rect);
                     if *lock(&self.state) == AppState::Viewer && !minimized && focused && on_target
                     {
-                        self.dispatch(Command::ViewerClosed, ctx);
+                        // Fresh-install landing on the clicked monitor:
+                        // no saved rect and no live rect → centred at
+                        // the default size (same path as ResetMonitors).
+                        *lock(&self.viewer_rect) = None;
+                        *lock(&self.viewer_target) = Some(ViewerTarget {
+                            monitor: m,
+                            native_rect: None,
+                        });
+                        self.dispatch(Command::OpenViewer, ctx);
                         return;
                     }
                     // The viewer pass applies the saved native rect (or
