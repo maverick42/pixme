@@ -1,9 +1,9 @@
 //! OS-specific services: one implementation per OS, selected at compile time.
 //! All `#[cfg(target_os)]` code lives here — nowhere else in the crate.
 //!
-//! Both OSes present a resident icon whose menu carries the same two actions
-//! ("Take a capture", "Open PixMe"): the macOS menu-bar status item and the
-//! Windows notification-area tray icon. Menu clicks on either OS are pushed
+//! Both OSes present a resident icon whose menu carries "Open PixMe" (and
+//! "Quit" on Windows): the macOS menu-bar status item and the Windows
+//! notification-area tray icon. Menu clicks on either OS are pushed
 //! into [`PENDING`] and drained by [`crate::app::Shared::pump`] on the next UI
 //! pass. macOS additionally installs the native application menus.
 
@@ -34,11 +34,6 @@ pub trait PlatformServices: Send + Sync {
     fn capture_permission_status(&self) -> Option<bool> {
         None
     }
-
-    /// Whether the OS provides a native application menu bar (macOS: yes —
-    /// menus live at the top of the screen; Windows: no — the viewer renders
-    /// its own egui menu strip inside the window instead).
-    fn has_native_app_menu(&self) -> bool;
 }
 
 /// The implementation for the running OS.
@@ -104,6 +99,80 @@ pub use macos::window_list;
 #[cfg(target_os = "windows")]
 pub use windows::window_list;
 
+/// A connected monitor plus its OS-stable identifier — the key used by
+/// the persisted `monitors` prefs map (custom name and, later, saved
+/// geometry). The stable id survives disconnect/reconnect cycles
+/// (CGDisplay UUID on macOS, monitor PNP DeviceID on Windows); when the
+/// OS reports none, a geometry key stands in.
+#[derive(Clone, Debug)]
+pub struct MonitorIdentity {
+    /// Stable key into `Settings::monitors`.
+    pub stable_id: String,
+    /// The live monitor record (xcap enumeration).
+    pub info: crate::capture::MonitorInfo,
+    /// Display-type classification for the status-strip icon —
+    /// informational only.
+    pub kind: crate::capture::MonitorKind,
+}
+
+/// The OS-stable id for `info`, or `None` — the caller falls back to a
+/// geometry key.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::stable_monitor_id;
+/// The OS-stable id for `info` (see above).
+#[cfg(target_os = "windows")]
+pub(crate) use windows::stable_monitor_id;
+
+/// Classifies `info` for the status-strip icon — pure data, never a
+/// capture/selection input. Anything uncertain resolves to `Unknown`.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::monitor_kind;
+/// Classifies `info` (see above).
+#[cfg(target_os = "windows")]
+pub(crate) use windows::monitor_kind;
+
+/// Connected-display count, for the hot-plug poll.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::display_count;
+/// Connected-display count (see above).
+#[cfg(target_os = "windows")]
+pub(crate) use windows::display_count;
+
+/// The connected monitors with their stable identities, for the status
+/// strip's monitor row. Enumeration failures yield an empty list (the
+/// strip simply shows no monitor buttons).
+pub fn monitor_identities() -> Vec<MonitorIdentity> {
+    crate::capture::screen::monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|info| {
+            let stable_id = stable_monitor_id(&info).unwrap_or_else(|| {
+                format!(
+                    "rect:{},{},{}x{}",
+                    info.rect.x, info.rect.y, info.rect.width, info.rect.height
+                )
+            });
+            let kind = monitor_kind(&info);
+            // xcap falls back to a generic "Display #…" name for
+            // virtuals (Sidecar) — the OS-localized name is friendlier.
+            #[cfg(target_os = "macos")]
+            let info = {
+                let mut info = info;
+                let localized = macos::ns_localized_name(info.id);
+                if !localized.is_empty() {
+                    info.name = localized;
+                }
+                info
+            };
+            MonitorIdentity {
+                stable_id,
+                info,
+                kind,
+            }
+        })
+        .collect()
+}
+
 /// Lock helper: recover a poisoned mutex rather than crash a menu callback.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -128,9 +197,10 @@ pub(crate) fn take_pending_commands() -> Vec<Command> {
 /// item + app menus and the Windows tray menu.
 pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
     Some(match id {
-        "take_capture" => Command::ShowBar,
         "open_viewer" => Command::OpenViewer,
         "settings" => Command::OpenSettings,
+        "reset_monitors" => Command::ResetMonitors,
+        "about" => Command::OpenAbout,
         "import_clipboard" => Command::ImportClipboard,
         "edit.undo" => Command::UndoActive,
         "edit.redo" => Command::RedoActive,
@@ -142,7 +212,6 @@ pub(crate) fn command_from_menu_id(id: &str) -> Option<Command> {
         "file.delete" => Command::DeleteFileActive,
         "file.open_last_dir" => Command::OpenLastDir,
         "file.print" => Command::PrintActive,
-        "capture.launch" => Command::ShowBar,
         "quit" => Command::Quit,
         id if id.starts_with("recent:") => {
             Command::OpenPath(std::path::PathBuf::from(&id["recent:".len()..]))
@@ -161,14 +230,6 @@ pub use macos::sync_menu_enabled;
 #[cfg(target_os = "windows")]
 pub use windows::sync_menu_enabled;
 
-/// Rebuilds the File ▸ Recents submenu when the list changed (see above).
-#[cfg(target_os = "macos")]
-pub use macos::sync_recent_menu;
-/// No-op on Windows: its menus are egui-drawn every frame.
-#[cfg(target_os = "windows")]
-#[inline]
-pub fn sync_recent_menu(_recents: &[std::path::PathBuf]) {}
-
 /// Strips `WS_CAPTION` from undecorated floating windows to prevent
 /// the compositor offset (PhotoCraft #2246 fix; no-op on macOS).
 #[cfg(target_os = "windows")]
@@ -177,6 +238,27 @@ pub use windows::strip_undecorated_frame;
 #[cfg(target_os = "macos")]
 #[inline]
 pub fn strip_undecorated_frame() {}
+
+/// Arms transient capture exclusion for the returned guard's lifetime:
+/// PixMe windows (except pins) get `WDA_EXCLUDEFROMCAPTURE`, one DWM
+/// composition is flushed so the flag is effective, and the exclusion
+/// lifts on drop — error and panic paths included. This keeps a
+/// still-tearing-down viewer out of the frozen frame without hiding
+/// PixMe from screen sharing or other capture tools.
+/// No-op on macOS (CGWindowList captures already exclude us by flag).
+#[cfg(target_os = "windows")]
+pub use windows::{CaptureExclusionGuard, capture_exclusion};
+/// No-op on macOS (see above) — a unit guard keeps the call sites
+/// identical on both OSes.
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn capture_exclusion() -> CaptureExclusionGuard {
+    CaptureExclusionGuard
+}
+/// The macOS no-op guard returned by [`capture_exclusion`].
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct CaptureExclusionGuard;
 
 /// Reveals a file selected in the OS file manager after saving.
 #[cfg(target_os = "macos")]
@@ -401,6 +483,30 @@ pub use windows::{
     capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay, hide_cursor,
     left_mouse_down, unhide_cursor,
 };
+
+/// Brings the app itself frontmost (dock reopen — `Focus` alone does
+/// not activate the app on macOS) and deminiaturizes the viewer.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{activate_app, viewer_is_minimized};
+/// No-op on Windows: the winit `Focus` path already foregrounds it.
+#[cfg(target_os = "windows")]
+#[inline]
+pub(crate) fn activate_app() {}
+/// Windows reads `ViewportInfo::minimized` from egui directly.
+#[cfg(target_os = "windows")]
+#[inline]
+pub(crate) fn viewer_is_minimized() -> bool {
+    false
+}
+
+/// Re-grabs the capture overlay's focus while `Capturing` — Windows
+/// only: Alt+Tab can steal it and Esc would then hit another app. The
+/// macOS capture kiosk already locks the session, making this a no-op.
+#[cfg(target_os = "macos")]
+pub use macos::refocus_capture_overlay;
+/// Re-grabs the capture overlay's focus while `Capturing` (see above).
+#[cfg(target_os = "windows")]
+pub use windows::refocus_capture_overlay;
 
 #[cfg(test)]
 mod tests {

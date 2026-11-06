@@ -2,23 +2,21 @@
 //! path and the eframe event loop.
 //!
 //! One shared machine, identical on both OSes: `Idle` (no visible window —
-//! the app is resident in the macOS menu bar / Windows tray), `Bar` (floating
-//! capture bar), `Capturing` (selection in progress) and `Viewer` (tabbed
-//! session window). `Bar` and `Viewer` are strictly exclusive. Every user
-//! action is a [`Command`] — from bar buttons, the resident-icon menu, the
-//! app menus, the viewer, or later global hotkeys — queued and dispatched at
-//! the top of whichever viewport pass runs.
+//! the app is resident in the macOS menu bar / Windows tray), `Capturing`
+//! (selection in progress) and `Viewer` (tabbed session window, home of the
+//! capture controls). Every user action is a [`Command`] — from the viewer's
+//! capture bar, the resident-icon menu or the app menus — queued and
+//! dispatched at the top of whichever viewport pass runs.
 //!
 //! Viewport topology: egui/winit never repaints a window that was never
 //! shown, so the root viewport is a permanent 1×1 transparent "anchor"
 //! window (`taskbar(false)`, no decorations) that keeps the pump alive.
-//! The real windows — bar, viewer, settings — are deferred child viewports
+//! The real windows — viewer, settings — are deferred child viewports
 //! registered each frame while their state requires them.
 //!
-//! Launch shows no window (`Idle`): the user picks "Take a capture" or "Open
-//! PixMe" from the resident-icon menu. Closing the bar opens the viewer when
-//! the session has captures, else returns to `Idle`. Closing the viewer
-//! returns to `Idle` (session kept). Quitting only happens through the menu.
+//! Launch opens the viewer directly (it restores the persisted session).
+//! Closing the viewer returns to `Idle` (session kept). Quitting only
+//! happens through the menu.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,7 +29,6 @@ use crate::config::Settings;
 use crate::editor::Document;
 use crate::i18n::{self, Language};
 use crate::ui::capture_overlay::OverlaySession;
-use crate::ui::toolbar::Toolbar;
 use crate::ui::viewer::Viewer;
 use crate::{platform, ui};
 
@@ -41,8 +38,6 @@ pub enum AppState {
     /// No visible window — the app is resident in the menu bar / tray.
     #[default]
     Idle,
-    /// The floating capture bar is on screen.
-    Bar,
     /// A capture/selection is in progress (phase 3 fills this state in).
     Capturing,
     /// The tabbed session viewer is the visible window.
@@ -50,8 +45,8 @@ pub enum AppState {
 }
 
 /// Which capture the user asked for. Distinct from [`crate::capture`]'s
-/// backend contract: these are the *commands* the bar, the Capture menu and
-/// future hotkeys dispatch; the pipeline maps them to `xcap` calls.
+/// backend contract: these are the *commands* the viewer's capture bar
+/// dispatches; the pipeline maps them to `xcap` calls.
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureMode {
     /// The frontmost window.
@@ -79,12 +74,11 @@ pub enum Command {
     ConfirmCapture,
     /// The capture overlay was cancelled (Esc / window close).
     CancelCapture,
-    /// Show the floating bar (icon menu, app menu, viewer's "+").
-    ShowBar,
     /// Show the viewer (icon menu's "Open PixMe").
     OpenViewer,
-    /// The bar's X was clicked: viewer if the session has captures, else `Idle`.
-    CloseBar,
+    /// Left click on the status item / tray icon: open the viewer from
+    /// `Idle`, close it back to the resident icon when it is up.
+    ToggleViewer,
     /// The viewer window's close was requested.
     ViewerClosed,
     /// Open the settings window.
@@ -137,6 +131,16 @@ pub enum Command {
     ConfirmDiscard,
     /// Unsaved-session confirmation: cancel.
     ConfirmCancel,
+    /// Move the viewer onto the monitor with this stable id (status strip).
+    SelectMonitor(String),
+    /// Re-enumerate the connected monitors (status strip ↻ button).
+    RefreshMonitors,
+    /// Open the monitor-rename prompt (status strip right-click).
+    RenameMonitor(String),
+    /// Forget every saved per-monitor preference (names + window
+    /// geometry) and re-centre the viewer on the primary display —
+    /// the resident menu's "Reset monitors" escape hatch.
+    ResetMonitors,
     /// Close a pinned capture window.
     ClosePin(u32),
     /// Copy a pinned capture's image to the clipboard.
@@ -213,8 +217,7 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         | Command::CancelCapture
         | Command::ClosePin(_)
         | Command::CopyPin(_)
-        | Command::ViewerClosed
-        | Command::CloseBar => true,
+        | Command::ViewerClosed => true,
         // Draw owns its document: its undo/redo/copy apply there; the
         // viewer's copies must not act behind the modal.
         Command::UndoActive | Command::RedoActive | Command::CopyActive => {
@@ -224,13 +227,12 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         // re-opening. When the SETTINGS modal is up the same menu click
         // brings it forward.
         Command::OpenSettings | Command::OpenAbout => modal == ModalState::Settings,
-        Command::OpenViewer => modal == ModalState::Settings,
+        Command::OpenViewer | Command::ToggleViewer => modal == ModalState::Settings,
         // Everything else is blocked while a modal owns the UI.
         Command::DeleteActive
         | Command::DeleteFileActive
         | Command::Capture(_)
         | Command::CaptureNow(_)
-        | Command::ShowBar
         | Command::ImportClipboard
         | Command::OpenFile
         | Command::OpenPath(_)
@@ -243,15 +245,16 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         | Command::RenameActive
         | Command::OpenDraw
         | Command::PrintActive
+        | Command::SelectMonitor(_)
+        | Command::RefreshMonitors
+        | Command::RenameMonitor(_)
+        | Command::ResetMonitors
         | Command::SavePin(_) => false,
     }
 }
 
 /// `egui::ViewportId` of the child windows (`from_hash_of` is not a const fn
 /// in egui 0.36, hence the functions).
-fn bar_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("pixme.bar")
-}
 fn viewer_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.viewer")
 }
@@ -281,7 +284,6 @@ fn draw_id() -> egui::ViewportId {
 pub fn wake_viewports(ctx: &egui::Context) {
     ctx.request_repaint_of(egui::ViewportId::ROOT);
     ctx.repaint_if_live(viewer_id());
-    ctx.repaint_if_live(bar_id());
     ctx.repaint_if_live(draw_id());
 }
 
@@ -332,30 +334,71 @@ pub struct Shared {
     /// Last on-screen outer rectangle of the viewer viewport (restored on
     /// reopen and translated onto the captured monitor after a capture).
     pub viewer_rect: Mutex<Option<egui::Rect>>,
-    /// Monitor the viewer must appear on when it next opens (set after a
-    /// capture confirms so the viewer lands on the captured screen).
-    pub viewer_target_monitor: Mutex<Option<MonitorInfo>>,
-    /// The floating toolbar's transient state.
-    pub toolbar: Mutex<Toolbar>,
-    /// Last on-screen position of the bar viewport (restored on reopen).
-    pub bar_pos: Mutex<Option<egui::Pos2>>,
-    /// Last on-screen outer rect of the bar viewport — the countdown card
-    /// anchors below it and follows its drags.
-    pub bar_rect: Mutex<Option<egui::Rect>>,
-    /// Monitor the floating bar currently sits on — resolved in NATIVE
-    /// units at write time (bar's own ppp), so the countdown never has to
+    /// Where the viewer must land: a monitor plus, when one was saved,
+    /// its persisted outer rect in NATIVE units (per-monitor geometry).
+    pub viewer_target: Mutex<Option<ViewerTarget>>,
+    /// Monitor the viewer currently sits on — resolved in NATIVE units at
+    /// write time (the viewer's own ppp), so the countdown never has to
     /// mix two windows' point spaces (mixed-DPI safe).
-    pub bar_monitor: Mutex<Option<MonitorInfo>>,
-    /// Monitor the viewer currently sits on — same role as `bar_monitor`.
     pub viewer_monitor: Mutex<Option<MonitorInfo>>,
+    /// The connected monitors with their OS-stable ids — the status
+    /// strip's monitor row. Snapshot refreshed at startup and on
+    /// [`Command::RefreshMonitors`]; never re-enumerated per frame.
+    pub monitors: Mutex<Vec<platform::MonitorIdentity>>,
+    /// Geometry ledger for programmatic viewer moves — commands are
+    /// deduped against the last REQUESTED rect, never reported ones.
+    pub viewer_sync: Mutex<ui::viewport_sync::ViewportSync>,
+    /// Frames to skip before re-sampling the reported `viewer_rect` —
+    /// set after a programmatic move so a transient mid-DPI rect is
+    /// never persisted.
+    pub viewer_geo_settle: Mutex<u8>,
+    /// Topology-change pin window: while set, the geometry loop
+    /// re-applies the saved rect every frame (macOS re-shuffles
+    /// windows asynchronously after a plug/unplug — one restore is
+    /// not enough) and nothing is persisted.
+    pub viewer_topology_pin: Mutex<Option<std::time::Instant>>,
+    /// Last topology-pin pull-back — throttled so a per-frame push
+    /// can't create a position feedback storm with egui/winit.
+    pub viewer_pin_last: Mutex<Option<std::time::Instant>>,
+    /// Last reported viewer outer rect — sampled each frame to spot
+    /// user move/resize gestures in flight.
+    pub viewer_last_outer: Mutex<Option<egui::Rect>>,
+    /// Last observed outer-rect change: a gesture is settled 250 ms
+    /// after the last change, and a settle on another monitor becomes
+    /// a relocation to that monitor's saved geometry.
+    pub viewer_move_at: Mutex<Option<std::time::Instant>>,
+
+    /// Pending landing target for the Draw editor — stashed by
+    /// `OpenDraw` (the viewer's monitor + that monitor's saved
+    /// `draw_rect_native`, if any), consumed by the draw viewport's
+    /// first pass. Reuses the viewer's monitor+rect container.
+    draw_target: Mutex<Option<ViewerTarget>>,
+    /// The monitor the Draw window currently sits on — the host its
+    /// settled geometry is persisted under when the window's centre
+    /// lands outside every known display.
+    draw_monitor: Mutex<Option<MonitorInfo>>,
+    /// Last reported Draw outer rect — sampled each frame to spot a
+    /// user move/resize gesture in flight (mirrors `viewer_last_outer`).
+    draw_last_outer: Mutex<Option<egui::Rect>>,
+    /// Last observed Draw outer-rect change: a gesture is settled
+    /// 250 ms after the last change, then `draw_rect_native` is
+    /// written under the host monitor (mirrors `viewer_move_at`).
+    draw_move_at: Mutex<Option<std::time::Instant>>,
+    /// Frames to skip settle tracking after the programmatic
+    /// placement — the reported rect lies while the move lands
+    /// (same convention as `viewer_geo_settle`).
+    draw_geo_settle: Mutex<u8>,
+
+    /// A window's native rect changed on its current monitor —
+    /// `prefs.monitors[id].rect_native`/`draw_rect_native` is stale and
+    /// `pump` flushes a debounced `settings.save()`.
+    pub monitor_geom_dirty_at: Mutex<Option<std::time::Instant>>,
     /// winit `available_monitors()` placements `(x, y, w, h)` in physical
     /// pixels, snapshotted for the overlay's `with_monitor`/`SetMonitor`
     /// targeting (xcap and winit don't enumerate in the same order).
     pub winit_placements: Mutex<Vec<(i32, i32, u32, u32)>>,
     /// Whether the settings window is open.
     pub settings_open: AtomicBool,
-    /// The Windows About modal is open (egui twin of the native panel).
-    pub about_open: AtomicBool,
     /// The editable copy shown by the settings window — written back to
     /// `settings` only on OK; Annuler/close drops it untouched.
     pub settings_draft: Mutex<Option<Settings>>,
@@ -370,11 +413,18 @@ pub struct Shared {
     /// size and position on that monitor.
     pub last_fixed_region: Mutex<Option<(u32, egui::Rect)>>,
     /// The monitor the pending capture was launched from — set by
-    /// [`Shared::push_capture`] when a window (the bar, the viewer) starts
-    /// a capture, consumed by `begin_capture`. `None` for resident-icon
-    /// launches (no window): `begin_capture` falls back to the monitor
-    /// under the cursor, then the primary monitor.
+    /// [`Shared::push_capture`] when the viewer starts a capture, consumed
+    /// by `begin_capture`. `None` for window-less launches (dev hooks):
+    /// `begin_capture` falls back to the monitor under the cursor, then
+    /// the primary monitor.
     capture_start_monitor: Mutex<Option<MonitorInfo>>,
+    /// The state a delayed capture was launched from: arming the
+    /// countdown hides the viewer right away (a live viewer rides the
+    /// whole wait on screen, then its teardown races the freeze — the
+    /// "ghost" watermark), so `begin_capture` reads the real origin here
+    /// instead of the by-then-`Idle` state — and the countdown's Esc
+    /// restores it.
+    capture_return_to: Mutex<Option<AppState>>,
     /// Pinned captures — autonomous always-on-top windows, each backed
     /// by a deferred viewport. They outlive every state transition and
     /// die with the app.
@@ -395,6 +445,16 @@ pub struct Shared {
     /// The in-flight quit-time flush: `Some` while the writer drains
     /// its queue; the reply (or the deadline) closes the app.
     pub quit_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// The in-flight monitor refresh: `RefreshMonitors` enumerates off
+    /// the UI thread — `xcap` + `EnumDisplayDevices` + `QueryDisplayConfig`
+    /// can block for a long time (RDP, indirect displays) — and `pump`
+    /// swaps the list in when the reply lands.
+    pub monitors_rx: Mutex<Option<std::sync::mpsc::Receiver<Vec<platform::MonitorIdentity>>>>,
+    /// The hot-plug poll: last seen display count + last poll instant —
+    /// a change pushes `RefreshMonitors` so a disconnected monitor's
+    /// viewer anchoring re-clamps instead of stranding the window.
+    pub display_poll: Mutex<(u32, std::time::Instant)>,
+
     /// When the quit flush was requested — bounds the wait.
     quit_started: Mutex<Option<std::time::Instant>>,
     /// The in-flight "Tout enregistrer" batch: the worker owns the tabs
@@ -439,6 +499,18 @@ pub struct Shared {
     pub startup_notice: Mutex<Option<String>>,
 }
 
+/// Where a window must land: `monitor` plus the persisted outer rect
+/// in the monitor's NATIVE units when prefs hold one (`None` = centre
+/// the window on that monitor with its current size). Used by the
+/// viewer (`viewer_target`) and the Draw editor (`draw_target`).
+#[derive(Clone, Debug)]
+pub struct ViewerTarget {
+    /// The destination monitor.
+    pub monitor: MonitorInfo,
+    /// Saved outer rect `[x, y, w, h]` in native units, if any.
+    pub native_rect: Option<[i32; 4]>,
+}
+
 /// `capture_id` source — every capture gets one id so its whole life
 /// (start, confirm, store, cancel, failure) greps as a single trail.
 static NEXT_CAPTURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -480,25 +552,24 @@ impl Shared {
     }
 
     /// Queues a capture command and records the monitor the request came
-    /// from — the visible window (the bar, the viewer) under the cursor —
-    /// so the overlay opens on "the screen where the zone starts". The
-    /// record survives the capture delay: `begin_capture` may run later,
-    /// from the anchor's pass. Resident-icon launches (no window) leave
-    /// the slot empty and `begin_capture` falls back to the primary.
+    /// from — the viewer window the capture bar lives in — so the overlay
+    /// opens on "the screen where the zone starts". The record survives
+    /// the capture delay: `begin_capture` may run later, from the anchor's
+    /// pass. Window-less launches (dev hooks) leave the slot empty and
+    /// `begin_capture` falls back to the monitor under the cursor.
     pub fn push_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
-        *lock(&self.capture_start_monitor) = monitor_under(ctx);
+        // The session monitor — the monitor the viewer sits on — is the
+        // capture's start monitor (§2.5); the asking viewport's monitor
+        // is the fallback (dev hooks, tests with no live viewer).
+        *lock(&self.capture_start_monitor) = lock(&self.viewer_monitor)
+            .clone()
+            .or_else(|| monitor_under(ctx));
         self.push(Command::Capture(mode));
     }
 
     /// Settings guard for UI code that edits preferences.
     pub fn lock_settings(&self) -> MutexGuard<'_, Settings> {
         lock(&self.settings)
-    }
-
-    /// Whether the OS shows a native application menu bar (macOS) or the
-    /// viewer must draw its own menu strip (Windows).
-    pub fn has_native_app_menu(&self) -> bool {
-        platform::current().has_native_app_menu()
     }
 
     /// A modal child viewport is up (save-as, settings) — other windows
@@ -515,10 +586,8 @@ impl Shared {
             ModalState::Draw
         } else if lock(&self.save_dialog).is_some() {
             ModalState::SaveDialog
-        } else if self.settings_open.load(Ordering::Relaxed)
-            || self.about_open.load(Ordering::Relaxed)
-        {
-            // The About modal is modal to the viewer too: the dimmed veil
+        } else if self.settings_open.load(Ordering::Relaxed) {
+            // The settings modal is modal to the viewer too: the dimmed veil
             // + click-eater cover the panel until OK / cross / Esc.
             ModalState::Settings
         } else if self.viewer_dialog_open.load(Ordering::Relaxed) {
@@ -562,6 +631,15 @@ impl Shared {
     pub fn pump(&self, ctx: &egui::Context) {
         crate::logging::report_health();
         platform::strip_undecorated_frame();
+        // Debounced per-monitor geometry save: the viewer writes
+        // `rect_native` on every settled move/resize — a half-second of
+        // quiet flushes `prefs.json` once per gesture.
+        let flush = lock(&self.monitor_geom_dirty_at)
+            .is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(500));
+        if flush {
+            *lock(&self.monitor_geom_dirty_at) = None;
+            lock(&self.settings).save();
+        }
         // The quit-time flush finished on the store thread — or the
         // wait ran out / the writer died: the app closes either way.
         // Checked before `dispatch` so the pass that initiates `Quit`
@@ -597,6 +675,12 @@ impl Shared {
                 // evaluated, or the app deadlocks with modal=Saving.
                 ctx.request_repaint();
             }
+        }
+        // Windows: Alt+Tab (or any OS mechanism) can steal the overlay's
+        // focus mid-capture and Esc would then hit another app — keep
+        // handing it back while `Capturing`. No-op on macOS (kiosk).
+        if *lock(&self.state) == AppState::Capturing {
+            platform::refocus_capture_overlay(ctx, overlay_id());
         }
         let commands: Vec<Command> = platform::take_pending_commands()
             .into_iter()
@@ -640,13 +724,12 @@ impl Shared {
             platform::sync_menu_enabled(modal, has_doc, has_file, has_last_dir);
             ctx.request_repaint_of(egui::ViewportId::ROOT);
             ctx.repaint_if_live(viewer_id());
-            ctx.repaint_if_live(bar_id());
         }
         // Recent files change without a modal transition (open/save
         // succeeds, history cleared): the macOS File menu is native and
         // must be re-synced explicitly — a no-op on Windows, whose menus
         // are egui-drawn every frame.
-        platform::sync_recent_menu(&lock(&self.settings).recent_files);
+
         // A background session restore lands here — swap the empty
         // session for the loaded tabs and drop the spinner.
         let done = lock(&self.restore_rx)
@@ -657,6 +740,72 @@ impl Shared {
             self.finish_restore(session);
             ctx.repaint_if_live(viewer_id());
         }
+        // A background monitor refresh lands here — swap the cached
+        // list. While it runs, keep repainting so the poll stays alive
+        // in Idle too (same trap as `quit_rx`). Bound first: a scrutinee
+        // temporary would keep the `monitors_rx` guard held through the
+        // match arms, which relock it — instant self-deadlock.
+        let refresh = lock(&self.monitors_rx).as_ref().map(|r| r.try_recv());
+        match refresh {
+            Some(Ok(list)) => {
+                tracing::info!(count = list.len(), "monitors_refreshed");
+                // A failed enumeration (mid reconfiguration) yields an
+                // EMPTY list — never swap it in: it would purge the
+                // inventory, empty `bounds`, and disable the viewer's
+                // clamping. Keep the previous list on zero.
+                if !list.is_empty() {
+                    *lock(&self.monitors) = list;
+                } else {
+                    tracing::warn!(
+                        "monitor refresh returned no monitors — keeping the previous inventory"
+                    );
+                }
+                *lock(&self.monitors_rx) = None;
+                // A plug/unplug shuffles windows at the OS level, and
+                // macOS re-applies its own placement asynchronously —
+                // a single restore races it and loses. Arm a ~2 s pin
+                // window: the geometry loop re-applies the saved rect
+                // every frame until the OS settles (and persists
+                // nothing meanwhile).
+                if *lock(&self.state) == AppState::Viewer {
+                    *lock(&self.viewer_topology_pin) =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                }
+                ctx.repaint_if_live(viewer_id());
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                // The worker died mid-enumeration — free the slot so a
+                // later refresh can retry.
+                tracing::warn!("monitor refresh worker died");
+                *lock(&self.monitors_rx) = None;
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => ctx.request_repaint(),
+            None => {}
+        }
+        // Monitor hot-(un)plug: poll the OS display count ~1/s — a
+        // disconnect leaves a stale monitor in the cached inventory,
+        // and the geometry clamp would keep anchoring the viewer to a
+        // screen that no longer exists (window stranded off-screen).
+        {
+            let mut last = lock(&self.display_poll);
+            if last.1.elapsed() >= std::time::Duration::from_secs(1) {
+                last.1 = std::time::Instant::now();
+                let n = platform::display_count();
+                if last.0 != n {
+                    last.0 = n;
+                    drop(last);
+                    // Arm the pin NOW, not when the async refresh lands:
+                    // macOS starts shuffling the window immediately, and
+                    // the stale inventory (iPad still listed for ~1 s)
+                    // would otherwise persist the transient position into
+                    // the dying monitor's rect_native.
+                    *lock(&self.viewer_topology_pin) =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                    self.push(Command::RefreshMonitors);
+                    ctx.request_repaint();
+                }
+            }
+        }
         // A background save-all finished: the tabs come back into the
         // viewer; a ConfirmSave batch then closes the (now clean)
         // session, or keeps it open when some tab is still unsaved.
@@ -665,6 +814,7 @@ impl Shared {
             .and_then(|j| j.rx.try_recv().ok());
         if let Some((tabs, saved_paths)) = save_done {
             let job = lock(&self.save_all).take().expect("save-all job");
+            let saved_count = saved_paths.len();
             {
                 let mut s = lock(&self.settings);
                 for path in saved_paths {
@@ -676,6 +826,19 @@ impl Shared {
                 let mut viewer = lock(&self.viewer);
                 viewer.tabs = tabs;
                 viewer.recompute_dirty();
+            }
+            if saved_count == job.total {
+                crate::ui::widgets::toast(
+                    ctx,
+                    crate::ui::widgets::ToastKind::Success,
+                    t!("viewer.toast.saved_all", count = saved_count).to_string(),
+                );
+            } else {
+                crate::ui::widgets::toast(
+                    ctx,
+                    crate::ui::widgets::ToastKind::Error,
+                    t!("viewer.toast.save_failed").to_string(),
+                );
             }
             if job.then_confirm {
                 if lock(&self.viewer).dirty {
@@ -708,6 +871,11 @@ impl Shared {
                     s.push_recent(job.path);
                     s.save();
                     *lock(&self.save_dialog) = None;
+                    crate::ui::widgets::toast(
+                        ctx,
+                        crate::ui::widgets::ToastKind::Success,
+                        t!("viewer.toast.saved").to_string(),
+                    );
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
                 Err(e) => {
@@ -733,7 +901,7 @@ impl Shared {
             return;
         }
         // Every user action is one Command through this funnel — logging
-        // it here covers the bar, the menus, the tray and the viewer.
+        // it here covers the menus, the tray and the viewer.
         tracing::info!(command = %command_desc(&command), "command");
         match command {
             Command::Capture(mode) => {
@@ -745,6 +913,16 @@ impl Shared {
                     // The delay is session state: it persists between
                     // captures but is never saved to disk.
                     *lock(&self.countdown) = Some(ui::countdown::Countdown::new(mode, delay));
+                    // The viewer hides NOW, not at countdown zero: a live
+                    // viewer would ride the whole wait on screen, and its
+                    // teardown at `CaptureNow` would race the freeze (the
+                    // "ghost" watermark). The origin is stashed so a
+                    // cancelled capture still lands back here. Skipped
+                    // while Draw is modal — the editor can't float alone.
+                    if *lock(&self.state) == AppState::Viewer && lock(&self.draw).is_none() {
+                        *lock(&self.capture_return_to) = Some(AppState::Viewer);
+                        self.enter(AppState::Idle, ctx);
+                    }
                 } else {
                     self.begin_capture(mode, ctx);
                 }
@@ -752,82 +930,13 @@ impl Shared {
             Command::CaptureNow(mode) => self.begin_capture(mode, ctx),
             Command::ConfirmCapture => self.confirm_capture(ctx),
             Command::CancelCapture => self.cancel_capture(ctx),
-            Command::ShowBar => {
-                // The bar reopens where the user last dragged it — but
-                // only while PixMe still lives on that monitor. The
-                // anchor is the visible window's monitor (the viewer's,
-                // or the bar's own when the bar is re-invoked); with no
-                // window up it is the monitor under the mouse. A
-                // remembered spot on another monitor is stale — the bar
-                // re-centres on the anchor instead of popping up where
-                // the user is not looking.
-                let anchor = match *lock(&self.state) {
-                    AppState::Viewer => lock(&self.viewer_monitor).clone(),
-                    AppState::Bar => lock(&self.bar_monitor).clone(),
-                    _ => None,
-                }
-                .or_else(|| {
-                    platform::cursor_position()
-                        .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
-                })
-                .or_else(|| monitor_under(ctx))
-                .or_else(|| crate::capture::screen::primary_monitor().ok());
-                let monitors = crate::capture::screen::monitors().unwrap_or_default();
-                let spot_on_anchor = (*lock(&self.bar_pos))
-                    .zip(anchor.as_ref())
-                    .is_some_and(|(pos, a)| ui_pos_on_anchor(pos, &monitors, a));
-                // `place_on_monitor` asks `sync_viewport` to re-centre the
-                // bar on that monitor next frame — only wanted on the
-                // fallback path, never over a remembered spot.
-                if !spot_on_anchor {
-                    *lock(&self.bar_pos) = None;
-                    if let Some(m) = anchor {
-                        let scale = m.scale_factor.max(1.0);
-                        let origin = platform::native_to_ui(
-                            egui::pos2(m.rect.x as f32, m.rect.y as f32),
-                            scale,
-                        );
-                        let size = platform::native_to_ui(
-                            egui::pos2(m.rect.width as f32, m.rect.height as f32),
-                            scale,
-                        )
-                        .to_vec2();
-                        *lock(&self.bar_pos) = Some(egui::pos2(
-                            origin.x + (size.x - 340.0) / 2.0,
-                            origin.y + size.y * 0.12,
-                        ));
-                        lock(&self.toolbar).place_on_monitor(m);
-                    }
-                }
-                self.enter(AppState::Bar, ctx);
-            }
             Command::OpenViewer => {
                 self.enter(AppState::Viewer, ctx);
                 // Re-invoking while the window is already open (behind
                 // other apps, or minimized in the Dock) must still bring
                 // it forward: `enter` only requests focus on a state
                 // CHANGE, so de-minimize and focus explicitly here.
-                ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
-                // The direct Focus command both wakes the (possibly
-                // sleeping) viewport and, on macOS, activates the app
-                // (`activateIgnoringOtherApps` + `makeKeyAndOrderFront`)
-                // — a mere in-app focus request would do nothing while
-                // another application is frontmost.
-                ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
-                self.request_focus(viewer_id());
-                ctx.repaint_if_live(viewer_id());
-            }
-            Command::CloseBar => {
-                // Back where the user came from: the viewer when the session
-                // has captures, the resident icon otherwise. The guard is
-                // bound out of the `if` scrutinee: `enter(Viewer)` re-locks
-                // `viewer` and a live scrutinee guard would deadlock.
-                let empty = lock(&self.viewer).tabs.is_empty();
-                if empty {
-                    self.enter(AppState::Idle, ctx);
-                } else {
-                    self.enter(AppState::Viewer, ctx);
-                }
+                self.bring_viewer_forward(ctx);
             }
             Command::ViewerClosed => {
                 if lock(&self.draw).is_some() {
@@ -838,34 +947,69 @@ impl Shared {
                 // lost, so the dirty warning is Quit-only.
                 self.enter(AppState::Idle, ctx);
             }
-            Command::OpenAbout => {
-                // macOS keeps its native About panel in the PixMe menu;
-                // Windows opens the egui twin of that panel.
-                #[cfg(not(target_os = "macos"))]
-                {
-                    self.about_open.store(true, Ordering::Relaxed);
-                    ctx.repaint_if_live(viewer_id());
+            Command::ToggleViewer => {
+                // The resident icon's left click acts like a taskbar
+                // button PER MONITOR: each display's menu bar (macOS)
+                // / taskbar (Windows) carries it, so the click's cursor
+                // position picks the monitor the action applies to.
+                let clicked = platform::cursor_position().and_then(|(cx, cy)| {
+                    lock(&self.monitors)
+                        .iter()
+                        .find(|id| {
+                            let r = &id.info.rect;
+                            let (x0, y0) = (r.x as f32, r.y as f32);
+                            let (x1, y1) = (
+                                (r.x + r.width as i32) as f32,
+                                (r.y + r.height as i32) as f32,
+                            );
+                            cx >= x0 && cx < x1 && cy >= y0 && cy < y1
+                        })
+                        .map(|id| id.stable_id.clone())
+                });
+                if let Some(stable_id) = clicked {
+                    // SelectMonitor holds the taskbar semantics: shown on
+                    // that monitor → hide; anything else → show there.
+                    self.dispatch(Command::SelectMonitor(stable_id), ctx);
+                    return;
                 }
+                // Cursor off every known display (or position read
+                // failed): plain toggle on the current monitor.
+                let (minimized, focused) = ctx.input(|i| {
+                    let v = i.raw.viewports.get(&viewer_id());
+                    (
+                        v.and_then(|v| v.minimized).unwrap_or(false),
+                        v.and_then(|v| v.focused).unwrap_or(false),
+                    )
+                });
+                let minimized = minimized || platform::viewer_is_minimized();
+                if *lock(&self.state) == AppState::Viewer && !minimized && focused {
+                    self.dispatch(Command::ViewerClosed, ctx);
+                } else {
+                    self.dispatch(Command::OpenViewer, ctx);
+                }
+            }
+            Command::OpenAbout => {
+                // One About surface on both OSes: the settings modal
+                // opened on its About page.
+                ui::settings::open_at(ctx, ui::settings::SettingsPage::About);
+                self.dispatch(Command::OpenSettings, ctx);
             }
             Command::OpenSettings => {
                 if self.settings_open.load(Ordering::Relaxed) {
                     // Already open: re-invocation brings the existing
-                    // modal to the front rather than re-opening it.
-                    ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
-                    self.request_focus(viewer_id());
-                    ctx.repaint_if_live(viewer_id());
+                    // modal's host viewer to the front rather than
+                    // re-opening it.
+                    self.bring_viewer_forward(ctx);
                     return;
                 }
                 self.settings_open.store(true, Ordering::Relaxed);
                 // The window edits a draft: changes apply on OK only.
                 *lock(&self.settings_draft) = Some(lock(&self.settings).clone());
-                // The settings are a modal of the viewer: make sure the
-                // viewer exists (and is restored) before it shows.
+                // The settings are a modal of the viewer: the viewer must
+                // exist AND come forward — a minimized/background window
+                // would swallow the modal.
                 self.enter(AppState::Viewer, ctx);
-                // The modal lives in the VIEWER's pass — repainting the
-                // anchor alone would leave an idle viewer asleep and the
-                // modal would wait for the next input event.
-                ctx.repaint_if_live(viewer_id());
+                self.bring_viewer_forward(ctx);
             }
             Command::CloseSettings => {
                 self.settings_open.store(false, Ordering::Relaxed);
@@ -914,6 +1058,99 @@ impl Shared {
                 let mut viewer = lock(&self.viewer);
                 viewer.confirm_close = false;
                 viewer.confirm_then_quit = false;
+            }
+            Command::SelectMonitor(stable_id) => {
+                let target = lock(&self.monitors)
+                    .iter()
+                    .find(|m| m.stable_id == stable_id)
+                    .map(|m| m.info.clone());
+                if let Some(m) = target {
+                    // Taskbar semantics, shared by the strip buttons and
+                    // the resident icon: clicking the monitor the viewer
+                    // is SHOWN and FOCUSED on hides it; anything else
+                    // (other monitor, hidden, minimized, behind another
+                    // app) brings it up on the clicked monitor's saved
+                    // rect.
+                    let (minimized, focused) = ctx.input(|i| {
+                        let v = i.raw.viewports.get(&viewer_id());
+                        (
+                            v.and_then(|v| v.minimized).unwrap_or(false),
+                            v.and_then(|v| v.focused).unwrap_or(false),
+                        )
+                    });
+                    let minimized = minimized || platform::viewer_is_minimized();
+                    let on_target =
+                        lock(&self.viewer_monitor).as_ref().map(|v| v.rect) == Some(m.rect);
+                    if *lock(&self.state) == AppState::Viewer && !minimized && focused && on_target
+                    {
+                        self.dispatch(Command::ViewerClosed, ctx);
+                        return;
+                    }
+                    // The viewer pass applies the saved native rect (or
+                    // the centred default); `OpenViewer` also opens from
+                    // Idle, un-minimizes, and raises a behind window.
+                    *lock(&self.viewer_target) = Some(self.viewer_target_for(m));
+                    self.dispatch(Command::OpenViewer, ctx);
+                }
+            }
+            Command::RefreshMonitors => {
+                // Enumeration blocks on OS display queries — run it off
+                // the UI thread; `pump` swaps the list in on reply.
+                if lock(&self.monitors_rx).is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(platform::monitor_identities());
+                    });
+                    *lock(&self.monitors_rx) = Some(rx);
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    ctx.repaint_if_live(viewer_id());
+                }
+            }
+            Command::RenameMonitor(stable_id) => {
+                // The draft opens on the custom name, or the OS name when
+                // none was chosen yet — the field never starts empty.
+                let name = lock(&self.settings)
+                    .monitors
+                    .get(&stable_id)
+                    .and_then(|p| p.name.clone())
+                    .or_else(|| {
+                        lock(&self.monitors)
+                            .iter()
+                            .find(|m| m.stable_id == stable_id)
+                            .map(|m| m.info.name.clone())
+                    })
+                    .unwrap_or_else(|| stable_id.clone());
+                lock(&self.viewer).open_monitor_rename(stable_id, name);
+            }
+            Command::ResetMonitors => {
+                // Back to first-launch monitor state: every per-monitor
+                // entry (custom names AND saved geometry) plus the
+                // last-host marker, flushed to prefs.json right away.
+                {
+                    let mut s = lock(&self.settings);
+                    s.monitors.clear();
+                    s.last_monitor = None;
+                    s.save();
+                }
+                // Re-land like a fresh install: centred on the primary
+                // display at the default size. Clearing `viewer_rect`
+                // stops `place_viewer_on_monitor` from keeping the
+                // current rect when its centre is already inside.
+                let primary = {
+                    let inv = lock(&self.monitors);
+                    inv.iter()
+                        .find(|id| id.info.is_primary)
+                        .or_else(|| inv.first())
+                        .map(|id| id.info.clone())
+                };
+                if let Some(m) = primary {
+                    *lock(&self.viewer_rect) = None;
+                    *lock(&self.viewer_target) = Some(ViewerTarget {
+                        monitor: m,
+                        native_rect: None,
+                    });
+                    self.dispatch(Command::OpenViewer, ctx);
+                }
             }
             Command::ClosePin(id) => {
                 // Deregistering the viewport next pass destroys the window.
@@ -982,7 +1219,9 @@ impl Shared {
             }
             Command::OpenAllRecent => {
                 let paths = lock(&self.settings).recent_files.clone();
-                let opened = paths.iter().any(|p| self.open_one(p));
+                // `|`, not `||` — `any` short-circuits at the first
+                // success and only one file would open.
+                let opened = paths.iter().fold(false, |acc, p| self.open_one(p) | acc);
                 if opened {
                     self.enter(AppState::Viewer, ctx);
                 }
@@ -1059,8 +1298,22 @@ impl Shared {
             Command::CopyActive => {
                 if let Some(img) = lock(&self.viewer).copy_image() {
                     match crate::export::clipboard::copy_image(&img) {
-                        Ok(()) => tracing::info!("clipboard_copy"),
-                        Err(e) => tracing::warn!("copy failed: {e}"),
+                        Ok(()) => {
+                            tracing::info!("clipboard_copy");
+                            crate::ui::widgets::toast(
+                                ctx,
+                                crate::ui::widgets::ToastKind::Success,
+                                t!("viewer.toast.copied").to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("copy failed: {e}");
+                            crate::ui::widgets::toast(
+                                ctx,
+                                crate::ui::widgets::ToastKind::Error,
+                                t!("viewer.toast.copy_failed").to_string(),
+                            );
+                        }
                     }
                 }
             }
@@ -1086,6 +1339,25 @@ impl Shared {
                     *lock(&self.draw) = Some(crate::ui::draw::DrawSession::open(
                         doc, tab, title, undo, redo, &prefs,
                     ));
+                    // The editor opens on the viewer's monitor — its
+                    // saved `draw_rect_native` when prefs hold one,
+                    // centred there otherwise. Stale gesture tracking
+                    // from a previous session must not persist early.
+                    let monitor = lock(&self.viewer_monitor)
+                        .clone()
+                        .or_else(|| monitor_under(ctx))
+                        .or_else(|| crate::capture::screen::primary_monitor().ok());
+                    if let Some(m) = monitor {
+                        let native_rect = self.monitor_stable_id(&m).and_then(|id| {
+                            prefs.monitors.get(&id).and_then(|p| p.draw_rect_native)
+                        });
+                        *lock(&self.draw_target) = Some(ViewerTarget {
+                            monitor: m,
+                            native_rect,
+                        });
+                    }
+                    *lock(&self.draw_last_outer) = None;
+                    *lock(&self.draw_move_at) = None;
                     self.request_focus(draw_id());
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
@@ -1329,17 +1601,14 @@ impl Shared {
                 platform::capture_chrome_exit();
             }
             // The viewer is a real application window: bring it to the
-            // front. The bar is a palette — `always_on_top`, never focus.
+            // front.
             if next == AppState::Viewer {
                 self.request_focus(viewer_id());
+                // The viewport's native window is destroyed on
+                // deregistration and rebuilt on re-entry: the geometry
+                // ledger must be re-applied.
+                *lock(&self.viewer_sync) = ui::viewport_sync::ViewportSync::new("PixMe Viewer");
             }
-        }
-        if next == AppState::Bar {
-            // The bar's HWND is destroyed when the viewport deregisters and
-            // rebuilt on re-entry — clear the geometry ledger so size and
-            // position commands are resent (a stale ledger dedupes them and
-            // the new window keeps the builder's clipped default size).
-            lock(&self.toolbar).reset_sync();
         }
         // Restoring runs on EVERY viewer entry (guarded to once): a
         // same-state re-entry after reset must not skip the load.
@@ -1347,6 +1616,30 @@ impl Shared {
             self.restore_session(ctx);
         }
         ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+
+    /// The stable id of the inventory monitor matching `m` by rect —
+    /// xcap ids are unstable across enumerations on Windows.
+    fn monitor_stable_id(&self, m: &MonitorInfo) -> Option<String> {
+        lock(&self.monitors)
+            .iter()
+            .find(|id| id.info.rect == m.rect)
+            .map(|id| id.stable_id.clone())
+    }
+
+    /// The landing target for `m`: the persisted native rect when prefs
+    /// hold one for its stable id, else the centred/current-size default.
+    fn viewer_target_for(&self, m: MonitorInfo) -> ViewerTarget {
+        let native_rect = self.monitor_stable_id(&m).and_then(|id| {
+            lock(&self.settings)
+                .monitors
+                .get(&id)
+                .and_then(|p| p.rect_native)
+        });
+        ViewerTarget {
+            monitor: m,
+            native_rect,
+        }
     }
 
     /// Resolves the dirty-session confirmation: ends the session and either
@@ -1368,6 +1661,30 @@ impl Shared {
         } else {
             self.enter(AppState::Idle, ctx);
         }
+    }
+
+    /// Restores and raises the viewer: un-minimizes, activates the app
+    /// and requests focus until it lands. Shared by `OpenViewer` and
+    /// every command whose surface lives inside the viewer (settings,
+    /// monitor selection) — `enter(Viewer)` alone never brings an
+    /// already-open window forward.
+    fn bring_viewer_forward(&self, ctx: &egui::Context) {
+        ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Minimized(false));
+        // macOS: `Focus`/`Minimized` viewport commands do not activate the
+        // application — without `NSApp activate` the viewer stays behind
+        // the frontmost app (dock reopen needed two clicks).
+        platform::activate_app();
+        // The direct Focus command both wakes the (possibly sleeping)
+        // viewport and, on macOS, activates the app
+        // (`activateIgnoringOtherApps` + `makeKeyAndOrderFront`) — a
+        // mere in-app focus request would do nothing while another
+        // application is frontmost.
+        ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
+        self.request_focus(viewer_id());
+        // The modal lives in the VIEWER's pass — repainting the anchor
+        // alone would leave an idle viewer asleep and the modal would
+        // wait for the next input event.
+        ctx.repaint_if_live(viewer_id());
     }
 
     /// Marks `id` for focus grabbing: the child callback re-sends `Focus`
@@ -1400,8 +1717,8 @@ impl Shared {
     }
 
     /// Starts `mode`: region modes spawn the selection overlay over the
-    /// frozen monitor, full-screen arms an instant capture (the bar must be
-    /// torn down first — one warm-up frame inside the overlay/anchor pass).
+    /// frozen monitor, full-screen arms an instant capture (the viewer must
+    /// be torn down first — one warm-up frame inside the overlay/anchor pass).
     /// `Pin` lands in a later phase.
     fn begin_capture(&self, mode: CaptureMode, ctx: &egui::Context) {
         // Chained capture (menu/hotkey while a session is live): Esc must
@@ -1409,25 +1726,36 @@ impl Shared {
         // is never a return destination. Snapshot the state first: a
         // scrutinee-held guard would live for the whole match.
         let current = *lock(&self.state);
-        let return_to = match current {
-            AppState::Capturing => lock(&self.capture)
-                .as_ref()
-                .map(|s| s.return_to)
-                .unwrap_or(AppState::Idle),
-            state => state,
-        };
+        // A delayed capture hid the viewer when its countdown was armed:
+        // the stashed origin — not the countdown's `Idle` — is where Esc
+        // lands. No stash: the live state decides (a chained capture
+        // keeps the original session's destination).
+        let return_to = lock(&self.capture_return_to)
+            .take()
+            .unwrap_or(match current {
+                AppState::Capturing => lock(&self.capture)
+                    .as_ref()
+                    .map(|s| s.return_to)
+                    .unwrap_or(AppState::Idle),
+                state => state,
+            });
         match mode {
             CaptureMode::Region
             | CaptureMode::FixedRegion
             | CaptureMode::FullScreen
             | CaptureMode::WindowOrObject
             | CaptureMode::Pin => {
-                // The overlay initially opens on the screen under the cursor
-                // (or where the capture was asked for), then follows the
-                // cursor across monitors until the user starts a selection.
-                let monitor = platform::cursor_position()
-                    .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
-                    .or_else(|| lock(&self.capture_start_monitor).take())
+                // The overlay initially opens on the SESSION monitor —
+                // the viewer's own monitor, recorded by `push_capture`
+                // — then the cursor's, the asking viewport's, or the
+                // primary's. It still follows the cursor across
+                // monitors until a selection starts.
+                let monitor = lock(&self.capture_start_monitor)
+                    .take()
+                    .or_else(|| {
+                        platform::cursor_position()
+                            .and_then(|(x, y)| crate::capture::screen::monitor_at(x, y))
+                    })
                     .or_else(|| monitor_under(ctx))
                     .or_else(|| crate::capture::screen::primary_monitor().ok());
                 let Some(monitor) = monitor else {
@@ -1448,6 +1776,13 @@ impl Shared {
                 session.include_pointer = lock(&self.settings).include_pointer;
                 let _span = session.span().entered();
                 tracing::info!(mode = ?mode, "capture_start");
+                // WDA_EXCLUDEFROMCAPTURE while the windows this capture
+                // displaces (viewer, countdown card) still exist — a dead
+                // hwnd can't be flagged and DWM honours the affinity at
+                // its own cadence, so arming at BitBlt time loses the
+                // race on fast machines. `warm_freeze` lifts it once the
+                // frames are frozen; no-op on macOS.
+                session.early_excl = Some(crate::platform::capture_exclusion());
                 let instant = session.instant;
                 *lock(&self.capture) = Some(session);
                 self.enter(AppState::Capturing, ctx);
@@ -1523,7 +1858,7 @@ impl Shared {
             return;
         }
         // Open the viewer on the monitor that was just captured.
-        *lock(&self.viewer_target_monitor) = Some(frame.monitor.clone());
+        *lock(&self.viewer_target) = Some(self.viewer_target_for(frame.monitor.clone()));
         let title = {
             let mut viewer = lock(&self.viewer);
             let title = self.capture_title();
@@ -1567,6 +1902,8 @@ impl Shared {
 
     /// Cancel leaves the session untouched and returns where capture began.
     fn cancel_capture(&self, ctx: &egui::Context) {
+        // A stray countdown stash must not leak into the next capture.
+        *lock(&self.capture_return_to) = None;
         let return_to = {
             let mut slot = lock(&self.capture);
             if let Some(s) = slot.as_ref() {
@@ -1734,6 +2071,11 @@ impl Shared {
     /// the meta columns. `pump()` closes the app when the barrier
     /// lifts or the timeout expires; the saving veil covers the wait.
     fn quit_now(&self, ctx: &egui::Context) {
+        // Flush a pending monitor-geometry save first — the debounce
+        // timer may not have fired yet.
+        if lock(&self.monitor_geom_dirty_at).take().is_some() {
+            lock(&self.settings).save();
+        }
         if !self.session_persists() {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
             return;
@@ -1776,6 +2118,9 @@ impl Shared {
             )
         };
         self.writer.finalize(rows, live, active, next_title);
+        // The measured VACUUM rides the queue behind Finalize: it runs
+        // inside the bounded quit wait, not in a Drop the exit may skip.
+        self.writer.vacuum();
         *lock(&self.quit_rx) = Some(self.writer.flush());
         *lock(&self.quit_started) = Some(std::time::Instant::now());
         ctx.repaint_if_live(viewer_id());
@@ -1866,25 +2211,6 @@ fn monitor_under(ctx: &egui::Context) -> Option<MonitorInfo> {
     .and_then(|c| crate::capture::screen::monitor_at(c.x, c.y))
 }
 
-/// Whether `pos` (egui ui points) lands on `anchor`'s monitor, hit-tested
-/// against `monitors` — each candidate converts `pos` with its own scale
-/// (mixed-DPI safe). Monitors compare by rect, not id: xcap ids are not
-/// stable across enumerations on Windows.
-fn ui_pos_on_anchor(pos: egui::Pos2, monitors: &[MonitorInfo], anchor: &MonitorInfo) -> bool {
-    monitors
-        .iter()
-        .find(|m| {
-            let scale = m.scale_factor.max(1.0);
-            let native = platform::ui_to_native(pos, scale);
-            let r = &m.rect;
-            native.x >= r.x as f32
-                && native.x < r.x as f32 + r.width as f32
-                && native.y >= r.y as f32
-                && native.y < r.y as f32 + r.height as f32
-        })
-        .is_some_and(|m| m.rect == anchor.rect)
-}
-
 /// Root application state, created once in [`eframe::App::ui`]'s setup.
 pub struct PixMeApp {
     /// Everything the deferred-viewport callbacks reach.
@@ -1942,6 +2268,19 @@ impl PixMeApp {
         let debug_capture = std::env::var("PIXME_CAPTURE")
             .ok()
             .and_then(|v| debug_mode(&v));
+        // The launch landing: the viewer reopens on the monitor it last
+        // sat on (stable id), at its saved rect when prefs hold one —
+        // applied by the normal target path on the first viewer pass.
+        let inventory = platform::monitor_identities();
+        let initial_target = settings.last_monitor.as_deref().and_then(|id| {
+            inventory
+                .iter()
+                .find(|m| m.stable_id == id)
+                .map(|m| ViewerTarget {
+                    monitor: m.info.clone(),
+                    native_rect: settings.monitors.get(id).and_then(|p| p.rect_native),
+                })
+        });
         let app = Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(AppState::Idle),
@@ -1951,20 +2290,30 @@ impl PixMeApp {
                 settings: Mutex::new(settings),
                 viewer: Mutex::new(Viewer::default()),
                 viewer_rect: Mutex::new(None),
-                viewer_target_monitor: Mutex::new(None),
-                toolbar: Mutex::new(Toolbar::default()),
-                bar_pos: Mutex::new(None),
-                bar_rect: Mutex::new(None),
-                bar_monitor: Mutex::new(None),
+                viewer_target: Mutex::new(initial_target),
                 viewer_monitor: Mutex::new(None),
+                monitors: Mutex::new(inventory),
+                viewer_sync: Mutex::new(ui::viewport_sync::ViewportSync::new("PixMe Viewer")),
+                viewer_geo_settle: Mutex::new(0),
+                viewer_topology_pin: Mutex::new(None),
+                viewer_pin_last: Mutex::new(None),
+                viewer_last_outer: Mutex::new(None),
+                viewer_move_at: Mutex::new(None),
+                draw_target: Mutex::new(None),
+                draw_monitor: Mutex::new(None),
+                draw_last_outer: Mutex::new(None),
+                draw_move_at: Mutex::new(None),
+                draw_geo_settle: Mutex::new(0),
+
+                monitor_geom_dirty_at: Mutex::new(None),
                 winit_placements: Mutex::new(Vec::new()),
                 settings_open: AtomicBool::new(false),
-                about_open: AtomicBool::new(false),
                 settings_draft: Mutex::new(None),
                 capture: Mutex::new(None),
                 countdown: Mutex::new(None),
                 last_fixed_region: Mutex::new(None),
                 capture_start_monitor: Mutex::new(None),
+                capture_return_to: Mutex::new(None),
                 pins: Mutex::new(Vec::new()),
                 next_pin_id: Mutex::new(0),
                 save_dialog: Mutex::new(None),
@@ -1983,6 +2332,9 @@ impl PixMeApp {
                 },
                 restore_rx: Mutex::new(None),
                 quit_rx: Mutex::new(None),
+                monitors_rx: Mutex::new(None),
+                display_poll: Mutex::new((platform::display_count(), std::time::Instant::now())),
+
                 quit_started: Mutex::new(None),
                 save_all: Mutex::new(None),
                 save_one: Mutex::new(None),
@@ -2005,11 +2357,7 @@ impl PixMeApp {
         };
         // Launch lands on the viewer, not resident-idle: it restores
         // the persisted session and gives a visible landing point.
-        // Any viewport left open by eframe's persisted state (e.g. the
-        // capture bar showing at a previous quit) is closed explicitly.
         app.shared.enter(AppState::Viewer, &cc.egui_ctx);
-        cc.egui_ctx
-            .cmd_if_live(bar_id(), egui::ViewportCommand::Close);
         app.tap_debug_capture(&cc.egui_ctx, debug_capture)
     }
 
@@ -2038,10 +2386,59 @@ impl PixMeApp {
 }
 
 impl eframe::App for PixMeApp {
-    /// Transparent clear: the anchor and the bar are transparent windows, and
-    /// child viewports paint their whole surface anyway.
+    /// Transparent clear: the anchor, countdown and pinned windows are
+    /// transparent, and child viewports paint their whole surface anyway.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
+    /// Last code that runs on every quit path — winit calls
+    /// `process::exit` right after, before any destructor, so the
+    /// measured session-db VACUUM cannot ride `Store::drop`. Queue it
+    /// behind the pending writes on the store thread and wait for the
+    /// drain with the same bound the quit veil uses.
+    /// Last code that runs on every quit path — winit calls
+    /// `process::exit` right after, before any destructor, so quit-time
+    /// work cannot ride `Drop` or `Command::Quit` alone (Cmd+Q and the
+    /// window cross never dispatch it). Replays `begin_quit`'s tail:
+    /// pending-Draw commit, Finalize (meta refresh + stale-row prune),
+    /// then the measured session-db VACUUM on the store thread, all
+    /// inside one bounded flush wait.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut draw) = lock(&self.shared.draw).take() {
+            draw.finalize_pending();
+            lock(&self.shared.viewer).commit_draw(draw.tab, draw.doc, draw.undo, draw.redo);
+        }
+        let (rows, live, active, next_title) = {
+            let viewer = lock(&self.shared.viewer);
+            (
+                viewer
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(ord, t)| t.to_meta_row(ord))
+                    .collect::<Vec<_>>(),
+                viewer
+                    .tabs
+                    .iter()
+                    .map(|t| t.doc.meta.id.clone())
+                    .collect::<Vec<_>>(),
+                viewer.active_index().unwrap_or(0),
+                viewer.next_title(),
+            )
+        };
+        self.shared.writer.finalize(rows, live, active, next_title);
+        self.shared.writer.vacuum();
+        match self.shared.writer.flush().recv_timeout(QUIT_FLUSH_TIMEOUT) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+                "session flush exceeded {}s — quitting anyway",
+                QUIT_FLUSH_TIMEOUT.as_secs()
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!("store writer died before the quit flush")
+            }
+        }
     }
 
     /// The anchor pass: dispatch queued commands, then (de)register child
@@ -2057,40 +2454,18 @@ impl eframe::App for PixMeApp {
         // (a fullscreen confirm deadlocked exactly this way).
         let state = *lock(&self.shared.state);
         match state {
-            AppState::Bar => {
-                let shared = Arc::clone(&self.shared);
-                let builder = bar_builder(*lock(&shared.bar_pos));
-                ctx.show_viewport_deferred(bar_id(), builder, move |ui, _class| {
-                    let ctx = ui.ctx().clone();
-                    shared.pump(&ctx);
-                    shared.maybe_focus(&ctx, bar_id());
-                    ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
-                    if let Some(pos) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
-                        *lock(&shared.bar_pos) = Some(pos);
-                    }
-                    if ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                        && lock(&shared.countdown).is_some()
-                    {
-                        *lock(&shared.countdown) = None;
-                        ctx.request_repaint_of(egui::ViewportId::ROOT);
-                    }
-                    let mut toolbar = lock(&shared.toolbar);
-                    let mut settings = lock(&shared.settings);
-                    toolbar.show(ui, &mut settings, &shared);
-                });
-            }
             AppState::Viewer => {
                 let shared = Arc::clone(&self.shared);
                 // If a capture just landed on a specific monitor, make sure
                 // the viewer opens on that monitor (preserving its relative
                 // placement / size when already known, or centring it there).
-                if let Some(m) = lock(&shared.viewer_target_monitor).clone() {
-                    // The window is being (re)built ON m: its ppp is m's
-                    // own scale.
-                    let next = place_viewer_on_monitor(
+                if let Some(t) = lock(&shared.viewer_target).clone() {
+                    // The window is being (re)built ON the target monitor:
+                    // its ppp is the monitor's own scale.
+                    let next = target_ui_rect(
+                        &t,
                         *lock(&shared.viewer_rect),
-                        &m,
-                        m.scale_factor.max(1.0),
+                        t.monitor.scale_factor.max(1.0),
                     );
                     *lock(&shared.viewer_rect) = Some(next);
                 }
@@ -2099,23 +2474,244 @@ impl eframe::App for PixMeApp {
                     let ctx = ui.ctx().clone();
                     shared.pump(&ctx);
                     shared.maybe_focus(&ctx, viewer_id());
-                    let target = lock(&shared.viewer_target_monitor).take();
-                    if let Some(m) = target {
-                        // `OuterPosition` is converted back by THIS
-                        // window's current ppp — convert with it so the
-                        // physical target is exact even mid-DPI-change.
-                        let ppp = platform::window_ppp(&ctx, m.scale_factor.max(1.0));
-                        let next =
-                            place_viewer_on_monitor(*lock(&shared.viewer_rect), &m, ppp);
+                    let target = lock(&shared.viewer_target).take();
+                    if let Some(t) = target {
+                        // Commands are converted back by THIS window's
+                        // current ppp — convert with it so the physical
+                        // target is exact even mid-DPI-change.
+                        let ppp = platform::window_ppp(&ctx, t.monitor.scale_factor.max(1.0));
+                        let next = target_ui_rect(&t, *lock(&shared.viewer_rect), ppp);
                         *lock(&shared.viewer_rect) = Some(next);
-                        *lock(&shared.viewer_monitor) = Some(m);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(next.min));
+                        *lock(&shared.viewer_monitor) = Some(t.monitor);
+                        // `next` is the OUTER rect: `InnerSize` needs the
+                        // decoration delta (outer − inner reported last
+                        // frame; zero until measured).
+                        let deco = ctx.input(|i| {
+                            match (i.viewport().outer_rect, i.viewport().inner_rect) {
+                                (Some(o), Some(n)) => o.size() - n.size(),
+                                _ => egui::Vec2::ZERO,
+                            }
+                        });
+                        let inner = (next.size() - deco).max(egui::vec2(100.0, 100.0));
+                        {
+                            let mut sync = lock(&shared.viewer_sync);
+                            sync.request_outer_position(&ctx, next.min);
+                            sync.request_inner_size(&ctx, inner);
+                        }
+                        // The reported rect lies for a frame or two while
+                        // the move (and any DPI hand-off) settles — never
+                        // persist it.
+                        *lock(&shared.viewer_geo_settle) = 2;
                     } else if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-                        *lock(&shared.viewer_rect) = Some(outer);
-                        let ppp = platform::window_ppp(&ctx, 1.0);
-                        let centre = platform::ui_to_native(outer.center(), ppp);
-                        *lock(&shared.viewer_monitor) =
-                            crate::capture::screen::monitor_at(centre.x, centre.y);
+                        let mut settle = lock(&shared.viewer_geo_settle);
+                        if *settle > 0 {
+                            *settle -= 1;
+                        } else {
+                            let ppp = platform::window_ppp(&ctx, 1.0);
+                            // The viewer is freely draggable — across
+                            // monitors too. A move that settles on a
+                            // DIFFERENT monitor becomes a relocation:
+                            // that monitor's memorized rect (or the
+                            // centred fallback) is applied through the
+                            // same target path as `SelectMonitor`. A
+                            // stale current monitor (disconnected)
+                            // falls back to the monitor under the
+                            // centre.
+                            let centre = platform::ui_to_native(outer.center(), ppp);
+                            // Cached-inventory hit-test, never a fresh xcap
+                            // enumeration: `monitor_at` calls Monitor::all()
+                            // EVERY FRAME on the main thread — during a
+                            // display reconfiguration (iPad plug/unplug)
+                            // that blocks and freezes the UI. The async
+                            // refresh keeps the inventory current instead.
+                            let hit_rect = {
+                                let inv = lock(&shared.monitors);
+                                inv.iter()
+                                    .find(|id| {
+                                        let r = &id.info.rect;
+                                        let (x0, y0) = (r.x as f32, r.y as f32);
+                                        let (x1, y1) = (
+                                            (r.x + r.width as i32) as f32,
+                                            (r.y + r.height as i32) as f32,
+                                        );
+                                        centre.x >= x0
+                                            && centre.x < x1
+                                            && centre.y >= y0
+                                            && centre.y < y1
+                                    })
+                                    .map(|id| id.info.clone())
+                            };
+                            let hit = hit_rect.clone();
+                            let cur = lock(&shared.viewer_monitor).clone().filter(|c| {
+                                lock(&shared.monitors)
+                                    .iter()
+                                    .any(|id| id.info.rect == c.rect)
+                            });
+                            // Topology pin window: macOS re-shuffles the
+                            // window asynchronously after a plug/unplug.
+                            // The saved rect is pushed DIRECTLY here (not
+                            // via viewer_target — that path's settle
+                            // counter pauses this loop for two frames and
+                            // would let a late shuffle stick).
+                            let pinned = lock(&shared.viewer_topology_pin)
+                                .is_some_and(|until| std::time::Instant::now() < until);
+                            // The hosting monitor: the one under the
+                            // window centre in normal time — the viewer
+                            // drags freely and follows wherever it is
+                            // dropped. While the pin owns corrections
+                            // (topology turbulence), the PREVIOUS host is
+                            // preferred so a mid-shuffle centre dumped
+                            // onto another display can't steal the
+                            // window. `or(cur)` plus the primary/live
+                            // fallback cover a centre landing in a
+                            // monitor gap or the host being gone.
+                            let bounds = if pinned {
+                                cur.clone().or_else(|| hit.clone())
+                            } else {
+                                hit.clone().or_else(|| cur.clone())
+                            }
+                            .or_else(|| {
+                                let inv = lock(&shared.monitors);
+                                inv.iter()
+                                    .find(|id| id.info.is_primary)
+                                    .or_else(|| inv.first())
+                                    .map(|id| id.info.clone())
+                            });
+                            // The hosting monitor VANISHED (unplug): the
+                            // OS dumps the window wherever — run the same
+                            // target path as `SelectMonitor` so the new
+                            // monitor's saved rect is restored. Gated on
+                            // `cur` being gone: a normal cross-monitor
+                            // drop changes `bounds` too but must NOT
+                            // relocate — free drag wins, and its landing
+                            // rect is persisted on settle below.
+                            let monitor_changed = cur.is_none()
+                                && bounds.as_ref().is_some_and(|m| {
+                                    lock(&shared.viewer_monitor).as_ref().map(|v| v.rect)
+                                        != Some(m.rect)
+                                });
+                            if monitor_changed && let Some(m) = &bounds {
+                                *lock(&shared.viewer_target) =
+                                    Some(shared.viewer_target_for(m.clone()));
+                            }
+                            // Gesture tracking: every reported-rect
+                            // change restarts a 250 ms quiet timer —
+                            // a move/resize is "done" once it settles.
+                            // While the pin owns corrections (topology
+                            // shuffle), no gesture is tracked.
+                            let moved =
+                                lock(&shared.viewer_last_outer).replace(outer) != Some(outer);
+                            if pinned {
+                                *lock(&shared.viewer_move_at) = None;
+                            } else if moved {
+                                *lock(&shared.viewer_move_at) = Some(std::time::Instant::now());
+                            }
+                            // Copy the Option OUT first: keeping the
+                            // scrutinee guard alive through the `if`
+                            // body self-deadlocks the clear below.
+                            let move_at = *lock(&shared.viewer_move_at);
+                            if !pinned && let Some(t) = move_at {
+                                if t.elapsed() >= std::time::Duration::from_millis(250) {
+                                    *lock(&shared.viewer_move_at) = None;
+                                    // Gesture over — the ONE geometry
+                                    // write (nothing persists mid-drag):
+                                    // the dropped rect goes under the
+                                    // monitor the window ACTUALLY sits
+                                    // on, so the monitor buttons always
+                                    // switch to the last real position
+                                    // of each display. Skipped while an
+                                    // unplug restore is armed — the
+                                    // dumped rect is transient.
+                                    if !monitor_changed
+                                        && let Some(m) = hit.clone().or_else(|| cur.clone())
+                                        && let Some(id) = shared.monitor_stable_id(&m)
+                                    {
+                                        let rect = clamped_native_rect(outer, ppp, &m.rect);
+                                        tracing::debug!(
+                                            monitor = m.name.as_str(),
+                                            ppp,
+                                            outer = ?outer,
+                                            rect = ?rect,
+                                            "monitor_geometry_persist"
+                                        );
+                                        let mut s = lock(&shared.settings);
+                                        let prefs = s.monitors.entry(id.clone()).or_default();
+                                        let mut dirty = prefs.rect_native != Some(rect);
+                                        if dirty {
+                                            prefs.rect_native = Some(rect);
+                                        }
+                                        if s.last_monitor.as_deref() != Some(id.as_str()) {
+                                            s.last_monitor = Some(id);
+                                            dirty = true;
+                                        }
+                                        if dirty {
+                                            *lock(&shared.monitor_geom_dirty_at) =
+                                                Some(std::time::Instant::now());
+                                        }
+                                    }
+                                } else {
+                                    // Poll so the settle check still runs
+                                    // once the OS stops sending move events.
+                                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                                }
+                            }
+                            let mut eff = outer;
+                            if let Some(m) = &bounds {
+                                // Topology pin: macOS re-shuffles the
+                                // window asynchronously after a plug/
+                                // unplug — often WITHIN the same monitor
+                                // (it dumps the window at bottom-left).
+                                // Pull it back whenever the reported
+                                // rect deviates from the saved one,
+                                // throttled to 300 ms: a per-frame push
+                                // created a position feedback storm
+                                // (egui/winit fight → full freeze).
+                                if pinned {
+                                    let saved = target_ui_rect(
+                                        &shared.viewer_target_for(m.clone()),
+                                        *lock(&shared.viewer_rect),
+                                        ppp,
+                                    );
+                                    // Sliding pin: macOS re-shuffles
+                                    // asynchronously for several seconds
+                                    // after a replug. Detection runs
+                                    // EVERY frame (unthrottled) so the
+                                    // window can't expire while it is
+                                    // still displaced; only the push is
+                                    // throttled to 200 ms.
+                                    if saved.min.distance(outer.min) > 0.5 {
+                                        *lock(&shared.viewer_topology_pin) = Some(
+                                            std::time::Instant::now()
+                                                + std::time::Duration::from_secs(2),
+                                        );
+                                        if lock(&shared.viewer_pin_last).as_ref().is_none_or(|t| {
+                                            t.elapsed() >= std::time::Duration::from_millis(200)
+                                        }) {
+                                            *lock(&shared.viewer_pin_last) =
+                                                Some(std::time::Instant::now());
+                                            ctx.send_viewport_cmd(
+                                                egui::ViewportCommand::OuterPosition(saved.min),
+                                            );
+                                            eff = saved;
+                                        }
+                                    }
+                                }
+                            }
+                            *lock(&shared.viewer_monitor) = bounds;
+                            // `last_monitor` is written in the settle
+                            // persist above — NOT per frame: tracking
+                            // the physical host mid-drag would flag it
+                            // as the "last" monitor before the gesture
+                            // even ends.
+                            // `viewer_rect` tracks the reported rect —
+                            // per-monitor `rect_native` persistence does
+                            // NOT happen here: it is written exactly
+                            // once, when the move/resize gesture settles
+                            // (the `viewer_move_at` quiet check above).
+                            if *lock(&shared.viewer_rect) != Some(eff) {
+                                *lock(&shared.viewer_rect) = Some(eff);
+                            }
+                        }
                     }
                     // Draw is modal to the viewer: deferred viewports are
                     // plain top-level windows with no OS child-window
@@ -2135,166 +2731,11 @@ impl eframe::App for PixMeApp {
                     // the first real window delivers it — non-modal, the
                     // app stays usable.
                     notice_window(&ctx, "pixme.startup_notice", &shared.startup_notice);
-                    // Windows About modal — the egui twin of the macOS
-                    // native About panel, framed like the settings modal:
-                    // title band with a painted close cross, compact body.
-                    if shared.about_open.load(Ordering::Relaxed) {
-                        let mut open = true;
-                        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            open = false;
-                        }
-                        egui::Area::new(egui::Id::new("pixme.about_modal"))
-                            .order(egui::Order::Foreground)
-                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                            .show(&ctx, |ui| {
-                                let t = crate::ui::theme::tokens(&ctx);
-                                egui::Frame::default()
-                                    .fill(t.dock)
-                                    .stroke(egui::Stroke::new(1.0, t.card_border))
-                                    .corner_radius(egui::CornerRadius::same(t.radius_lg))
-                                    .show(ui, |ui| {
-                                        ui.set_width(300.0);
-                                        ui.spacing_mut().item_spacing.y = 0.0;
-                                        // Title band: "À propos" + close cross.
-                                        egui::Frame::default()
-                                            .inner_margin(egui::Margin::symmetric(10, 6))
-                                            .fill(t.card)
-                                            .corner_radius(egui::CornerRadius {
-                                                nw: t.radius_lg,
-                                                ne: t.radius_lg,
-                                                sw: 0,
-                                                se: 0,
-                                            })
-                                            .show(ui, |ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(
-                                                            t!("menu.help.about").to_string(),
-                                                        )
-                                                        .color(t.text)
-                                                        .strong(),
-                                                    );
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            let (rect, resp) = ui
-                                                                .allocate_exact_size(
-                                                                    egui::Vec2::splat(20.0),
-                                                                    egui::Sense::click(),
-                                                                );
-                                                            if ui.is_rect_visible(rect) {
-                                                                let hovered = resp.hovered();
-                                                                if hovered {
-                                                                    let fill = egui::Color32::from_rgba_unmultiplied(
-                                                                        t.danger.r(),
-                                                                        t.danger.g(),
-                                                                        t.danger.b(),
-                                                                        34,
-                                                                    );
-                                                                    ui.painter().rect_filled(
-                                                                        rect,
-                                                                        egui::CornerRadius::same(t.radius_sm),
-                                                                        fill,
-                                                                    );
-                                                                }
-                                                                crate::ui::icons::paint(
-                                                                    ui,
-                                                                    rect,
-                                                                    crate::ui::icons::Icon::X,
-                                                                    if hovered { 14.0 } else { 12.0 },
-                                                                    if hovered { t.danger } else { t.icon },
-                                                                );
-                                                            }
-                                                            if resp.clicked() {
-                                                                open = false;
-                                                            }
-                                                        },
-                                                    );
-                                                });
-                                            });
-                                        egui::Frame::default()
-                                            .inner_margin(egui::Margin::same(16))
-                                            .show(ui, |ui| {
-                                                ui.vertical_centered(|ui| {
-                                                    // Full-bleed 256 artwork
-                                                    // (the window icon) — the
-                                                    // 1024 dock master carries
-                                                    // margins + shadow and reads
-                                                    // as "no icon" at 64 px.
-                                                    let icon_rgba =
-                                                        crate::ui::icons::app_icon_rgba(128);
-                                                    let icon_img =
-                                                        egui::ColorImage::from_rgba_unmultiplied(
-                                                            [128, 128],
-                                                            &icon_rgba,
-                                                        );
-                                                    let icon_tex = ctx.load_texture(
-                                                        "pixme://about-icon",
-                                                        icon_img,
-                                                        egui::TextureOptions::LINEAR,
-                                                    );
-                                                    ui.image(egui::load::SizedTexture::new(
-                                                        icon_tex.id(),
-                                                        egui::vec2(64.0, 64.0),
-                                                    ));
-                                                    ui.add_space(6.0);
-                                                    ui.label(
-                                                        egui::RichText::new("PixMe").font(
-                                                            crate::ui::theme::semibold(17.0),
-                                                        ),
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "v{}",
-                                                            env!("CARGO_PKG_VERSION")
-                                                        ))
-                                                        .size(11.0),
-                                                    );
-                                                    ui.add_space(8.0);
-                                                    ui.label(
-                                                        egui::RichText::new(
-                                                            t!("settings.about.copyright")
-                                                                .to_string(),
-                                                        )
-                                                        .size(10.5),
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new(
-                                                            t!("settings.about.license").to_string(),
-                                                        )
-                                                        .size(10.5),
-                                                    );
-                                                });
-                                                ui.add_space(10.0);
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        if crate::ui::widgets::primary_button(
-                                                            ui,
-                                                            "OK",
-                                                        )
-                                                        .clicked()
-                                                        {
-                                                            open = false;
-                                                        }
-                                                    },
-                                                );
-                                            });
-                                    });
-                            });
-                        if !open {
-                            shared.about_open.store(false, Ordering::Relaxed);
-                        }
-                    }
                 });
             }
             AppState::Capturing => {
                 // The freeze happens here, before any capture window exists:
-                // two anchor frames let the bar tear down, then the screen is
+                // anchor frames let the viewer tear down, then the screen is
                 // captured — registering the overlay only *after* the freeze
                 // keeps it out of the photograph.
                 enum Step {
@@ -2310,7 +2751,19 @@ impl eframe::App for PixMeApp {
                         None => Step::Gone,
                         Some(s) if s.failed => Step::Cancel,
                         Some(s) if s.frozen.is_none() => {
-                            s.warm_freeze();
+                            // The freeze waits for the REAL teardown of
+                            // the windows the capture displaced — a fast
+                            // machine counts two warm frames inside one
+                            // DWM composition and the BitBlt still reads
+                            // the dying viewer's pixels (the "ghost"
+                            // watermark). The viewport id leaves
+                            // `raw.viewports` once winit confirms the
+                            // native window is gone.
+                            let gone = ctx.input(|i| {
+                                !i.raw.viewports.contains_key(&viewer_id())
+                                    && !i.raw.viewports.contains_key(&countdown_id())
+                            });
+                            s.warm_freeze(gone);
                             Step::Freeze
                         }
                         Some(s) if s.instant => Step::Confirm,
@@ -2368,8 +2821,8 @@ impl eframe::App for PixMeApp {
         }
 
         // The capture-delay countdown: like the pins it lives outside the
-        // state machine — it can run on top of the bar, the viewer or an
-        // empty desktop. It repaints itself to zero, then fires CaptureNow.
+        // state machine — it can run on top of the viewer or an empty
+        // desktop. It repaints itself to zero, then fires CaptureNow.
         if lock(&self.shared.countdown).is_some() {
             let shared = Arc::clone(&self.shared);
             ctx.show_viewport_deferred(countdown_id(), countdown_builder(), move |ui, _class| {
@@ -2379,18 +2832,18 @@ impl eframe::App for PixMeApp {
                 // Esc cancels the pending capture.
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     *lock(&shared.countdown) = None;
+                    // The countdown hid the viewer on arm — cancelling
+                    // puts it back.
+                    if let Some(state) = lock(&shared.capture_return_to).take() {
+                        shared.enter(state, &ctx);
+                    }
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                     return;
                 }
-                // The countdown parks on the monitor PixMe lives on: the
-                // floating bar's when it is up, the viewer's otherwise —
-                // resolved in native units by the owner window, so no two
-                // windows' point spaces are ever mixed here.
-                let anchor = if *lock(&shared.state) == AppState::Bar {
-                    lock(&shared.bar_monitor).clone()
-                } else {
-                    lock(&shared.viewer_monitor).clone()
-                };
+                // The countdown parks on the viewer's monitor — resolved
+                // in native units by the owner window, so no two windows'
+                // point spaces are ever mixed here.
+                let anchor = lock(&shared.viewer_monitor).clone();
                 let running = lock(&shared.countdown)
                     .as_mut()
                     .is_some_and(|c| c.show(ui, anchor));
@@ -2437,6 +2890,100 @@ impl eframe::App for PixMeApp {
                 shared.pump(&ctx);
                 shared.maybe_focus(&ctx, draw_id());
                 ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                // Geometry, same convention as the viewer: the stashed
+                // target is applied once at open (saved `draw_rect_native`
+                // or centred on the host monitor), then a 250 ms quiet
+                // after the last reported-rect change settles a gesture
+                // into the host monitor's persisted rect.
+                let target = lock(&shared.draw_target).take();
+                if let Some(t) = target {
+                    let ppp = platform::window_ppp(&ctx, t.monitor.scale_factor.max(1.0));
+                    let rect = match t.native_rect {
+                        Some(_) => target_ui_rect(&t, None, ppp),
+                        // Nothing persisted for this monitor: centre the
+                        // window on it at its current (or builder's) size.
+                        None => {
+                            let mon = platform::monitor_ui_rect(&t.monitor, ppp);
+                            let size = ctx
+                                .input(|i| i.viewport().outer_rect)
+                                .map(|r| r.size())
+                                .unwrap_or(egui::vec2(1100.0, 700.0))
+                                .min(mon.size());
+                            egui::Rect::from_center_size(mon.center(), size)
+                        }
+                    };
+                    // `rect` is the OUTER rect: `InnerSize` needs the
+                    // decoration delta (outer − inner reported last
+                    // frame; zero until measured).
+                    let deco =
+                        ctx.input(
+                            |i| match (i.viewport().outer_rect, i.viewport().inner_rect) {
+                                (Some(o), Some(n)) => o.size() - n.size(),
+                                _ => egui::Vec2::ZERO,
+                            },
+                        );
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(rect.min));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        (rect.size() - deco).max(egui::vec2(100.0, 100.0)),
+                    ));
+                    *lock(&shared.draw_monitor) = Some(t.monitor);
+                    // The reported rect lies for a frame or two while the
+                    // move settles — never persist it.
+                    *lock(&shared.draw_geo_settle) = 2;
+                } else if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                    let mut settle = lock(&shared.draw_geo_settle);
+                    if *settle > 0 {
+                        *settle -= 1;
+                    } else {
+                        drop(settle);
+                        let moved = lock(&shared.draw_last_outer).replace(outer) != Some(outer);
+                        if moved {
+                            *lock(&shared.draw_move_at) = Some(std::time::Instant::now());
+                        }
+                        let move_at = *lock(&shared.draw_move_at);
+                        if let Some(t) = move_at {
+                            if t.elapsed() >= std::time::Duration::from_millis(250) {
+                                *lock(&shared.draw_move_at) = None;
+                                // Gesture over — the ONE geometry write:
+                                // persisted under the monitor the window's
+                                // centre actually sits on (free cross-monitor
+                                // drag, same rule as the viewer).
+                                let ppp = platform::window_ppp(&ctx, 1.0);
+                                let centre = platform::ui_to_native(outer.center(), ppp);
+                                let host = {
+                                    let inv = lock(&shared.monitors);
+                                    inv.iter()
+                                        .find(|id| {
+                                            let r = &id.info.rect;
+                                            centre.x >= r.x as f32
+                                                && centre.x < (r.x + r.width as i32) as f32
+                                                && centre.y >= r.y as f32
+                                                && centre.y < (r.y + r.height as i32) as f32
+                                        })
+                                        .map(|id| id.info.clone())
+                                        .or_else(|| lock(&shared.draw_monitor).clone())
+                                };
+                                if let Some(m) = host
+                                    && let Some(id) = shared.monitor_stable_id(&m)
+                                {
+                                    *lock(&shared.draw_monitor) = Some(m.clone());
+                                    let rect = clamped_native_rect(outer, ppp, &m.rect);
+                                    let mut s = lock(&shared.settings);
+                                    let prefs = s.monitors.entry(id).or_default();
+                                    if prefs.draw_rect_native != Some(rect) {
+                                        prefs.draw_rect_native = Some(rect);
+                                        *lock(&shared.monitor_geom_dirty_at) =
+                                            Some(std::time::Instant::now());
+                                    }
+                                }
+                            } else {
+                                // Poll so the settle check still runs
+                                // once the OS stops sending move events.
+                                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                            }
+                        }
+                    }
+                }
                 if ctx.input(|i| i.viewport().close_requested()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     // The session decides: quit silently when clean, or
@@ -2456,6 +3003,10 @@ impl eframe::App for PixMeApp {
                     && let Some(mut session) = lock(&shared.draw).take()
                 {
                     tracing::info!("draw_closed");
+                    // The user's last tool styling survives to the next
+                    // Draw session — same convention as the text_*
+                    // fields, whichever way the window closed.
+                    session.persist_opts(&shared);
                     // The modal closed: the viewer gets focus back.
                     ctx.cmd_if_live(viewer_id(), egui::ViewportCommand::Focus);
                     if outcome == crate::ui::draw::Outcome::Ok {
@@ -2579,32 +3130,6 @@ fn notice_window(ctx: &egui::Context, id: &'static str, slot: &Mutex<Option<Stri
     }
 }
 
-/// The floating bar: borderless, transparent, always on top, sized to its
-/// content; position restored across hide/show cycles.
-fn bar_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
-    let builder = egui::ViewportBuilder::default()
-        .with_title("PixMe Bar")
-        .with_icon(ui::icons::app_icon_data())
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_resizable(false)
-        .with_always_on_top()
-        .with_has_shadow(false)
-        .with_taskbar(false)
-        // Accessory apps stay inert until a window asks for focus.
-        .with_active(true)
-        .with_inner_size([340.0, 48.0]);
-    #[cfg(target_os = "windows")]
-    // winit forces WS_CAPTION at creation — created hidden; the pump's
-    // `strip_undecorated_frame` ShowWindow's it once chrome-free (egui's
-    // `Visible(true)` would re-apply the caption via winit's apply_diff).
-    let builder = builder.with_visible(false);
-    match position {
-        Some(pos) => builder.with_position(pos),
-        None => builder,
-    }
-}
-
 /// The viewer window: decorated, resizable, the app's real home.
 fn viewer_builder(position: Option<egui::Pos2>) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
@@ -2649,6 +3174,54 @@ fn place_viewer_on_monitor(
         mon_min.y + ((mon_size.y - size.y) * 0.5).max(0.0),
     );
     egui::Rect::from_min_size(pos, size)
+}
+
+/// The viewer's landing rect in the target window's UI units: the
+/// persisted native outer rect converted with `ppp` when one was saved
+/// for the monitor, else the keep-if-inside / centred placement.
+fn target_ui_rect(t: &ViewerTarget, current: Option<egui::Rect>, ppp: f32) -> egui::Rect {
+    match t.native_rect {
+        Some([x, y, w, h]) => {
+            let min = platform::native_to_ui(egui::pos2(x as f32, y as f32), ppp);
+            let size = platform::native_to_ui(egui::pos2(w as f32, h as f32), ppp).to_vec2();
+            // Defensive clamp: a stale/corrupt persisted rect (written
+            // during a mixed-DPI transition) must never land the window
+            // larger than the monitor or off-screen. The real rect is
+            // persisted on the next settle, so the entry self-heals.
+            let mon = platform::monitor_ui_rect(&t.monitor, ppp);
+            let size = size.min(mon.size()).max(egui::vec2(100.0, 100.0));
+            let min = min.clamp(mon.min, mon.max - size);
+            egui::Rect::from_min_size(min, size)
+        }
+        None => place_viewer_on_monitor(current, &t.monitor, ppp),
+    }
+}
+
+/// The reported `outer` rect converted to the monitor's native units and
+/// clamped inside `mon`'s bounds — shared by the per-monitor geometry
+/// persistence of every window role (viewer `rect_native`, Draw editor
+/// `draw_rect_native`). The clamp is the DPI-transition guard: during a
+/// mixed-DPI transition `outer` and `ppp` can be mismatched (old points
+/// × new scale), persisting a rect inflated by the ratio — re-applied on
+/// the next relocation it compounds (the window grows at every
+/// cross-DPI move). The real rect is always inside the host's native
+/// bounds, so a clamped write is never lossy here.
+fn clamped_native_rect(
+    outer: egui::Rect,
+    ppp: f32,
+    mon: &crate::capture::PhysicalRect,
+) -> [i32; 4] {
+    let n_min = platform::ui_to_native(outer.min, ppp);
+    let n_max = platform::ui_to_native(outer.max, ppp);
+    let w = (n_max.x - n_min.x).clamp(100.0, mon.width as f32);
+    let h = (n_max.y - n_min.y).clamp(100.0, mon.height as f32);
+    let x = n_min
+        .x
+        .clamp(mon.x as f32, mon.x as f32 + mon.width as f32 - w);
+    let y = n_min
+        .y
+        .clamp(mon.y as f32, mon.y as f32 + mon.height as f32 - h);
+    [x as i32, y as i32, w as i32, h as i32]
 }
 
 /// The capture overlay: a borderless always-on-top window covering the
@@ -2721,7 +3294,8 @@ fn pin_builder(origin: egui::Pos2, size: egui::Vec2) -> egui::ViewportBuilder {
         .with_inner_size(size + egui::vec2(0.0, crate::ui::pin::TOP_MARGIN))
         .with_position(origin - egui::vec2(0.0, crate::ui::pin::TOP_MARGIN));
     #[cfg(target_os = "windows")]
-    // Hidden until `strip_undecorated_frame` shows it (see `bar_builder`).
+    // Hidden until `strip_undecorated_frame` shows it — winit forces
+    // WS_CAPTION at creation; `egui`'s `Visible(true)` would re-apply it.
     let builder = builder.with_visible(false);
     builder
 }
@@ -2742,7 +3316,8 @@ fn countdown_builder() -> egui::ViewportBuilder {
         .with_active(false)
         .with_inner_size([140.0, 140.0]);
     #[cfg(target_os = "windows")]
-    // Hidden until `strip_undecorated_frame` shows it (see `bar_builder`).
+    // Hidden until `strip_undecorated_frame` shows it — winit forces
+    // WS_CAPTION at creation; `egui`'s `Visible(true)` would re-apply it.
     let builder = builder.with_visible(false);
     builder
 }
@@ -2786,6 +3361,12 @@ pub fn run() -> eframe::Result<()> {
             .with_has_shadow(false)
             .with_taskbar(false)
             .with_active(false)
+            // Hidden at creation on Windows only: the strip guard applies
+            // the empty region BEFORE the first ShowWindow — killing the
+            // startup-race ring. macOS keeps it visible: an invisible
+            // ROOT drops repaint requests and starves the command pump
+            // (queued resident-icon commands needed two clicks).
+            .with_visible(cfg!(target_os = "macos"))
             .with_inner_size([1.0, 1.0]),
         // Geometry persistence would restore a stale bar-sized rect onto the
         // invisible anchor; all positions are computed by the app instead.
@@ -2812,7 +3393,6 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn chromeless_viewports_start_hidden() {
-        assert_eq!(bar_builder(None).visible, Some(false));
         assert_eq!(
             pin_builder(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0)).visible,
             Some(false)
@@ -2826,24 +3406,34 @@ mod tests {
 
     fn harness() -> (Shared, egui::Context) {
         let shared = Shared {
-            state: Mutex::new(AppState::Bar),
+            state: Mutex::new(AppState::Idle),
             settings: Mutex::new(Settings::default()),
             viewer: Mutex::new(Viewer::default()),
             viewer_rect: Mutex::new(None),
-            viewer_target_monitor: Mutex::new(None),
-            toolbar: Mutex::new(Toolbar::default()),
-            bar_pos: Mutex::new(None),
-            bar_rect: Mutex::new(None),
-            bar_monitor: Mutex::new(None),
+            viewer_target: Mutex::new(None),
             viewer_monitor: Mutex::new(None),
+            monitors: Mutex::new(Vec::new()),
+            viewer_sync: Mutex::new(ui::viewport_sync::ViewportSync::new("PixMe Viewer")),
+            viewer_geo_settle: Mutex::new(0),
+            viewer_topology_pin: Mutex::new(None),
+            viewer_pin_last: Mutex::new(None),
+            viewer_last_outer: Mutex::new(None),
+            viewer_move_at: Mutex::new(None),
+            draw_target: Mutex::new(None),
+            draw_monitor: Mutex::new(None),
+            draw_last_outer: Mutex::new(None),
+            draw_move_at: Mutex::new(None),
+            draw_geo_settle: Mutex::new(0),
+
+            monitor_geom_dirty_at: Mutex::new(None),
             winit_placements: Mutex::new(Vec::new()),
             settings_open: AtomicBool::new(false),
-            about_open: AtomicBool::new(false),
             settings_draft: Mutex::new(None),
             capture: Mutex::new(None),
             countdown: Mutex::new(None),
             last_fixed_region: Mutex::new(None),
             capture_start_monitor: Mutex::new(None),
+            capture_return_to: Mutex::new(None),
             pins: Mutex::new(Vec::new()),
             next_pin_id: Mutex::new(0),
             save_dialog: Mutex::new(None),
@@ -2854,6 +3444,9 @@ mod tests {
             ),
             restore_rx: Mutex::new(None),
             quit_rx: Mutex::new(None),
+            monitors_rx: Mutex::new(None),
+            display_poll: Mutex::new((platform::display_count(), std::time::Instant::now())),
+
             quit_started: Mutex::new(None),
             save_all: Mutex::new(None),
             save_one: Mutex::new(None),
@@ -2913,26 +3506,13 @@ mod tests {
     fn capture_enters_the_capturing_state() {
         // Region capture arms the selection overlay — the viewer only opens
         // after the overlay confirms. On a headless runner monitor
-        // enumeration may fail instead: the machine must then stay in `Bar`.
+        // enumeration may fail instead: the machine must then stay in `Idle`.
         let (shared, ctx) = harness();
         let state = drive(&shared, &ctx, Command::Capture(CaptureMode::Region));
         assert!(
-            matches!(state, AppState::Capturing | AppState::Bar),
+            matches!(state, AppState::Capturing | AppState::Idle),
             "unexpected state {state:?}"
         );
-    }
-
-    #[test]
-    fn closing_bar_with_empty_session_returns_to_idle() {
-        let (shared, ctx) = harness();
-        assert_eq!(drive(&shared, &ctx, Command::CloseBar), AppState::Idle);
-    }
-
-    #[test]
-    fn closing_bar_with_captures_opens_viewer() {
-        let (shared, ctx) = harness();
-        lock(&shared.viewer).push_stub("capture 1");
-        assert_eq!(drive(&shared, &ctx, Command::CloseBar), AppState::Viewer);
     }
 
     #[test]
@@ -2942,6 +3522,38 @@ mod tests {
         drive(&shared, &ctx, Command::OpenViewer);
         assert_eq!(drive(&shared, &ctx, Command::ViewerClosed), AppState::Idle);
         assert_eq!(lock(&shared.viewer).tabs.len(), 1);
+    }
+
+    /// The resident icon's left click toggles: opens the viewer from
+    /// Idle, closes it back to the resident icon when it is up and
+    /// focused.
+    #[test]
+    fn toggle_viewer_opens_and_closes() {
+        let (shared, ctx) = harness();
+        assert_eq!(
+            drive(&shared, &ctx, Command::ToggleViewer),
+            AppState::Viewer
+        );
+        // The viewer reports itself focused — the click closes it.
+        ctx.input_mut(|i| {
+            i.raw.viewports.entry(viewer_id()).or_default().focused = Some(true);
+        });
+        assert_eq!(drive(&shared, &ctx, Command::ToggleViewer), AppState::Idle);
+    }
+
+    /// Up but merely behind another app — the click raises it (open
+    /// semantics), never closes it into `Idle`.
+    #[test]
+    fn toggle_viewer_behind_raises_instead_of_closing() {
+        let (shared, ctx) = harness();
+        drive(&shared, &ctx, Command::OpenViewer);
+        ctx.input_mut(|i| {
+            i.raw.viewports.entry(viewer_id()).or_default().focused = Some(false);
+        });
+        assert_eq!(
+            drive(&shared, &ctx, Command::ToggleViewer),
+            AppState::Viewer
+        );
     }
 
     /// Closing the viewer window just returns the resident app to
@@ -3165,16 +3777,6 @@ mod tests {
         assert!(lock(&shared.viewer).tabs.is_empty());
     }
 
-    #[test]
-    fn bar_and_viewer_are_never_shown_together() {
-        // Exclusivity is enforced structurally: the state machine holds one
-        // active window at a time and only that viewport is registered.
-        let (shared, ctx) = harness();
-        drive(&shared, &ctx, Command::OpenViewer);
-        assert_eq!(drive(&shared, &ctx, Command::ShowBar), AppState::Bar);
-        assert_eq!(drive(&shared, &ctx, Command::OpenViewer), AppState::Viewer);
-    }
-
     /// Every `Command` variant, one instance each. `is_command_enabled`
     /// matches exhaustively (no wildcard arm), so a new variant added here
     /// without a ruling in the table fails to compile — and forgetting to
@@ -3185,9 +3787,8 @@ mod tests {
             Command::CaptureNow(CaptureMode::Region),
             Command::ConfirmCapture,
             Command::CancelCapture,
-            Command::ShowBar,
             Command::OpenViewer,
-            Command::CloseBar,
+            Command::ToggleViewer,
             Command::ViewerClosed,
             Command::OpenSettings,
             Command::CloseSettings,
@@ -3210,6 +3811,9 @@ mod tests {
             Command::ConfirmSave,
             Command::ConfirmDiscard,
             Command::ConfirmCancel,
+            Command::SelectMonitor(String::new()),
+            Command::RefreshMonitors,
+            Command::RenameMonitor(String::new()),
             Command::ClosePin(0),
             Command::CopyPin(0),
             Command::SavePin(0),
@@ -3249,9 +3853,8 @@ mod tests {
             ),
             (Command::ConfirmCapture, true, true, true, true),
             (Command::CancelCapture, true, true, true, true),
-            (Command::ShowBar, false, false, false, false),
             (Command::OpenViewer, true, false, false, false),
-            (Command::CloseBar, true, true, true, true),
+            (Command::ToggleViewer, true, false, false, false),
             (Command::ViewerClosed, true, true, true, true),
             (Command::OpenSettings, true, false, false, false),
             (Command::CloseSettings, true, true, true, true),
@@ -3280,6 +3883,21 @@ mod tests {
             (Command::ConfirmSave, true, true, true, true),
             (Command::ConfirmDiscard, true, true, true, true),
             (Command::ConfirmCancel, true, true, true, true),
+            (
+                Command::SelectMonitor(String::new()),
+                false,
+                false,
+                false,
+                false,
+            ),
+            (Command::RefreshMonitors, false, false, false, false),
+            (
+                Command::RenameMonitor(String::new()),
+                false,
+                false,
+                false,
+                false,
+            ),
             (Command::ClosePin(1), true, true, true, true),
             (Command::CopyPin(1), true, true, true, true),
             (Command::SavePin(1), false, false, false, false),
@@ -3328,7 +3946,6 @@ mod tests {
                     | Command::ClosePin(_)
                     | Command::CopyPin(_)
                     | Command::ViewerClosed
-                    | Command::CloseBar
             );
             assert_eq!(
                 is_command_enabled(&command, ModalState::Capturing),
@@ -3419,6 +4036,7 @@ mod tests {
                         shadow: 0.0,
                     },
                 ),
+                tool: None,
             });
             viewer.push_capture_document(doc, "dup".to_owned());
             viewer.push_capture_document(
@@ -3551,50 +4169,5 @@ mod tests {
                 "ClosePin(7) was not queued after clicking at {press_pos:?}"
             );
         }
-    }
-
-    /// `ShowBar` restores the remembered bar spot only while it lands on
-    /// the anchor monitor — a spot from a since-moved viewer is stale.
-    #[test]
-    fn remembered_bar_spot_must_share_the_anchor_monitor() {
-        fn monitor(x: i32, y: i32) -> MonitorInfo {
-            MonitorInfo {
-                id: x as u32,
-                name: "m".into(),
-                rect: crate::capture::PhysicalRect {
-                    x,
-                    y,
-                    width: 1000,
-                    height: 800,
-                },
-                // scale 1.0 keeps `ui_to_native` an identity on both
-                // OSes so the hit test is deterministic.
-                scale_factor: 1.0,
-                is_primary: false,
-            }
-        }
-        let sidecar = monitor(-1133, 819);
-        let main5k = monitor(0, 0);
-        let monitors = vec![sidecar.clone(), main5k];
-        // On the Sidecar display, a spot on it restores.
-        assert!(ui_pos_on_anchor(
-            egui::pos2(-700.0, 900.0),
-            &monitors,
-            &sidecar
-        ));
-        // …but a spot remembered on the BenQ does not.
-        assert!(!ui_pos_on_anchor(
-            egui::pos2(500.0, 300.0),
-            &monitors,
-            &sidecar
-        ));
-        // A spot outside every monitor is stale too.
-        assert!(!ui_pos_on_anchor(
-            egui::pos2(9999.0, 9999.0),
-            &monitors,
-            &sidecar
-        ));
-        // No monitors enumerated (xcap failure): nothing restores.
-        assert!(!ui_pos_on_anchor(egui::pos2(-700.0, 900.0), &[], &sidecar));
     }
 }

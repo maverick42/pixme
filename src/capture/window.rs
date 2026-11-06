@@ -39,7 +39,7 @@ pub struct WindowInfo {
 }
 
 /// All on-screen pickable windows, front-to-back — minus minimized, tiny,
-/// OS-chrome-layer and PixMe's own windows (the bar and the overlay must
+/// OS-chrome-layer and PixMe's own windows (the overlay and pins must
 /// never be capturable).
 pub fn windows() -> Result<Vec<WindowInfo>, CaptureError> {
     let own_pid = std::process::id();
@@ -81,6 +81,9 @@ pub fn capture_window(id: u32) -> Result<Capture, CaptureError> {
     // Same reasoning as `screen::capture_all_monitors`: the OS composites
     // the cursor into the frame — hide it for the grab.
     crate::platform::hide_cursor();
+    // Same as `screen::`: PixMe windows are excluded only for the
+    // guard's scope, not permanently — Teams keeps seeing them.
+    let _excl = crate::platform::capture_exclusion();
     let image_result = w.capture_image();
     crate::platform::unhide_cursor();
     let image = image_result.map_err(|e| CaptureError::Failed(e.to_string()))?;

@@ -43,9 +43,9 @@ on macOS and Windows) and falls back to **Dark** when the OS reports nothing.
 
 | Token | Pro (dark) | Pro Light | Use |
 | --- | --- | --- | --- |
-| `chrome` | `#323232` | `#F0F0F0` | Window chrome, toolbar bar surface |
-| `dock` | `#1E1E1E` | `#E2E2E2` | Background behind cards |
-| `card` | `#323232` | `#F0F0F0` | Panels / floating bar fill |
+| `chrome` | `#323232` | `#F0F0F0` | Window chrome, toolbar band surface |
+| `dock` | `#1E1E1E` | `#E2E2E2` | Background behind cards, vbar fill |
+| `card` | `#323232` | `#F0F0F0` | Panels / pinned-capture fill |
 | `card_border` | `#1E1E1E` | `#D6D6D6` | Panel outline |
 | `field` | `#242424` | `#FFFFFF` | Inputs, dropdowns |
 | `field_border` | `#4A4A4A` | `#BABABA` | Input outline |
@@ -170,17 +170,35 @@ From the reference's `widgets.rs`/`icons.rs`: `icon_button`, `primary_button` /
 `toggle`, `checkbox`, `card` frame, `hairline`/`vline`, `elided_label`
 (truncate with `…`, full text on hover), `menu_scroll` for long popups.
 
-The floating mini-toolbar is a borderless, transparent, always-on-top
-viewport; its visible frame is drawn as `card` fill + `card_border` stroke +
-`radius_lg` + `window_shadow`, dragged via `ViewportCommand::start_drag`.
+The viewer's vertical capture bar ("vbar") is a fixed 36 pt
+`egui::Panel::right` inside the viewer window — `dock` fill, the panel's
+built-in separator (which reads the theme's `separator` token), icon
+buttons for the five capture modes plus delay and options popups. It is
+always visible in Tabs and Mosaic modes, gated by the shared command
+table like menu entries.
+
+The vbar and the horizontal toolbar honour the persisted `icon_style`
+setting: `standard` (the reference look above), `color` (same Lucide
+glyphs in per-icon hues) or `duotone` (Phosphor two-tone SVGs, MIT,
+`assets/icons-duotone/`, restyled white then tinted like Lucide so the
+fill layer lands at 20 % of the hue). The per-icon palette lives in
+`theme::icon_hue` — theme-independent constants like the annotation
+colours: window/object violet `#A38BF0`, region `#4C9AFF`, full screen
+`#3EBB8A`, fixed region `#F08A3C`, pin `#E56A8F`, delay `#E5B43C`,
+options `#9AA5B1`; toolbar hues: open `#E5B43C`, save `#4C9AFF`, zoom
+group `#5BC0DE`, view toggles `#9AA5B1`, draw `#F08A3C`, resize
+`#3EBB8A`, copy `#E56A8F`, print `#9AA5B1`. Widget-state overrides
+still win (disabled → `text_faint`, armed delay → `danger`).
 
 ## Contrast guarantees (tests ported)
 
 WCAG 2 contrast helper from `theme.rs` tests; floors: body `text` ≥ 4.5:1,
 `icon`/`text_dim` ≥ 3:1 on `chrome`, `dock`, `card`, `field`, `hover`,
 `tab_strip`, `row_selected`; `accent_text` ≥ 3:1 on `card`; close glyph ≥ 4.5:1.
-The floating bar is additionally checked visually over light and dark desktop
-backgrounds (it floats above arbitrary content; `card` + `shadow` isolate it).
+The vbar sits inside the viewer's own `dock` surface, so no extra
+isolation check is needed; overlay chrome (capture veil, magnifier card)
+is additionally verified visually over arbitrary desktop content since
+it floats above it.
 
 ## Reference source files analysed (visual reference checkout)
 

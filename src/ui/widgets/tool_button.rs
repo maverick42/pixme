@@ -6,6 +6,7 @@ use egui::{
     Align2, Color32, CornerRadius, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
+use crate::config::IconStyle;
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme;
 
@@ -29,15 +30,49 @@ pub fn tool_button(
     selected: bool,
     enabled: bool,
 ) -> Response {
+    tool_button_styled(
+        ui,
+        icon,
+        label,
+        has_menu,
+        selected,
+        enabled,
+        IconStyle::Standard,
+    )
+}
+
+/// Same button honouring `style`: `Color` paints the glyph in its own
+/// hue, `Duotone` swaps in the Phosphor two-tone glyph. The caret glyph
+/// stays Lucide; the disabled state overrides the style like everywhere.
+pub fn tool_button_styled(
+    ui: &mut Ui,
+    icon: Icon,
+    label: &str,
+    has_menu: bool,
+    selected: bool,
+    enabled: bool,
+    style: IconStyle,
+) -> Response {
     let t = theme::tokens(ui.ctx());
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(TOOL_W, TOOL_H), Sense::click());
+    // The caption zone is `rect - caret`: grow the button when the label
+    // would clip (long translations like "Enregistrer" under the caret).
+    let label_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), theme::medium(10.0), t.text)
+        .size()
+        .x;
+    let width = TOOL_W.max(label_w + 6.0 + if has_menu { CARET_W } else { 0.0 });
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, TOOL_H), Sense::click());
     let (icon_tint, text_col) = if !enabled {
         (t.text_faint, t.text_faint)
-    } else if response.hovered() {
-        // Hover pops: accent icon + soft ring over the tinted fill.
-        (t.accent, t.text)
     } else {
-        (t.icon, t.text)
+        let state_tint = if response.hovered() {
+            // Hover pops: accent icon + soft ring over the tinted fill.
+            t.accent
+        } else {
+            t.icon
+        };
+        (icons::hue(icon, style).unwrap_or(state_tint), t.text)
     };
     if ui.is_rect_visible(rect) {
         let (fill, stroke) = if !enabled {
@@ -64,7 +99,7 @@ pub fn tool_button(
             rect.width()
         };
         let main = Rect::from_min_size(rect.min, Vec2::new(main_w, rect.height()));
-        icons::paint(
+        icons::styled_paint(
             ui,
             Rect::from_center_size(
                 Pos2::new(main.center().x, main.min.y + 15.0),
@@ -72,6 +107,7 @@ pub fn tool_button(
             ),
             icon,
             ICON_SIZE,
+            style,
             icon_tint,
         );
         // Caption: centred in the main zone, clipped to it.

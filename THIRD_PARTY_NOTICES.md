@@ -6,11 +6,11 @@ adapted code style) live in `ATTRIBUTION.md`.
 
 ## Noto Color Emoji (PNG artwork, `assets/emoji/`)
 
-- **Project**: Noto Emoji — https://github.com/googlefonts/noto-emoji
+- **Project**: Noto Emoji — <https://github.com/googlefonts/noto-emoji>
 - **Copyright**: Google Inc. (see `AUTHORS`/`CONTRIBUTORS` upstream)
 - **Source revision**: commit `41e31b110b4eb929dffb410264694a06205b7ad7`
 - **License**: Apache License 2.0 — verbatim text below and at
-  https://github.com/googlefonts/noto-emoji/blob/41e31b110b4eb929dffb410264694a06205b7ad7/LICENSE
+  <https://github.com/googlefonts/noto-emoji/blob/41e31b110b4eb929dffb410264694a06205b7ad7/LICENSE>
 - **NOTICE file**: none exists at the pinned commit (only `AUTHORS` and
   `CONTRIBUTORS`), so no NOTICE text is reproduced here.
 - **Taken**: 64 curated PNGs, `png/128/emoji_u<codepoint>.png`,
@@ -18,7 +18,7 @@ adapted code style) live in `ATTRIBUTION.md`.
 
 Bundled files (manifest order, `assets/emoji/manifest.txt`):
 
-```
+```text
 emoji_u2705.png  emoji_u274c.png  emoji_u2714.png  emoji_u26a0.png
 emoji_u2757.png  emoji_u2753.png  emoji_u1f6ab.png emoji_u26d4.png
 emoji_u1f6d1.png emoji_u1f534.png emoji_u1f7e2.png emoji_u1f7e1.png
@@ -39,6 +39,7 @@ emoji_u1f4f7.png emoji_u270f.png  emoji_u1f550.png emoji_u1f514.png
 
 ---
 
+```text
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
@@ -240,3 +241,4 @@ emoji_u1f4f7.png emoji_u270f.png  emoji_u1f550.png emoji_u1f514.png
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+```

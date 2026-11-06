@@ -17,9 +17,9 @@
 use std::cell::RefCell;
 
 use rust_i18n::t;
-use tray_icon::TrayIcon;
 use tray_icon::menu::accelerator::{Accelerator, Code, Modifiers};
 use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
 
 use super::PlatformServices;
 use crate::capture::CaptureError;
@@ -32,11 +32,6 @@ impl PlatformServices for MacOs {
     fn ensure_capture_permission(&self) -> Result<(), CaptureError> {
         // Phase 3: CGPreflightScreenCaptureAccess / CGRequestScreenCaptureAccess.
         Ok(())
-    }
-
-    fn has_native_app_menu(&self) -> bool {
-        // The PixMe/Capture/File/Window menus live on the system menu bar.
-        true
     }
 
     fn capture_permission_status(&self) -> Option<bool> {
@@ -87,20 +82,6 @@ struct Installed {
     _tray: Option<TrayIcon>,
     _app_menu: Menu,
     labels: Labels,
-    /// File ▸ Recents: the submenu, its parent and the file list it was
-    /// last built with — [`sync_recent_menu`] re-syncs it because a
-    /// native menu is not re-queried when settings change.
-    recent: RecentMenu,
-}
-
-/// The File ▸ Recents submenu state (dynamic, unlike the keyed items).
-struct RecentMenu {
-    /// The "Fichier" submenu the Recents submenu sits in.
-    parent: Submenu,
-    sub: Submenu,
-    items: Vec<MenuItem>,
-    paths: Vec<std::path::PathBuf>,
-    shown: bool,
 }
 
 thread_local! {
@@ -117,27 +98,6 @@ fn append(menu: &impl MenuAppend, item: &dyn IsMenuItem) {
 
 fn separator(menu: &impl MenuAppend) {
     append(menu, &PredefinedMenuItem::separator());
-}
-
-/// Metadata for the native About panel (PixMe menu → "About PixMe").
-/// `license`, `authors`, `comments` and `website` are unsupported on
-/// macOS; the panel shows name, version, copyright and the artwork.
-fn about_metadata() -> tray_icon::menu::AboutMetadata {
-    let icon = {
-        let d = icons::dock_icon_data();
-        tray_icon::menu::Icon::from_rgba(d.rgba.clone(), d.width, d.height).ok()
-    };
-    tray_icon::menu::AboutMetadata {
-        name: Some("PixMe".to_owned()),
-        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        copyright: Some(format!(
-            "© 2026 Frédérik Benoist (dev.q2ii.fr)
-{}",
-            t!("settings.about.license")
-        )),
-        icon,
-        ..Default::default()
-    }
 }
 
 /// The append operation `Menu` and `Submenu` share.
@@ -180,35 +140,37 @@ pub fn install_ui(ctx: &egui::Context) {
             crate::app::wake_viewports(&repaint_ctx);
         }
     }));
+    let tray_ctx = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        // Left click toggles the viewer; the menu stays on the right
+        // click (`with_menu_on_left_click(false)` below).
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Down,
+            ..
+        } = event
+        {
+            super::queue_menu_command(crate::app::Command::ToggleViewer);
+            crate::app::wake_viewports(&tray_ctx);
+        }
+    }));
 
     let mut labels = Labels::default();
-
-    // Status item: the same two actions the Windows tray menu carries.
-    // Quitting lives exclusively in the PixMe application menu.
-    let status_menu = Menu::new();
-    item(
-        &mut labels,
-        &status_menu,
-        "take_capture",
-        "menubar.take_capture",
-        None,
-    );
-    item(
-        &mut labels,
-        &status_menu,
-        "open_viewer",
-        "menubar.open_viewer",
-        None,
-    );
-    let tray = install_status_item(status_menu);
+    // Status item: pure toggle surface — left click toggles the viewer
+    // (no right-click menu: the app menu carries the same entries).
+    let tray = install_status_item();
+    install_dock_reopen_hook(ctx.clone());
 
     // Application menu bar (system menu bar, always present).
     let app_menu = Menu::new();
     let app = Submenu::new("PixMe", true);
-    let about =
-        PredefinedMenuItem::about(Some(t!("menu.app.about").as_ref()), Some(about_metadata()));
+    // The About entry opens the settings modal on its About page —
+    // one About surface on both OSes, no native panel.
+    let about = MenuItem::with_id("about", t!("menu.app.about").as_ref(), true, None);
     append(&app, &about);
-    labels.predef.push((about, "menu.app.about"));
+    labels
+        .items
+        .push((about, "menu.app.about", "about".to_owned()));
     // Greyed until the website exists — registered for relabeling but its
     // id maps to no command, so `sync_menu_enabled` leaves it disabled.
     let visit = MenuItem::with_id(
@@ -221,6 +183,13 @@ pub fn install_ui(ctx: &egui::Context) {
     labels
         .items
         .push((visit, "menu.help.visit_site", "visit_site".to_owned()));
+    item(
+        &mut labels,
+        &app,
+        "reset_monitors",
+        "menubar.reset_monitors",
+        None,
+    );
     separator(&app);
     item(
         &mut labels,
@@ -238,70 +207,6 @@ pub fn install_ui(ctx: &egui::Context) {
         Some(Accelerator::new(Modifiers::META, Code::KeyQ)),
     );
     append(&app_menu, &app);
-
-    // Mirrors the viewer's egui File menu (minus Quit, which lives in
-    // the PixMe menu here): Open / Import | Save / Save all / Rename /
-    // Delete | Recents / last folder | Print.
-    let file = Submenu::new(t!("menu.file").as_ref(), true);
-    labels.subs.push((file.clone(), "menu.file"));
-    item(
-        &mut labels,
-        &file,
-        "file.open",
-        "menu.file.open",
-        Some(Accelerator::new(Modifiers::META, Code::KeyO)),
-    );
-    item(
-        &mut labels,
-        &file,
-        "import_clipboard",
-        "menu.app.import_clipboard",
-        Some(Accelerator::new(
-            Modifiers::META | Modifiers::ALT,
-            Code::KeyV,
-        )),
-    );
-    separator(&file);
-    item(
-        &mut labels,
-        &file,
-        "file.save",
-        "menu.file.save",
-        Some(Accelerator::new(Modifiers::META, Code::KeyS)),
-    );
-    item(
-        &mut labels,
-        &file,
-        "file.save_all",
-        "menu.file.save_all",
-        Some(Accelerator::new(
-            Modifiers::META | Modifiers::SHIFT,
-            Code::KeyS,
-        )),
-    );
-    item(&mut labels, &file, "file.rename", "menu.file.rename", None);
-    item(&mut labels, &file, "file.delete", "menu.file.delete", None);
-    separator(&file);
-    // The Recents submenu is appended by `sync_recent_menu` only while
-    // the list is non-empty — hidden entirely when it is, as on Windows.
-    let recent_sub = Submenu::new(t!("menu.file.recent").as_ref(), true);
-    labels.subs.push((recent_sub.clone(), "menu.file.recent"));
-    item(
-        &mut labels,
-        &file,
-        "file.open_last_dir",
-        "vbar.open.last_dir",
-        None,
-    );
-    separator(&file);
-    item(
-        &mut labels,
-        &file,
-        "file.print",
-        "menu.file.print",
-        Some(Accelerator::new(Modifiers::META, Code::KeyP)),
-    );
-    append(&app_menu, &file);
 
     // The Edit submenu carries the OS copy/paste conventions (⌘C/⌘V):
     // key equivalents go through AppKit, so they reach us no matter
@@ -329,19 +234,6 @@ pub fn install_ui(ctx: &egui::Context) {
     item(&mut labels, &edit, "edit.copy", "menu.edit.copy", None);
     append(&app_menu, &edit);
 
-    // The viewer's Capture menu — a single launch action, like the "+"
-    // tab: the mode picker lives on the floating bar.
-    let capture = Submenu::new(t!("menu.capture").as_ref(), true);
-    labels.subs.push((capture.clone(), "menu.capture"));
-    item(
-        &mut labels,
-        &capture,
-        "capture.launch",
-        "menu.capture.launch",
-        None,
-    );
-    append(&app_menu, &capture);
-
     let window = Submenu::new(t!("menu.window").as_ref(), true);
     labels.subs.push((window.clone(), "menu.window"));
     for (make, key) in [
@@ -365,13 +257,6 @@ pub fn install_ui(ctx: &egui::Context) {
             _tray: tray,
             _app_menu: app_menu,
             labels,
-            recent: RecentMenu {
-                parent: file,
-                sub: recent_sub,
-                items: Vec::new(),
-                paths: Vec::new(),
-                shown: false,
-            },
         });
     });
 }
@@ -418,71 +303,16 @@ pub fn sync_menu_enabled(
                     item.set_enabled(enabled(&command));
                 }
             }
-            for item in &installed.recent.items {
-                if let Some(command) = super::command_from_menu_id(item.id().0.as_str()) {
-                    item.set_enabled(enabled(&command));
-                }
-            }
-        }
-    });
-}
-
-/// Rebuilds the File ▸ Recents submenu when `recents` no longer matches
-/// the list it was built with — settings change without a modal
-/// transition, so `Shared::pump` feeds this every pass (cheap compare).
-/// Called on the main thread, where the thread_local muda handles live.
-pub fn sync_recent_menu(recents: &[std::path::PathBuf]) {
-    INSTALLED.with(|cell| {
-        let Some(installed) = &mut *cell.borrow_mut() else {
-            return;
-        };
-        let recent = &mut installed.recent;
-        if recent.paths == recents {
-            return;
-        }
-        recent.paths = recents.to_vec();
-        while recent.sub.remove_at(0).is_some() {}
-        recent.items.clear();
-        if recents.is_empty() {
-            if recent.shown {
-                if let Err(err) = recent.parent.remove(&recent.sub) {
-                    tracing::warn!("cannot remove recent submenu: {err}");
-                }
-                recent.shown = false;
-            }
-            return;
-        }
-        for path in recents {
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let item = MenuItem::with_id(format!("recent:{}", path.display()), name, true, None);
-            append(&recent.sub, &item);
-            recent.items.push(item);
-        }
-        if !recent.shown {
-            // Insert just before "Ouvrir le dernier dossier" — mirroring
-            // the viewer's File menu order.
-            let pos = recent
-                .parent
-                .items()
-                .iter()
-                .position(|kind| kind.id().0 == "file.open_last_dir")
-                .unwrap_or_else(|| recent.parent.items().len());
-            if let Err(err) = recent.parent.insert(&recent.sub, pos) {
-                tracing::warn!("cannot insert recent submenu: {err}");
-            }
-            recent.shown = true;
         }
     });
 }
 
 /// The menu-bar status item with its template (monochrome) icon.
-fn install_status_item(menu: Menu) -> Option<TrayIcon> {
+fn install_status_item() -> Option<TrayIcon> {
     let mut builder = TrayIcon::builder()
-        .with_menu(Box::new(menu))
-        .with_menu_on_left_click(true)
+        // Left click toggles the viewer (TrayIconEvent); no menu —
+        // the app menu bar's PixMe menu carries the same entries.
+        .with_menu_on_left_click(false)
         .with_tooltip("PixMe");
     match tray_icon::Icon::from_rgba(icons::menubar_icon_rgba(), STATUS_ICON_PX, STATUS_ICON_PX) {
         Ok(icon) => builder = builder.with_icon_templated(icon),
@@ -881,7 +711,7 @@ pub fn cursor_snapshot(scale_factor: f32) -> Option<super::CursorSnapshot> {
             cursor = send_id(cls, sel_registerName(c"currentCursor".as_ptr()));
         }
         // The pointer may sit over another app's window (a delayed capture,
-        // or right after the bar tore down): both "current" cursors are
+        // or right after the viewer tore down): both "current" cursors are
         // then NULL — fall back to the standard arrow so the stamp always
         // has an image when the user asked for the pointer in captures.
         if cursor.is_null() {
@@ -1064,7 +894,7 @@ pub fn dismiss_active_menus() -> bool {
 /// is deprecated there and silently ignored on 15.x, which left the real
 /// menu bar interactive during captures); the legacy selector is the
 /// fallback on older systems. Main thread only.
-fn activate_app() {
+pub fn activate_app() {
     use std::ffi::c_void;
 
     #[link(name = "objc", kind = "dylib")]
@@ -1075,14 +905,24 @@ fn activate_app() {
     }
 
     type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendUsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+    type MsgSendIdUsize = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
     type MsgSendVoid = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    type MsgSendVoidId = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
     type MsgSendVoidBool = unsafe extern "C" fn(*mut c_void, *mut c_void, bool);
+    type MsgSendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
     type MsgSendBoolSel = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
 
     unsafe {
         let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_usize: MsgSendUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_usize: MsgSendIdUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_isize: MsgSendIsize = std::mem::transmute(objc_msgSend as *const ());
         let send_void: MsgSendVoid = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_id: MsgSendVoidId = std::mem::transmute(objc_msgSend as *const ());
         let send_void_bool: MsgSendVoidBool = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool: MsgSendBool = std::mem::transmute(objc_msgSend as *const ());
         let send_bool_sel: MsgSendBoolSel = std::mem::transmute(objc_msgSend as *const ());
         let cls = objc_getClass(c"NSApplication".as_ptr());
         if cls.is_null() {
@@ -1103,6 +943,85 @@ fn activate_app() {
                 true,
             );
         }
+        // Any normal-level window (the viewer — the 1×1 anchor is
+        // floating-level) that is miniaturized in the Dock is pulled
+        // straight out and ordered front: `ViewportCommand::Minimized(false)`
+        // waits on the child viewport's pass, which AppKit pauses while
+        // the window is minimized.
+        let windows = send_id(app, sel_registerName(c"windows".as_ptr()));
+        if !windows.is_null() {
+            let count = send_usize(windows, sel_registerName(c"count".as_ptr()));
+            let sel_obj = sel_registerName(c"objectAtIndex:".as_ptr());
+            let sel_level = sel_registerName(c"level".as_ptr());
+            let sel_min = sel_registerName(c"isMiniaturized".as_ptr());
+            let sel_demin = sel_registerName(c"deminiaturize:".as_ptr());
+            let sel_vis = sel_registerName(c"isVisible".as_ptr());
+            let sel_key_front = sel_registerName(c"makeKeyAndOrderFront:".as_ptr());
+            for i in 0..count {
+                let win = send_id_usize(windows, sel_obj, i);
+                if win.is_null() || send_isize(win, sel_level) != 0 {
+                    continue;
+                }
+                let was_min = send_bool(win, sel_min);
+                if was_min {
+                    send_void_id(win, sel_demin, std::ptr::null_mut());
+                }
+                if was_min || send_bool(win, sel_vis) {
+                    send_void_id(win, sel_key_front, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+}
+
+/// Whether the viewer's native `NSWindow` is currently miniaturized in
+/// the Dock (yellow `-` button): `ToggleViewer` must then restore it
+/// instead of closing it to `Idle`.
+pub fn viewer_is_minimized() -> bool {
+    use std::ffi::c_void;
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendUsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+    type MsgSendIdUsize = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
+    type MsgSendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_usize: MsgSendUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_usize: MsgSendIdUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_isize: MsgSendIsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool: MsgSendBool = std::mem::transmute(objc_msgSend as *const ());
+        let cls = objc_getClass(c"NSApplication".as_ptr());
+        if cls.is_null() {
+            return false;
+        }
+        let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
+        if app.is_null() {
+            return false;
+        }
+        let windows = send_id(app, sel_registerName(c"windows".as_ptr()));
+        if windows.is_null() {
+            return false;
+        }
+        let count = send_usize(windows, sel_registerName(c"count".as_ptr()));
+        let sel_obj = sel_registerName(c"objectAtIndex:".as_ptr());
+        let sel_level = sel_registerName(c"level".as_ptr());
+        let sel_min = sel_registerName(c"isMiniaturized".as_ptr());
+        for i in 0..count {
+            let win = send_id_usize(windows, sel_obj, i);
+            if !win.is_null() && send_isize(win, sel_level) == 0 && send_bool(win, sel_min) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1250,4 +1169,370 @@ pub fn elevate_overlay() {
             }
         }
     }
+}
+
+/// The display's stable UUID (`CGDisplayCreateUUIDFromDisplayID`) — derived
+/// from the monitor's vendor/model/serial, it survives reconnects, port
+/// changes and reboots, unlike `CGDirectDisplayID` which is per-session.
+/// `None` when the OS reports none: the caller falls back to a geometry key.
+pub(crate) fn stable_monitor_id(monitor: &crate::capture::MonitorInfo) -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::ffi::c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *const c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        // `NULL` allocator = kCFAllocatorDefault.
+        fn CFUUIDCreateString(alloc: *const c_void, uuid: *const c_void) -> CFStringRef;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    unsafe {
+        let uuid = CGDisplayCreateUUIDFromDisplayID(monitor.id);
+        if uuid.is_null() {
+            return None;
+        }
+        let raw = CFUUIDCreateString(std::ptr::null(), uuid);
+        CFRelease(uuid);
+        if raw.is_null() {
+            return None;
+        }
+        Some(CFString::wrap_under_create_rule(raw).to_string())
+    }
+}
+/// No-op on macOS: the capture kiosk (`presentationOptions` +
+/// screensaver-level overlay) already keeps the session's focus —
+/// there is nothing to hand back.
+pub fn refocus_capture_overlay(_ctx: &egui::Context, _id: egui::ViewportId) {}
+
+/// Classifies `info` for the status-strip icon: `CGDisplayIsBuiltin`
+/// covers the laptop panel. The `IODisplayCreateInfoDictionary`
+/// transport splits the rest — `"Virtual"` marks virtual/indirect
+/// displays; an iPad is only claimed `Tablet` when the product name
+/// mentions it (Sidecar), never on the transport alone. Uncertain
+/// lookups fall back to `Unknown`; a plain external monitor reports
+/// no virtual transport → `External`.
+pub(crate) fn monitor_kind(info: &crate::capture::MonitorInfo) -> crate::capture::MonitorKind {
+    use crate::capture::MonitorKind;
+    use std::ffi::{c_char, c_void};
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayIsBuiltin(display: u32) -> bool;
+        fn CGDisplayIOServicePort(display: u32) -> u32;
+    }
+    unsafe extern "C" {
+        fn dlsym(handle: *const c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryEntryCreateCFProperties(
+            entry: u32,
+            properties: *mut core_foundation::dictionary::CFDictionaryRef,
+            allocator: *const c_void,
+            options: u32,
+        ) -> i32;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFStringGetCString(
+            s: *const c_void,
+            buf: *mut c_char,
+            size: isize,
+            encoding: u32,
+        ) -> bool;
+        fn CFRelease(cf: *const c_void);
+        fn CFNumberGetValue(n: *const c_void, ty: i64, out: *mut i32) -> bool;
+    }
+
+    let id = info.id;
+    if unsafe { CGDisplayIsBuiltin(id) } {
+        return MonitorKind::BuiltIn;
+    }
+    // `NSScreen.localizedName` is the one reliable Sidecar signal on
+    // Apple Silicon — an iPad reports "Sidecar Display (AirPlay)" or
+    // the device name there even though `CGDisplayIOServicePort` is
+    // dead (returns 0). Checked first: it must not be gated behind
+    // the IOKit probe below. `Tablet` only on an explicit iPad/
+    // Sidecar marker; a virtual/AirPlay name without it → `Virtual`.
+    let localized = ns_localized_name(id).to_lowercase();
+    if localized.contains("ipad") || localized.contains("sidecar") {
+        return MonitorKind::Tablet;
+    }
+    if localized.contains("virtual") || localized.contains("airplay") {
+        return MonitorKind::Virtual;
+    }
+    // `CGDisplayIsVirtual` marks virtual displays — Sidecar iPads
+    // included; they report no IODisplay transport, so without this
+    // they fell to `Unknown`. It isn't exported by older SDKs — weak
+    // `dlsym` lookup so the check simply stays false where missing.
+    let is_virtual = unsafe {
+        let f = dlsym(-2isize as *const c_void, c"CGDisplayIsVirtual".as_ptr());
+        if f.is_null() {
+            false
+        } else {
+            let f: unsafe extern "C" fn(u32) -> bool = std::mem::transmute(f);
+            f(id)
+        }
+    };
+    if is_virtual {
+        return MonitorKind::Virtual;
+    }
+
+    let port = unsafe { CGDisplayIOServicePort(id) };
+    if port == 0 {
+        // No IOKit entry (Apple Silicon) — a localized name was still
+        // readable → a real non-builtin display IS external; nothing
+        // readable at all → Unknown (never guessed).
+        return if localized.is_empty() {
+            MonitorKind::Unknown
+        } else {
+            MonitorKind::External
+        };
+    }
+    let mut dict: core_foundation::dictionary::CFDictionaryRef = std::ptr::null();
+    let ok = unsafe { IORegistryEntryCreateCFProperties(port, &mut dict, std::ptr::null(), 0) };
+    unsafe { IOObjectRelease(port) };
+    if ok != 0 || dict.is_null() {
+        return MonitorKind::Unknown;
+    }
+    let read_str = |key: &core::ffi::CStr| -> String {
+        unsafe {
+            let cf_key = {
+                #[link(name = "CoreFoundation", kind = "framework")]
+                unsafe extern "C" {
+                    fn CFStringCreateWithCString(
+                        alloc: *const c_void,
+                        s: *const c_char,
+                        enc: u32,
+                    ) -> *const c_void;
+                }
+                CFStringCreateWithCString(std::ptr::null(), key.as_ptr(), 0x08000100)
+            };
+            if cf_key.is_null() {
+                return String::new();
+            }
+            let v = CFDictionaryGetValue(dict as *const c_void, cf_key);
+            CFRelease(cf_key);
+            let mut buf = [0i8; 128];
+            if !v.is_null() && CFStringGetCString(v, buf.as_mut_ptr(), 128, 0x08000100) {
+                std::ffi::CStr::from_ptr(buf.as_ptr())
+                    .to_string_lossy()
+                    .to_lowercase()
+            } else {
+                String::new()
+            }
+        }
+    };
+    let name = read_str(c"IOServicePropertyTransportType");
+    let product = read_str(c"kDisplayProductName");
+    unsafe { CFRelease(dict as *const c_void) };
+
+    // Sidecar surfaces as a "Virtual" transport whose product name is
+    // the iPad — only then do we claim `Tablet`; a bare virtual
+    // transport stays `Virtual`, never a guessed tablet.
+    if product.contains("ipad") || product.contains("sidecar") {
+        return MonitorKind::Tablet;
+    }
+    if name.contains("virtual") || product.contains("virtual") {
+        return MonitorKind::Virtual;
+    }
+    if name.is_empty() && product.is_empty() {
+        return MonitorKind::Unknown;
+    }
+    MonitorKind::External
+}
+
+/// `NSScreen.localizedName` for `id` — Sidecar iPads report their
+/// device name ("iPad") there even when no IOKit transport exists.
+pub(crate) fn ns_localized_name(id: u32) -> String {
+    // NSScreen is main-thread-only AppKit: the async monitor-refresh
+    // worker calls this off the main thread, which can wedge the app.
+    // Callers on a background thread get the xcap name instead — the
+    // main-thread refresh (startup, SelectMonitor) still enriches it.
+    if !main_thread() {
+        return String::new();
+    }
+    use std::ffi::{c_char, c_void};
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    type MId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MIdId = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+    type MIdChar = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char) -> *mut c_void;
+    type MIdUsz = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    type MUsz = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+    type MU32 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+    type MCChar = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const c_char;
+    unsafe {
+        let send_id: MId = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_id: MIdId = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_char: MIdChar = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_usz: MIdUsz = std::mem::transmute(objc_msgSend as *const ());
+        let send_usz: MUsz = std::mem::transmute(objc_msgSend as *const ());
+        let send_u32: MU32 = std::mem::transmute(objc_msgSend as *const ());
+        let send_cchar: MCChar = std::mem::transmute(objc_msgSend as *const ());
+        let screens = send_id(
+            objc_getClass(c"NSScreen".as_ptr()),
+            sel_registerName(c"screens".as_ptr()),
+        );
+        if screens.is_null() {
+            return String::new();
+        }
+        let key = send_id_char(
+            objc_getClass(c"NSString".as_ptr()),
+            sel_registerName(c"stringWithUTF8String:".as_ptr()),
+            c"NSScreenNumber".as_ptr(),
+        );
+        let count = send_usz(screens, sel_registerName(c"count".as_ptr()));
+        for i in 0..count {
+            let s = send_id_usz(screens, sel_registerName(c"objectAtIndex:".as_ptr()), i);
+            if s.is_null() {
+                continue;
+            }
+            let dd = send_id(s, sel_registerName(c"deviceDescription".as_ptr()));
+            if dd.is_null() {
+                continue;
+            }
+            let num = send_id_id(dd, sel_registerName(c"objectForKey:".as_ptr()), key);
+            if num.is_null() || send_u32(num, sel_registerName(c"unsignedIntValue".as_ptr())) != id
+            {
+                continue;
+            }
+            let n = send_id(s, sel_registerName(c"localizedName".as_ptr()));
+            if !n.is_null() {
+                let p = send_cchar(n, sel_registerName(c"UTF8String".as_ptr()));
+                if !p.is_null() {
+                    return std::ffi::CStr::from_ptr(p).to_string_lossy().to_string();
+                }
+            }
+        }
+        String::new()
+    }
+}
+
+/// A Dock-icon click queues `OpenViewer` — the arm un-minimizes and
+/// focuses the viewer without moving it. `applicationShouldHandleReopen:
+/// hasVisibleWindows:` is added on the app delegate when nothing answers
+/// it, or swizzled onto winit's implementation (which still runs first).
+fn install_dock_reopen_hook(ctx: egui::Context) {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ORIG: AtomicUsize = AtomicUsize::new(0);
+    // The C callback can't capture: the egui context is parked in a
+    // static so the queued OpenViewer also wakes the pump.
+    static DOCK_CTX: std::sync::Mutex<Option<egui::Context>> = std::sync::Mutex::new(None);
+    *DOCK_CTX.lock().unwrap() = Some(ctx);
+
+    unsafe extern "C" fn on_reopen(
+        this: *mut c_void,
+        sel: *mut c_void,
+        sender: *mut c_void,
+        has_visible: bool,
+    ) -> bool {
+        let orig = ORIG.load(Ordering::Relaxed) as *const c_void;
+        let result = if orig.is_null() {
+            true
+        } else {
+            type Orig = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, bool) -> bool;
+            unsafe {
+                let f: Orig = std::mem::transmute(orig);
+                f(this, sel, sender, has_visible)
+            }
+        };
+        // Queue, don't act — the delegate callback runs mid-event and
+        // the command is pumped on the next pass, which we wake now.
+        super::queue_menu_command(crate::app::Command::OpenViewer);
+        if let Some(ctx) = DOCK_CTX.lock().unwrap().as_ref() {
+            crate::app::wake_viewports(ctx);
+        }
+        result
+    }
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+        fn object_getClass(obj: *mut c_void) -> *mut c_void;
+        fn class_addMethod(
+            cls: *mut c_void,
+            sel: *mut c_void,
+            imp: *const c_void,
+            types: *const std::ffi::c_char,
+        ) -> bool;
+        fn class_getInstanceMethod(cls: *mut c_void, sel: *mut c_void) -> *mut c_void;
+        fn method_getImplementation(m: *mut c_void) -> *const c_void;
+        fn method_setImplementation(m: *mut c_void, imp: *const c_void) -> *const c_void;
+    }
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendBoolSel = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool_sel: MsgSendBoolSel = std::mem::transmute(objc_msgSend as *const ());
+        let app = send_id(
+            objc_getClass(c"NSApplication".as_ptr()),
+            sel_registerName(c"sharedApplication".as_ptr()),
+        );
+        if app.is_null() {
+            return;
+        }
+        let delegate = send_id(app, sel_registerName(c"delegate".as_ptr()));
+        if delegate.is_null() {
+            return;
+        }
+        let sel = sel_registerName(c"applicationShouldHandleReopen:hasVisibleWindows:".as_ptr());
+        if send_bool_sel(
+            delegate,
+            sel_registerName(c"respondsToSelector:".as_ptr()),
+            sel,
+        ) {
+            // winit implements it (it turns the call into an event eframe
+            // ignores): wrap — the original still runs first.
+            let m = class_getInstanceMethod(object_getClass(delegate), sel);
+            ORIG.store(method_getImplementation(m) as usize, Ordering::Relaxed);
+            method_setImplementation(m, on_reopen as *const c_void);
+        } else {
+            // No existing handler: ours is the whole answer (YES = the
+            // app may reopen — the queued OpenViewer does the real work).
+            class_addMethod(
+                object_getClass(delegate),
+                sel,
+                on_reopen as *const c_void,
+                c"B@:@B".as_ptr(),
+            );
+        }
+    }
+}
+
+/// The number of connected displays — polled to detect monitor
+/// hot-(un)plug so the viewer can re-anchor off a vanished screen.
+pub fn display_count() -> u32 {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    }
+    let mut n = 0u32;
+    unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &mut n) };
+    n
+}
+
+/// True when running on the main thread (pthread_main_np).
+fn main_thread() -> bool {
+    #[link(name = "c")]
+    unsafe extern "C" {
+        fn pthread_main_np() -> i32;
+    }
+    unsafe { pthread_main_np() == 1 }
 }

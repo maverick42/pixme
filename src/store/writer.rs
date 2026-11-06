@@ -54,6 +54,10 @@ enum Job {
         /// Auto-title counter.
         next_title: usize,
     },
+    /// Measured VACUUM — queued between Finalize and Flush at quit so
+    /// the compaction runs on this thread, after all writes, outside
+    /// any transaction.
+    Vacuum,
     /// Barrier: reply when the whole queue is drained and parked jobs
     /// have been retried. The quit path blocks on this.
     Flush(mpsc::Sender<()>),
@@ -215,6 +219,11 @@ impl Writer {
 
     /// The exit barrier: the receiver fires once the queue is empty
     /// and parked failures have been retried.
+    /// Queues the quit-time measured VACUUM after the pending writes.
+    pub fn vacuum(&self) {
+        self.send(Job::Vacuum);
+    }
+
     pub fn flush(&self) -> mpsc::Receiver<()> {
         let (tx, rx) = mpsc::channel();
         self.send(Job::Flush(tx));
@@ -327,6 +336,10 @@ fn run(
                         false
                     }
                 }
+            }
+            Job::Vacuum => {
+                store.vacuum_if_needed();
+                true
             }
             Job::Meta(rows) => match store.write_meta(rows) {
                 Ok(()) => true,

@@ -182,6 +182,10 @@ fn render_one(img: &mut RgbaImage, scratch: &mut ScratchLayer, anno: &Annotation
     match &anno.kind {
         // Region effects read + write the base directly.
         AnnotationKind::Blur(o) => apply_blur(img, o),
+        // The zone highlighter is a multiply (not an alpha wash):
+        // black text stays black, white takes the colour — it must
+        // read the base pixels, so it renders as a region effect.
+        AnnotationKind::HighlightArea(o) => apply_highlight(img, o),
         AnnotationKind::Freehand(o) if o.eraser_mode != super::document::EraserMode::Color => {
             apply_freehand_effect(img, o);
         }
@@ -268,6 +272,9 @@ impl DragPreview {
     pub fn render(&mut self, anno: &Annotation) -> Option<(RgbaImage, u32, u32)> {
         match &anno.kind {
             AnnotationKind::Blur(_) => return None,
+            // The multiply highlighter reads the base — no layered
+            // patch exists for it (same as Blur: outline preview).
+            AnnotationKind::HighlightArea(_) => return None,
             AnnotationKind::Freehand(o) if o.eraser_mode != super::document::EraserMode::Color => {
                 return None;
             }
@@ -353,6 +360,7 @@ impl DragPreview {
                 shifted.kind.translate(-(rx as f32), -(ry as f32));
                 match &shifted.kind {
                     AnnotationKind::Blur(o) => apply_blur(&mut patch, o),
+                    AnnotationKind::HighlightArea(o) => apply_highlight(&mut patch, o),
                     AnnotationKind::Freehand(o) => {
                         apply_freehand_effect(&mut patch, o);
                     }
@@ -466,10 +474,12 @@ pub(crate) fn union_rect(
 }
 
 /// True for annotations that read/write the base directly (Blur,
-/// blur/pixelate eraser strokes) rather than compositing a layer.
+/// blur/pixelate eraser strokes, the multiply zone highlighter)
+/// rather than compositing a layer.
 pub(crate) fn region_effect(anno: &Annotation) -> bool {
     match &anno.kind {
         AnnotationKind::Blur(_) => true,
+        AnnotationKind::HighlightArea(_) => true,
         AnnotationKind::Freehand(o) => o.eraser_mode != super::document::EraserMode::Color,
         _ => false,
     }
@@ -488,6 +498,7 @@ pub(crate) fn effect_footprint(
 ) -> Option<(u32, u32, u32, u32)> {
     let pad = match &anno.kind {
         AnnotationKind::Blur(_) => 4.0,
+        AnnotationKind::HighlightArea(_) => 2.0,
         AnnotationKind::Freehand(o) => o.width + 8.0,
         _ => return None,
     };
@@ -2587,6 +2598,51 @@ fn apply_blur(img: &mut RgbaImage, o: &super::document::BlurObj) {
     composite(img, &patch, x as i64, y as i64, 1.0);
 }
 
+/// Zone highlighter: the fill is MULTIPLIED over the base — black text
+/// stays black, white takes the colour (the usual highlighter look).
+/// `opacity` scales the effect strength. Rendered as a region effect:
+/// the multiply needs the destination pixels, so no intermediate
+/// layer exists. The coverage mask is painted by the same SDF fill
+/// the layered path uses, so edges keep their AA.
+fn apply_highlight(img: &mut RgbaImage, o: &super::document::AreaObj) {
+    let (x, y, w, h) = clip_rect(o.rect, img.width(), img.height());
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut mask = RgbaImage::new(w, h);
+    let mut local = o.rect;
+    local.x -= x as i32;
+    local.y -= y as i32;
+    draw_shape_sdf(
+        &mut mask,
+        local,
+        o.shape != AreaShape::Rect,
+        0.0,
+        Some(o.color),
+        Color32::TRANSPARENT,
+        0.0,
+        Dash::Solid,
+        0.0,
+        Color32::TRANSPARENT,
+        0.0,
+    );
+    let strength = o.opacity.clamp(0.0, 1.0);
+    let col = c32(o.color).0;
+    for py in 0..h {
+        for px in 0..w {
+            let cov = mask.get_pixel(px, py).0[3] as f32 / 255.0 * strength;
+            if cov <= 0.0 {
+                continue;
+            }
+            let d = img.get_pixel_mut(x + px, y + py);
+            for (d_ch, c) in d.0.iter_mut().take(3).zip(col.iter().take(3)) {
+                let m = *d_ch as f32 * *c as f32 / 255.0;
+                *d_ch = (m * cov + *d_ch as f32 * (1.0 - cov)) as u8;
+            }
+        }
+    }
+}
+
 /// Block-average mosaic for the pixelate blur style.
 fn pixelate(src: &RgbaImage, block: u32) -> RgbaImage {
     let (w, h) = (src.width(), src.height());
@@ -2778,7 +2834,11 @@ mod tests {
     }
 
     pub(super) fn anno(id: u64, kind: AnnotationKind) -> Annotation {
-        Annotation { id, kind }
+        Annotation {
+            id,
+            kind,
+            tool: None,
+        }
     }
 
     pub(super) fn doc_with(annos: Vec<Annotation>) -> Document {
@@ -2830,6 +2890,7 @@ mod tests {
     fn render_one_ref(img: &mut RgbaImage, anno: &Annotation) {
         match &anno.kind {
             AnnotationKind::Blur(o) => apply_blur(img, o),
+            AnnotationKind::HighlightArea(o) => apply_highlight(img, o),
             AnnotationKind::Freehand(o)
                 if o.eraser_mode != super::super::document::EraserMode::Color =>
             {
@@ -3453,6 +3514,7 @@ pub(super) mod bench {
                     opacity: 1.0,
                     shadow: 3.0,
                 }),
+                tool: None,
             });
             id += 1;
             doc.annotations.push(Annotation {
@@ -3472,6 +3534,7 @@ pub(super) mod bench {
                     opacity: 1.0,
                     shadow: 0.0,
                 }),
+                tool: None,
             });
             id += 1;
             doc.annotations.push(Annotation {
@@ -3485,6 +3548,7 @@ pub(super) mod bench {
                     },
                     id: 0x1F449,
                 }),
+                tool: None,
             });
             id += 1;
             doc.annotations.push(Annotation {
@@ -3500,6 +3564,7 @@ pub(super) mod bench {
                     shape: AreaShape::Rect,
                     strength: 50,
                 }),
+                tool: None,
             });
             id += 1;
         }

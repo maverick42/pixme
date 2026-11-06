@@ -136,6 +136,7 @@ mod tests {
                 opacity: 1.0,
                 shadow: 0.0,
             }),
+            tool: None,
         }
     }
 
@@ -238,6 +239,7 @@ mod tests {
                 shape: AreaShape::Rect,
                 strength: 30,
             }),
+            tool: None,
         });
         let out = crate::editor::render::render_to_image(&d);
         assert_eq!(out.get_pixel(0, 0).0, [20, 30, 40, 255]);
@@ -285,6 +287,7 @@ mod tests {
             d.annotations.push(Annotation {
                 id: 1,
                 kind: AnnotationKind::Brace(down),
+                tool: None,
             });
             let out = render_to_image(&d);
             assert!(

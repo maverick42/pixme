@@ -11,6 +11,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::editor::document::{
+    AreaShape, BlurStyle, BraceKind, Dash, EraserMode, LineEnd, StepMode, StepSize, StepStyle,
+    TextAlign, TipShape,
+};
 use crate::i18n::Language;
 use crate::ui::theme::ThemeKind;
 
@@ -42,6 +46,22 @@ impl Appearance {
             },
         }
     }
+}
+
+/// How the capture-bar icons are drawn — the "Style des icônes" setting.
+/// Applies to the vertical capture bar only; every other surface keeps
+/// the standard monochrome glyphs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IconStyle {
+    /// Lucide line icons tinted with the theme tokens — the reference look.
+    #[default]
+    Standard,
+    /// The same Lucide glyphs, each in its own fixed colour.
+    Color,
+    /// Phosphor two-tone glyphs (`assets/icons-duotone/`), each in its
+    /// own fixed colour.
+    Duotone,
 }
 
 /// How long captures persist in the session database — the
@@ -85,14 +105,191 @@ pub enum TabSort {
     ByDate,
 }
 
+/// One tool's complete option set — every armed tool owns its own
+/// copy of every option it can touch (colour, width, dash, opacity,
+/// brush, blur, text, step, emoji…), so nothing ever propagates
+/// between tools. Fields a tool does not use stay inert.
+/// Struct-level `#[serde(default)]` fills any missing key from
+/// [`ToolStyle::default`], so new fields never need a migration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolStyle {
+    /// Stroke/tool colour.
+    pub color: [u8; 3],
+    /// Filled-shape colour.
+    pub fill_color: [u8; 3],
+    /// Stroke width px.
+    pub width: f32,
+    /// Dashing pattern.
+    pub dash: Dash,
+    /// Drop-shadow offset px.
+    pub shadow: f32,
+    /// Object opacity 0–1.
+    pub opacity: f32,
+    /// Line start glyph (Fin).
+    pub line_start: LineEnd,
+    /// Line end glyph (Début).
+    pub line_end: LineEnd,
+    /// Outline thickness.
+    pub outline: f32,
+    /// Outline colour.
+    pub line_outline_color: [u8; 3],
+    /// Line drop-shadow toggle.
+    pub line_shadow: bool,
+    /// Corner radius.
+    pub radius: f32,
+    /// Freehand tip shape.
+    pub tip: TipShape,
+    /// Bracket kind.
+    pub brace_kind: BraceKind,
+    /// Area shape.
+    pub shape: AreaShape,
+    /// Highlighter coverage opacity.
+    pub hl_opacity: f32,
+    /// Eraser colour.
+    pub eraser_color: [u8; 3],
+    /// Eraser size px.
+    pub eraser_size: f32,
+    /// Eraser brush mode.
+    pub eraser_mode: EraserMode,
+    /// Blur style.
+    pub blur_style: BlurStyle,
+    /// Blur strength.
+    pub blur_strength: u8,
+    /// Text font family.
+    pub font: String,
+    /// Text font size px.
+    pub font_size: f32,
+    /// Text bold toggle.
+    pub bold: bool,
+    /// Text italic toggle.
+    pub italic: bool,
+    /// Text outline width.
+    pub text_outline: f32,
+    /// Text outline colour.
+    pub text_outline_color: [u8; 3],
+    /// Text alignment.
+    pub align: TextAlign,
+    /// Step marker mode.
+    pub step_mode: StepMode,
+    /// Step marker style.
+    pub step_style: StepStyle,
+    /// Step marker size.
+    pub step_size: StepSize,
+    /// Next number counter.
+    pub step_next_num: u32,
+    /// Next letter counter.
+    pub step_next_let: u32,
+    /// Step badge background colour.
+    pub step_bg: [u8; 3],
+    /// Step badge foreground colour.
+    pub step_fg: [u8; 3],
+    /// Step outline thickness.
+    pub step_ring: f32,
+    /// Step outline colour.
+    pub step_ring_color: [u8; 3],
+    /// Step shadow toggle.
+    pub step_shadow: bool,
+    /// Step lowercase toggle.
+    pub step_lower: bool,
+    /// Emoji id (Unicode code point).
+    pub emoji_id: u32,
+    /// Last side the user dragged an emoji to, image px.
+    pub emoji_size: Option<f32>,
+}
+
+/// Factory defaults — the same values `Opts::default` seeds.
+impl Default for ToolStyle {
+    fn default() -> Self {
+        Self {
+            color: [225, 40, 40],
+            fill_color: [80, 160, 235],
+            width: 3.0,
+            dash: Dash::Solid,
+            shadow: 3.0,
+            opacity: 1.0,
+            line_start: LineEnd::None,
+            line_end: LineEnd::Arrow,
+            outline: 2.0,
+            line_outline_color: [255, 255, 255],
+            line_shadow: true,
+            radius: 8.0,
+            tip: TipShape::Round,
+            brace_kind: BraceKind::CurlyLeft,
+            shape: AreaShape::Rect,
+            hl_opacity: 0.45,
+            eraser_color: [255, 255, 255],
+            eraser_size: 12.0,
+            eraser_mode: EraserMode::Color,
+            blur_style: BlurStyle::Blur,
+            blur_strength: 75,
+            font: "Arial".to_owned(),
+            font_size: 32.0,
+            bold: false,
+            italic: false,
+            text_outline: 2.0,
+            text_outline_color: [255, 255, 255],
+            align: TextAlign::Left,
+            step_mode: StepMode::Numbers,
+            step_style: StepStyle::Circle,
+            step_size: StepSize::Medium,
+            step_next_num: 1,
+            step_next_let: 1,
+            step_bg: [225, 40, 40],
+            step_fg: [255, 255, 255],
+            step_ring: 5.0,
+            step_ring_color: [255, 255, 255],
+            step_shadow: true,
+            step_lower: false,
+            emoji_id: 0x1F449,
+            emoji_size: None,
+        }
+    }
+}
+
+/// Last-used Draw tool options, persisted so each tool restores its
+/// complete styling on the next Draw session — one `ToolStyle` bank
+/// per tool, nothing shared.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DrawOptions {
+    /// Per-tool option banks, keyed by tool.
+    pub tools: std::collections::BTreeMap<crate::ui::draw::Tool, ToolStyle>,
+}
+
+/// Per-monitor persisted preferences, keyed by the monitor's stable id
+/// ([`crate::platform::MonitorIdentity::stable_id`]). Entries are never
+/// dropped when the monitor disconnects — a reconnected display gets its
+/// name and geometry back silently.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitorPrefs {
+    /// The user's display name for the monitor (`None` = the OS name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The viewer window's rect on this monitor `[x, y, w, h]`, in the
+    /// monitor's native units (physical px on Windows, points on macOS)
+    /// — applied when the monitor is re-selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rect_native: Option<[i32; 4]>,
+    /// The Draw editor window's rect on this monitor `[x, y, w, h]`,
+    /// same native units — applied when Draw reopens on this monitor
+    /// (`None` = centre it there).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draw_rect_native: Option<[i32; 4]>,
+}
+
 /// The complete persisted settings file.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// UI language: `auto` follows the OS locale.
     pub language: Language,
     /// Theme preference: `auto` follows the OS appearance.
     pub appearance: Appearance,
+    /// Capture-bar icon style (see [`IconStyle`]).
+    #[serde(default)]
+    pub icon_style: IconStyle,
     /// Include the mouse pointer in captures. Session-only by user
     /// decision: it survives between captures but is never written to
     /// disk — every launch starts without the pointer.
@@ -124,24 +321,6 @@ pub struct Settings {
     pub db_status: bool,
     /// Tab ordering — `None` = insertion order.
     pub tab_sort: Option<TabSort>,
-    /// Text-tool colour `[r, g, b]` persisted across sessions.
-    #[serde(default = "default_text_color")]
-    pub text_color: [u8; 3],
-    /// Text-tool font family ("Arial", "Inter", …).
-    #[serde(default = "default_text_font")]
-    pub text_font: String,
-    /// Text-tool font size in px (menu 8..=72, default 32).
-    #[serde(default = "default_text_size")]
-    pub text_size: u8,
-    /// Text-tool bold toggle.
-    pub text_bold: bool,
-    /// Text-tool italic toggle.
-    pub text_italic: bool,
-    /// Text-tool outline width (0..=10).
-    pub text_outline: u8,
-    /// Text-tool outline colour `[r, g, b]`.
-    #[serde(default = "default_outline_color")]
-    pub text_outline_color: [u8; 3],
     /// Filename template for batch/auto saves ("$Y-$M-$D_$H$N$S").
     #[serde(default = "default_filename_template")]
     pub filename_template: String,
@@ -151,20 +330,19 @@ pub struct Settings {
     /// Sequential counter consumed by `#` placeholders in the template.
     #[serde(default = "default_filename_counter")]
     pub filename_counter: u64,
+    /// Last-used Draw tool options (see [`DrawOptions`]).
+    #[serde(default)]
+    pub draw_opts: DrawOptions,
+    /// Per-monitor preferences, keyed by stable id — names and saved
+    /// window geometry; entries survive disconnects (see [`MonitorPrefs`]).
+    #[serde(default)]
+    pub monitors: std::collections::BTreeMap<String, MonitorPrefs>,
+    /// The stable id of the monitor the viewer last sat on — restored
+    /// at launch so the app reopens where it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_monitor: Option<String>,
 }
 
-fn default_text_color() -> [u8; 3] {
-    [220, 40, 40]
-}
-fn default_text_font() -> String {
-    "Arial".to_owned()
-}
-fn default_text_size() -> u8 {
-    32
-}
-fn default_outline_color() -> [u8; 3] {
-    [255, 255, 255]
-}
 fn default_filename_template() -> String {
     "$Y-$M-$D_$H$N$S".to_owned()
 }
@@ -195,6 +373,8 @@ impl Default for Settings {
         Self {
             language: Language::default(),
             appearance: Appearance::default(),
+            icon_style: IconStyle::default(),
+            draw_opts: DrawOptions::default(),
             include_pointer: false,
             copy_to_clipboard: false,
             capture_delay_secs: 0,
@@ -204,16 +384,11 @@ impl Default for Settings {
             db_retention: DbRetention::default(),
             db_status: default_db_status(),
             tab_sort: None,
-            text_color: default_text_color(),
-            text_font: default_text_font(),
-            text_size: default_text_size(),
-            text_bold: false,
-            text_italic: false,
-            text_outline: 2,
-            text_outline_color: default_outline_color(),
             filename_template: default_filename_template(),
             filename_templates: default_filename_templates(),
             filename_counter: default_filename_counter(),
+            monitors: std::collections::BTreeMap::new(),
+            last_monitor: None,
         }
     }
 }
@@ -379,5 +554,35 @@ mod tests {
         assert_eq!(s.recent_files, vec![PathBuf::from("/tmp/a.png")]);
         s.remove_recent(&PathBuf::from("/tmp/missing.png"));
         assert_eq!(s.recent_files, vec![PathBuf::from("/tmp/a.png")]);
+    }
+
+    /// The monitors map round-trips through JSON, including the sparse
+    /// optional fields (a name-only entry writes no `rect_native` key).
+    #[test]
+    fn monitor_prefs_serde_round_trip() {
+        let mut s = Settings::default();
+        s.monitors.insert(
+            "uuid-1".into(),
+            MonitorPrefs {
+                name: Some("Dell bureau".into()),
+                rect_native: Some([0, 0, 2560, 1440]),
+                draw_rect_native: Some([100, 50, 1100, 700]),
+            },
+        );
+        s.monitors.insert(
+            "uuid-2".into(),
+            MonitorPrefs {
+                name: Some("Side".into()),
+                rect_native: None,
+                draw_rect_native: None,
+            },
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("rect_native\":null"));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.monitors, s.monitors);
+        // A prefs file without the key at all still loads (older versions).
+        let bare: Settings = serde_json::from_str("{}").unwrap();
+        assert!(bare.monitors.is_empty());
     }
 }

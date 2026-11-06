@@ -13,6 +13,37 @@ use crate::capture::{Capture, PhysicalRect};
 /// Unique id of an annotation inside a [`Document`].
 pub type AnnotationId = u64;
 
+/// One drawable tool of the strip (two-column grid).
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
+pub enum Tool {
+    Select,
+    /// The marquee: frames a region for cut/copy/paste/delete/blur/fill.
+    SelectArea,
+    TextBoxRect,
+    TextBoxOval,
+    Text,
+    Step,
+    Arrow,
+    Pencil,
+    Brace,
+    Eraser,
+    Rect,
+    RectFill,
+    Ellipse,
+    EllipseFill,
+    HighlightArea,
+    Blur,
+    /// Colour eyedropper: the loupe follows the cursor, a click picks
+    /// the pixel's colour, `C` copies its `#RRGGBB`.
+    Pipette,
+    /// Emoji sticker: click places it at the remembered/default size,
+    /// dragging frames a free square. Sticky — Esc or another tool
+    /// leaves it.
+    Emoji,
+}
+
 /// Stroke dashing shared by every outlined object ("Tirets" option).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)] // the variants ARE the dash styles (Dash, Dot, DashDot)
@@ -541,6 +572,11 @@ pub struct Annotation {
     pub id: AnnotationId,
     /// Shape and payload.
     pub kind: AnnotationKind,
+    /// The tool that produced the object at creation time — memorized so
+    /// "Set as default options" writes back to the right tool bank.
+    /// `None` for objects no tool owns (pasted pictures, seeds, restores
+    /// from before the field existed).
+    pub tool: Option<Tool>,
 }
 
 impl AnnotationKind {

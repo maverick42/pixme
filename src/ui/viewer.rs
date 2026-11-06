@@ -1,10 +1,10 @@
 //! The session viewer — PixMe's main window.
 //!
-//! One tab per capture of the session, a "+" action that hands back to the
-//! floating bar for a new capture, and the translated Save/Discard/Cancel
-//! confirmation when a dirty session would be lost. On Windows the viewer
-//! also draws the application's menu strip (no global menu bar exists);
-//! on macOS the same actions live in the native PixMe/Capture/File menus.
+//! One tab per capture of the session, a vertical capture bar starting new
+//! captures, and the translated Save/Discard/Cancel confirmation when a
+//! dirty session would be lost. On macOS the application's actions live in
+//! the native PixMe/File/Edit/Window menus; on Windows the tray menu and
+//! the toolbar carry them.
 //! The toolbar carries the file/edit actions (open, save, select, zoom,
 //! resize, clipboard, print, close); Draw lands in the next phase.
 
@@ -16,8 +16,8 @@ use egui::{
 };
 use rust_i18n::t;
 
-use crate::app::{Command, Shared};
-use crate::config::TabSort;
+use crate::app::{CaptureMode, Command, Shared};
+use crate::config::{Settings, TabSort};
 use crate::editor::Document;
 use crate::editor::history::AnnoEdit;
 use crate::ui::icons::{self, Icon};
@@ -334,6 +334,11 @@ pub struct Viewer {
     resize: Option<ResizeDialog>,
     /// The rename prompt's draft, open while Some.
     rename: Option<RenameState>,
+    /// The monitor-rename prompt's draft, open while Some.
+    monitor_rename: Option<MonitorRename>,
+    /// Disconnected-monitor buttons dismissed this run — the prefs entry
+    /// itself is kept, so a reconnect brings the monitor back silently.
+    dismissed_monitors: std::collections::HashSet<String>,
     /// The protection dialog (set/change/remove password), open while Some.
     protect: Option<ProtectDialog>,
     /// The "delete the file on disk" confirmation, open while Some.
@@ -425,6 +430,8 @@ impl Default for Viewer {
             resize: None,
             dup_names: false,
             rename: None,
+            monitor_rename: None,
+            dismissed_monitors: std::collections::HashSet::new(),
             protect: None,
             confirm_delete: None,
             unlock_draft: String::new(),
@@ -455,6 +462,83 @@ impl Default for Viewer {
             #[cfg(feature = "dev-tools")]
             debug_edit_step: 0,
         }
+    }
+}
+
+/// The monitor-rename prompt: the monitor's stable id + draft + focus flag.
+struct MonitorRename {
+    /// Key into `Settings::monitors`.
+    stable_id: String,
+    /// Field content.
+    draft: String,
+    /// The name field grabs focus once on open.
+    focused: bool,
+}
+
+/// One status-strip monitor row: a connected inventory entry, or a
+/// persisted prefs entry whose monitor is currently absent.
+struct MonitorRow {
+    /// Key into `Settings::monitors` / `Command::SelectMonitor`.
+    stable_id: String,
+    /// Custom name when set, else the OS name (or a fallback).
+    label: String,
+    /// The monitor's bounds — matched against the viewer's monitor by
+    /// rect (xcap ids are not stable across enumerations on Windows).
+    rect: crate::capture::PhysicalRect,
+    /// `false` for persisted-but-absent monitors (greyed, dismissible).
+    connected: bool,
+    /// Display-type classification — icon + tooltip only.
+    kind: crate::capture::MonitorKind,
+}
+
+/// The status strip's monitor rows: connected monitors in spatial order
+/// (the inventory is sorted by `capture::sort_monitors_by_position`), then
+/// persisted-but-absent entries (unless the user dismissed
+/// them this run — dismissal is visual only, prefs are never dropped).
+fn monitor_rows(
+    inventory: &[crate::platform::MonitorIdentity],
+    prefs: &std::collections::BTreeMap<String, crate::config::MonitorPrefs>,
+    dismissed: &std::collections::HashSet<String>,
+) -> Vec<MonitorRow> {
+    let mut rows: Vec<MonitorRow> = inventory
+        .iter()
+        .map(|m| MonitorRow {
+            stable_id: m.stable_id.clone(),
+            label: prefs
+                .get(&m.stable_id)
+                .and_then(|p| p.name.clone())
+                .unwrap_or_else(|| m.info.name.clone()),
+            rect: m.info.rect,
+            connected: true,
+            kind: m.kind,
+        })
+        .collect();
+    for (id, p) in prefs {
+        if dismissed.contains(id) || rows.iter().any(|r| r.stable_id == *id) {
+            continue;
+        }
+        rows.push(MonitorRow {
+            stable_id: id.clone(),
+            label: p
+                .name
+                .clone()
+                .unwrap_or_else(|| t!("viewer.monitor.fallback").to_string()),
+            rect: crate::capture::PhysicalRect::default(),
+            connected: false,
+            kind: crate::capture::MonitorKind::Unknown,
+        });
+    }
+    rows
+}
+
+/// The translated display-type label for a status-strip monitor tooltip.
+fn monitor_kind_label(kind: crate::capture::MonitorKind) -> std::borrow::Cow<'static, str> {
+    match kind {
+        crate::capture::MonitorKind::BuiltIn => t!("viewer.monitor.kind.builtin"),
+        crate::capture::MonitorKind::External => t!("viewer.monitor.kind.external"),
+        crate::capture::MonitorKind::Tablet => t!("viewer.monitor.kind.tablet"),
+        crate::capture::MonitorKind::Virtual => t!("viewer.monitor.kind.virtual"),
+        crate::capture::MonitorKind::Unknown => t!("viewer.monitor.kind.unknown"),
     }
 }
 
@@ -776,9 +860,20 @@ impl Viewer {
         self.confirm_close
             || self.resize.is_some()
             || self.rename.is_some()
+            || self.monitor_rename.is_some()
             || self.protect.is_some()
             || self.confirm_delete.is_some()
             || self.dup_names
+    }
+
+    /// Opens the monitor-rename prompt for `stable_id` (status strip
+    /// right-click), pre-filled with `draft` (custom or OS name).
+    pub fn open_monitor_rename(&mut self, stable_id: String, draft: String) {
+        self.monitor_rename = Some(MonitorRename {
+            stable_id,
+            draft,
+            focused: false,
+        });
     }
 
     /// `(tab index, doc clone, anno stacks)` — opening Draw snapshots
@@ -1058,6 +1153,23 @@ impl Viewer {
         self.unlock_error = false;
         self.scroll_active_into_view = true;
         self.reset_view();
+    }
+
+    /// ⌘ (macOS) / Alt (Windows) +←/→ tab navigation: `self.tabs` IS
+    /// the display order — `sort_tabs`
+    /// physically reorders it, so ±1 lands on the visible neighbour
+    /// in the strip and the mosaic alike. Clamped at the ends — no
+    /// wrap-around. `set_active` carries the full click semantics
+    /// (protected tabs re-lock, selection scrolls into view).
+    fn cycle_tab(&mut self, step: isize) {
+        let n = self.tabs.len() as isize;
+        if n < 2 {
+            return;
+        }
+        let next = (self.active_index().unwrap_or(0) as isize + step).clamp(0, n - 1);
+        if next != self.active_index().unwrap_or(0) as isize {
+            self.set_active(next as usize);
+        }
     }
 
     /// Whether `index` is a protected tab still waiting for its password.
@@ -1669,6 +1781,7 @@ impl Viewer {
                             lower: false,
                         },
                     ),
+                    tool: None,
                 });
                 self.commit_draw(
                     i,
@@ -1726,6 +1839,7 @@ impl Viewer {
         let modal_open = self.confirm_close
             || self.resize.is_some()
             || self.rename.is_some()
+            || self.monitor_rename.is_some()
             || self.protect.is_some()
             || self.confirm_delete.is_some()
             || self.dup_names
@@ -1796,11 +1910,34 @@ impl Viewer {
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
                 shared.push(Command::Quit);
                 ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(CYCLE_TAB_MOD, egui::Key::ArrowLeft)) {
+                self.cycle_tab(-1);
+                ctx.request_repaint();
+            } else if ctx.input_mut(|i| i.consume_key(CYCLE_TAB_MOD, egui::Key::ArrowRight)) {
+                self.cycle_tab(1);
+                ctx.request_repaint();
             }
         }
-        // Explicit fill: the app-wide clear color is transparent (the anchor
-        // and the floating bar need it), so windows must paint their own.
+        // Explicit fill: the app-wide clear color is transparent (the anchor,
+        // countdown and pinned windows need it), so windows must paint
+        // their own.
         let t = theme::tokens(&ctx);
+        // The vertical capture bar: a fixed strip on the right edge,
+        // always visible in both view modes — the only place a capture
+        // starts from. Registered before the status strip so it owns the
+        // full window height; its left separator line is the built-in
+        // panel one (the theme's `separator` token via `bg_stroke`).
+        egui::Panel::right("viewer.vbar")
+            .resizable(false)
+            .exact_size(36.0)
+            .frame(
+                egui::Frame::default()
+                    .inner_margin(Margin::symmetric(5, 8))
+                    .fill(t.dock),
+            )
+            .show(ui, |ui| {
+                self.vbar(ui, shared);
+            });
         egui::Panel::bottom("viewer.status")
             .frame(
                 egui::Frame::default()
@@ -1809,6 +1946,7 @@ impl Viewer {
             )
             .show(ui, |ui| {
                 self.status_strip(ui, shared);
+                widgets::paint_toasts_above(ui.ctx(), 34.0);
             });
         CentralPanel::default()
             .frame(
@@ -1821,10 +1959,6 @@ impl Viewer {
                 // carries its own margins, so the column stays flush
                 // and compact like the reference.
                 ui.spacing_mut().item_spacing.y = 0.0;
-                if !shared.has_native_app_menu() {
-                    self.menu_strip(ui, shared);
-                    widgets::hairline(ui);
-                }
                 self.toolbar_strip(ui, shared);
                 widgets::hairline(ui);
                 if self.view_mode == ViewMode::Tabs {
@@ -1896,6 +2030,7 @@ impl Viewer {
         self.confirm_dialog(&ctx, shared);
         self.resize_dialog(&ctx);
         self.rename_dialog(&ctx);
+        self.monitor_rename_dialog(&ctx, shared);
         self.protect_dialog(&ctx);
         self.delete_file_dialog(&ctx);
         self.dup_names_dialog(&ctx);
@@ -2060,28 +2195,114 @@ impl Viewer {
                 ui.label(egui::RichText::new(label).color(t.text_dim).size(10.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .color(t.text_faint)
-                        .size(10.0),
+                // Monitor group, right-aligned next to the version: ↻
+                // refresh, then one button per known monitor — connected
+                // entries select the viewer's monitor (right-click
+                // renames), persisted-but-absent ones stay greyed until
+                // a click dismisses them (prefs are never dropped).
+                if ui
+                    .add_enabled_ui(shared.command_enabled(&Command::RefreshMonitors), |ui| {
+                        widgets::icon_button(ui, Icon::RefreshCw, false)
+                    })
+                    .inner
+                    .on_hover_text(t!("viewer.monitor.refresh"))
+                    .clicked()
+                {
+                    shared.push(Command::RefreshMonitors);
+                }
+                let rows = monitor_rows(
+                    &crate::app::lock(&shared.monitors),
+                    &shared.lock_settings().monitors,
+                    &self.dismissed_monitors,
                 );
-                if shared.lock_settings().db_status {
-                    let writing = shared.writer.pending_writes() > 0;
-                    let reading = shared.writer.is_reading();
-                    if writing || reading {
-                        // Activity flags only flip while frames run —
-                        // schedule the green-side repaint so an idle
-                        // queue never leaves a stale red dot.
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(250));
+                let current = crate::app::lock(&shared.viewer_monitor).clone();
+                for row in rows.iter().rev() {
+                    let is_current =
+                        row.connected && current.as_ref().is_some_and(|m| m.rect == row.rect);
+                    let kind_tip = monitor_kind_label(row.kind);
+                    let tip = if !row.connected {
+                        t!("viewer.monitor.disconnected", name = row.label.as_str())
+                    } else if is_current {
+                        t!("viewer.monitor.current", name = row.label.as_str())
+                    } else {
+                        t!(
+                            "viewer.monitor.typed",
+                            name = row.label.as_str(),
+                            kind = kind_tip
+                        )
+                    };
+                    if row.connected {
+                        let resp = ui
+                            .add_enabled_ui(
+                                shared.command_enabled(&Command::SelectMonitor(
+                                    row.stable_id.clone(),
+                                )),
+                                |ui| {
+                                    widgets::icon_button(
+                                        ui,
+                                        crate::ui::icons::monitor_icon(row.kind),
+                                        is_current,
+                                    )
+                                },
+                            )
+                            .inner
+                            .on_hover_text(tip);
+                        if resp.clicked() {
+                            shared.push(Command::SelectMonitor(row.stable_id.clone()));
+                        } else if resp.secondary_clicked() {
+                            shared.push(Command::RenameMonitor(row.stable_id.clone()));
+                        }
+                    } else {
+                        // Greyed, dismissible ghost: painted manually
+                        // (icon_button has no disabled tint).
+                        let (rect, resp) = ui
+                            .allocate_exact_size(Vec2::splat(widgets::BUTTON_SIZE), Sense::click());
+                        icons::paint(ui, rect, Icon::Monitor, 16.0, t.text_faint);
+                        let resp = resp.on_hover_text(tip);
+                        if resp.clicked() {
+                            self.dismissed_monitors.insert(row.stable_id.clone());
+                        } else if resp.secondary_clicked() {
+                            shared.push(Command::RenameMonitor(row.stable_id.clone()));
+                        }
                     }
-                    db_dot(ui, &t!("vbar.status.write"), writing, &t);
-                    db_dot(ui, &t!("vbar.status.read"), reading, &t);
-                    ui.label(
-                        egui::RichText::new(t!("vbar.status.db").to_string())
-                            .color(t.text_faint)
-                            .size(10.0),
-                    );
+                }
+                // Read the two flags under a short-lived guard — the
+                // strip must not hold the settings lock while other
+                // code needs it.
+                let (db_status, db_off) = {
+                    let s = shared.lock_settings();
+                    (
+                        s.db_status,
+                        s.db_retention == crate::config::DbRetention::Never,
+                    )
+                };
+                if db_status {
+                    if db_off {
+                        // Session persistence is off — say so instead of
+                        // lamps that could never light.
+                        ui.label(
+                            egui::RichText::new(t!("vbar.status.db_off").to_string())
+                                .color(t.text_faint)
+                                .size(10.0),
+                        );
+                    } else {
+                        let writing = shared.writer.pending_writes() > 0;
+                        let reading = shared.writer.is_reading();
+                        if writing || reading {
+                            // Activity flags only flip while frames run —
+                            // schedule the green-side repaint so an idle
+                            // queue never leaves a stale red dot.
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(250));
+                        }
+                        db_dot(ui, &t!("vbar.status.write"), writing, &t);
+                        db_dot(ui, &t!("vbar.status.read"), reading, &t);
+                        ui.label(
+                            egui::RichText::new(t!("vbar.status.db").to_string())
+                                .color(t.text_faint)
+                                .size(10.0),
+                        );
+                    }
                 }
             });
         });
@@ -2103,9 +2324,12 @@ impl Viewer {
     fn toolbar_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let has_doc = self.active_index().is_some();
         // Read once up-front — the Ouvrir menu's last item greys without it.
-        let has_last_dir = {
+        let (has_last_dir, icon_style) = {
             let s = shared.lock_settings();
-            s.last_open_dir.is_some() || s.last_save_dir.is_some()
+            (
+                s.last_open_dir.is_some() || s.last_save_dir.is_some(),
+                s.icon_style,
+            )
         };
         egui::Frame::default()
             .inner_margin(Margin::symmetric(8, 4))
@@ -2135,13 +2359,14 @@ impl Viewer {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
                             // Ouvrir ▾ — file picker on the main click.
-                            let r = widgets::tool_button(
+                            let r = widgets::tool_button_styled(
                                 ui,
                                 Icon::FolderOpen,
                                 &t!("vbar.open.label"),
                                 true,
                                 false,
                                 true,
+                                icon_style,
                             );
                             let menu_clicked = r.clicked() && widgets::caret_hit(&r, true);
                             if r.clicked() && !menu_clicked {
@@ -2150,26 +2375,29 @@ impl Viewer {
                             // Menus render every frame, forced open on the
                             // caret-click frame — see `tool_popup`.
                             open_menu(ui, &r, shared, has_last_dir, menu_clicked);
-                            if widgets::tool_button(
+                            let r = widgets::tool_button_styled(
                                 ui,
                                 Icon::Save,
                                 &t!("vbar.save.label"),
-                                false,
+                                true,
                                 false,
                                 has_doc,
-                            )
-                            .clicked()
-                            {
+                                icon_style,
+                            );
+                            let save_clicked = r.clicked() && widgets::caret_hit(&r, true);
+                            if r.clicked() && !save_clicked {
                                 shared.push(Command::SaveActive);
                             }
+                            save_menu(ui, &r, shared, has_doc, save_clicked);
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::ZoomIn,
                                 &t!("vbar.zoom_in.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
@@ -2180,13 +2408,14 @@ impl Viewer {
                                         ZoomMode::Factor((self.scale_for_step() * 1.25).min(8.0));
                                 }
                             }
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::ZoomOut,
                                 &t!("vbar.zoom_out.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
@@ -2200,13 +2429,14 @@ impl Viewer {
                             // The zoom button shows the live percent; its caret
                             // opens the mode/preset menu, main click = 100%.
                             let zoom_label = self.zoom_label();
-                            let r = widgets::tool_button(
+                            let r = widgets::tool_button_styled(
                                 ui,
                                 Icon::Scan,
                                 &zoom_label,
                                 true,
                                 false,
                                 has_doc,
+                                icon_style,
                             );
                             let menu_clicked = r.clicked() && widgets::caret_hit(&r, true);
                             if r.clicked() && !menu_clicked {
@@ -2240,32 +2470,36 @@ impl Viewer {
                             } else {
                                 (Icon::LayoutGrid, t!("viewer.mode.mosaic"))
                             };
-                            if widgets::tool_button(ui, icon, &label, false, mosaic, true)
-                                .on_hover_text(tip)
-                                .clicked()
+                            if widgets::tool_button_styled(
+                                ui, icon, &label, false, mosaic, true, icon_style,
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
                             {
                                 self.toggle_view_mode();
                             }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Pencil,
                                 &t!("vbar.draw.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
                                 shared.push(crate::app::Command::OpenDraw);
                             }
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Scaling,
                                 &t!("vbar.resize.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                                 && let Some(i) = self.active_index()
@@ -2285,42 +2519,45 @@ impl Viewer {
                                 });
                             }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Copy,
                                 &t!("vbar.copy.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
                                 shared.push(Command::CopyActive);
                             }
                             widgets::vline(ui, widgets::TOOL_H - 10.0);
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
                                 Icon::Printer,
                                 &t!("vbar.print.label"),
                                 false,
                                 false,
                                 has_doc,
+                                icon_style,
                             )
                             .clicked()
                             {
                                 shared.push(Command::PrintActive);
                             }
-                            if widgets::tool_button(
+                            if widgets::tool_button_styled(
                                 ui,
-                                Icon::X,
-                                &t!("vbar.close.label"),
+                                Icon::Settings,
+                                &t!("vbar.settings.label"),
                                 false,
                                 false,
-                                true,
+                                shared.command_enabled(&Command::OpenSettings),
+                                icon_style,
                             )
                             .clicked()
                             {
-                                shared.push(Command::ViewerClosed);
+                                shared.push(Command::OpenSettings);
                             }
                         });
                     });
@@ -2341,6 +2578,152 @@ impl Viewer {
                     }
                 });
             });
+    }
+
+    /// The vertical capture bar: the five capture modes, then the delay
+    /// and capture-options dropdowns — the only place a capture starts
+    /// from. Capture buttons read the shared command table so they grey
+    /// out under modals exactly like the menu entries.
+    fn vbar(&mut self, ui: &mut egui::Ui, shared: &Shared) {
+        let mut settings = shared.lock_settings();
+        let icon_style = settings.icon_style;
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
+            for (icon, tip, mode) in [
+                (
+                    Icon::SquareDashedMousePointer,
+                    "toolbar.window.tooltip",
+                    CaptureMode::WindowOrObject,
+                ),
+                (
+                    Icon::SquareDashed,
+                    "toolbar.region.tooltip",
+                    CaptureMode::Region,
+                ),
+                (
+                    Icon::Monitor,
+                    "toolbar.fullscreen.tooltip",
+                    CaptureMode::FullScreen,
+                ),
+                (
+                    Icon::Crop,
+                    "toolbar.fixed_region.tooltip",
+                    CaptureMode::FixedRegion,
+                ),
+                (Icon::Pin, "toolbar.pin.tooltip", CaptureMode::Pin),
+            ] {
+                if ui
+                    .add_enabled_ui(shared.command_enabled(&Command::Capture(mode)), |ui| {
+                        widgets::icon_button_styled(ui, icon, false, icon_style, None)
+                    })
+                    .inner
+                    .on_hover_text(t!(tip))
+                    .clicked()
+                {
+                    shared.push_capture(mode, ui.ctx());
+                }
+            }
+            ui.add_space(2.0);
+            widgets::hairline(ui);
+            ui.add_space(2.0);
+            // An armed delay paints the clock red — the "armed" marker.
+            let delay_btn = ui
+                .add_enabled_ui(!shared.modal_child_open(), |ui| {
+                    widgets::icon_button_styled(
+                        ui,
+                        Icon::Clock,
+                        false,
+                        icon_style,
+                        (settings.capture_delay_secs > 0).then(|| theme::tokens(ui.ctx()).danger),
+                    )
+                })
+                .inner
+                .on_hover_text(t!("toolbar.delay.tooltip"));
+            Self::delay_menu(&delay_btn, &mut settings);
+            ui.add_space(2.0);
+            widgets::hairline(ui);
+            ui.add_space(2.0);
+            let opts_btn = ui
+                .add_enabled_ui(!shared.modal_child_open(), |ui| {
+                    widgets::icon_button_styled(ui, Icon::Settings, false, icon_style, None)
+                })
+                .inner
+                .on_hover_text(t!("toolbar.options.tooltip"));
+            Self::options_menu(&opts_btn, &mut settings);
+        });
+    }
+
+    /// Dropdown on the clock button: delay in seconds before a capture.
+    /// The chosen delay is session state — it survives between captures
+    /// but is never saved to disk.
+    fn delay_menu(btn: &egui::Response, settings: &mut Settings) {
+        let before = settings.capture_delay_secs;
+        egui::Popup::menu(btn).show(|ui| {
+            ui.selectable_value(&mut settings.capture_delay_secs, 0, t!("delay.none"));
+            // A quick 5-second pick, then the full 1–9 s range below a
+            // separator.
+            ui.selectable_value(
+                &mut settings.capture_delay_secs,
+                5,
+                t!("delay.seconds", count = 5),
+            );
+            ui.separator();
+            for secs in 1..=9u32 {
+                let key = if secs == 1 {
+                    "delay.second"
+                } else {
+                    "delay.seconds"
+                };
+                ui.selectable_value(
+                    &mut settings.capture_delay_secs,
+                    secs,
+                    t!(key, count = secs),
+                );
+            }
+        });
+        if before != settings.capture_delay_secs {
+            tracing::info!(
+                setting = "capture_delay_secs",
+                value = settings.capture_delay_secs,
+                "settings_changed"
+            );
+        }
+    }
+
+    /// Menu on the gear button: capture-related toggles only — application
+    /// settings live in the settings UI, never in the capture bar.
+    fn options_menu(btn: &egui::Response, settings: &mut Settings) {
+        let before_pointer = settings.include_pointer;
+        let before_clip = settings.copy_to_clipboard;
+        let mut changed = false;
+        egui::Popup::menu(btn).show(|ui| {
+            changed |= ui
+                .checkbox(&mut settings.include_pointer, t!("options.include_pointer"))
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut settings.copy_to_clipboard,
+                    t!("options.copy_to_clipboard"),
+                )
+                .changed();
+        });
+        if changed {
+            if before_pointer != settings.include_pointer {
+                tracing::info!(
+                    setting = "include_pointer",
+                    value = settings.include_pointer,
+                    "settings_changed"
+                );
+            }
+            if before_clip != settings.copy_to_clipboard {
+                tracing::info!(
+                    setting = "copy_to_clipboard",
+                    value = settings.copy_to_clipboard,
+                    "settings_changed"
+                );
+            }
+            settings.save();
+        }
     }
 
     /// The zoom button's caption — the live factor as a percent (first
@@ -2366,183 +2749,12 @@ impl Viewer {
         }
     }
 
-    /// egui menu strip for OSes without a native menu bar (Windows). Same
-    /// commands as the native menus — the only difference is where they
-    /// render.
-    fn menu_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
-        egui::Frame::default()
-            .inner_margin(Margin::symmetric(8, 4))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // Menu titles, not buttons: no fill, no border — the hover
-                    // highlight alone signals them (PhotoCraft's egui menu bar
-                    // reads the same way on Windows).
-                    let v = &mut ui.style_mut().visuals;
-                    v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-                    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-                    menu_button(ui, t!("menu.file").as_ref(), |ui| {
-                        let has_doc = self.active_index().is_some();
-                        let has_last_dir = {
-                            let s = shared.lock_settings();
-                            s.last_open_dir.is_some() || s.last_save_dir.is_some()
-                        };
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::OpenFile,
-                            t!("menu.file.open").as_ref(),
-                            Some(Icon::FolderOpen),
-                            shared.command_enabled(&Command::OpenFile),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::ImportClipboard,
-                            t!("menu.app.import_clipboard").as_ref(),
-                            Some(Icon::ClipboardPaste),
-                            shared.command_enabled(&Command::ImportClipboard),
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::SaveActive,
-                            t!("menu.file.save").as_ref(),
-                            Some(Icon::Save),
-                            has_doc && shared.command_enabled(&Command::SaveActive),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::SaveAll,
-                            t!("menu.file.save_all").as_ref(),
-                            Some(Icon::Download),
-                            has_doc && shared.command_enabled(&Command::SaveAll),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::RenameActive,
-                            t!("menu.file.rename").as_ref(),
-                            None,
-                            has_doc && shared.command_enabled(&Command::RenameActive),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::DeleteFileActive,
-                            t!("menu.file.delete").as_ref(),
-                            Some(Icon::X),
-                            self.active_has_file()
-                                && shared.command_enabled(&Command::DeleteFileActive),
-                        );
-                        ui.separator();
-                        recent_submenu(ui, shared);
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::OpenLastDir,
-                            t!("vbar.open.last_dir").as_ref(),
-                            Some(Icon::Folder),
-                            has_last_dir && shared.command_enabled(&Command::OpenLastDir),
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::PrintActive,
-                            t!("menu.file.print").as_ref(),
-                            Some(Icon::Printer),
-                            has_doc && shared.command_enabled(&Command::PrintActive),
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::Quit,
-                            t!("menu.app.quit").as_ref(),
-                            Some(Icon::LogOut),
-                            shared.command_enabled(&Command::Quit),
-                        );
-                    });
-                    menu_button(ui, t!("menu.edit").as_ref(), |ui| {
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::UndoActive,
-                            t!("menu.edit.undo").as_ref(),
-                            Some(Icon::Undo2),
-                            shared.command_enabled(&Command::UndoActive),
-                        );
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::RedoActive,
-                            t!("menu.edit.redo").as_ref(),
-                            Some(Icon::Redo2),
-                            shared.command_enabled(&Command::RedoActive),
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::CopyActive,
-                            t!("menu.edit.copy").as_ref(),
-                            Some(Icon::Copy),
-                            shared.command_enabled(&Command::CopyActive),
-                        );
-                    });
-                    menu_button(ui, t!("menu.capture").as_ref(), |ui| {
-                        // Single entry: show the floating bar (same as the "+"
-                        // tab button) — the mode picker lives on the bar.
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::ShowBar,
-                            t!("menu.capture.launch").as_ref(),
-                            Some(Icon::Plus),
-                            shared.command_enabled(&Command::ShowBar),
-                        );
-                    });
-                    menu_button(ui, t!("settings.title").as_ref(), |ui| {
-                        menu_item(
-                            ui,
-                            shared,
-                            Command::OpenSettings,
-                            t!("menu.app.preferences").as_ref(),
-                        );
-                    });
-                    menu_button(ui, t!("menu.help").as_ref(), |ui| {
-                        // The website entry stays greyed until it exists.
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::OpenViewer,
-                            t!("menu.help.visit_site").as_ref(),
-                            None,
-                            false,
-                        );
-                        ui.separator();
-                        menu_item_icon(
-                            ui,
-                            shared,
-                            Command::OpenAbout,
-                            t!("menu.help.about").as_ref(),
-                            None,
-                            shared.command_enabled(&Command::OpenAbout),
-                        );
-                    });
-                });
-            });
-    }
-
     /// The capture tab strip: one selectable label per capture — red
     /// diamond when unsaved-or-modified, padlock when protected, a close
-    /// cross, and the right-click options menu — then "+".
+    /// cross, and the right-click options menu.
     /// The capture tab strip: chips in a wheel-scrollable area (no
-    /// scrollbar — the reference's behaviour), overflow arrows and "+"
-    /// pinned at the right edge.
+    /// scrollbar — the reference's behaviour), overflow arrows pinned
+    /// at the right edge.
     fn tab_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         egui::Frame::default()
             .inner_margin(Margin::symmetric(8, 6))
@@ -2555,8 +2767,7 @@ impl Viewer {
                     // ◀ ▶ only exist while the chips overflow; max_width
                     // keeps the scroll area from pushing them off-screen.
                     let step = widgets::BUTTON_SIZE + 4.0;
-                    let right_w =
-                        widgets::BUTTON_SIZE + if self.tabs_overflow { 2.0 * step } else { 0.0 };
+                    let right_w = if self.tabs_overflow { 2.0 * step } else { 0.0 };
                     let strip_w = (ui.available_width() - right_w).max(60.0);
                     let mut area = egui::ScrollArea::horizontal()
                         .id_salt("pixme-tabs")
@@ -2591,12 +2802,6 @@ impl Viewer {
                                 self.tab_scroll_to = Some(self.tab_scroll_pos + 160.0);
                             }
                         });
-                    }
-                    if widgets::icon_button(ui, Icon::Plus, false)
-                        .on_hover_text(t!("viewer.new_capture.tooltip"))
-                        .clicked()
-                    {
-                        shared.push(Command::ShowBar);
                     }
                 });
             });
@@ -2915,10 +3120,10 @@ impl Viewer {
         }
     }
 
-    /// The mosaic grid: one thumbnail tile per capture plus a trailing
-    /// "new capture" tile, in a vertical scroll area whose column count
-    /// adapts to the available width. Enter on the active tile opens it
-    /// in Tabs mode (same as a double-click).
+    /// The mosaic grid: one thumbnail tile per capture, in a vertical
+    /// scroll area whose column count adapts to the available width.
+    /// Enter on the active tile opens it in Tabs mode (same as a
+    /// double-click).
     fn mosaic_content(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let t = theme::tokens(ui.ctx());
         let avail = ui.available_rect_before_wrap();
@@ -2928,6 +3133,7 @@ impl Viewer {
         let modal_open = self.confirm_close
             || self.resize.is_some()
             || self.rename.is_some()
+            || self.monitor_rename.is_some()
             || self.protect.is_some()
             || self.confirm_delete.is_some()
             || shared.modal_child_open();
@@ -2949,17 +3155,12 @@ impl Viewer {
                 // the window edge.
                 ui.add_space(spacing);
                 let cols = (ui.available_width() / (tile_w + spacing)).floor().max(1.0) as usize;
-                let total = self.tabs.len() + 1; // one tile per tab + the "+" tile
-                for row in (0..total).step_by(cols) {
+                for row in (0..self.tabs.len()).step_by(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = spacing;
                         ui.add_space(spacing);
-                        for cell in row..(row + cols).min(total) {
-                            if cell < self.tabs.len() {
-                                self.mosaic_tile(ui, cell, shared, tile_w, tile_h);
-                            } else {
-                                self.mosaic_new_tile(ui, shared, tile_w, tile_h);
-                            }
+                        for cell in row..(row + cols).min(self.tabs.len()) {
+                            self.mosaic_tile(ui, cell, shared, tile_w, tile_h);
                         }
                     });
                 }
@@ -3177,50 +3378,6 @@ impl Viewer {
             ui.set_min_width(200.0);
             self.tab_menu(ui, index, shared);
         });
-    }
-
-    /// The trailing "new capture" tile — the mosaic's twin of the tab
-    /// strip's "+": clicking it brings the floating bar back.
-    fn mosaic_new_tile(&mut self, ui: &mut egui::Ui, shared: &Shared, w: f32, h: f32) {
-        let t = theme::tokens(ui.ctx());
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
-        let hovered = resp.hovered();
-        ui.painter().rect(
-            rect,
-            CornerRadius::same(t.radius_md),
-            if hovered { t.hover } else { t.card },
-            Stroke::new(
-                1.0,
-                if hovered {
-                    t.accent_border
-                } else {
-                    t.card_border
-                },
-            ),
-            StrokeKind::Inside,
-        );
-        let plus = Rect::from_center_size(
-            Pos2::new(rect.center().x, rect.center().y - 10.0),
-            Vec2::splat(24.0),
-        );
-        icons::paint(
-            ui,
-            plus,
-            Icon::Plus,
-            24.0,
-            if hovered { t.accent } else { t.icon },
-        );
-        ui.painter().text(
-            Pos2::new(rect.center().x, rect.max.y - 22.0),
-            egui::Align2::CENTER_CENTER,
-            t!("viewer.new_capture.tooltip"),
-            theme::medium(10.5),
-            t.text_dim,
-        );
-        let resp = resp.on_hover_text(t!("viewer.new_capture.tooltip"));
-        if resp.clicked() {
-            shared.push(Command::ShowBar);
-        }
     }
 
     /// The tile's caption band: an always-visible dark strip with the
@@ -3525,6 +3682,11 @@ impl Viewer {
             match resolved {
                 Some((w, h)) => {
                     self.resize_active(w, h, state.anti_alias);
+                    widgets::toast(
+                        ctx,
+                        widgets::ToastKind::Success,
+                        t!("viewer.toast.resized").to_string(),
+                    );
                     applied = true;
                 }
                 None => state.invalid = true,
@@ -3643,6 +3805,69 @@ impl Viewer {
         }
         if !(cancel || (apply && !state.taken)) {
             self.rename = Some(state);
+        }
+    }
+
+    /// The monitor-rename prompt (status strip right-click): one name
+    /// field. Applying writes `Settings::monitors[id].name` — an empty
+    /// draft clears the custom name back to the OS name.
+    fn monitor_rename_dialog(&mut self, ctx: &egui::Context, shared: &Shared) {
+        let Some(mut state) = self.monitor_rename.take() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-monitor-rename"),
+            &t!("viewer.monitor.rename_title"),
+            300.0,
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t!("dialog.rename.label").to_string());
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut state.draft)
+                            .desired_width(180.0)
+                            .font(theme::medium(12.0)),
+                    );
+                    if !state.focused {
+                        field.request_focus();
+                        state.focused = true;
+                    }
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                });
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::primary_button(ui, &t!("dialog.rename.ok")).clicked() {
+                        apply = true;
+                    }
+                    if widgets::secondary_button(ui, &t!("save.cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            },
+        );
+        if resp.should_close() || resp.inner.0 {
+            cancel = true;
+        }
+        if apply {
+            let name = state.draft.trim().to_owned();
+            {
+                let mut s = shared.lock_settings();
+                let prefs = s.monitors.entry(state.stable_id.clone()).or_default();
+                prefs.name = (!name.is_empty()).then_some(name.clone());
+                s.save();
+            }
+            tracing::info!(
+                setting = "monitor_name",
+                id = %state.stable_id,
+                "settings_changed"
+            );
+        }
+        if !(cancel || apply) {
+            self.monitor_rename = Some(state);
         }
     }
 
@@ -4041,27 +4266,100 @@ fn tool_popup(
         });
 }
 
+/// Modifier for the ←/→ tab-cycle shortcut: ⌘ on macOS, Alt on
+/// Windows — the convention the user picked per platform.
+#[cfg(target_os = "macos")]
+const CYCLE_TAB_MOD: egui::Modifiers = egui::Modifiers::COMMAND;
+#[cfg(target_os = "windows")]
+const CYCLE_TAB_MOD: egui::Modifiers = egui::Modifiers::ALT;
+
+/// One popup-menu row: a leading Lucide icon + label, full-width hover
+/// and click — every caret-menu row carries an icon for scannability.
+fn menu_row(ui: &mut egui::Ui, icon: Icon, text: impl Into<String>, enabled: bool) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(width, 24.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if enabled && resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(t.radius_sm), t.hover);
+    }
+    let tint = if enabled { t.icon } else { t.text_faint };
+    let text_col = if enabled { t.text } else { t.text_faint };
+    icons::paint(
+        ui,
+        Rect::from_center_size(
+            rect.left_center() + egui::vec2(14.0, 0.0),
+            egui::Vec2::splat(16.0),
+        ),
+        icon,
+        14.0,
+        tint,
+    );
+    ui.painter().text(
+        rect.left_center() + egui::vec2(32.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text.into(),
+        egui::FontId::proportional(12.0),
+        text_col,
+    );
+    resp
+}
+
 /// Ouvrir's menu: New / Open / Import from clipboard / last used folder
 /// (greyed until a folder has been used once).
 fn open_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_last_dir: bool, open: bool) {
     tool_popup(ui, resp, "open-menu", open, |ui| {
-        for (key, cmd) in [
-            ("menu.file.open", Command::OpenFile),
-            ("menu.app.import_clipboard", Command::ImportClipboard),
+        for (key, icon, cmd) in [
+            ("menu.file.open", Icon::FolderOpen, Command::OpenFile),
+            (
+                "menu.app.import_clipboard",
+                Icon::ClipboardPaste,
+                Command::ImportClipboard,
+            ),
         ] {
-            if ui.button(t!(key)).clicked() {
+            if menu_row(ui, icon, t!(key).to_string(), true).clicked() {
                 shared.push(cmd);
                 ui.close();
             }
         }
         ui.separator();
-        ui.add_enabled_ui(has_last_dir, |ui| {
-            if ui.button(t!("vbar.open.last_dir")).clicked() {
-                shared.push(Command::OpenLastDir);
-                ui.close();
-            }
-        });
+        if menu_row(
+            ui,
+            Icon::Folder,
+            t!("vbar.open.last_dir").to_string(),
+            has_last_dir,
+        )
+        .clicked()
+        {
+            shared.push(Command::OpenLastDir);
+            ui.close();
+        }
         recent_menu_items(ui, shared);
+    });
+}
+
+/// The Save button's caret popup: batch save — the only "save all"
+/// entry point left with the menus gone.
+fn save_menu(ui: &egui::Ui, resp: &Response, shared: &Shared, has_doc: bool, open: bool) {
+    tool_popup(ui, resp, "save-menu", open, |ui| {
+        if menu_row(
+            ui,
+            Icon::Download,
+            t!("menu.file.save_all").to_string(),
+            has_doc && shared.command_enabled(&Command::SaveAll),
+        )
+        .clicked()
+        {
+            shared.push(Command::SaveAll);
+            ui.close();
+        }
     });
 }
 
@@ -4081,24 +4379,24 @@ fn recent_menu_items(ui: &mut egui::Ui, shared: &Shared) {
             .unwrap_or_else(|| path.display().to_string());
         let command = Command::OpenPath(path.clone());
         let enabled = shared.command_enabled(&command);
-        let resp = ui
-            .add_enabled(enabled, egui::Button::new(name))
-            .on_hover_text(path.display().to_string());
+        let resp =
+            menu_row(ui, Icon::Clock, name, enabled).on_hover_text(path.display().to_string());
         if resp.clicked() {
             shared.push(command);
             ui.close();
         }
     }
     ui.separator();
-    for (command, key) in [
-        (Command::OpenAllRecent, "menu.file.open_all_recent"),
-        (Command::ClearRecent, "menu.file.clear_recent"),
+    for (command, key, icon) in [
+        (
+            Command::OpenAllRecent,
+            "menu.file.open_all_recent",
+            Icon::FolderOpen,
+        ),
+        (Command::ClearRecent, "menu.file.clear_recent", Icon::X),
     ] {
         let enabled = shared.command_enabled(&command);
-        if ui
-            .add_enabled(enabled, egui::Button::new(t!(key).as_ref()))
-            .clicked()
-        {
+        if menu_row(ui, icon, t!(key).to_string(), enabled).clicked() {
             shared.push(command);
             ui.close();
         }
@@ -4151,94 +4449,6 @@ fn mosaic_zoom_menu(ui: &egui::Ui, resp: &Response, v: &mut Viewer, open: bool) 
             }
         }
     });
-}
-
-/// One top-level menu label opening a popup (egui menu strip style).
-fn menu_button(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-    let mut resp = ui.button(label);
-    // Anchor the dropdown to the title's text edge, not the padded button
-    // edge — the flat titles carry no visible frame, so aligning the popup
-    // on the text is what reads like a real menu bar (egui's own SubMenu
-    // does the same trick in the vertical axis).
-    resp.interact_rect.min.x += ui.spacing().button_padding.x;
-    egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(180.0);
-        add(ui);
-    });
-}
-
-/// One menu entry dispatching a [`Command`] when clicked, greyed out
-/// when the command is forbidden by the current modal state.
-///
-/// Menu row with an optional leading icon; `enabled` gates the grey-out
-/// (document presence, last-dir availability, modal state).
-fn menu_item_icon(
-    ui: &mut egui::Ui,
-    shared: &Shared,
-    command: Command,
-    label: &str,
-    icon: Option<Icon>,
-    enabled: bool,
-) {
-    ui.add_enabled_ui(enabled, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            // The icon slot is always reserved so icon-less rows keep
-            // their labels aligned with the iconed ones.
-            let t = crate::ui::theme::tokens(ui.ctx());
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
-            if let Some(icon) = icon {
-                crate::ui::icons::paint(ui, rect, icon, 16.0, t.icon);
-            }
-            if ui.button(label).clicked() {
-                shared.push(command);
-                ui.close();
-            }
-        });
-    });
-}
-
-/// The "Récents" submenu: up to five most recent files, hidden entirely
-/// when the list is empty.
-fn recent_submenu(ui: &mut egui::Ui, shared: &Shared) {
-    let recents = shared.lock_settings().recent_files.clone();
-    if recents.is_empty() {
-        return;
-    }
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        // Same reserved icon slot as the other rows — alignment is kept
-        // and the submenu gets its folder glyph.
-        let t = crate::ui::theme::tokens(ui.ctx());
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
-        crate::ui::icons::paint(ui, rect, Icon::Folder, 16.0, t.icon);
-        // egui's native submenu row: chevron on the right, hover-open.
-        egui::containers::menu::SubMenuButton::new(t!("menu.file.recent")).ui(ui, |ui| {
-            for path in recents {
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                let command = Command::OpenPath(path.clone());
-                let enabled = shared.command_enabled(&command);
-                let resp = ui
-                    .add_enabled(enabled, egui::Button::new(name))
-                    .on_hover_text(path.display().to_string());
-                if resp.clicked() {
-                    shared.push(command);
-                    ui.close();
-                }
-            }
-        });
-    });
-}
-
-fn menu_item(ui: &mut egui::Ui, shared: &Shared, command: Command, label: &str) {
-    let enabled = shared.command_enabled(&command);
-    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-        shared.push(command);
-        ui.close();
-    }
 }
 
 #[cfg(test)]
@@ -4652,6 +4862,7 @@ mod tests {
                 shadow: 0.0,
                 lower: false,
             }),
+            tool: None,
         };
         session.doc.annotations.push(anno.clone());
         session.undo.push_back(AnnoEdit::Add { anno, index: 0 });
@@ -4870,6 +5081,7 @@ mod tests {
                 shadow: 0.0,
                 lower: false,
             }),
+            tool: None,
         });
         v.commit_draw(
             0,
@@ -4883,5 +5095,57 @@ mod tests {
         v.mosaic_zoom_in();
         v.sync_thumb_queue();
         assert!(v.thumb_queue.is_empty());
+    }
+
+    /// Connected inventory rows first, persisted-but-absent after;
+    /// dismissed ghosts stay hidden while their prefs entry survives.
+    #[test]
+    fn monitor_rows_union_and_dismissal() {
+        fn ident(id: &str, x: i32) -> crate::platform::MonitorIdentity {
+            crate::platform::MonitorIdentity {
+                stable_id: id.to_owned(),
+                info: MonitorInfo {
+                    id: 1,
+                    name: format!("OS {id}"),
+                    rect: PhysicalRect {
+                        x,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                    },
+                    scale_factor: 1.0,
+                    is_primary: false,
+                },
+                kind: crate::capture::MonitorKind::Unknown,
+            }
+        }
+        let inventory = vec![ident("a", 0)];
+        let mut prefs = std::collections::BTreeMap::new();
+        prefs.insert(
+            "a".to_owned(),
+            crate::config::MonitorPrefs {
+                name: Some("Bureau".into()),
+                rect_native: None,
+                draw_rect_native: None,
+            },
+        );
+        prefs.insert(
+            "gone".to_owned(),
+            crate::config::MonitorPrefs {
+                name: Some("Ancien".into()),
+                rect_native: None,
+                draw_rect_native: None,
+            },
+        );
+        let rows = monitor_rows(&inventory, &prefs, &std::collections::HashSet::new());
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].connected && rows[0].label == "Bureau");
+        assert!(!rows[1].connected && rows[1].label == "Ancien");
+        // A dismissed ghost disappears — its prefs entry is untouched.
+        let dismissed: std::collections::HashSet<String> =
+            ["gone".to_owned()].into_iter().collect();
+        let rows = monitor_rows(&inventory, &prefs, &dismissed);
+        assert_eq!(rows.len(), 1);
+        assert!(prefs.contains_key("gone"));
     }
 }

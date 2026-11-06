@@ -1420,7 +1420,6 @@ Format: date — context — decision — consequences.
   even with slight trackpad drift; dragging the image body or the centre grip
   pill still moves the window.
 
-
 ## 2026-10-30 — Lossy stdout writer for `tracing-subscriber` and panic-log-first hook
 
 - **Context**: a macOS crash report (`pixme-2026-10-30-185600.ips`) after the
@@ -1683,7 +1682,6 @@ Format: date — context — decision — consequences.
   - macOS version is 100% unaffected (`strip_undecorated_frame` is an inlined
     no-op on macOS in `src/platform/mod.rs`).
 
-
 ## 2026-11-01 — Session store: eager write-through on a dedicated writer thread
 
 - **Context**: the session was persisted only at quit (one `save_session`
@@ -1847,3 +1845,322 @@ Format: date — context — decision — consequences.
 - **Consequences**: the flash is a Windows shell artifact outside
   PixMe's control. Any screenshot/capture tool showing a
   screen-covering overlay triggers the same toggle.
+
+## 2026-11-03 — Viewer-centered UI: the floating capture bar is replaced by the viewer's vbar
+
+- **Context**: the app had two mutually-exclusive windows — a floating
+  capture bar (`AppState::Bar`) and the tabbed viewer — each with its own
+  viewport, geometry plumbing and OS integration. The `docs/audit/ui-overhaul.md`
+  plan makes the viewer the single home of the app.
+- **Decision**: `Bar` removed from the lifecycle (`Idle | Capturing |
+  Viewer`). Capture controls now live in a fixed 36 pt `egui::Panel::right`
+  inside the viewer ("vbar"): the five capture modes plus delay and
+  options popups, always visible in Tabs and Mosaic modes, gated by the
+  shared `is_command_enabled` table. Captures dispatch through
+  `Shared::push_capture`; `global-hotkey` (declared, never used) and the
+  dead capture/export stubs went out with the bar.
+- **Consequences**: one fewer window, no bar geometry/focus/state code;
+  all user capture entries funnel through one place. Manual drag of the
+  viewer was removed with the move lock (next entries) so the vbar is
+  always one strip away.
+
+## 2026-11-03 — Monitor inventory: OS-stable ids, per-monitor prefs, status-strip row
+
+- **Context**: the viewer needed per-monitor names and geometry; xcap
+  monitor ids are unstable (Windows ids are pointer handles, macOS ids
+  are per-session).
+- **Decision**: `platform::MonitorIdentity { stable_id, info }` —
+  `CGDisplayCreateUUIDFromDisplayID` on macOS, `EnumDisplayDevicesW` +
+  `EDD_GET_DEVICE_INTERFACE_NAME` (PNP DeviceID) on Windows, a
+  `rect:{x},{y},{w}x{h}` key as fallback. `Settings::monitors` persists
+  `{ name?, rect_native? }` per stable id in `prefs.json`; entries are
+  never dropped on disconnect — disconnected monitors stay listed greyed
+  until clicked once (visual dismissal only). The inventory is a
+  snapshot refreshed at startup and by the status strip's ↻ button —
+  never re-enumerated per frame.
+- **Consequences**: monitor state survives reconnects/reboots; the
+  DeviceID is port-dependent on Windows (documented limitation — the
+  rect key covers it poorly). `monitor_rows` is a pure function, unit
+  tested.
+
+## 2026-11-03 — Viewer move lock + per-monitor geometry restore
+
+- **Context**: once monitor buttons become the relocation mechanism,
+  the viewer itself must not be user-draggable (otherwise both paths
+  fight and persisted rects go stale).
+- **Decision**: `platform::viewer_move_lock` — macOS applies
+  `setMovable(false)` on the "PixMe"-titled normal-level NSWindow;
+  Windows subclasses the viewer HWND (`GWLP_WNDPROC`) swallowing
+  `WM_NCLBUTTONDOWN`/`HTCAPTION` and `WM_SYSCOMMAND`/`SC_MOVE`. Borders
+  stay resizable; programmatic moves are unaffected. Re-applied on every
+  `enter(Viewer)` since the deferred viewport is destroyed/recreated.
+  `viewer_target` carries `{ monitor, native_rect }` — `SelectMonitor`
+  and the post-capture landing both go through `viewer_target_for` and a
+  dedicated `ViewportSync` ledger (dedup on requested, never reported,
+  geometry). `viewer_geo_settle` skips persisting the reported rect for
+  2 frames after a move; `rect_native` writes are debounced to one
+  `prefs.json` flush per half-second (flushed in `quit_now` too).
+- **Consequences**: parity semantics on both OSes; the saved rect is
+  OUTER so `InnerSize` subtracts the measured decoration delta. The
+  Windows subclass is written but not compiled on macOS — needs a
+  Windows build check.
+
+## 2026-11-03 — Capture starts on the session monitor; Windows re-focus during Capturing
+
+- **Context**: the overlay opened under the cursor; with a monitor
+  "selected" in the viewer the user's intent is the viewer's monitor.
+- **Decision**: `push_capture` records `viewer_monitor` directly;
+  `begin_capture` and `warm_freeze` rank session monitor → remembered
+  fixed-region rect → cursor → primary (tried in a loop so a stale id
+  can't strand the overlay). While `Capturing`, `pump` re-issues
+  `ViewportCommand::Focus` on the overlay every frame on Windows
+  (`platform::refocus_capture_overlay`, best-effort vs Alt+Tab); the
+  macOS kiosk needs nothing (no-op).
+- **Consequences**: cursor roaming unchanged (the overlay still follows
+  the cursor across monitors until a selection starts). Re-focus is
+  best-effort: `SetForegroundWindow` can be refused — Esc then hits
+  another app until a click; Win key / Ctrl+Alt+Del are never
+  suppressible (documented limit, no `WH_KEYBOARD_LL` by choice).
+
+## 2026-11-03 — Resident icon: ToggleViewer on left click, open/settings/quit menu, dock reopen
+
+- **Context**: the tray/status item used to only open the viewer;
+  the audit makes it a pure open/settings/quit surface.
+- **Decision**: `Command::ToggleViewer` — `OpenViewer` from `Idle`,
+  `ViewerClosed` when open — fired on `TrayIconEvent::Click` (left-down)
+  with `with_menu_on_left_click(false)` (menu stays on right click).
+  Both OSes get the same menu: Open PixMe / Settings… / Check for
+  updates (disabled placeholder, no updater) / Close PixMe. macOS Dock
+  clicks queue `OpenViewer` via `applicationShouldHandleReopen:
+  hasVisibleWindows:` — `class_addMethod` when nothing answers it, else
+  `method_setImplementation` wrapped onto winit's impl (original runs
+  first). Windows taskbar unchanged: viewer keeps its native button,
+  the 1×1 anchor keeps `taskbar(false)`.
+- **Consequences**: captures can never start behind the user's back
+  from the resident icon. The Dock hook swizzles the winit delegate —
+  re-check after a winit/eframe bump.
+
+## 2026-11-03 — Windows anchor white ring: hidden creation + unconditional empty region
+
+- **Context**: Windows 11 DWM drew a rounded border + accent line on the
+  1×1 anchor (§2.7): the window was created visible before the strip
+  guard could clip it (startup race), and `SWP_FRAMECHANGED` reset the
+  region without changing `(w,h)` so the ring reappeared.
+- **Decision**: root viewport created `with_visible(false)` — the strip
+  guard applies the empty region before the first `ShowWindow`; and
+  `SetWindowRgn` is reapplied for `Role::Anchor` on EVERY pass (free on
+  1×1) instead of only on style/size change. The ≤8 px guard stays so
+  recycled HWNDs can't be blanked.
+- **Consequences**: verified on macOS that an invisible root viewport
+  keeps the event pump alive. Windows-side: needs a build/launch check
+  on the Windows box.
+
+## 2026-11-03 — Viewer bounds clamp replaces the hard move lock (user feedback)
+
+- **Context**: the move lock (`setMovable(false)` / caption-drag
+  swallow) made the viewer fully immovable — the user never asked for
+  that; the requirement is only that the window can't be dragged
+  beyond its monitor's limits (crossing monitors stays on the status
+  strip buttons).
+- **Decision**: the OS move lock is removed. The viewer callback now
+  clamps the reported `outer_rect` to the CURRENT monitor's UI bounds
+  every settled frame (`clamp_rect_inside` + `viewer_sync`), falling
+  back to the monitor under the centre when the current one went away.
+  `Settings.last_monitor` (stable id) is persisted alongside
+  `rect_native` in the same debounced flush — written during a gesture
+  but flushed to disk only after ~500 ms of quiet, so persistence lands
+  at the END of a move. At launch the last monitor's saved rect is
+  restored through the normal `viewer_target` path.
+- **Consequences**: dragging inside the monitor is free again; the
+  boundary is a rubber wall (one frame of lag). The macOS/Windows
+  lock implementations were deleted — nothing platform-specific
+  remains to verify for this.
+
+## 2026-11-04 — Free cross-monitor drag; geometry written once at gesture settle
+
+- **Context**: the monitor-boundary clamp made the viewer unmovable past
+  its monitor's edge. An intermediate design snapped the window to the
+  target monitor's memorized rect on drop — rejected by the user: a
+  move must stay completely normal, only persistence reacts.
+- **Decision**: `clamp_rect_inside` and its per-frame boundary push are
+  removed — the OS moves the window, PixMe never interferes. The
+  hosting monitor follows the window's physical position (centre
+  hit-test on the cached inventory) in normal time; during the topology
+  pin the PREVIOUS host is preferred so a mid-shuffle dump onto a
+  reconnected display can't steal the window. `rect_native` and
+  `last_monitor` are written exactly ONCE per gesture — when the
+  reported `outer_rect` has been quiet for 250 ms (`viewer_move_at`,
+  polled via `request_repaint_after`) — under the monitor the window
+  actually sits on, so the status-strip monitor buttons always land on
+  each display's last real position. The unplug restore (`viewer_target`
+  arm) is gated on the previous host being disconnected — a normal
+  drop never relocates.
+- **Consequences**: dragging works like any OS window; prefs stay clean
+  (single write per gesture, still disk-flushed via the existing
+  `monitor_geom_dirty_at` debounce). Two self-deadlock traps documented
+  for this loop: `if let` scrutinee `MutexGuard`s live through the
+  whole body — never re-lock the same `Shared` mutex inside such a
+  body.
+
+## 2026-11-04 — Taskbar semantics for monitor buttons and the resident icon
+
+- **Context**: the status-strip monitor buttons only relocated the
+  viewer, and the resident icon's left click was a plain open/close
+  toggle — the user wants per-monitor taskbar behavior (each macOS
+  display carries its own menu bar / each Windows display its taskbar).
+- **Decision**: `SelectMonitor` gained toggle semantics — clicking the
+  monitor the viewer is shown AND focused on hides it (`ViewerClosed`);
+  every other case (other monitor, viewer hidden in Idle, minimized,
+  or behind another app) arms `viewer_target` for that monitor's saved
+  rect and dispatches `OpenViewer` (which also un-minimizes and raises).
+  `ToggleViewer` (resident icon left click) resolves the display under
+  the cursor at click time via `platform::cursor_position` and forwards
+  to `SelectMonitor` — falling back to the previous plain toggle when
+  the cursor sits off every known display. Shared by the strip buttons:
+  clicking the selected monitor's button now hides the viewer too.
+- **Consequences**: one consistent gesture — "click the display's icon
+  to summon PixMe there, click again to dismiss". Windows gets the same
+  behavior through the shared command path.
+
+## 2026-11-04 — Windows capture-overlay chrome: DWM border suppression + capture exclusion
+
+- **Context**: three field reports on the region overlay. (a) Windows:
+  a white line along the screen's top edge on every PC (also via RDP) —
+  the DWM accent line drawn on borderless windows; the existing
+  `SetWindowRgn` fix used by the countdown/pins cannot apply to the
+  overlay (it would clip real frozen-frame pixels). (b) Both OSes: the
+  crosshair/veil stops ~1 px short of the top edge — on Windows the DWM
+  line covers that row, on macOS the nudge loop's 1 pt tolerance could
+  leave a genuinely uncovered strip. (c) One Windows laptop: the torn-down
+  viewer still appears as a watermark in the frozen frame — xcap reads
+  the DWM composition via GDI `BitBlt`, and ~2 warm-up frames are not
+  always enough for the composition to drop the window's pixels.
+- **Decision**: in `strip_undecorated_frame`, the overlay gets
+  `DwmSetWindowAttribute(DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE)` (Windows
+  11; harmless elsewhere) instead of a window region. Every enumerated
+  PixMe window EXCEPT the pins gets
+  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` — viewer, overlay,
+  countdown, dialogs can never photograph themselves, whatever the
+  teardown timing. Pins stay capturable: a pinned capture is screen
+  content. On macOS the overlay-alignment tolerance tightens from 1.0 pt
+  to 0.25 pt so the window must actually reach the monitor's top edge.
+- **Consequences**: PixMe's own UI is now invisible to ALL screen capture
+  tools on Windows 10 2004+, not only its own (the designed use of the
+  API). The macOS nudge loop retries harder against the visibleFrame
+  clamp — still capped by `MAX_NUDGE_TRIES`. `windows.rs` compiles only
+  on Windows: verified on this branch's Windows build, not on macOS.
+  **Superseded**: the permanent exclusion made PixMe invisible to Teams
+  screen sharing and every other capture tool — replaced by the
+  transient guard below (same day).
+
+## 2026-11-04 — Transient capture exclusion around the freeze (+ DwmFlush)
+
+- **Context**: the permanent `WDA_EXCLUDEFROMCAPTURE` above hid every
+  PixMe window from ALL capture tools — Teams screen sharing and
+  third-party screenshooters could no longer see the viewer.
+- **Decision**: the flag is now armed only for the capture `BitBlt`'s
+  duration, via `platform::capture_exclusion()` — an RAII
+  `CaptureExclusionGuard` that (a) toggles the flag on every PixMe hwnd
+  except pins by LIVE `EnumThreadWindows` enumeration (a window created
+  since the last `strip_undecorated_frame` pass is covered — no registry
+  staleness; pins are skipped via a `PIN_HWNDS` registry plus a live
+  "PixMe Pin" title check for not-yet-classified pins), (b) calls
+  `DwmFlush()` so the affinity change is inside the composed frame
+  before the readback, and (c) lifts the exclusion on drop — error and
+  panic paths included. The same guard is shared by all three capture
+  sites (`screen::capture`, `capture_all_monitors`, `window::capture`).
+- **Unverified assumptions — to validate on a Windows build**:
+  1. `DwmFlush` lands early enough for DWM to honour the affinity change
+     before xcap's `BitBlt` (DWM applies affinity at its own cadence).
+  2. `BitBlt` being synchronous, the guard scope still covers the whole
+     xcap grab on every path.
+  Instrumented at debug level (`capture_exclusion_armed` /
+  `capture_exclusion_lifted`: hwnd count, `DwmFlush` duration, active
+  duration) — validate with `RUST_LOG=pixme=debug` on the laptop that
+  showed the ghost.
+- **Fallback**: if the ghost reappears despite `DwmFlush`, the next step
+  is decided WITH the user — not implemented unilaterally.
+- **WGC note**: Windows.Graphics.Capture also honours
+  `WDA_EXCLUDEFROMCAPTURE` and cannot express "everything except my
+  windows" — it does not solve this problem. Any WGC evaluation
+  (latency, HDR, mixed-DPI monitors) is a separate track.
+- **Consequences**: PixMe windows are only invisible for the grab's
+  duration (ms) — imperceptible to Teams/others; macOS unchanged
+  (no-op guard). `windows.rs` still compiles only on Windows.
+
+## 2026-11-05 — Capture-bar icon styles (Standard / Color / Duotone)
+
+- **Context**: the vbar's monochrome Lucide set read as austere; the user
+  asked for a more colourful, modern look selectable in Settings.
+- **Decision**: a persisted `icon_style` setting (`standard | color |
+  duotone`, default `standard`) on the General page, applying to the
+  vertical capture bar AND the horizontal toolbar (`tool_button`s) —
+  the draw tools, tabs, menus and status strip keep the standard
+  theme-tinted Lucide glyphs so the visual reference remains the
+  identity. `Color` reuses the Lucide SVGs with a fixed per-icon hue
+  (`theme::icon_hue`, theme-independent like the annotation palette);
+  `Duotone` swaps in eighteen embedded Phosphor duotone SVGs (MIT,
+  `assets/icons-duotone/`) — `timer` stands in for `Clock`,
+  `app-window` for `SquareDashedMousePointer`, `rows` for `PanelTop`.
+  Both coloured styles keep the widget-state overrides: disabled greys
+  out, the armed delay marker stays `danger`. (First cut covered the
+  vbar only; the user meant the horizontal toolbar — scope widened to
+  both the same day.)
+- **Consequences**: one more asset directory + licence
+  (`LICENSE-phosphor.txt`), a `DUOTONE_DATA` table beside `DATA` in
+  `icon_data.rs`, and `icons::styled_paint` + `icons::hue` behind
+  `widgets::icon_button_styled` / `widgets::tool_button_styled` as the
+  style-aware render path. Adding a fourth style means a new asset
+  table plus a hue entry per styled icon.
+
+## 2026-11-05 — Ghost fallback: early exclusion, real-teardown gate, countdown hides the viewer
+
+- **Context**: the ghost reappeared on the user's fastest PC — the torn-down
+  viewer watermarking the frozen frame, exactly the fallback case the
+  2026-11-04 entry reserved for a user decision. Root cause confirmed: the
+  BitBlt-time arming loses two races on a fast machine — a dead hwnd can't
+  be flagged at all, and two warm frames can fit inside one DWM
+  composition so `DwmFlush` returns before the flag/demolition is visible
+  to the readback. With a capture delay the viewer additionally stayed
+  mounted for the whole countdown and was destroyed at `CaptureNow`, a
+  few frames before the freeze.
+- **Decision** (agreed with the user — their own hypothesis confirmed):
+  1. `begin_capture` arms `WDA_EXCLUDEFROMCAPTURE` while the displaced
+     windows are still alive (`OverlaySession::early_excl`), held until
+     the freeze lands — the flag is inside the composed stream before any
+     teardown begins.
+  2. `warm_freeze` no longer counts blind frames only: the freeze waits
+     until `viewer_id`/`countdown_id` leave `raw.viewports` (winit-acked
+     native teardown), with a ~2 s escape hatch against a stuck entry.
+  3. Arming a delayed capture hides the viewer immediately
+     (`Command::Capture` → `enter(Idle)` when the state is `Viewer` and no
+     Draw modal is up); the origin is stashed in `capture_return_to` so a
+     cancelled countdown restores it and a cancelled capture still lands
+     back on the viewer.
+- **Consequences**: shared-code change — macOS gets the same
+  hide-at-arm behaviour (desirable anyway) and the teardown gate
+  (harmless); the early arm is a no-op guard there. The transient
+  exclusion's coverage is unchanged: still lifted the moment the frozen
+  frames are taken, pins still photograph themselves.
+
+## 2026-11-05 — Per-monitor Draw editor geometry (`draw_rect_native`)
+
+- **Context**: the Draw editor always opened at egui's default placement;
+  the user wants its position/size remembered per monitor across
+  openings and sessions — centred on the monitor when nothing is saved,
+  cleared by "Reset monitors" like the rest of the per-monitor state.
+- **Decision**: `MonitorPrefs` gains `draw_rect_native` (same native-units
+  `[x, y, w, h]` convention as `rect_native`). `OpenDraw` stashes a
+  `draw_target` (the viewer's monitor + its saved rect, reused
+  `ViewerTarget` shape); the draw viewport pass applies it once —
+  saved rect through `target_ui_rect`'s clamped path, else centred via
+  `monitor_ui_rect` — then tracks user moves with the viewer's
+  last-outer/250 ms-quiet settle before writing the clamped rect under
+  the monitor under the window's centre (`clamped_native_rect`, the
+  DPI-inflation guard extracted from the viewer's inline block).
+  `ResetMonitors` needs no extra code: `monitors.clear()` wipes the
+  field with its entry.
+- **Consequences**: draw geometry survives restarts and follows the
+  display it lives on; the gesture settle reuses the debounced
+  `monitor_geom_dirty_at` flush, no new save path. Shared code (works
+  identically on macOS).

@@ -14,7 +14,7 @@ use crate::ui::theme;
 use crate::ui::viewport_sync::ViewportSync;
 
 /// Transparent margin kept around the digit so its painted outline is
-/// not clipped by the viewport bounds (same trick as the floating bar).
+/// not clipped by the viewport bounds.
 const SHADOW_MARGIN: i8 = 14;
 
 /// Side of the square area holding the digit.
@@ -85,8 +85,8 @@ impl Countdown {
 
     /// Paints the countdown digit for this frame and keeps the viewport
     /// hugging it, parked at the bottom-right of `anchor`'s monitor (the
-    /// bar's or the viewer's — resolved in native units by the owner, so
-    /// no window's points are mixed here). Without an anchor it falls
+    /// viewer's — resolved in native units by the owner, so no window's
+    /// points are mixed here). Without an anchor it falls
     /// back to the monitor under the cursor, then the primary. Returns
     /// `false` once the deadline passed — the caller then fires the
     /// capture.

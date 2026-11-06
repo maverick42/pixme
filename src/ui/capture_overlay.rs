@@ -88,8 +88,8 @@ pub struct OverlaySession {
     /// crosshair exists, stamped onto the final crop at the click point
     /// (`None` when `include_pointer` is off or the cursor is hidden).
     pub(crate) cursor: Option<crate::platform::CursorSnapshot>,
-    /// Frames painted before the screenshot is taken — the bar's window must
-    /// be torn down first or it would photograph itself.
+    /// Frames painted before the screenshot is taken — the viewer's window
+    /// must be torn down first or it would photograph itself.
     warm_frames: u8,
     /// All monitors frozen up front so the crosshair can follow the cursor
     /// across screens until a selection starts.
@@ -160,6 +160,14 @@ pub struct OverlaySession {
     pub capture_id: u64,
     /// When the capture started — the `ms` field of `capture_finished`.
     pub started_at: std::time::Instant,
+    /// `WDA_EXCLUDEFROMCAPTURE` armed by `begin_capture` while the windows
+    /// this capture displaces are still alive — a dead hwnd can't be
+    /// flagged, and DWM honours the affinity at its own cadence, so
+    /// arming at BitBlt time loses the race on fast machines (the
+    /// "ghost" watermark). Held until the freeze lands — the selection
+    /// phase must not hide PixMe from screen shares — or dropped with
+    /// the session on cancel/confirm. No-op on macOS.
+    pub early_excl: Option<crate::platform::CaptureExclusionGuard>,
 }
 
 impl OverlaySession {
@@ -202,6 +210,7 @@ impl OverlaySession {
             swallow_esc_until: None,
             capture_id: 0,
             started_at: std::time::Instant::now(),
+            early_excl: None,
         }
     }
 
@@ -258,14 +267,21 @@ impl OverlaySession {
     }
 
     /// Freeze warm-up, called by the **anchor** pass while no capture window
-    /// exists yet: two anchor frames let the floating bar finish tearing
-    /// down, then every connected monitor is photographed at once. Crucially
-    /// this runs *before* the overlay viewport is created — capturing while
-    /// it is on screen would photograph the overlay's own veil. Returns
-    /// `true` once frozen.
-    pub fn warm_freeze(&mut self) -> bool {
-        self.warm_frames += 1;
-        if self.warm_frames < 2 {
+    /// exists yet: two anchor frames let the viewer finish tearing
+    /// down, then every connected monitor is photographed at once — but
+    /// only once `viewer_gone` reports the displaced windows' real
+    /// teardown: on a fast machine two frames fit inside one DWM
+    /// composition, and the BitBlt would still read the dying viewer's
+    /// pixels (the "ghost" watermark). Crucially this runs *before* the
+    /// overlay viewport is created — capturing while it is on screen
+    /// would photograph the overlay's own veil. Returns `true` once
+    /// frozen.
+    pub fn warm_freeze(&mut self, viewer_gone: bool) -> bool {
+        self.warm_frames = self.warm_frames.saturating_add(1);
+        // A viewport id stuck in `raw.viewports` must not stall the
+        // capture forever — after ~2 s take the frame, ghost or not.
+        let wait = !viewer_gone && self.started_at.elapsed() < std::time::Duration::from_secs(2);
+        if self.warm_frames < 2 || wait {
             return false;
         }
         if self.frozen.is_none() && !self.failed {
@@ -274,7 +290,12 @@ impl OverlaySession {
                 // menus so an open menu remains pickable in the frozen frame.
                 self.window_list = window::windows().ok();
             }
-            match screen::capture_all_monitors(self.include_pointer) {
+            let result = screen::capture_all_monitors(self.include_pointer);
+            // The early exclusion's job ends with the freeze — holding it
+            // through the selection phase would hide PixMe from screen
+            // sharing for minutes. Dropping lifts every live window's flag.
+            self.early_excl = None;
+            match result {
                 Ok((frames, cursor)) => {
                     self.cursor = cursor;
                     if !self.instant && crate::platform::dismiss_active_menus() {
@@ -284,27 +305,31 @@ impl OverlaySession {
                         self.swallow_esc_until =
                             Some(std::time::Instant::now() + SYNTHETIC_ESC_GRACE);
                     }
-                    // Pick the monitor under the cursor right now; fall back
-                    // to the pre-selected monitor or the primary/first frame.
+                    // The session monitor — the viewer's, recorded by
+                    // `push_capture` — is the start monitor (§2.5). A
+                    // remembered fixed-region rect's own monitor is next
+                    // (it reopens where it was), then the cursor's, then
+                    // the primary/first frame; each candidate is tried
+                    // in order so a stale monitor id can never strand
+                    // the overlay without a frame.
                     let cursor_mon = crate::platform::cursor_position()
                         .and_then(|(x, y)| screen::monitor_at(x, y))
                         .map(|m| m.id);
-                    // For FixedRegion/Pin with a remembered rect on a known
-                    // monitor, open on that monitor initially unless the
-                    // cursor is elsewhere.
-                    let initial_id = cursor_mon
-                        .or_else(|| self.restore_sel.map(|(id, _)| id))
-                        .or_else(|| self.monitor.as_ref().map(|m| m.id))
-                        .or_else(|| {
-                            frames
-                                .iter()
-                                .find(|c| c.monitor.is_primary)
-                                .or_else(|| frames.first())
-                                .map(|c| c.monitor.id)
-                        });
+                    let candidates = [
+                        self.monitor.as_ref().map(|m| m.id),
+                        self.restore_sel.map(|(id, _)| id),
+                        cursor_mon,
+                        frames
+                            .iter()
+                            .find(|c| c.monitor.is_primary)
+                            .or_else(|| frames.first())
+                            .map(|c| c.monitor.id),
+                    ];
                     self.frozen_all = frames;
-                    if let Some(id) = initial_id {
-                        self.activate_monitor(id);
+                    for id in candidates.into_iter().flatten() {
+                        if self.activate_monitor(id) {
+                            break;
+                        }
                     }
                     if !self.instant && self.frozen.is_some() {
                         // The frozen frames are safe: hide the REAL menu
@@ -354,6 +379,7 @@ impl OverlaySession {
         // bounds, so painting AND input cover the monitor edge to edge.
         let rect = ctx
             .input(|i| i.viewport().inner_rect)
+            .map(|r| Rect::from_min_size(Pos2::ZERO, r.size()))
             .unwrap_or_else(|| ui.max_rect());
         let t = theme::tokens(&ctx);
         ui.painter().rect_filled(rect, 0.0, t.dock);
@@ -467,8 +493,11 @@ impl OverlaySession {
                 // re-placing until it covers the monitor's real frame,
                 // capped so a failed kiosk can never spin.
                 let want = egui::vec2(m.rect.width as f32, m.rect.height as f32);
-                let aligned = (outer.min - origin).abs().max_elem() <= 1.0
-                    && (outer.size() - want).abs().max_elem() <= 1.0;
+                // Tolerance under 0.25 pt (half a physical px on Retina):
+                // a 1-pt gap leaves a real undimmed strip along the
+                // monitor's top edge — uncovered, unselectable.
+                let aligned = (outer.min - origin).abs().max_elem() <= 0.25
+                    && (outer.size() - want).abs().max_elem() <= 0.25;
                 if !aligned && self.nudge_tries < MAX_NUDGE_TRIES {
                     self.nudge_tries += 1;
                     ctx.send_viewport_cmd(ViewportCommand::OuterPosition(origin));
@@ -532,7 +561,21 @@ impl OverlaySession {
         if blind {
             ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
-        let cursor = if blind {
+        // A press swallowed by the WindowServer top-edge zone freezes the
+        // overlay's repaints: no OS event reaches egui, so show() stops
+        // running and the selection never follows the cursor. Poll a
+        // repaint every 16 ms while the physical button is held without
+        // egui seeing a press (or while a drag is live) so the blind
+        // drag keeps tracking the OS cursor.
+        if blind || self.drag.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        let cursor = if blind || self.drag.is_some() {
+            // The OS cursor, not egui's `latest_pos`: a press swallowed by
+            // the top-edge zone captures the mouse — egui stops receiving
+            // mouse-moves, so its position freezes at the press point. At
+            // release `blind` flips false and the stale egui pos would
+            // squash the selection back to nothing.
             self.os_cursor_pos(&ctx)
         } else {
             self.cursor_pos(&ctx)
@@ -632,12 +675,18 @@ impl OverlaySession {
     /// button — a press eaten by an OS edge zone (`resp.drag_started`
     /// never fired) still starts a drag while the cursor sits in bounds.
     fn handle_drag(&mut self, pos: Pos2, resp: &egui::Response, bounds: Rect, os_down: bool) {
-        let in_bounds = bounds.contains(pos);
         let pos = clamp_pos(pos, bounds);
         let synthetic = self
             .suppress_press_until
             .is_some_and(|until| std::time::Instant::now() < until);
-        if self.drag.is_none() && !synthetic && (resp.drag_started() || (os_down && in_bounds)) {
+        // A press swallowed by an OS edge zone (macOS top strip) never
+        // reaches egui — start the blind drag on the physical button
+        // alone. `in_bounds` must NOT gate it: pressing at the very top
+        // of the screen puts the cursor outside the window's bounds, and
+        // gating there left the press dead (no selection, drag end on
+        // release, nothing to cancel with Esc). `pos` is clamped to the
+        // bounds, so the anchor lands on the top edge.
+        if self.drag.is_none() && !synthetic && (resp.drag_started() || os_down) {
             self.blind_drag = !resp.drag_started();
             self.drag = Some(if let Some(sel) = self.selection {
                 if let Some(h) = hit_handle(sel, pos) {

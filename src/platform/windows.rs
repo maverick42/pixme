@@ -13,8 +13,8 @@ use std::cell::RefCell;
 use std::path::Path;
 
 use rust_i18n::t;
-use tray_icon::TrayIcon;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
 
 use super::PlatformServices;
 use crate::capture::CaptureError;
@@ -27,11 +27,6 @@ impl PlatformServices for Windows {
     fn ensure_capture_permission(&self) -> Result<(), CaptureError> {
         // Windows needs no screen-capture permission.
         Ok(())
-    }
-
-    fn has_native_app_menu(&self) -> bool {
-        // Menus are drawn inside the viewer window (egui menu strip).
-        false
     }
 }
 
@@ -68,6 +63,20 @@ pub fn install_ui(ctx: &egui::Context) {
             crate::app::wake_viewports(&repaint_ctx);
         }
     }));
+    let tray_ctx = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        // Left click toggles the viewer; the menu stays on the right
+        // click (`with_menu_on_left_click(false)` below).
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Down,
+            ..
+        } = event
+        {
+            super::queue_menu_command(crate::app::Command::ToggleViewer);
+            crate::app::wake_viewports(&tray_ctx);
+        }
+    }));
 
     fn add(
         menu: &Menu,
@@ -84,8 +93,27 @@ pub fn install_ui(ctx: &egui::Context) {
 
     let menu = Menu::new();
     let mut items = Vec::new();
-    add(&menu, &mut items, "take_capture", "menubar.take_capture");
     add(&menu, &mut items, "open_viewer", "menubar.open_viewer");
+    add(&menu, &mut items, "settings", "menu.app.preferences");
+    {
+        // Greyed until an updater exists — its id maps to no command.
+        let item = MenuItem::with_id(
+            "check_updates",
+            t!("menubar.check_updates").as_ref(),
+            false,
+            None,
+        );
+        if let Err(err) = menu.append(&item) {
+            tracing::warn!("cannot append tray menu item: {err}");
+        }
+        items.push((item, "menubar.check_updates", "check_updates"));
+    }
+    add(
+        &menu,
+        &mut items,
+        "reset_monitors",
+        "menubar.reset_monitors",
+    );
     if let Err(err) = menu.append(&PredefinedMenuItem::separator()) {
         tracing::warn!("cannot append tray menu separator: {err}");
     }
@@ -93,7 +121,9 @@ pub fn install_ui(ctx: &egui::Context) {
 
     let mut builder = TrayIcon::builder()
         .with_menu(Box::new(menu.clone()))
-        .with_menu_on_left_click(true)
+        // Left click toggles the viewer (TrayIconEvent); the menu is
+        // for the right click.
+        .with_menu_on_left_click(false)
         .with_tooltip("PixMe");
     // The Windows tray has no template mode: use the full-colour artwork
     // (readable on light and dark taskbars alike).
@@ -182,32 +212,151 @@ pub fn sync_menu_enabled(
     });
 }
 
-/// Strips `WS_CAPTION` and shapes undecorated floating windows (#2246).
-///
-/// ## Known Upstream Bugs (winit / DWM)
-///
-/// 1. **Content offset (31 px down)**: `winit` 0.30 forces `WS_CAPTION | WS_BORDER`
-///    on all windows, even with `decorations: false`, and relies on `WM_NCCALCSIZE`
-///    to hide them. On Windows with Intel graphics drivers or OpenGL, the desktop
-///    compositor still reserves space for the caption, shifting content ~31 px
-///    down and clipping it at the window bottom (emilk/egui#2770, libsdl#12105).
-///    This reproduces the fix from PhotoCraft (`window_frame.rs`, issue #2246):
-///    stripping `WS_CHROME` removes the non-client area so no offset occurs.
-///
-/// 2. **DWM 1 px top line**: on Windows 11, DWM draws an accent line at y=0 on
-///    borderless windows (documented in `winit::platform::windows::WindowExtWindows::set_undecorated_shadow`:
-///    *"Enabling the shadow causes a thin 1px line to appear on the top of the window"*).
-///    Applying a native Win32 window region (`SetWindowRgn`) tells DWM the true
-///    geometry of the window so nothing is drawn outside it:
-///    - For the floating bar and countdown (`"PixMe Bar"`, `"PixMe Countdown"`):
-///      both carry a 14 pt transparent `SHADOW_MARGIN`, so clipping y=0..2
-///      removes the DWM line without touching the card or its soft shadow.
-///    - For pinned captures (`"PixMe Pin"`): sets a rounded-rect region (`16 px`),
-///      matching the card's rounded corners and preserving the full border stroke.
-///
-/// Note: whenever winit touches window flags (focus change, new child window),
-/// it triggers `SWP_FRAMECHANGED` which resets the window region. The guard
-/// reapplies `SetWindowRgn` whenever styles are stripped or dimensions change.
+// Strips `WS_CAPTION` and shapes undecorated floating windows (#2246).
+//
+// ## Known Upstream Bugs (winit / DWM)
+//
+// 1. **Content offset (31 px down)**: `winit` 0.30 forces `WS_CAPTION | WS_BORDER`
+//    on all windows, even with `decorations: false`, and relies on `WM_NCCALCSIZE`
+//    to hide them. On Windows with Intel graphics drivers or OpenGL, the desktop
+//    compositor still reserves space for the caption, shifting content ~31 px
+//    down and clipping it at the window bottom (emilk/egui#2770, libsdl#12105).
+//    This reproduces the fix from PhotoCraft (`window_frame.rs`, issue #2246):
+//    stripping `WS_CHROME` removes the non-client area so no offset occurs.
+//
+// 2. **DWM 1 px top line**: on Windows 11, DWM draws an accent line at y=0 on
+//    borderless windows (documented in `winit::platform::windows::WindowExtWindows::set_undecorated_shadow`:
+//    *"Enabling the shadow causes a thin 1px line to appear on the top of the window"*).
+//    Applying a native Win32 window region (`SetWindowRgn`) tells DWM the true
+//    geometry of the window so nothing is drawn outside it:
+//    - For the countdown (`"PixMe Countdown"`): it carries a 14 pt
+//      transparent `SHADOW_MARGIN`, so clipping y=0..2 removes the DWM
+//      line without touching the card or its soft shadow.
+//    - For pinned captures (`"PixMe Pin"`): sets a rounded-rect region (`16 px`),
+//      matching the card's rounded corners and preserving the full border stroke.
+//    - For the capture overlay (`"PixMe Overlay"`): clipping is impossible —
+//      the top pixel rows carry real frozen-frame content that must stay
+//      visible and selectable. `DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE`
+//      suppresses the border itself instead (Windows 11; ignored elsewhere).
+//
+// 3. **Ghost window in the frozen frame**: xcap grabs the screen with a GDI
+//    `BitBlt` of the composed desktop. On slower machines the composition can
+//    still hold a PixMe window's pixels when the freeze fires ~2 frames after
+//    its viewport is torn down — the viewer then appears as a watermark under
+//    the dim veil. `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` redacts
+//    PixMe windows from the readback — but it is toggled TRANSIENTLY, only
+//    for the capture's duration (see [`capture_exclusion`]): a permanent
+//    exclusion hid PixMe from Teams and every other capture tool. Every role
+//    is excluded EXCEPT the pins: a pinned capture is meant to be screen
+//    content and must photograph. Best-effort — `WDA_EXCLUDEFROMCAPTURE`
+//    needs Windows 10 2004+; the call fails harmlessly on older builds.
+//
+// Note: whenever winit touches window flags (focus change, new child window),
+// it triggers `SWP_FRAMECHANGED` which resets the window region. The guard
+// reapplies `SetWindowRgn` whenever styles are stripped or dimensions change.
+thread_local! {
+    /// Hwnds classified as pins — they represent screen content and
+    /// must stay capturable. Populated by the window pass in
+    /// [`strip_undecorated_frame`]; a pin not yet classified (created
+    /// since the last pass) is still skipped by its live "PixMe Pin"
+    /// title in [`set_capture_exclusion`].
+    static PIN_HWNDS: std::cell::RefCell<std::collections::HashSet<isize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Enables/disables `WDA_EXCLUDEFROMCAPTURE` on every PixMe window
+/// except pins, by enumerating this thread's windows LIVE — a window
+/// created since the last `strip_undecorated_frame` pass is covered
+/// too (no registry staleness). Returns how many hwnds were toggled.
+/// Best-effort: ignored on Windows builds before 10 2004.
+fn set_capture_exclusion(exclude: bool) -> u32 {
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
+    const WDA_NONE: u32 = 0;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetWindowDisplayAffinity(hwnd: isize, affinity: u32) -> i32;
+        fn EnumThreadWindows(
+            id_thread: u32,
+            lpfn: unsafe extern "system" fn(isize, isize) -> i32,
+            lparam: isize,
+        ) -> i32;
+        fn GetCurrentThreadId() -> u32;
+        fn GetWindowTextW(hwnd: isize, s: *mut u16, n: i32) -> i32;
+    }
+    struct Ctx {
+        affinity: u32,
+        applied: u32,
+    }
+    unsafe extern "system" fn visit(hwnd: isize, lp: isize) -> i32 {
+        let ctx = unsafe { &mut *(lp as *mut Ctx) };
+        let pinned = PIN_HWNDS.with(|s| s.borrow().contains(&hwnd)) || {
+            // A pin created since the last classification pass still
+            // carries its live title — skip it the same way.
+            let mut buf = [0u16; 64];
+            let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), 64) } as usize;
+            String::from_utf16_lossy(&buf[..n]) == "PixMe Pin"
+        };
+        if !pinned {
+            unsafe { SetWindowDisplayAffinity(hwnd, ctx.affinity) };
+            ctx.applied += 1;
+        }
+        1
+    }
+    let mut ctx = Ctx {
+        affinity: if exclude {
+            WDA_EXCLUDEFROMCAPTURE
+        } else {
+            WDA_NONE
+        },
+        applied: 0,
+    };
+    unsafe {
+        EnumThreadWindows(GetCurrentThreadId(), visit, &mut ctx as *mut Ctx as isize);
+    }
+    ctx.applied
+}
+
+/// RAII guard armed by [`capture_exclusion`]: the exclusion lifts on
+/// drop — error and panic paths included.
+pub struct CaptureExclusionGuard {
+    armed_at: std::time::Instant,
+}
+
+/// Activates `WDA_EXCLUDEFROMCAPTURE` on every PixMe window except
+/// pins, then waits out one DWM composition (`DwmFlush`) so the flag
+/// is guaranteed effective before the caller's `BitBlt` — GDI reads
+/// the composed frame, so a still-tearing-down viewer would otherwise
+/// ghost into the freeze. The exclusion lifts when the returned guard
+/// drops: screen sharing and other capture tools keep seeing PixMe.
+pub fn capture_exclusion() -> CaptureExclusionGuard {
+    let armed_at = std::time::Instant::now();
+    let hwnds = set_capture_exclusion(true);
+    let flush_t = std::time::Instant::now();
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmFlush() -> i32;
+    }
+    let hr = unsafe { DwmFlush() };
+    tracing::debug!(
+        hwnds,
+        flush_ms = flush_t.elapsed().as_secs_f64() * 1e3,
+        flush_hr = hr,
+        "capture_exclusion_armed"
+    );
+    CaptureExclusionGuard { armed_at }
+}
+
+impl Drop for CaptureExclusionGuard {
+    fn drop(&mut self) {
+        let lifted = set_capture_exclusion(false);
+        tracing::debug!(
+            active_ms = self.armed_at.elapsed().as_secs_f64() * 1e3,
+            lifted_hwnds = lifted,
+            "capture_exclusion_lifted"
+        );
+    }
+}
+
 pub fn strip_undecorated_frame() {
     use std::collections::HashMap;
 
@@ -261,12 +410,23 @@ pub fn strip_undecorated_frame() {
         fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, cx: i32, cy: i32) -> isize;
     }
 
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(hwnd: isize, attr: u32, value: *const u32, size: u32) -> i32;
+    }
+
+    /// `DWMWA_BORDER_COLOR` (dwmapi.h).
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    /// `DWMWA_COLOR_NONE`: suppresses the DWM border entirely.
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    /// `SetWindowDisplayAffinity` is declared in the file-level
+    /// [`set_capture_exclusion`] — the exclusion is transient now.
+
     const SW_SHOWNOACTIVATE: i32 = 4;
     const SW_SHOW: i32 = 5;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Role {
-        Bar,
         Countdown,
         Pin,
         Overlay,
@@ -282,9 +442,7 @@ pub fn strip_undecorated_frame() {
 
     unsafe extern "system" fn visit(hwnd: isize, _lp: isize) -> i32 {
         let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-        if (exstyle & WS_EX_TOPMOST) == 0 {
-            return 1;
-        }
+        let topmost = (exstyle & WS_EX_TOPMOST) != 0;
 
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
 
@@ -295,14 +453,15 @@ pub fn strip_undecorated_frame() {
         let (role, first_seen) = ROLES.with(|roles| {
             let mut m = roles.borrow_mut();
             if let Some(&r) = m.get(&hwnd) {
-                (Some(r), false)
-            } else if title == "PixMe Bar" {
-                m.insert(hwnd, Role::Bar);
-                // Clear the window title text in Win32 so DefWindowProc on WM_NCACTIVATE
-                // (fired when focus shifts to countdown) never draws title text.
-                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
-                (Some(Role::Bar), true)
-            } else if title == "PixMe Countdown" {
+                return (Some(r), false);
+            }
+            // Only topmost windows get a role: the viewer shares the
+            // "PixMe" title with the anchor but is NOT topmost — letting
+            // it through the title switch would tag it Anchor.
+            if !topmost {
+                return (None, false);
+            }
+            if title == "PixMe Countdown" {
                 m.insert(hwnd, Role::Countdown);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
                 (Some(Role::Countdown), true)
@@ -323,6 +482,20 @@ pub fn strip_undecorated_frame() {
             }
         });
 
+        // Pins represent screen content: registered so the transient
+        // capture exclusion always skips them (the live title check
+        // inside `set_capture_exclusion` covers a pin not yet
+        // classified).
+        if role == Some(Role::Pin) {
+            PIN_HWNDS.with(|s| {
+                s.borrow_mut().insert(hwnd);
+            });
+        }
+
+        if !topmost {
+            return 1;
+        }
+
         let Some(role) = role else {
             return 1;
         };
@@ -334,6 +507,20 @@ pub fn strip_undecorated_frame() {
             // edge (the capture must reach the taskbar's clock).
             unsafe {
                 SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+            }
+        }
+
+        if role == Role::Overlay && (first_seen || (style & WS_CHROME) != 0) {
+            // Suppress DWM's 1 px accent line at the window's top edge —
+            // SetWindowRgn (the countdown/pin fix) would clip real
+            // frozen-frame rows. Best-effort: Windows 11 only.
+            unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    &DWMWA_COLOR_NONE,
+                    std::mem::size_of::<u32>() as u32,
+                );
             }
         }
 
@@ -375,9 +562,14 @@ pub fn strip_undecorated_frame() {
                     }
                 });
 
-                if need_reapply_region || size_changed {
+                // The anchor's empty region is reapplied EVERY pass: a
+                // winit `SWP_FRAMECHANGED` (DPI change, new child window,
+                // focus) resets the region without touching (w,h) —
+                // checking size alone would leave the ring restored.
+                // Free on a 1×1 window.
+                if need_reapply_region || size_changed || role == Role::Anchor {
                     let rgn = match role {
-                        Role::Bar | Role::Countdown => {
+                        Role::Countdown => {
                             // Clip the top 2 pixels of empty transparent margin to eliminate
                             // the DWM top accent line.
                             unsafe { CreateRectRgn(0, 2, w + 1, h + 1) }
@@ -1131,3 +1323,282 @@ pub fn capture_chrome_enter() {}
 
 /// No-op on Windows (see [`capture_chrome_enter`]).
 pub fn capture_chrome_exit() {}
+
+/// The monitor's PNP DeviceID (`EnumDisplayDevicesW` with
+/// `EDD_GET_DEVICE_INTERFACE_NAME`) — stable per physical monitor on the
+/// same port; it may change when the cable moves ports, which the
+/// geometry-key fallback covers poorly (documented limitation). `None`
+/// when no entry matches the xcap device name (`\\.\DISPLAYn`).
+pub(crate) fn stable_monitor_id(monitor: &crate::capture::MonitorInfo) -> Option<String> {
+    const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 0x0000_0001;
+
+    // DISPLAY_DEVICEW — cb, DeviceName[32], DeviceString[128],
+    // StateFlags, DeviceID[128], DeviceKey[128].
+    #[repr(C)]
+    struct DisplayDevice {
+        cb: u32,
+        device_name: [u16; 32],
+        device_string: [u16; 128],
+        state_flags: u32,
+        device_id: [u16; 128],
+        device_key: [u16; 128],
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumDisplayDevicesW(
+            dev: *const u16,
+            num: u32,
+            dd: *mut DisplayDevice,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn blank() -> DisplayDevice {
+        DisplayDevice {
+            cb: std::mem::size_of::<DisplayDevice>() as u32,
+            device_name: [0; 32],
+            device_string: [0; 128],
+            state_flags: 0,
+            device_id: [0; 128],
+            device_key: [0; 128],
+        }
+    }
+    fn utf16_trim(buf: &[u16]) -> String {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    }
+
+    for i in 0.. {
+        let mut dd = blank();
+        if unsafe { EnumDisplayDevicesW(std::ptr::null(), i, &mut dd, 0) } == 0 {
+            break;
+        }
+        // xcap's monitor name is the GDI device name ("\\.\DISPLAY1")
+        // read from MONITORINFOEXW.szDevice — the adapter to drill into.
+        if utf16_trim(&dd.device_name) != monitor.name {
+            continue;
+        }
+        for j in 0.. {
+            let mut md = blank();
+            if unsafe {
+                EnumDisplayDevicesW(
+                    dd.device_name.as_ptr(),
+                    j,
+                    &mut md,
+                    EDD_GET_DEVICE_INTERFACE_NAME,
+                )
+            } == 0
+            {
+                break;
+            }
+            let id = utf16_trim(&md.device_id);
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+        break;
+    }
+    None
+}
+/// Re-grabs the capture overlay's focus while `Capturing` — Alt+Tab (or
+/// any OS mechanism) can steal it, then Esc would hit another app.
+/// Best-effort: Windows may refuse the raise (`SetForegroundWindow`
+/// rules), but clicks anywhere still reach the fullscreen overlay.
+pub fn refocus_capture_overlay(ctx: &egui::Context, id: egui::ViewportId) {
+    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+}
+
+/// Classifies `info` for the status-strip icon via
+/// `QueryDisplayConfig`/`DisplayConfigGetDeviceInfo`: the path target's
+/// `outputTechnology` distinguishes internal laptop panels
+/// (INTERNAL / LVDS / embedded-DisplayPort), indirect/virtual drivers
+/// (Spacedesk, Miracast receivers...) and real video transports. A path
+/// that can't be resolved yields `Unknown` — never a guessed type.
+pub(crate) fn monitor_kind(info: &crate::capture::MonitorInfo) -> crate::capture::MonitorKind {
+    use crate::capture::MonitorKind;
+
+    const QDC_ONLY_ACTIVE_PATHS: u32 = 0x0000_0002;
+    const DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME: u32 = 1;
+    // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY values (wingdi.h).
+    const TECH_LVDS: u32 = 6;
+    const TECH_DISPLAYPORT_EMBEDDED: u32 = 11;
+    const TECH_MIRACAST: u32 = 15;
+    const TECH_INDIRECT_WIRED: u32 = 16;
+    const TECH_INDIRECT_WIRELESS: u32 = 17;
+    const TECH_INDIRECT_VIRTUAL: u32 = 18;
+    const TECH_INTERNAL: u32 = 0x8000_0000;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayConfigPathSourceInfo {
+        adapter_id: i64,
+        id: u32,
+        mode_info_idx: u32,
+        status_flags: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayConfigPathTargetInfo {
+        adapter_id: i64,
+        id: u32,
+        mode_info_idx: u32,
+        output_technology: u32,
+        rotation: u32,
+        scaling: u32,
+        refresh_num: u32,
+        refresh_den: u32,
+        scan_line_ordering: u32,
+        target_available: i32,
+        status_flags: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayConfigPathInfo {
+        source_info: DisplayConfigPathSourceInfo,
+        target_info: DisplayConfigPathTargetInfo,
+        flags: u32,
+    }
+    #[repr(C)]
+    struct DisplayConfigDeviceInfoHeader {
+        ty: u32,
+        size: u32,
+        adapter_id: i64,
+        id: u32,
+    }
+    #[repr(C)]
+    struct DisplayConfigSourceDeviceName {
+        header: DisplayConfigDeviceInfoHeader,
+        view_gdi_device_name: [u16; 32],
+    }
+    // DISPLAYCONFIG_MODE_INFO: QueryDisplayConfig fills one 64-byte
+    // struct per mode — header (infoType, id, adapterId LUID) plus the
+    // 48-byte target/source/desktop-image union. The modes are unused
+    // here but the buffer must still be real: sizing it in `c_void`
+    // elements overflows the allocation eightfold.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayConfigModeInfo {
+        info_type: u32,
+        id: u32,
+        adapter_id: i64,
+        payload: [u64; 6],
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetDisplayConfigBufferSizes(flags: u32, n_path: *mut u32, n_mode: *mut u32) -> i32;
+        fn QueryDisplayConfig(
+            flags: u32,
+            n_path: *mut u32,
+            paths: *mut DisplayConfigPathInfo,
+            n_mode: *mut u32,
+            modes: *mut c_void,
+            topology: *mut c_void,
+        ) -> i32;
+        fn DisplayConfigGetDeviceInfo(packet: *mut DisplayConfigDeviceInfoHeader) -> i32;
+    }
+
+    use std::ffi::c_void;
+
+    let mut n_path = 0u32;
+    let mut n_mode = 0u32;
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut n_path, &mut n_mode) } != 0
+    {
+        return MonitorKind::Unknown;
+    }
+    let mut paths = vec![
+        DisplayConfigPathInfo {
+            source_info: DisplayConfigPathSourceInfo {
+                adapter_id: 0,
+                id: 0,
+                mode_info_idx: 0,
+                status_flags: 0,
+            },
+            target_info: DisplayConfigPathTargetInfo {
+                adapter_id: 0,
+                id: 0,
+                mode_info_idx: 0,
+                output_technology: 0,
+                rotation: 0,
+                scaling: 0,
+                refresh_num: 0,
+                refresh_den: 0,
+                scan_line_ordering: 0,
+                target_available: 0,
+                status_flags: 0,
+            },
+            flags: 0,
+        };
+        n_path as usize
+    ];
+    let mut modes = vec![
+        DisplayConfigModeInfo {
+            info_type: 0,
+            id: 0,
+            adapter_id: 0,
+            payload: [0; 6],
+        };
+        n_mode as usize
+    ];
+    if unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut n_path,
+            paths.as_mut_ptr(),
+            &mut n_mode,
+            modes.as_mut_ptr() as *mut c_void,
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        return MonitorKind::Unknown;
+    }
+    paths.truncate(n_path as usize);
+
+    for path in &paths {
+        let mut src = DisplayConfigSourceDeviceName {
+            header: DisplayConfigDeviceInfoHeader {
+                ty: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DisplayConfigSourceDeviceName>() as u32,
+                adapter_id: path.source_info.adapter_id,
+                id: path.source_info.id,
+            },
+            view_gdi_device_name: [0u16; 32],
+        };
+        if unsafe { DisplayConfigGetDeviceInfo(&mut src.header) } != 0 {
+            continue;
+        }
+        let end = src
+            .view_gdi_device_name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(32);
+        if String::from_utf16_lossy(&src.view_gdi_device_name[..end]) != info.name {
+            continue;
+        }
+        return match path.target_info.output_technology {
+            TECH_INTERNAL | TECH_LVDS | TECH_DISPLAYPORT_EMBEDDED => MonitorKind::BuiltIn,
+            TECH_INDIRECT_WIRED
+            | TECH_INDIRECT_WIRELESS
+            | TECH_INDIRECT_VIRTUAL
+            | TECH_MIRACAST => MonitorKind::Virtual,
+            // Real video transports: VGA/S-Video/Composite/Component/DVI/
+            // HDMI/D-JPN/SDI/DisplayPort/UDI/SDTV dongle/DP USB tunnel.
+            0..=5 | 8..=10 | 12..=14 | 19 => MonitorKind::External,
+            _ => MonitorKind::Unknown,
+        };
+    }
+    MonitorKind::Unknown
+}
+
+/// The number of connected displays — polled to detect monitor
+/// hot-(un)plug so the viewer can re-anchor off a vanished screen.
+pub fn display_count() -> u32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    // SM_CMONITORS = 80.
+    unsafe { GetSystemMetrics(80) as u32 }
+}

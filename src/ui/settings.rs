@@ -1,5 +1,5 @@
 //! The settings window content, edited as a DRAFT: pages on the left
-//! (General, File name), the page's rows on the right, and an
+//! (General, File name, About), the page's rows on the right, and an
 //! OK / Annuler footer. `OK` writes the draft back to `Shared.settings`
 //! and persists it; Annuler / the painted cross / Escape discard it.
 //! A retention switch that would lose stored captures asks for
@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use rust_i18n::t;
 
 use crate::app::{Shared, lock};
-use crate::config::{Appearance, DbRetention, Settings};
+use crate::config::{Appearance, DbRetention, IconStyle, Settings};
 use crate::i18n::Language;
 use crate::ui::icons::Icon;
 use crate::ui::{theme, widgets};
@@ -23,8 +23,8 @@ pub enum SettingsPage {
     General,
     /// The saved-file filename template and its editable presets.
     Filename,
-    /// Data and log folder locations, diagnostics bundle.
-    Folders,
+    /// App identity, version, data/log folder locations, diagnostics.
+    About,
 }
 
 /// egui-temp keys: the active page, and a draft parked behind the
@@ -37,6 +37,11 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
     // Escape closes the modal like Annuler: the draft is dropped.
     if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
         discard(shared);
+    }
+    // A pending retention confirm replaces the whole body — a separate
+    // egui::Window on the same ctx gets its clicks eaten by the modal.
+    if retention_confirm(ui, shared) {
+        return;
     }
     let page = ui
         .ctx()
@@ -61,15 +66,16 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
                 |ui| match page {
                     SettingsPage::General => general_page(ui, draft),
                     SettingsPage::Filename => filename_page(ui, draft),
-                    SettingsPage::Folders => folders_page(ui),
+                    SettingsPage::About => about_page(ui),
                 },
             );
         });
     }
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(PAGE_KEY), page));
-    widgets::hairline(ui);
-    ui.add_space(4.0);
+    // Footer pinned to the window's bottom edge: the remaining space
+    // above is consumed first, so the row never moves between pages.
+    ui.add_space((ui.available_height() - 28.0).max(0.0));
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         // An empty template could never produce a file name — OK stays
         // greyed until the field is usable again.
@@ -87,7 +93,6 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
             discard(shared);
         }
     });
-    retention_confirm(ui.ctx(), shared);
 }
 
 /// The left page list: two entries for now, styled like the reference's
@@ -101,7 +106,7 @@ fn sidebar(ui: &mut egui::Ui, page: &mut SettingsPage) {
         for (value, key) in [
             (SettingsPage::General, "settings.page.general"),
             (SettingsPage::Filename, "settings.page.filename"),
-            (SettingsPage::Folders, "settings.page.folders"),
+            (SettingsPage::About, "settings.page.about"),
         ] {
             if ui
                 .selectable_label(*page == value, t!(key).to_string())
@@ -124,6 +129,10 @@ fn general_page(ui: &mut egui::Ui, draft: &mut Settings) {
         widgets::hairline(ui);
         row(ui, &t!("settings.appearance.label"), |ui| {
             appearance_picker(ui, draft);
+        });
+        widgets::hairline(ui);
+        row(ui, &t!("settings.icon_style.label"), |ui| {
+            icon_style_picker(ui, draft);
         });
         widgets::hairline(ui);
         row(ui, &t!("settings.db_retention.label"), |ui| {
@@ -222,10 +231,38 @@ fn filename_page(ui: &mut egui::Ui, draft: &mut Settings) {
 
 /// "Dossiers" page: the data and log folder locations — copyable,
 /// openable in the OS file manager — plus the diagnostics bundle.
-fn folders_page(ui: &mut egui::Ui) {
+fn about_page(ui: &mut egui::Ui) {
     let t = theme::tokens(ui.ctx());
     ui.vertical(|ui| {
-        ui.add_space(10.0);
+        ui.add_space(4.0);
+        // App identity — the content the standalone About window used to
+        // show: the 256 artwork, the name, the running version, licence.
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            let icon_rgba = crate::ui::icons::app_icon_rgba(128);
+            let icon_img = egui::ColorImage::from_rgba_unmultiplied([128, 128], &icon_rgba);
+            let icon_tex =
+                ui.ctx()
+                    .load_texture("pixme://about-icon", icon_img, egui::TextureOptions::LINEAR);
+            ui.image(egui::load::SizedTexture::new(
+                icon_tex.id(),
+                egui::vec2(48.0, 48.0),
+            ));
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("PixMe").color(t.text).strong());
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(10.5)
+                        .color(t.text_dim),
+                );
+                ui.label(
+                    egui::RichText::new(t!("settings.about.license").to_string())
+                        .size(10.5)
+                        .color(t.text_faint),
+                );
+            });
+        });
+        ui.add_space(8.0);
         // Label column sized to the longest row label, so both paths
         // start at the same x whatever the locale's word lengths.
         let label_w = [
@@ -270,6 +307,12 @@ fn folders_page(ui: &mut egui::Ui) {
                 .color(t.text_faint),
         );
     });
+}
+
+/// Opens the settings modal straight on `page` — the About menu entry
+/// uses it; `show` reads the choice back through `PAGE_KEY`.
+pub fn open_at(ctx: &egui::Context, page: SettingsPage) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(PAGE_KEY), page));
 }
 
 /// One About-page location row: label, the path (elided, full path on
@@ -335,12 +378,14 @@ fn folder_row(
 /// would lose stored captures, which parks the draft behind the confirm
 /// dialog first.
 fn apply(ctx: &egui::Context, shared: &Shared) {
-    let Some(draft) = lock(&shared.settings_draft).take() else {
+    let Some(draft) = lock(&shared.settings_draft).clone() else {
         return;
     };
     let old_retention = lock(&shared.settings).db_retention;
     if old_retention.more_restrictive(draft.db_retention) && shared.writer.document_count() > 0 {
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new(PENDING_DRAFT), draft));
+        // Park a COPY: the live draft stays in the modal so the
+        // settings window keeps rendering behind the confirm.
+        ctx.data_mut(|d| d.insert_persisted(egui::Id::new(PENDING_DRAFT), draft));
         return;
     }
     write_back(draft, shared);
@@ -351,16 +396,17 @@ fn apply(ctx: &egui::Context, shared: &Shared) {
 /// deliberately left out (they churn silently on every save).
 fn log_changes(old: &Settings, new: &Settings) {
     type Field = (&'static str, fn(&Settings) -> String);
-    let fields: [Field; 10] = [
+    let fields: [Field; 9] = [
         ("language", |s| format!("{:?}", s.language)),
         ("appearance", |s| format!("{:?}", s.appearance)),
+        ("icon_style", |s| format!("{:?}", s.icon_style)),
         ("copy_to_clipboard", |s| s.copy_to_clipboard.to_string()),
         ("db_retention", |s| format!("{:?}", s.db_retention)),
         ("db_status", |s| s.db_status.to_string()),
         ("tab_sort", |s| format!("{:?}", s.tab_sort)),
-        ("text_color", |s| format!("{:?}", s.text_color)),
-        ("text_font", |s| s.text_font.clone()),
-        ("text_size", |s| s.text_size.to_string()),
+        ("draw_opts", |s| {
+            format!("{:?}", s.draw_opts.tools.keys().count())
+        }),
         ("filename_template", |s| s.filename_template.clone()),
     ];
     for (name, f) in fields {
@@ -409,45 +455,48 @@ fn discard(shared: &Shared) {
 
 /// The pending-draft confirmation: applying loses stored captures —
 /// Cancel keeps the modal open with the previous retention value.
-fn retention_confirm(ctx: &egui::Context, shared: &Shared) {
-    let pending = ctx.data_mut(|d| d.get_temp::<Settings>(egui::Id::new(PENDING_DRAFT)));
-    let Some(draft) = pending else { return };
-    let mut open = true;
-    egui::Window::new(t!("settings.db.warn.title").to_string())
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label(t!("settings.db.warn.body").to_string());
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .button(t!("settings.db.warn.cancel").to_string())
-                    .clicked()
-                {
-                    // Revert only the retention choice; the rest of the
-                    // draft stays for further editing.
-                    let mut back = draft.clone();
-                    back.db_retention = lock(&shared.settings).db_retention;
-                    *lock(&shared.settings_draft) = Some(back);
-                    ctx.data_mut(|d| d.remove::<Settings>(egui::Id::new(PENDING_DRAFT)));
-                }
-                if ui
-                    .button(t!("settings.db.warn.confirm").to_string())
-                    .clicked()
-                {
-                    ctx.data_mut(|d| d.remove::<Settings>(egui::Id::new(PENDING_DRAFT)));
-                    write_back(draft.clone(), shared);
-                }
-            });
+/// Drawn INSIDE the settings window (returns `true` while active): a
+/// separate egui::Window gets its clicks eaten by the modal.
+fn retention_confirm(ui: &mut egui::Ui, shared: &Shared) -> bool {
+    let ctx = ui.ctx().clone();
+    let pending = ctx.data_mut(|d| d.get_persisted::<Settings>(egui::Id::new(PENDING_DRAFT)));
+    let Some(draft) = pending else {
+        return false;
+    };
+    let t = theme::tokens(&ctx);
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new(t!("settings.db.warn.title").to_string())
+                .color(t.text)
+                .size(13.0)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(t!("settings.db.warn.body").to_string()).color(t.text_dim));
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button(t!("settings.db.warn.cancel").to_string())
+                .clicked()
+            {
+                // Revert only the retention choice; the rest of the
+                // draft stays for further editing.
+                let mut back = draft.clone();
+                back.db_retention = lock(&shared.settings).db_retention;
+                *lock(&shared.settings_draft) = Some(back);
+                ctx.data_mut(|d| d.remove::<Settings>(egui::Id::new(PENDING_DRAFT)));
+            }
+            if ui
+                .button(t!("settings.db.warn.confirm").to_string())
+                .clicked()
+            {
+                ctx.data_mut(|d| d.remove::<Settings>(egui::Id::new(PENDING_DRAFT)));
+                write_back(draft.clone(), shared);
+            }
         });
-    if !open {
-        let mut back = draft.clone();
-        back.db_retention = lock(&shared.settings).db_retention;
-        *lock(&shared.settings_draft) = Some(back);
-        ctx.data_mut(|d| d.remove::<Settings>(egui::Id::new(PENDING_DRAFT)));
-    }
+    });
+    true
 }
 
 /// One `label: [dropdown]` row, right-aligned control like the reference's
@@ -513,6 +562,23 @@ fn appearance_picker(ui: &mut egui::Ui, draft: &mut Settings) {
             (Appearance::Light, t!("settings.appearance.light")),
         ] {
             ui.selectable_value(&mut draft.appearance, value, label);
+        }
+    });
+}
+
+/// Capture-bar icon-style dropdown: Lucide monochrome (the reference
+/// look), the same glyphs in per-icon colours, or Phosphor two-tones.
+fn icon_style_picker(ui: &mut egui::Ui, draft: &mut Settings) {
+    let label = |s: IconStyle| match s {
+        IconStyle::Standard => t!("settings.icon_style.standard"),
+        IconStyle::Color => t!("settings.icon_style.color"),
+        IconStyle::Duotone => t!("settings.icon_style.duotone"),
+    };
+    let current = label(draft.icon_style);
+    let btn = widgets::dropdown_button(ui, &current);
+    egui::Popup::menu(&btn).show(|ui| {
+        for value in [IconStyle::Standard, IconStyle::Color, IconStyle::Duotone] {
+            ui.selectable_value(&mut draft.icon_style, value, label(value));
         }
     });
 }

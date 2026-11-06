@@ -1,12 +1,10 @@
-//! Screen capture: monitor enumeration and the three capture kinds.
+//! Screen capture: monitor enumeration and the capture kinds.
 //!
-//! Contract only — implementations land in phase 3 on top of `xcap`. All OS
-//! details (Screen Recording permission on macOS, per-monitor DPI on Windows)
-//! stay behind this module and `crate::platform`.
+//! All OS details (Screen Recording permission on macOS, per-monitor DPI on
+//! Windows) stay behind this module and `crate::platform`.
 
 use serde::{Deserialize, Serialize};
 
-pub mod region;
 pub mod screen;
 pub mod window;
 
@@ -52,6 +50,23 @@ pub struct PhysicalRect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WindowId(pub u64);
 
+/// What kind of display a monitor is — informational only (status-strip
+/// icon + tooltip); never drives capture, selection or persistence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MonitorKind {
+    /// A laptop's integrated panel (CGDisplayIsBuiltin / INTERNAL tech).
+    BuiltIn,
+    /// A regular desktop monitor.
+    External,
+    /// A tablet used as a display (iPad via Sidecar).
+    Tablet,
+    /// A virtual/indirect display driver.
+    Virtual,
+    /// Type not reliably determined — never guessed.
+    #[default]
+    Unknown,
+}
+
 /// One connected monitor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonitorInfo {
@@ -72,6 +87,16 @@ pub struct MonitorInfo {
     pub is_primary: bool,
 }
 
+/// Sorts monitors into spatial order — the canonical list order for every
+/// consumer (status strip, inventories, fallback picks). Key: horizontal
+/// centre of `rect`, then top edge. Vertically stacked monitors share a
+/// centre-x band and therefore stay adjacent inside their column; there is
+/// no 1-D order that faithfully renders arbitrary 2-D layouts, but this key
+/// keeps the left→right reading correct for rows and columns.
+pub fn sort_monitors_by_position(monitors: &mut [MonitorInfo]) {
+    monitors.sort_by_key(|m| (m.rect.x as i64 + m.rect.width as i64 / 2, m.rect.y));
+}
+
 /// Capture failure surfaced to the user (message via i18n at the UI layer).
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
@@ -89,11 +114,86 @@ pub enum CaptureError {
     Unsupported(&'static str),
 }
 
-/// The capture back-end contract. One implementation per OS family, obtained
-/// from [`crate::platform`].
-pub trait Capturer: Send + Sync {
-    /// All connected monitors.
-    fn monitors(&self) -> Result<Vec<MonitorInfo>, CaptureError>;
-    /// Captures `kind` on `monitor`.
-    fn capture(&self, kind: CaptureKind, monitor: &MonitorInfo) -> Result<Capture, CaptureError>;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mon(id: u32, x: i32, y: i32, width: u32, height: u32) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            name: format!("m{id}"),
+            rect: PhysicalRect {
+                x,
+                y,
+                width,
+                height,
+            },
+            scale_factor: 1.0,
+            is_primary: false,
+        }
+    }
+
+    fn ids(monitors: &[MonitorInfo]) -> Vec<u32> {
+        monitors.iter().map(|m| m.id).collect()
+    }
+
+    #[test]
+    fn sort_orders_left_of_primary_first() {
+        // Sidecar iPad to the left of the primary screen: negative x.
+        let mut v = vec![mon(1, 0, 0, 2560, 1440), mon(2, -1133, 200, 1133, 744)];
+        sort_monitors_by_position(&mut v);
+        assert_eq!(ids(&v), [2, 1]);
+    }
+
+    #[test]
+    fn sort_orders_three_in_a_row_with_portrait_middle() {
+        // Landscape — portrait — landscape: the narrow middle keeps its slot.
+        let mut v = vec![
+            mon(3, 4000, 0, 2560, 1440),
+            mon(1, 0, 0, 2560, 1440),
+            mon(2, 2560, -200, 1440, 2560),
+        ];
+        sort_monitors_by_position(&mut v);
+        assert_eq!(ids(&v), [1, 2, 3]);
+    }
+
+    #[test]
+    fn sort_keeps_stacked_monitors_in_their_column() {
+        // A screen stacked above the middle one stays adjacent to it.
+        let mut v = vec![
+            mon(4, 6560, 0, 2560, 1440),
+            mon(2, 2560, 0, 2560, 1440),
+            mon(1, 0, 0, 2560, 1440),
+            mon(3, 2560, -1440, 2560, 1440),
+        ];
+        sort_monitors_by_position(&mut v);
+        assert_eq!(ids(&v), [1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn sort_orders_pure_vertical_stack_top_to_bottom() {
+        let mut v = vec![mon(2, 0, 1440, 2560, 1440), mon(1, 0, 0, 2560, 1440)];
+        sort_monitors_by_position(&mut v);
+        assert_eq!(ids(&v), [1, 2]);
+    }
+
+    #[test]
+    fn sort_orders_grid_column_major() {
+        // 2×2 grid: left column top→bottom, then right column.
+        let mut v = vec![
+            mon(4, 2560, 1440, 2560, 1440),
+            mon(2, 0, 1440, 2560, 1440),
+            mon(3, 2560, 0, 2560, 1440),
+            mon(1, 0, 0, 2560, 1440),
+        ];
+        sort_monitors_by_position(&mut v);
+        assert_eq!(ids(&v), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sort_single_monitor_is_stable() {
+        let mut v = vec![mon(1, 0, 0, 2560, 1440)];
+        sort_monitors_by_position(&mut v);
+        assert_eq!(ids(&v), [1]);
+    }
 }
