@@ -217,7 +217,7 @@ impl Default for ToolStyle {
             tip: TipShape::Round,
             brace_kind: BraceKind::CurlyLeft,
             shape: AreaShape::Rect,
-            hl_opacity: 0.45,
+            hl_opacity: 1.0,
             eraser_color: [255, 255, 255],
             eraser_size: 12.0,
             eraser_mode: EraserMode::Color,
