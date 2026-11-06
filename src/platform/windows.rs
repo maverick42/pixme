@@ -419,8 +419,8 @@ pub fn strip_undecorated_frame() {
     const DWMWA_BORDER_COLOR: u32 = 34;
     /// `DWMWA_COLOR_NONE`: suppresses the DWM border entirely.
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
-    /// `SetWindowDisplayAffinity` is declared in the file-level
-    /// [`set_capture_exclusion`] — the exclusion is transient now.
+    // `SetWindowDisplayAffinity` is declared in the file-level
+    // `set_capture_exclusion` — the exclusion is transient now.
 
     const SW_SHOWNOACTIVATE: i32 = 4;
     const SW_SHOW: i32 = 5;
@@ -662,7 +662,7 @@ pub fn resolve_base_dirs() -> crate::paths::BaseDirs {
     let fallback = local_app_data();
     let Some(exe_dir) = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|d| crate::paths::strip_verbatim(d)))
+        .and_then(|exe| exe.parent().map(crate::paths::strip_verbatim))
     else {
         // No exe path at all — degraded but survivable.
         return crate::paths::BaseDirs {
@@ -1058,9 +1058,9 @@ fn tick_wav() -> Vec<u8> {
     wav
 }
 
-/// Captures the current OS mouse cursor via `GetCursorInfo` + `GetIconInfo`
-/// + `DrawIconEx` into a 32-bit DIB section. Returns `None` when the cursor
-/// is hidden or cannot be queried.
+/// Captures the current OS mouse cursor via `GetCursorInfo` +
+/// `GetIconInfo` + `DrawIconEx` into a 32-bit DIB section. Returns `None`
+/// when the cursor is hidden or cannot be queried.
 pub fn cursor_snapshot(_scale_factor: f32) -> Option<super::CursorSnapshot> {
     use core::ffi::c_void;
 
@@ -1249,10 +1249,10 @@ pub fn cursor_snapshot(_scale_factor: f32) -> Option<super::CursorSnapshot> {
         {
             if any_native_alpha {
                 let a = b[3] as u32;
-                if a > 0 {
-                    dst[0] = ((b[2] as u32 * 255 + a / 2) / a).min(255) as u8;
-                    dst[1] = ((b[1] as u32 * 255 + a / 2) / a).min(255) as u8;
-                    dst[2] = ((b[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+                if let Some(den) = core::num::NonZeroU32::new(a) {
+                    dst[0] = ((b[2] as u32 * 255 + a / 2) / den).min(255) as u8;
+                    dst[1] = ((b[1] as u32 * 255 + a / 2) / den).min(255) as u8;
+                    dst[2] = ((b[0] as u32 * 255 + a / 2) / den).min(255) as u8;
                     dst[3] = a as u8;
                 }
             } else if b[0] != wpx[0] || b[1] != wpx[1] || b[2] != wpx[2] {
