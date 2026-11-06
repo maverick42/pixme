@@ -91,6 +91,11 @@ pub struct OverlaySession {
     /// Frames painted before the screenshot is taken — the viewer's window
     /// must be torn down first or it would photograph itself.
     warm_frames: u8,
+    /// Frames elapsed since the displaced windows' teardown was
+    /// confirmed: the compositor can lag a frame behind winit's
+    /// bookkeeping, so the freeze waits for one full frame with
+    /// `viewer_gone` true (the ghost is window-server lag, not ours).
+    gone_frames: u8,
     /// All monitors frozen up front so the crosshair can follow the cursor
     /// across screens until a selection starts.
     frozen_all: Vec<Capture>,
@@ -183,6 +188,7 @@ impl OverlaySession {
             include_pointer: false,
             cursor: None,
             warm_frames: 0,
+            gone_frames: 0,
             frozen_all: Vec::new(),
             frozen: None,
             monitor: None,
@@ -278,19 +284,38 @@ impl OverlaySession {
     /// frozen.
     pub fn warm_freeze(&mut self, viewer_gone: bool) -> bool {
         self.warm_frames = self.warm_frames.saturating_add(1);
-        // A viewport id stuck in `raw.viewports` must not stall the
-        // capture forever — after ~2 s take the frame, ghost or not.
-        let wait = !viewer_gone && self.started_at.elapsed() < std::time::Duration::from_secs(2);
+        if viewer_gone {
+            self.gone_frames = self.gone_frames.saturating_add(1);
+        }
+        // The compositor can lag one frame behind winit's viewport
+        // bookkeeping — settle ONE full frame with the viewer gone
+        // before the BitBlt. The ~2 s timeout still applies, ghost
+        // or not.
+        let settled = viewer_gone && self.gone_frames >= 2;
+        let wait = !settled && self.started_at.elapsed() < std::time::Duration::from_secs(2);
         if self.warm_frames < 2 || wait {
             return false;
         }
         if self.frozen.is_none() && !self.failed {
+            tracing::debug!(
+                viewer_gone,
+                gone_frames = self.gone_frames,
+                warm_frames = self.warm_frames,
+                ms = self.started_at.elapsed().as_secs_f64() * 1e3,
+                "freeze gate passed"
+            );
             if matches!(self.mode, CaptureMode::WindowOrObject) {
                 // Snapshot the window list BEFORE dismissing active popup
                 // menus so an open menu remains pickable in the frozen frame.
                 self.window_list = window::windows().ok();
             }
+            let blt_t = std::time::Instant::now();
             let result = screen::capture_all_monitors(self.include_pointer);
+            tracing::debug!(
+                ms = blt_t.elapsed().as_secs_f64() * 1e3,
+                ok = result.is_ok(),
+                "screen captured"
+            );
             // The early exclusion's job ends with the freeze — holding it
             // through the selection phase would hide PixMe from screen
             // sharing for minutes. Dropping lifts every live window's flag.
