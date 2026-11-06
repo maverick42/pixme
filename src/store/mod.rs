@@ -496,7 +496,7 @@ impl Store {
     /// drained, outside any transaction); failures log and never block
     /// the exit.
     pub fn vacuum_if_needed(&mut self) {
-        let Some(conn) = self.conn.take() else {
+        let Some(conn) = self.conn.as_mut() else {
             return;
         };
         let sizes = |conn: &Connection| -> (i64, i64, i64) {
@@ -506,7 +506,7 @@ impl Store {
             };
             (get("page_count"), get("freelist_count"), get("page_size"))
         };
-        let (pages, free, psize) = sizes(&conn);
+        let (pages, free, psize) = sizes(conn);
         if free * psize <= 32 * 1024 * 1024 || free * 2 <= pages {
             return;
         }
@@ -527,13 +527,12 @@ impl Store {
         if wal && let Err(err) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::warn!("session wal checkpoint failed: {err}");
         }
-        let (pages, free, psize) = sizes(&conn);
+        let (pages, free, psize) = sizes(conn);
         tracing::info!(
             bytes = pages * psize,
             free_bytes = free * psize,
             "session db vacuumed"
         );
-        self.conn = Some(conn);
     }
 }
 
