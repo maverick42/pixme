@@ -42,7 +42,7 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
         .data_mut(|d| d.get_temp::<Option<crate::hotkeys::HotkeyAction>>(egui::Id::new(REC_KEY)))
         .is_some_and(|a| a.is_some());
     if !recording_active && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
-        discard(shared);
+        discard(ui.ctx(), shared);
     }
     // A pending retention confirm replaces the whole body — a separate
     // egui::Window on the same ctx gets its clicks eaten by the modal.
@@ -134,7 +134,7 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
             }
         });
         if widgets::secondary_button(ui, &t!("draw.cancel")).clicked() {
-            discard(shared);
+            discard(ui.ctx(), shared);
         }
     });
 }
@@ -527,11 +527,24 @@ fn hotkey_pending(ctx: &egui::Context) -> bool {
     }
 }
 
+/// Drops the hotkey recorder's egui-temp state — every modal close
+/// path calls it: a stale `Some` would reopen settings already
+/// "listening" (OK greyed, armed combos still firing their actions).
+pub fn end_recording(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new(REC_KEY),
+            None::<crate::hotkeys::HotkeyAction>,
+        )
+    });
+}
+
 /// Annuler / cross / Escape: the draft is dropped, nothing persists.
-fn discard(shared: &Shared) {
+fn discard(ctx: &egui::Context, shared: &Shared) {
     shared.settings_open.store(false, Ordering::Relaxed);
     *lock(&shared.settings_draft) = None;
     *lock(&shared.hotkey_verify) = None;
+    end_recording(ctx);
     // A field may have been listening — re-arm whatever was suspended
     // and release any pending verification registration.
     if let Some(m) = lock(&shared.hotkeys).as_mut() {

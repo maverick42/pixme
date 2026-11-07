@@ -201,10 +201,50 @@ fn code_to_vk(code: Code) -> Option<u16> {
     })
 }
 
+/// The OS hotkey manager behind [`HotkeyManager`] — `Send + Sync` on
+/// every platform.
+///
+/// `global_hotkey`'s Windows manager is a bare `HWND` (`!Send`), but it
+/// is only ever used on the egui main thread — the one that created the
+/// window and pumps the `WM_HOTKEY` messages — while the listener thread
+/// only reads the id map, so sharing the handle cannot race.
+/// `RegisterHotKey`/`UnregisterHotKey` carry no thread affinity; the
+/// one thread-bound call is `DestroyWindow` in `Drop`, which fails
+/// gracefully off-thread — and the `Arc<Shared>` the listener thread
+/// parks on keeps the manager alive for the process lifetime anyway.
+#[cfg(target_os = "windows")]
+struct OsManager(GlobalHotKeyManager);
+
+#[cfg(target_os = "windows")]
+impl OsManager {
+    fn new() -> global_hotkey::Result<Self> {
+        GlobalHotKeyManager::new().map(Self)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl std::ops::Deref for OsManager {
+    type Target = GlobalHotKeyManager;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// SAFETY: every method runs on the thread that created the HWND (the
+// egui main thread); the handle itself holds no thread-local state.
+#[cfg(target_os = "windows")]
+unsafe impl Send for OsManager {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for OsManager {}
+
+#[cfg(not(target_os = "windows"))]
+type OsManager = GlobalHotKeyManager;
+
 /// Owned registrations: armed combos, the id→action index the listener
 /// thread reads, and the OS manager. Dropping unregisters everything.
 pub struct HotkeyManager {
-    manager: GlobalHotKeyManager,
+    manager: OsManager,
     armed: BTreeMap<HotkeyAction, HotKey>,
     ids: Arc<Mutex<BTreeMap<u32, HotkeyAction>>>,
     /// `true` while the settings recorder listens: every armed combo is
@@ -222,7 +262,7 @@ pub struct HotkeyManager {
 impl HotkeyManager {
     pub fn new() -> global_hotkey::Result<Self> {
         Ok(Self {
-            manager: GlobalHotKeyManager::new()?,
+            manager: OsManager::new()?,
             armed: BTreeMap::new(),
             ids: Arc::new(Mutex::new(BTreeMap::new())),
             suspended: false,

@@ -1091,6 +1091,7 @@ impl Shared {
                 self.settings_open.store(false, Ordering::Relaxed);
                 *lock(&self.settings_draft) = None;
                 *lock(&self.hotkey_verify) = None;
+                ui::settings::end_recording(ctx);
                 // A field may have been listening — re-arm whatever
                 // was suspended and release any pending verification.
                 if let Some(m) = lock(&self.hotkeys).as_mut() {
@@ -1115,6 +1116,7 @@ impl Shared {
                 self.settings_open.store(false, Ordering::Relaxed);
                 *lock(&self.settings_draft) = None;
                 *lock(&self.hotkey_verify) = None;
+                ui::settings::end_recording(ctx);
                 // A field may have been listening — re-arm whatever
                 // was suspended and release any pending verification.
                 if let Some(m) = lock(&self.hotkeys).as_mut() {
