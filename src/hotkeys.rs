@@ -547,7 +547,10 @@ mod tests {
             eprintln!("global hotkeys unavailable in this environment — skipping");
             return;
         };
-        let raw = "control+shift+KeyX";
+        // F13+ combos: no OS shortcut or runner image claims them, so
+        // the tests stay deterministic on any machine (letter combos
+        // can be taken — e.g. a CI runner image owning Win+Shift+A).
+        let raw = "control+shift+F13";
         assert_eq!(manager.probe(raw), Ok(()));
         manager.sync(&BTreeMap::from([(
             HotkeyAction::OpenViewer,
@@ -585,7 +588,7 @@ mod tests {
             eprintln!("global hotkeys unavailable in this environment — skipping");
             return;
         };
-        let raw = "shift+meta+KeyA";
+        let raw = "shift+meta+F14";
         assert_eq!(manager.probe(raw), Ok(()));
         let errors = manager.sync(&BTreeMap::from([(
             HotkeyAction::CaptureRegion,
@@ -606,7 +609,7 @@ mod tests {
             eprintln!("global hotkeys unavailable in this environment — skipping");
             return;
         };
-        let raw = "shift+meta+KeyV";
+        let raw = "shift+meta+F15";
         let hk = raw.parse().unwrap();
         manager.register_verify(hk, HotkeyAction::OpenViewer);
         assert_eq!(manager.probe(raw), Err(HotkeyError::Taken));
@@ -624,7 +627,7 @@ mod tests {
             eprintln!("global hotkeys unavailable in this environment — skipping");
             return;
         };
-        let raw = "shift+meta+KeyB";
+        let raw = "shift+meta+F16";
         manager.sync(&BTreeMap::from([(
             HotkeyAction::OpenViewer,
             raw.to_owned(),

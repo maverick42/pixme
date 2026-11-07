@@ -531,12 +531,7 @@ fn hotkey_pending(ctx: &egui::Context) -> bool {
 /// path calls it: a stale `Some` would reopen settings already
 /// "listening" (OK greyed, armed combos still firing their actions).
 pub fn end_recording(ctx: &egui::Context) {
-    ctx.data_mut(|d| {
-        d.insert_temp(
-            egui::Id::new(REC_KEY),
-            None::<crate::hotkeys::HotkeyAction>,
-        )
-    });
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(REC_KEY), None::<crate::hotkeys::HotkeyAction>));
 }
 
 /// Annuler / cross / Escape: the draft is dropped, nothing persists.
