@@ -76,6 +76,11 @@ pub enum Command {
     CancelCapture,
     /// Show the viewer (icon menu's "Open PixMe").
     OpenViewer,
+    /// A second-instance relaunch asked the resident instance to
+    /// surface (Windows wake event): like `OpenViewer`, but it also
+    /// runs while a modal owns the UI and re-raises the modal window
+    /// (Draw, pin save dialog) above the viewer it is modal to.
+    WakeViewer,
     /// Left click on the status item / tray icon: open the viewer from
     /// `Idle`, close it back to the resident icon when it is up.
     ToggleViewer,
@@ -228,6 +233,10 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         // brings it forward.
         Command::OpenSettings | Command::OpenAbout => modal == ModalState::Settings,
         Command::OpenViewer | Command::ToggleViewer => modal == ModalState::Settings,
+        // A relaunch surfaces the viewer under every modal EXCEPT a
+        // live capture — stealing focus from the overlay would eat its
+        // Esc/clicks — and the quit flush (early return above).
+        Command::WakeViewer => modal != ModalState::Capturing,
         // Everything else is blocked while a modal owns the UI.
         Command::DeleteActive
         | Command::DeleteFileActive
@@ -937,6 +946,25 @@ impl Shared {
                 // it forward: `enter` only requests focus on a state
                 // CHANGE, so de-minimize and focus explicitly here.
                 self.bring_viewer_forward(ctx);
+            }
+            Command::WakeViewer => {
+                // The surface work of OpenViewer, then re-raise every
+                // modal child ABOVE the just-raised viewer — deferred
+                // viewports are top-level windows, so a relaunch during
+                // Draw or a pin save would otherwise strand the modal
+                // behind its own dimmed parent.
+                self.enter(AppState::Viewer, ctx);
+                self.bring_viewer_forward(ctx);
+                let modals = [
+                    lock(&self.draw).is_some().then(draw_id),
+                    lock(&self.save_dialog).is_some().then(save_dialog_id),
+                ];
+                for id in modals.into_iter().flatten() {
+                    ctx.cmd_if_live(id, egui::ViewportCommand::Minimized(false));
+                    ctx.cmd_if_live(id, egui::ViewportCommand::Focus);
+                    self.request_focus(id);
+                    ctx.repaint_if_live(id);
+                }
             }
             Command::ViewerClosed => {
                 if lock(&self.draw).is_some() {
@@ -2255,6 +2283,10 @@ fn monitor_under(ctx: &egui::Context) -> Option<MonitorInfo> {
 pub struct PixMeApp {
     /// Everything the deferred-viewport callbacks reach.
     shared: Arc<Shared>,
+    /// The second-instance wake listener (Windows named event) — held
+    /// for the app lifetime so a relaunched `pixme.exe` surfaces this
+    /// instance's viewer. `None` on macOS and on event-creation failure.
+    _wakeup: Option<platform::WakeupServer>,
 }
 
 /// The `startup` event — the context every diagnosis needs first:
@@ -2302,6 +2334,17 @@ impl PixMeApp {
             settings.appearance.kind(cc.egui_ctx.system_theme()),
         );
         platform::install_ui(&cc.egui_ctx);
+        // Windows: the named event a relaunched `pixme.exe` sets — the
+        // listener queues `WakeViewer` exactly like a tray click queues
+        // a menu command. macOS gets `None`: LaunchServices reopens the
+        // running app itself, no second process exists.
+        let wakeup = {
+            let wake_ctx = cc.egui_ctx.clone();
+            platform::serve_instance_wakeup(&crate::paths::instance_key(), move || {
+                platform::queue_menu_command(Command::WakeViewer);
+                wake_viewports(&wake_ctx);
+            })
+        };
         log_banner(&settings);
         // Dev/test hook: `PIXME_CAPTURE=region|fullscreen|fixed` fires that
         // capture at startup without going through the resident menu.
@@ -2322,6 +2365,7 @@ impl PixMeApp {
                 })
         });
         let app = Self {
+            _wakeup: wakeup,
             shared: Arc::new(Shared {
                 state: Mutex::new(AppState::Idle),
                 last_language: Mutex::new(settings.language),
@@ -3594,6 +3638,40 @@ mod tests {
             drive(&shared, &ctx, Command::ToggleViewer),
             AppState::Viewer
         );
+    }
+
+    /// A second-instance relaunch surfaces the viewer from Idle like
+    /// `OpenViewer` — and stays legal while a modal owns the UI (the
+    /// re-raised modal rides above the viewer).
+    #[test]
+    fn wake_viewer_surfaces_from_idle() {
+        let (shared, ctx) = harness();
+        assert_eq!(drive(&shared, &ctx, Command::WakeViewer), AppState::Viewer);
+    }
+
+    /// The wake ruling: every modal but a live capture — stealing the
+    /// overlay's focus would eat its Esc/clicks — and never the quit
+    /// flush (`Saving` rejects everything anyway).
+    #[test]
+    fn wake_viewer_ruling() {
+        for modal in [
+            ModalState::None,
+            ModalState::Settings,
+            ModalState::Draw,
+            ModalState::SaveDialog,
+            ModalState::ViewerDialog,
+        ] {
+            assert!(
+                is_command_enabled(&Command::WakeViewer, modal),
+                "WakeViewer should be enabled under {modal:?}"
+            );
+        }
+        for modal in [ModalState::Capturing, ModalState::Saving] {
+            assert!(
+                !is_command_enabled(&Command::WakeViewer, modal),
+                "WakeViewer must stay blocked under {modal:?}"
+            );
+        }
     }
 
     /// Closing the viewer window just returns the resident app to

@@ -122,6 +122,15 @@ pub fn instance_lock() -> PathBuf {
     data_dir().join("instance.lock")
 }
 
+/// The OS-object key derived from [`instance_lock`], shared by the
+/// single-instance guard AND the Windows second-instance wake event, so
+/// both always target the same installation. Windows named-object names
+/// may not contain a backslash — the same string doubles as a lockfile
+/// path on macOS where `/` is normal.
+pub fn instance_key() -> String {
+    instance_lock().to_string_lossy().replace('\\', "/")
+}
+
 /// The panic dump (`logs/pixme.panic.log`) — separate from the daily
 /// file: the panic hook must never share a writer with the appender.
 pub fn panic_log() -> PathBuf {

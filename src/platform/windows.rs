@@ -1602,3 +1602,210 @@ pub fn display_count() -> u32 {
     // SM_CMONITORS = 80.
     unsafe { GetSystemMetrics(80) as u32 }
 }
+
+// ---------------------------------------------------------------------
+// Second-instance wake channel: a named auto-reset event.
+// ---------------------------------------------------------------------
+//
+// A second `pixme.exe` launch (desktop-shortcut double-click) surfaces
+// the RUNNING instance's viewer instead of showing the "already
+// running" dialog. The channel is `Local\PixMeWake-<hash>` — `Local\`
+// scopes the object to the user session and the kernel destroys it
+// with the last handle, so a crash can never leave a stale object.
+// Chosen over a socket or named pipe: no port, no filesystem artifact,
+// no signaler thread, and the listener's `WaitForSingleObject` is a
+// parked wait — zero wakeups while nothing happens.
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateEventW(
+        attrs: *const std::ffi::c_void,
+        manual: i32,
+        initial: i32,
+        name: *const u16,
+    ) -> isize;
+    fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
+    fn SetEvent(event: isize) -> i32;
+    fn CloseHandle(handle: isize) -> i32;
+    fn WaitForSingleObject(handle: isize, ms: u32) -> u32;
+    fn GetLastError() -> u32;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn AllowSetForegroundWindow(pid: u32) -> i32;
+}
+
+/// `SetEvent` needs no more than `EVENT_MODIFY_STATE`.
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+/// `WaitForSingleObject`'s signaled outcome.
+const WAIT_OBJECT_0: u32 = 0;
+/// `AllowSetForegroundWindow(ASFW_ANY)` hands the foreground right to
+/// EVERY process — the only grant usable when the resident's pid is
+/// unknown to the relaunched process.
+const ASFW_ANY: u32 = 0xFFFF_FFFF;
+/// `WaitForSingleObject(-1)` — parked until the event fires.
+const INFINITE: u32 = 0xFFFF_FFFF;
+
+/// The event name for `key` (the same per-installation key the
+/// single-instance mutex uses). FNV-1a keeps the name far under the
+/// 260-char object-name limit whatever the install path's length, and
+/// contains no backslash of its own.
+fn wakeup_event_name(key: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &b in key.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!(r"Local\PixMeWake-{hash:016x}")
+}
+
+fn wide(name: &str) -> Vec<u16> {
+    name.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Keeps the wake listener alive: dropping stops the waiter thread and
+/// closes the event. The app holds it for the whole run; tests drop it
+/// to join the thread instead of leaking a parked wait.
+pub struct WakeupServer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    event: isize,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for WakeupServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Break the parked wait so the thread sees `stop` and exits.
+        unsafe { SetEvent(self.event) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        unsafe { CloseHandle(self.event) };
+    }
+}
+
+/// Resident side: creates the wake event and parks a thread on it —
+/// each signal runs `on_wake` (which queues the surface command like a
+/// tray click). `None` when the event cannot be created: `main`'s
+/// translated dialog stays the fallback for a relaunch.
+pub fn serve_instance_wakeup<F>(key: &str, on_wake: F) -> Option<WakeupServer>
+where
+    F: Fn() + Send + 'static,
+{
+    let name = wide(&wakeup_event_name(key));
+    // Auto-reset (FALSE manual), initially non-signaled, default
+    // security — `Local\` already scopes the name to this session.
+    let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+    if event == 0 {
+        tracing::warn!("wake event unavailable: {}", unsafe { GetLastError() });
+        return None;
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread = {
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            loop {
+                match unsafe { WaitForSingleObject(event, INFINITE) } {
+                    WAIT_OBJECT_0 if !stop.load(std::sync::atomic::Ordering::Relaxed) => on_wake(),
+                    // Stopped (`Drop` signaled) or the handle went bad —
+                    // either way the listener ends here.
+                    _ => break,
+                }
+            }
+        })
+    };
+    Some(WakeupServer {
+        stop,
+        event,
+        thread: Some(thread),
+    })
+}
+
+/// Signaler side, called by the SECOND process once the instance guard
+/// reports the lock taken: grants the resident this process's
+/// foreground rights, then sets its wake event. `false` = no listener —
+/// the caller falls back to the translated `app.already_running`
+/// dialog.
+pub fn signal_instance_wakeup(key: &str) -> bool {
+    // The resident holds the guard from `main` but only installs the
+    // listener once its event loop is up — a quick relaunch can land in
+    // that gap, so retry briefly before conceding to the dialog.
+    const ATTEMPTS: u32 = 60;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+    let name = wide(&wakeup_event_name(key));
+    for _ in 0..ATTEMPTS {
+        let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if event != 0 {
+            // The user launched THIS process — we hold the foreground
+            // right SetForegroundWindow checks. ASFW_ANY hands it to
+            // every process so the resident can raise its viewer even
+            // from behind other apps.
+            unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+            let set = unsafe { SetEvent(event) } != 0;
+            unsafe { CloseHandle(event) };
+            return set;
+        }
+        std::thread::sleep(PAUSE);
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A key built from a TEMPORARY directory — never `paths`' real
+    /// `instance_key()`, so a test can never reach the live PixMe's
+    /// event even when a session is running.
+    fn temp_key(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("pixme-wake-{tag}-{}", std::process::id()))
+            .join("instance.lock")
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// The resident's listener fires on each signal; two different
+    /// installations (two keys) never see each other's event.
+    #[test]
+    fn wake_event_fires_the_resident_listener() {
+        let key = temp_key("live");
+        let fired = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let fired = Arc::clone(&fired);
+            serve_instance_wakeup(&key, move || {
+                fired.fetch_add(1, Ordering::Relaxed);
+            })
+        }
+        .expect("event creation must succeed in tests");
+
+        assert!(signal_instance_wakeup(&key));
+        for _ in 0..80 {
+            if fired.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(fired.load(Ordering::Relaxed), 1);
+        // A different install path = a different event: never signaled.
+        assert_ne!(
+            wakeup_event_name(&key),
+            wakeup_event_name(&temp_key("other"))
+        );
+        drop(server);
+    }
+
+    /// Name derivation is stable, session-scoped and path-derived —
+    /// the properties the per-installation contract needs.
+    #[test]
+    fn event_name_is_session_scoped_and_per_key() {
+        let a = wakeup_event_name(&temp_key("a"));
+        assert!(a.starts_with(r"Local\PixMeWake-"));
+        assert_eq!(a, wakeup_event_name(&temp_key("a")));
+        assert_ne!(a, wakeup_event_name(&temp_key("b")));
+        assert!(a.len() < 200, "name must stay under the object limit: {a}");
+    }
+}
