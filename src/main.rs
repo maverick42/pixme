@@ -81,6 +81,17 @@ fn main() -> eframe::Result<()> {
     // The guard must stay bound in `main` for the whole run.
     let instance = instance_guard();
     if instance.as_ref().is_some_and(|i| !i.is_single()) {
+        // A relaunch surfaces the RESIDENT instance's viewer instead of
+        // nagging: signal its wake event (Windows) and exit silently.
+        // `signal_instance_wakeup` is a stub-false on macOS — where a
+        // second process never starts anyway — and a signal failure
+        // (resident mid-startup, event missing) falls through to the
+        // translated dialog.
+        if platform::signal_instance_wakeup(&paths::instance_key()) {
+            tracing::info!("second launch: wake signaled, exiting");
+            logging::shutdown();
+            std::process::exit(0);
+        }
         // The message honours the configured language before any
         // window exists — i18n is loaded from settings directly.
         i18n::apply(config::Settings::load().language);
@@ -108,16 +119,14 @@ fn main() -> eframe::Result<()> {
 /// `None` = the guard itself failed — a resident app must not be
 /// blocked by that, so the failure only logs.
 fn instance_guard() -> Option<single_instance::SingleInstance> {
-    let path = paths::instance_lock();
     // The data dir may not exist on a first-ever run — without it the
     // lockfile cannot be created and the guard silently disables.
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = paths::instance_lock().parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // Windows mutex names may not contain a backslash — the same key
-    // doubles as a lockfile path on macOS where '/' is normal.
-    let key = path.to_string_lossy().replace('\\', "/");
-    match single_instance::SingleInstance::new(&key) {
+    // `paths::instance_key` is shared with the wake event so both
+    // objects always name the same installation.
+    match single_instance::SingleInstance::new(&paths::instance_key()) {
         Ok(instance) => Some(instance),
         Err(err) => {
             tracing::warn!("single-instance guard unavailable: {err}");

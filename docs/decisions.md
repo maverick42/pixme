@@ -2164,3 +2164,71 @@ Format: date — context — decision — consequences.
   display it lives on; the gesture settle reuses the debounced
   `monitor_geom_dirty_at` flush, no new save path. Shared code (works
   identically on macOS).
+
+## 2026-11-07 — Second-instance relaunch surfaces the viewer (Windows named event)
+
+- **Context**: on Windows, double-clicking the PixMe desktop shortcut while
+  the app is resident shows the `app.already_running` dialog — the user
+  wants the running instance's viewer to come forward instead. Earlier
+  entries skipped foreground-raising ("no cross-process window handle
+  without fragile Win32 code"); the agreed resolution is a named event,
+  not window-handle hunting.
+- **Decision**:
+  - **IPC = one named auto-reset event** `Local\PixMeWake-<fnv1a64(key)>`,
+    where `key` is `paths::instance_key()` — the same per-installation
+    string the single-instance mutex uses, so the wake can only ever
+    reach the SAME install's resident process (two portable folders keep
+    independent sessions AND independent wake events). `Local\` scopes it
+    to the user session; the kernel destroys the object with the last
+    handle, so a crash leaves nothing stale. FNV-1a keeps the name far
+    under the 260-char object limit on any path length.
+  - **Resident side** (`platform::serve_instance_wakeup`, installed in
+    `PixMeApp::new`): a parked `WaitForSingleObject` thread — zero
+    wakeups while nothing happens — queues `Command::WakeViewer` through
+    the same `queue_menu_command` + `wake_viewports` plumbing tray
+    clicks use. `WakeupServer` is held by `PixMeApp` for the run; its
+    `Drop` stops and joins the thread (tests use it).
+  - **Signaler side** (`platform::signal_instance_wakeup`, in `main`
+    before the dialog): `OpenEventW` retried ~3 s — the resident takes
+    the guard in `main` but installs the listener once the event loop is
+    up, so a quick relaunch can land in that gap — then
+    `AllowSetForegroundWindow(ASFW_ANY)`: the just-launched process owns
+    the foreground right `SetForegroundWindow` checks and hands it to
+    every process, so the resident's `Focus` lands even while it sits
+    behind other apps. Then `SetEvent` and a silent `exit(0)`. Any
+    failure falls through to the existing translated dialog.
+  - **`Command::WakeViewer`**: `enter(Viewer)` +
+    `bring_viewer_forward` (un-minimize → `Focus` → `pending_focus`
+    retries), then re-raises every live modal child (Draw, pin save
+    dialog) ABOVE the viewer — deferred viewports are top-level windows,
+    so a relaunch during Draw would otherwise strand the modal behind
+    its own dimmed parent. Ruling: enabled under every modal except
+    `Capturing` (stealing the overlay's focus would eat its Esc/clicks)
+    and `Saving` (the quit flush rejects everything anyway). It is
+    unreachable from menus — no menu id maps to it.
+  - `paths::instance_key()` single-sources the `\`→`/` derivation the
+    guard and the event share.
+- **Rejected alternatives**: a socket or named pipe (port/handle
+  lifecycle, a listener thread anyway, heavier); no IPC at all (the
+  dialog — the actual complaint); `single-instance`'s API has no
+  callback (recorded 2026-10-25); posting a registered Win32 message to
+  the resident's windows (needs HWND discovery — the same fragile code
+  foreground-raising was skipped over); the signaler calling
+  `CreateEventW` itself (a set event dies with the signaler's handle
+  before the resident can exist — the race remains, `OpenEvent`+retry
+  is deterministic).
+- **macOS is not concerned**: a relaunch can never spawn a second
+  process — LaunchServices delivers `applicationShouldHandleReopen:` to
+  the RUNNING app, and the Dock-reopen hook already queues `OpenViewer`.
+  `serve_instance_wakeup`/`signal_instance_wakeup` are `None`/`false`
+  stubs there, so the `app.already_running` dialog stays the
+  (unreachable) fallback with zero IPC machinery — no socket, no
+  thread.
+- **Still to validate on Windows** (manual): relaunch from the shortcut
+  in four states — viewer open, viewer minimized, viewer closed with
+  PixMe in the notification area, and during an open Draw. Every time
+  the viewer (plus its modal) must land frontmost, never behind, with
+  no dialog. Edge cases worth a look during validation: foreground
+  rights while a UAC prompt or another always-on-top app holds the
+  foreground (`ASFW_ANY` should cover the standard cases), and the
+  ~3 s signal-retry window during a cold resident start.

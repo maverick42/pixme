@@ -508,6 +508,38 @@ pub use macos::refocus_capture_overlay;
 #[cfg(target_os = "windows")]
 pub use windows::refocus_capture_overlay;
 
+/// The second-instance wake channel: a relaunched `pixme.exe` surfaces
+/// the resident instance's viewer instead of showing the
+/// `app.already_running` dialog. Windows implements it as a named
+/// auto-reset event keyed on [`crate::paths::instance_key`]:
+/// [`serve_instance_wakeup`] parks a listener thread in the resident,
+/// [`signal_instance_wakeup`] (second process) hands over its
+/// foreground rights then sets the event.
+#[cfg(target_os = "windows")]
+pub use windows::{WakeupServer, serve_instance_wakeup, signal_instance_wakeup};
+/// No second process can ever launch on macOS — LaunchServices reopens
+/// the RUNNING app and the Dock-reopen hook already queues
+/// `OpenViewer`. `None` here keeps `main`'s translated dialog as the
+/// (unreachable) fallback, with no IPC machinery at all.
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn serve_instance_wakeup(
+    _key: &str,
+    _on_wake: impl Fn() + Send + 'static,
+) -> Option<WakeupServer> {
+    None
+}
+/// The macOS no-op guard returned by [`serve_instance_wakeup`].
+#[cfg(target_os = "macos")]
+pub struct WakeupServer;
+/// Always `false` on macOS (see above): `main` shows the translated
+/// `app.already_running` dialog — unreachable in practice.
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn signal_instance_wakeup(_key: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
