@@ -281,6 +281,43 @@ impl Opts {
         let live = self.style();
         self.styles.entry(tool).or_insert(live)
     }
+
+    /// `true` when `tool`'s bank (the live fields when `armed`) holds
+    /// anything but the factory style — the step counters ride the
+    /// bank but are not styling, so they are ignored in the comparison.
+    fn bank_differs(&self, tool: Tool, armed: bool) -> bool {
+        let mut bank = if armed {
+            self.style()
+        } else {
+            self.styles.get(&tool).cloned().unwrap_or_default()
+        };
+        bank.step_next_num = 1;
+        bank.step_next_let = 1;
+        bank != crate::config::ToolStyle::default()
+    }
+
+    /// Resets `tool`'s bank to factory defaults; when `armed`, the
+    /// live fields adopt it too. Step counters are preserved —
+    /// numbering is not styling.
+    fn reset_bank(&mut self, tool: Tool, armed: bool) {
+        let mut def = crate::config::ToolStyle::default();
+        if tool == Tool::Step {
+            let (num, letter) = if armed {
+                (self.step_next_num, self.step_next_let)
+            } else {
+                self.styles
+                    .get(&tool)
+                    .map(|b| (b.step_next_num, b.step_next_let))
+                    .unwrap_or((1, 1))
+            };
+            def.step_next_num = num;
+            def.step_next_let = letter;
+        }
+        self.styles.insert(tool, def.clone());
+        if armed {
+            self.adopt(&def);
+        }
+    }
 }
 
 impl Default for Opts {
@@ -301,7 +338,7 @@ impl Default for Opts {
             tip: TipShape::Round,
             brace_kind: BraceKind::CurlyLeft,
             shape: AreaShape::Rect,
-            hl_opacity: 0.45,
+            hl_opacity: 1.0,
             eraser_color: Color32::WHITE,
             eraser_size: 12.0,
             eraser_mode: EraserMode::Color,
@@ -520,7 +557,7 @@ impl DrawSession {
         prefs: &crate::config::Settings,
     ) -> Self {
         let open_snapshot = postcard::to_allocvec(&doc.annotations).unwrap_or_default();
-        Self {
+        let mut session = Self {
             doc,
             tab,
             title,
@@ -558,7 +595,17 @@ impl DrawSession {
             preview_dirty: false,
             drag_region: None,
             nudge: None,
-        }
+        };
+        // Numbering follows the document, not the persisted bank: one
+        // past the highest marker per mode — 1/A on an empty canvas,
+        // and letters keep counting past Z (the renderer wraps to A).
+        // Written into the Step bank: the armed Select tool keeps its
+        // live fields, and arming Step adopts these counters.
+        let (num, letter) = next_step_counters(&session.doc);
+        let bank = session.opts.bank_mut(Tool::Step);
+        bank.step_next_num = num;
+        bank.step_next_let = letter;
+        session
     }
 
     /// The resolved end-of-session, if any.
@@ -2611,7 +2658,11 @@ impl DrawSession {
                 }
                 Tool::HighlightArea => {
                     let r = Rect::from_two_pos(ca, cb);
-                    let fill_col = o.color.gamma_multiply(o.hl_opacity);
+                    // Zone-definition preview, NOT the result: the real
+                    // highlight is a multiply that can never read as a
+                    // solid wall — a 12% tint + accent outline keeps the
+                    // zone (and its colour) visible at any opacity.
+                    let fill_col = o.color.gamma_multiply(0.12);
                     if o.shape == AreaShape::Rect {
                         painter.rect_filled(r, CornerRadius::ZERO, fill_col);
                         painter.rect_stroke(
@@ -3406,6 +3457,52 @@ impl DrawSession {
         );
     }
 
+    /// The tool whose option bank a bottom-bar chip menu resets: the
+    /// selected object's owning tool (same rule as `fix_options`),
+    /// else the armed tool. `None` when the chip stands for a context
+    /// with no bank (live marquee, a Picture/Emoji object, or a tool
+    /// with no styling options).
+    fn reset_target_tool(&self) -> Option<Tool> {
+        if self.sel_area.is_some() {
+            return None;
+        }
+        if let Some(a) = self.selected.and_then(|id| self.doc.annotation(id)) {
+            return fix_bank_tool(a);
+        }
+        match self.tool {
+            Tool::Select | Tool::SelectArea | Tool::Pipette | Tool::Emoji => None,
+            t => Some(t),
+        }
+    }
+
+    /// Right-click on a bottom-bar tab chip: offers "Reset options"
+    /// for the bank the chip stands for — greyed when there is no
+    /// bank or it still holds the factory style.
+    fn chip_options_menu(&mut self, resp: &Response, shared: &Shared) {
+        egui::Popup::context_menu(resp).show(|ui| {
+            let target = self.reset_target_tool();
+            let dirty = target.is_some_and(|t| self.opts.bank_differs(t, t == self.tool));
+            if ui
+                .add_enabled(
+                    dirty,
+                    egui::Button::new(t!("draw.ctx.reset_options").to_string()),
+                )
+                .clicked()
+            {
+                if let Some(tool) = target {
+                    self.opts.reset_bank(tool, tool == self.tool);
+                    self.persist_opts(shared);
+                    widgets::toast(
+                        ui.ctx(),
+                        widgets::ToastKind::Success,
+                        t!("draw.options_reset", tool = tool.tip().as_ref()).to_string(),
+                    );
+                }
+                ui.close();
+            }
+        });
+    }
+
     /// Mirrors text style changes into `self.opts` + `prefs.json`.
     #[allow(clippy::too_many_arguments)]
     fn save_text_prefs(
@@ -3584,6 +3681,7 @@ impl DrawSession {
                                 self.apply(AnnoEdit::Replace { before, after });
                             }
                         }
+                        self.chip_options_menu(&resp, shared);
                     }
                 } else if emoji_bar {
                     // One tab per manifest section — same chip chrome
@@ -3625,7 +3723,7 @@ impl DrawSession {
                         }
                     }
                 } else {
-                    egui::Frame::NONE
+                    let inner = egui::Frame::NONE
                         .fill(tk.field)
                         .stroke(Stroke::new(1.0, tk.field_border))
                         .corner_radius(CornerRadius {
@@ -3643,6 +3741,15 @@ impl DrawSession {
                                     .color(tk.text),
                             );
                         });
+                    let resp = ui.interact(
+                        inner.response.rect,
+                        ui.id().with("pixme-opt-chip"),
+                        egui::Sense::click(),
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    self.chip_options_menu(&resp, shared);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
@@ -5447,6 +5554,22 @@ fn step_options_row(
     changed
 }
 
+/// The next step counters for `doc` — one past the highest marker in
+/// each mode (1 / A on an empty canvas). Letters keep counting past
+/// 26: `step_label` wraps Z→A, matching the counter's own increment.
+fn next_step_counters(doc: &Document) -> (u32, u32) {
+    let (mut num, mut letter) = (0u32, 0u32);
+    for a in &doc.annotations {
+        if let AnnotationKind::Step(o) = &a.kind {
+            match o.mode {
+                StepMode::Numbers => num = num.max(o.count),
+                StepMode::Letters => letter = letter.max(o.count),
+            }
+        }
+    }
+    (num + 1, letter + 1)
+}
+
 /// The tool bank a "Set as default options" click writes into — the
 /// object's memorized origin tool for kinds several tools produce
 /// (rect/ellipse fills, freehand, text boxes), the kind's own tool for
@@ -6075,5 +6198,136 @@ mod live_drag_tests {
             !s.contains('{') && s.contains("Surligneur"),
             "unsubstituted placeholder: {s}"
         );
+    }
+
+    /// `Opts::reset_bank` restores the factory style but leaves the
+    /// step counters alone; `bank_differs` ignores them too.
+    #[test]
+    fn reset_bank_restores_factory_but_keeps_step_counters() {
+        let mut o = Opts {
+            step_bg: Color32::BLUE,
+            step_next_num: 7,
+            step_next_let: 3,
+            ..Opts::default()
+        };
+        assert!(o.bank_differs(Tool::Step, true));
+        o.reset_bank(Tool::Step, true);
+        assert_eq!(o.step_bg, Color32::from_rgb(225, 40, 40));
+        assert_eq!((o.step_next_num, o.step_next_let), (7, 3));
+        // Style fields alone no longer differ from factory defaults.
+        assert!(!o.bank_differs(Tool::Step, true));
+        // Unarmed tool: the bank resets, the live fields are untouched.
+        o.width = 9.0;
+        o.reset_bank(Tool::Arrow, false);
+        assert_eq!(o.styles[&Tool::Arrow].width, 3.0);
+        assert_eq!(o.width, 9.0);
+    }
+
+    /// The reset toast substitutes `%{tool}` like `options_fixed` does.
+    #[test]
+    fn options_reset_toast_substitutes_tool_name() {
+        let s = t!("draw.options_reset", tool = "Surligneur").to_string();
+        assert!(
+            !s.contains('{') && s.contains("Surligneur"),
+            "unsubstituted placeholder: {s}"
+        );
+    }
+
+    /// `next_step_counters`: empty → (1, A); else max+1 per mode —
+    /// letters keep counting past 26 (the renderer wraps Z→A).
+    #[test]
+    fn next_step_counters_scan_the_document() {
+        let mut doc = Document::new(Capture {
+            image: std::sync::Arc::new(image::RgbaImage::new(4, 4)),
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect::default(),
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        });
+        assert_eq!(next_step_counters(&doc), (1, 1));
+        for (count, mode) in [(3, StepMode::Numbers), (26, StepMode::Letters)] {
+            let id = doc.alloc_id();
+            doc.annotations.push(Annotation {
+                id,
+                kind: AnnotationKind::Step(StepObj {
+                    pos: pos2(1.0, 1.0),
+                    count,
+                    mode,
+                    style: StepStyle::Circle,
+                    size: StepSize::Medium,
+                    bg: Color32::RED,
+                    fg: Color32::WHITE,
+                    ring: 0.0,
+                    ring_color: Color32::WHITE,
+                    opacity: 1.0,
+                    shadow: 0.0,
+                    lower: false,
+                }),
+                tool: Some(Tool::Step),
+            });
+        }
+        assert_eq!(next_step_counters(&doc), (4, 27));
+    }
+
+    /// Entering Draw seeds the Step bank from the document, so arming
+    /// the tool continues numbering at max+1 — even when the persisted
+    /// bank remembers something else.
+    #[test]
+    fn step_counters_follow_the_document_at_open() {
+        let mut doc = Document::new(Capture {
+            image: std::sync::Arc::new(image::RgbaImage::new(4, 4)),
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect::default(),
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        });
+        for (count, mode) in [(3, StepMode::Numbers), (26, StepMode::Letters)] {
+            let id = doc.alloc_id();
+            doc.annotations.push(Annotation {
+                id,
+                kind: AnnotationKind::Step(StepObj {
+                    pos: pos2(1.0, 1.0),
+                    count,
+                    mode,
+                    style: StepStyle::Circle,
+                    size: StepSize::Medium,
+                    bg: Color32::RED,
+                    fg: Color32::WHITE,
+                    ring: 0.0,
+                    ring_color: Color32::WHITE,
+                    opacity: 1.0,
+                    shadow: 0.0,
+                    lower: false,
+                }),
+                tool: Some(Tool::Step),
+            });
+        }
+        let mut prefs = crate::config::Settings::default();
+        let bank = crate::config::ToolStyle {
+            step_next_num: 99,
+            step_next_let: 99,
+            ..crate::config::ToolStyle::default()
+        };
+        prefs.draw_opts.tools.insert(Tool::Step, bank);
+        let mut s = DrawSession::open(
+            doc,
+            0,
+            "t".to_owned(),
+            VecDeque::new(),
+            VecDeque::new(),
+            &prefs,
+        );
+        s.set_tool(Tool::Step);
+        // The document wins over the persisted 99s.
+        assert_eq!(s.opts.step_next_num, 4);
+        assert_eq!(s.opts.step_next_let, 27);
     }
 }
