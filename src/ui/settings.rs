@@ -23,6 +23,8 @@ pub enum SettingsPage {
     General,
     /// The saved-file filename template and its editable presets.
     Filename,
+    /// OS-wide shortcuts (Open PixMe, region capture).
+    Hotkeys,
     /// App identity, version, data/log folder locations, diagnostics.
     About,
 }
@@ -35,7 +37,11 @@ const PENDING_DRAFT: &str = "pixme.pending_settings_draft";
 /// Draws the settings pages inside the viewer's modal settings window.
 pub fn show(ui: &mut egui::Ui, shared: &Shared) {
     // Escape closes the modal like Annuler: the draft is dropped.
-    if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+    let recording_active = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<Option<crate::hotkeys::HotkeyAction>>(egui::Id::new(REC_KEY)))
+        .is_some_and(|a| a.is_some());
+    if !recording_active && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
         discard(shared);
     }
     // A pending retention confirm replaces the whole body — a separate
@@ -48,6 +54,37 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
         .data_mut(|d| d.get_temp::<SettingsPage>(egui::Id::new(PAGE_KEY)))
         .unwrap_or_default();
     let mut page = page;
+    // Leaving the Hotkeys page while a field listens (sidebar switch)
+    // would leave the global hotkeys suspended forever — clear the
+    // recorder and re-arm.
+    if page != SettingsPage::Hotkeys {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(egui::Id::new(REC_KEY), None::<crate::hotkeys::HotkeyAction>)
+        });
+        // A test pending off-page never resolves (the page owns the
+        // timeout): cancel it — the draft is untouched — and release
+        // any transient registration.
+        #[cfg(target_os = "macos")]
+        {
+            type Testing = (crate::hotkeys::HotkeyAction, u32, std::time::Instant);
+            if ui
+                .ctx()
+                .data_mut(|d| {
+                    d.get_temp::<Option<Testing>>(egui::Id::new(TEST_KEY))
+                        .flatten()
+                })
+                .is_some()
+            {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(egui::Id::new(TEST_KEY), None::<Testing>));
+                *lock(&shared.hotkey_verify) = None;
+            }
+        }
+        if let Some(m) = lock(&shared.hotkeys).as_mut() {
+            m.resume();
+            m.release_verify();
+        }
+    }
     {
         let mut guard = lock(&shared.settings_draft);
         let Some(draft) = guard.as_mut() else {
@@ -66,6 +103,7 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
                 |ui| match page {
                     SettingsPage::General => general_page(ui, draft),
                     SettingsPage::Filename => filename_page(ui, draft),
+                    SettingsPage::Hotkeys => hotkeys_page(ui, draft, shared),
                     SettingsPage::About => about_page(ui),
                 },
             );
@@ -82,9 +120,15 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
         let template_ok = lock(&shared.settings_draft)
             .as_ref()
             .is_some_and(|d| !d.filename_template.trim().is_empty());
+        // A hotkey recording or a pending confirmation press must
+        // resolve first — applying mid-verification would arm a combo
+        // that may be silently swallowed by another app, and
+        // mid-recording would persist while the armed set is
+        // suspended.
+        let ready = template_ok && !hotkey_pending(ui.ctx());
         // right_to_left draws rightmost-first: OK first → visual order
         // [Annuler][OK], the primary rightmost like every other dialog.
-        ui.add_enabled_ui(template_ok, |ui| {
+        ui.add_enabled_ui(ready, |ui| {
             if widgets::primary_button(ui, &t!("draw.ok")).clicked() {
                 apply(ui.ctx(), shared);
             }
@@ -106,6 +150,7 @@ fn sidebar(ui: &mut egui::Ui, page: &mut SettingsPage) {
         for (value, key) in [
             (SettingsPage::General, "settings.page.general"),
             (SettingsPage::Filename, "settings.page.filename"),
+            (SettingsPage::Hotkeys, "settings.page.hotkeys"),
             (SettingsPage::About, "settings.page.about"),
         ] {
             if ui
@@ -445,12 +490,54 @@ fn write_back(draft: Settings, shared: &Shared) {
     }
     shared.settings_open.store(false, Ordering::Relaxed);
     *lock(&shared.settings_draft) = None;
+    *lock(&shared.hotkey_verify) = None;
+    // A field may have been listening — re-arm whatever was suspended
+    // and release any pending verification registration.
+    if let Some(m) = lock(&shared.hotkeys).as_mut() {
+        m.resume();
+        m.release_verify();
+    }
+    // Re-arm the global hotkeys against the just-persisted map.
+    shared.push(crate::app::Command::HotkeysChanged);
+}
+
+/// `true` while a hotkey field is recording or a recorded combo waits
+/// for its confirmation press — the footer OK stays disabled until the
+/// binding resolves (confirmed, rejected or cancelled).
+fn hotkey_pending(ctx: &egui::Context) -> bool {
+    let recording = ctx.data_mut(|d| {
+        d.get_temp::<Option<crate::hotkeys::HotkeyAction>>(egui::Id::new(REC_KEY))
+            .is_some_and(|a| a.is_some())
+    });
+    if recording {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ctx.data_mut(|d| {
+            d.get_temp::<Option<(crate::hotkeys::HotkeyAction, u32, std::time::Instant)>>(
+                egui::Id::new(TEST_KEY),
+            )
+            .is_some_and(|v| v.is_some())
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// Annuler / cross / Escape: the draft is dropped, nothing persists.
 fn discard(shared: &Shared) {
     shared.settings_open.store(false, Ordering::Relaxed);
     *lock(&shared.settings_draft) = None;
+    *lock(&shared.hotkey_verify) = None;
+    // A field may have been listening — re-arm whatever was suspended
+    // and release any pending verification registration.
+    if let Some(m) = lock(&shared.hotkeys).as_mut() {
+        m.resume();
+        m.release_verify();
+    }
 }
 
 /// The pending-draft confirmation: applying loses stored captures —
@@ -603,4 +690,485 @@ fn retention_label(r: DbRetention) -> std::borrow::Cow<'static, str> {
         DbRetention::Today => t!("settings.db.today"),
         DbRetention::Always => t!("settings.db.always"),
     }
+}
+
+/// egui-temp keys: which action's field is listening, record-time
+/// errors (keyed by action), and the macOS confirmation state.
+const REC_KEY: &str = "pixme.hk_recording";
+const REC_ERR: &str = "pixme.hk_rec_err";
+#[cfg(target_os = "macos")]
+const TEST_KEY: &str = "pixme.hk_test";
+/// How long the test window stays open — the press is synthesized by
+/// the app, so it either lands within a frame or never does; 2 s is
+/// generous headroom for the Carbon dispatch round-trip.
+#[cfg(target_os = "macos")]
+const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn action_label_key(a: crate::hotkeys::HotkeyAction) -> &'static str {
+    match a {
+        crate::hotkeys::HotkeyAction::OpenViewer => "settings.hotkeys.open_viewer",
+        crate::hotkeys::HotkeyAction::CaptureRegion => "settings.hotkeys.capture_region",
+    }
+}
+
+/// The persisted accelerator ("control+shift+KeyR") rendered for the
+/// user: Ctrl/Alt/Shift + Cmd (macOS) / Win, then the bare key name.
+fn combo_label(raw: &str) -> String {
+    use global_hotkey::hotkey::{HotKey, Modifiers};
+    let Ok(hk) = raw.parse::<HotKey>() else {
+        return raw.to_owned();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if hk.mods.contains(Modifiers::CONTROL) {
+        parts.push("Ctrl".into());
+    }
+    if hk.mods.contains(Modifiers::ALT) {
+        parts.push(
+            if cfg!(target_os = "macos") {
+                "Opt"
+            } else {
+                "Alt"
+            }
+            .into(),
+        );
+    }
+    if hk.mods.contains(Modifiers::SHIFT) {
+        parts.push("Shift".into());
+    }
+    if hk.mods.contains(Modifiers::META) {
+        parts.push(
+            if cfg!(target_os = "macos") {
+                "Cmd"
+            } else {
+                "Win"
+            }
+            .into(),
+        );
+    }
+    let key = hk.key.to_string();
+    parts.push(
+        key.strip_prefix("Key")
+            .or_else(|| key.strip_prefix("Digit"))
+            .unwrap_or(&key)
+            .to_owned(),
+    );
+    parts.join("+")
+}
+
+/// `egui::Key` → `keyboard-types::Code` for the combos worth
+/// recording. `None` = key not bindable (kept listening, error shown).
+fn egui_to_code(key: egui::Key) -> Option<global_hotkey::hotkey::Code> {
+    use egui::Key as K;
+    use global_hotkey::hotkey::Code;
+    Some(match key {
+        K::A => Code::KeyA,
+        K::B => Code::KeyB,
+        K::C => Code::KeyC,
+        K::D => Code::KeyD,
+        K::E => Code::KeyE,
+        K::F => Code::KeyF,
+        K::G => Code::KeyG,
+        K::H => Code::KeyH,
+        K::I => Code::KeyI,
+        K::J => Code::KeyJ,
+        K::K => Code::KeyK,
+        K::L => Code::KeyL,
+        K::M => Code::KeyM,
+        K::N => Code::KeyN,
+        K::O => Code::KeyO,
+        K::P => Code::KeyP,
+        K::Q => Code::KeyQ,
+        K::R => Code::KeyR,
+        K::S => Code::KeyS,
+        K::T => Code::KeyT,
+        K::U => Code::KeyU,
+        K::V => Code::KeyV,
+        K::W => Code::KeyW,
+        K::X => Code::KeyX,
+        K::Y => Code::KeyY,
+        K::Z => Code::KeyZ,
+        K::Num0 => Code::Digit0,
+        K::Num1 => Code::Digit1,
+        K::Num2 => Code::Digit2,
+        K::Num3 => Code::Digit3,
+        K::Num4 => Code::Digit4,
+        K::Num5 => Code::Digit5,
+        K::Num6 => Code::Digit6,
+        K::Num7 => Code::Digit7,
+        K::Num8 => Code::Digit8,
+        K::Num9 => Code::Digit9,
+        K::F1 => Code::F1,
+        K::F2 => Code::F2,
+        K::F3 => Code::F3,
+        K::F4 => Code::F4,
+        K::F5 => Code::F5,
+        K::F6 => Code::F6,
+        K::F7 => Code::F7,
+        K::F8 => Code::F8,
+        K::F9 => Code::F9,
+        K::F10 => Code::F10,
+        K::F11 => Code::F11,
+        K::F12 => Code::F12,
+        K::ArrowUp => Code::ArrowUp,
+        K::ArrowDown => Code::ArrowDown,
+        K::ArrowLeft => Code::ArrowLeft,
+        K::ArrowRight => Code::ArrowRight,
+        K::Space => Code::Space,
+        K::Tab => Code::Tab,
+        K::Backspace => Code::Backspace,
+        K::Delete => Code::Delete,
+        K::Insert => Code::Insert,
+        K::Home => Code::Home,
+        K::End => Code::End,
+        K::PageUp => Code::PageUp,
+        K::PageDown => Code::PageDown,
+        K::Minus => Code::Minus,
+        K::Comma => Code::Comma,
+        K::Period => Code::Period,
+        K::Slash => Code::Slash,
+        K::Backslash => Code::Backslash,
+        K::Semicolon => Code::Semicolon,
+        K::OpenBracket => Code::BracketLeft,
+        K::CloseBracket => Code::BracketRight,
+        K::Quote => Code::Quote,
+        K::Backtick => Code::Backquote,
+        K::Enter => Code::Enter,
+        _ => return None,
+    })
+}
+
+/// Hotkeys page: one row per bindable action — translated label, a
+/// field-style record panel (bordered, accent while listening), ✕ to
+/// unset — plus a per-row error badge and a restore-defaults button
+/// (defaults = no binding). Modifier-only presses and unmapped keys
+/// are ignored while listening; only a validated combo or Escape ends
+/// the recording. A replacement is validated (dup / reserved / OS
+/// probe) before the draft is touched; the armed binding is only
+/// swapped after the OS accepted the new one.
+fn hotkeys_page(ui: &mut egui::Ui, draft: &mut Settings, shared: &Shared) {
+    use crate::hotkeys::HotkeyAction;
+    let ctx = ui.ctx().clone();
+    let tk = theme::tokens(&ctx);
+    let mut recording: Option<HotkeyAction> = ctx
+        .data_mut(|d| d.get_temp::<Option<HotkeyAction>>(egui::Id::new(REC_KEY)))
+        .flatten();
+    // A recording that just ended (success, Escape) re-arms the
+    // suspended hotkeys — the frame after the recording state cleared.
+    if recording.is_none()
+        && lock(&shared.hotkeys)
+            .as_ref()
+            .is_some_and(|m| m.is_suspended())
+    {
+        lock(&shared.hotkeys)
+            .as_mut()
+            .expect("checked above")
+            .resume();
+    }
+    let mut errors: std::collections::BTreeMap<HotkeyAction, String> = ctx
+        .data_mut(|d| d.get_temp(egui::Id::new(REC_ERR)))
+        .unwrap_or_default();
+    // macOS: the "Test" button synthesizes one real press of the
+    // bound combo and arms a short listen window — the listener
+    // consumes the press and clears the shared slot; a timeout means
+    // the combo is swallowed by another app (Carbon cannot detect
+    // foreign registrations at registration time). No-op on Windows —
+    // `RegisterHotKey` fails there when the combo is taken, so a test
+    // press is pointless.
+    #[cfg(target_os = "macos")]
+    let mut testing: Option<(HotkeyAction, u32, std::time::Instant)> = ctx.data_mut(|d| {
+        d.get_temp::<Option<(HotkeyAction, u32, std::time::Instant)>>(egui::Id::new(TEST_KEY))
+            .flatten()
+    });
+    #[cfg(not(target_os = "macos"))]
+    let testing: Option<(HotkeyAction, u32, std::time::Instant)> = None;
+
+    // Capture the next real key while a field is listening.
+    if let Some(action) = recording {
+        let events: Vec<egui::Event> = ctx.input(|i| i.events.to_vec());
+        for ev in events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = ev
+            else {
+                continue;
+            };
+            if key == egui::Key::Escape {
+                recording = None;
+                break;
+            }
+            let mut mods = global_hotkey::hotkey::Modifiers::empty();
+            if modifiers.ctrl {
+                mods |= global_hotkey::hotkey::Modifiers::CONTROL;
+            }
+            if modifiers.alt {
+                mods |= global_hotkey::hotkey::Modifiers::ALT;
+            }
+            if modifiers.shift {
+                mods |= global_hotkey::hotkey::Modifiers::SHIFT;
+            }
+            if modifiers.mac_cmd {
+                mods |= global_hotkey::hotkey::Modifiers::META;
+            }
+            // macOS can deliver the key event with an empty modifiers
+            // field (the frame state is authoritative) — fall back to
+            // the frame's modifier state before giving up.
+            if mods.is_empty() {
+                let f = ctx.input(|i| i.modifiers);
+                if f.ctrl {
+                    mods |= global_hotkey::hotkey::Modifiers::CONTROL;
+                }
+                if f.alt {
+                    mods |= global_hotkey::hotkey::Modifiers::ALT;
+                }
+                if f.shift {
+                    mods |= global_hotkey::hotkey::Modifiers::SHIFT;
+                }
+                if f.mac_cmd {
+                    mods |= global_hotkey::hotkey::Modifiers::META;
+                }
+            }
+            tracing::debug!(?key, ?mods, "hotkey_record_key");
+            if mods.is_empty() {
+                continue; // modifier key alone — keep listening
+            }
+            let Some(code) = egui_to_code(key) else {
+                continue; // unmapped key — keep listening
+            };
+            let hk = global_hotkey::hotkey::HotKey::new(Some(mods), code);
+            let raw = hk.to_string();
+            let dup = draft.hotkeys.iter().any(|(a, s)| *a != action && *s == raw);
+            // A combo already armed — for this or the other action —
+            // is proven deliverable: skip the probe (it would report
+            // it taken by our own registration) and the confirmation
+            // press (a transient register would collide with the live
+            // one — the lib keeps a single ref per id).
+            let already_armed = lock(&shared.hotkeys)
+                .as_ref()
+                .is_some_and(|m| m.is_armed(&hk));
+            let err = if already_armed {
+                None
+            } else if dup {
+                Some(t!("settings.hotkeys.err_dup").to_string())
+            } else {
+                // `probe` reuses the app's single manager — on macOS a
+                // second Carbon event handler cannot be installed, so
+                // a throwaway manager would fail every probe.
+                let probe = lock(&shared.hotkeys)
+                    .as_ref()
+                    .ok_or(crate::hotkeys::HotkeyError::Taken)
+                    .and_then(|m| m.probe(&raw));
+                match probe {
+                    Ok(()) => None,
+                    Err(crate::hotkeys::HotkeyError::Reserved) => {
+                        Some(t!("settings.hotkeys.err_reserved").to_string())
+                    }
+                    Err(crate::hotkeys::HotkeyError::Taken) => {
+                        Some(t!("settings.hotkeys.err_taken").to_string())
+                    }
+                }
+            };
+            if let Some(e) = err {
+                errors.insert(action, e);
+            } else {
+                draft.hotkeys.insert(action, raw);
+                errors.remove(&action);
+            }
+            recording = None;
+            break;
+        }
+    }
+
+    // macOS: watch the test window — the press proves the combo is
+    // deliverable (listener consumed it and cleared the slot); a
+    // timeout means another app swallows it — surface both as toasts.
+    #[cfg(target_os = "macos")]
+    if let Some((_, id, at)) = testing {
+        if *lock(&shared.hotkey_verify) != Some(id) {
+            testing = None; // the test press arrived
+            widgets::toast(
+                &ctx,
+                widgets::ToastKind::Success,
+                t!("settings.hotkeys.test_ok").to_string(),
+            );
+            if let Some(m) = lock(&shared.hotkeys).as_mut() {
+                m.release_verify();
+            }
+        } else if at.elapsed() > TEST_TIMEOUT {
+            testing = None;
+            widgets::toast(
+                &ctx,
+                widgets::ToastKind::Warning,
+                t!("settings.hotkeys.test_fail").to_string(),
+            );
+            *lock(&shared.hotkey_verify) = None;
+            if let Some(m) = lock(&shared.hotkeys).as_mut() {
+                m.release_verify();
+            }
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    ui.vertical(|ui| {
+        ui.add_space(6.0);
+        let sync_errors = lock(&shared.hotkey_errors).clone();
+        for action in HotkeyAction::ALL {
+            ui.horizontal(|ui| {
+                ui.label(t!(action_label_key(action)).to_string());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let bound = draft.hotkeys.get(&action).is_some_and(|s| !s.is_empty());
+                    let testing_action = testing.is_some_and(|(a, _, _)| a == action);
+                    // "Test" synthesizes one real press of the bound
+                    // combo — whoever owns it receives it; if it is
+                    // ours, the listener consumes it (no action fires)
+                    // and a toast confirms. The button stays visible,
+                    // disabled while the window runs and while a
+                    // recording is in progress (armed combos are
+                    // suspended then — the test could not fire).
+                    #[cfg(target_os = "macos")]
+                    if bound {
+                        ui.add_enabled_ui(!testing_action && recording.is_none(), |ui| {
+                            let test_resp =
+                                widgets::secondary_button(ui, &t!("settings.hotkeys.test"));
+                            if test_resp.clicked()
+                                && let Some(raw) = draft.hotkeys.get(&action)
+                                && let Ok(hk) = raw.parse::<global_hotkey::hotkey::HotKey>()
+                            {
+                                *lock(&shared.hotkey_verify) = Some(hk.id);
+                                testing = Some((action, hk.id, std::time::Instant::now()));
+                                if let Some(m) = lock(&shared.hotkeys).as_mut() {
+                                    m.release_verify();
+                                    if !m.is_armed(&hk) {
+                                        m.register_verify(hk, action);
+                                    }
+                                }
+                                crate::hotkeys::synthesize(&hk);
+                            }
+                        });
+                    }
+                    if bound
+                        && widgets::icon_button(ui, Icon::X, false)
+                            .on_hover_text(t!("settings.hotkeys.clear").to_string())
+                            .clicked()
+                    {
+                        draft.hotkeys.remove(&action);
+                        #[cfg(target_os = "macos")]
+                        {
+                            *lock(&shared.hotkey_verify) = None;
+                            testing = None;
+                            if let Some(m) = lock(&shared.hotkeys).as_mut() {
+                                m.release_verify();
+                            }
+                        }
+                    }
+                    let listening = recording == Some(action);
+                    let text = if listening {
+                        t!("settings.hotkeys.listening").to_string()
+                    } else if testing_action {
+                        t!("settings.hotkeys.verify").to_string()
+                    } else {
+                        draft
+                            .hotkeys
+                            .get(&action)
+                            .map(|s| combo_label(s))
+                            .unwrap_or_else(|| t!("settings.hotkeys.unset").to_string())
+                    };
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(150.0, 22.0), egui::Sense::click());
+                    ui.painter().rect(
+                        rect,
+                        4.0,
+                        if listening || testing_action {
+                            tk.dock
+                        } else {
+                            tk.field
+                        },
+                        egui::Stroke::new(
+                            if listening || testing_action {
+                                1.5
+                            } else {
+                                1.0
+                            },
+                            if listening || testing_action {
+                                tk.accent
+                            } else {
+                                tk.field_border
+                            },
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        text,
+                        egui::FontId::proportional(11.5),
+                        if bound || listening || testing_action {
+                            tk.text
+                        } else {
+                            tk.text_dim
+                        },
+                    );
+                    if resp.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        recording = Some(action);
+                        // While a field listens, every armed combo is
+                        // unregistered — its key press would otherwise
+                        // be consumed by the OS hotkey and could never
+                        // be re-recorded (and would fire its action).
+                        if let Some(m) = lock(&shared.hotkeys).as_mut() {
+                            m.suspend();
+                        }
+                        #[cfg(target_os = "macos")]
+                        {
+                            // A new recording supersedes any pending
+                            // test.
+                            *lock(&shared.hotkey_verify) = None;
+                            testing = None;
+                            if let Some(m) = lock(&shared.hotkeys).as_mut() {
+                                m.release_verify();
+                            }
+                        }
+                    }
+                });
+            });
+            let err = errors
+                .get(&action)
+                .cloned()
+                .or_else(|| match sync_errors.get(&action) {
+                    Some(crate::hotkeys::HotkeyError::Taken) => {
+                        Some(t!("settings.hotkeys.err_taken").to_string())
+                    }
+                    Some(crate::hotkeys::HotkeyError::Reserved) => {
+                        Some(t!("settings.hotkeys.err_reserved").to_string())
+                    }
+                    None => None,
+                });
+            if let Some(e) = err {
+                ui.label(egui::RichText::new(e).color(tk.accent));
+            }
+        }
+        ui.add_space(4.0);
+        if widgets::secondary_button(ui, &t!("settings.hotkeys.reset")).clicked() {
+            draft.hotkeys.clear();
+            errors.clear();
+            #[cfg(target_os = "macos")]
+            {
+                *lock(&shared.hotkey_verify) = None;
+                testing = None;
+                if let Some(m) = lock(&shared.hotkeys).as_mut() {
+                    m.release_verify();
+                }
+            }
+        }
+    });
+
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(REC_KEY), recording));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(REC_ERR), errors));
+    #[cfg(target_os = "macos")]
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(TEST_KEY), testing));
 }

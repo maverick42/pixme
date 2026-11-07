@@ -2232,3 +2232,74 @@ Format: date — context — decision — consequences.
   rights while a UAC prompt or another always-on-top app holds the
   foreground (`ASFW_ANY` should cover the standard cases), and the
   ~3 s signal-retry window during a cold resident start.
+
+## 2026-11-07 — Global hotkeys via `global-hotkey` crate
+
+- **Context**: two configurable OS-wide shortcuts (Open PixMe, capture a
+  rectangular area) that fire while every PixMe window is hidden.
+- **Decision**: `global-hotkey` 0.9 (`serde` feature) — already in the
+  approved dependency list — wraps `RegisterHotKey` (Windows) and Carbon
+  `RegisterEventHotKey` (macOS, no Accessibility permission). One
+  `HotkeyManager` (`src/hotkeys.rs`) owns the registrations and an
+  `id → action` index; a listener thread on
+  `GlobalHotKeyEvent::receiver()` pushes the matching `Command`
+  (`OpenViewer`, `Capture(Region)` via `push_capture`, which records the
+  viewer's monitor like a bar click) and calls `wake_viewports` — egui
+  does not repaint while hidden. Bindings persist as the crate's
+  accelerator strings in `Settings::hotkeys`; defaults are EMPTY (no
+  surprise conflicts). Conflict policy: internal-duplicate check, a
+  per-OS reserved list (Cmd+Shift+3/4/5 on macOS — project rule — plus
+  Cmd+Space/Tab/Q/W/H/M; Win+L/D/E and Ctrl+Alt+Del/Esc on Windows), and
+  the authoritative OS register attempt — a replacement only unregisters
+  the old combo AFTER it registers successfully; failure keeps the
+  previous binding and surfaces a per-action error. `HotkeysChanged`
+  re-syncs on settings apply; the manager's `Drop` unregisters at quit.
+- **Consequences**: new actions need a `HotkeyAction` variant + a
+  settings row (extensible by design). Known limit: the Windows/Super
+  modifier cannot be captured through egui input (not reported as a
+  modifier), so Win-combos are unbindable via the recorder.
+
+## 2026-11-07 — Hotkey probe must reuse the app's single manager
+
+- **Context**: recording a combo in the settings never stuck (field
+  dropped back to "Unset") on macOS. The recorder validated each combo
+  with `HotkeyManager::probe`, which built a throwaway
+  `GlobalHotKeyManager` per attempt — and `GlobalHotKeyManager::new`
+  calls Carbon `InstallEventHandler` on the application target, which
+  fails the second time (same handler, same event types), so every
+  probe errored with `Taken` once the app's real manager was installed.
+- **Decision**: `probe` is now a `&self` method that registers and
+  immediately unregisters the candidate on the app's single manager;
+  the listener cannot fire because the `id → action` index is never
+  touched. Re-recording the exact combo an action already holds skips
+  the probe (the same-process register would legitimately report
+  `Taken`). A missing manager (init failure) reports `Taken`.
+- **Consequences**: macOS can host exactly ONE
+  `GlobalHotKeyManager` per process — never create a second one.
+  Verified end-to-end: record → OK → `prefs.json` → re-arm → the combo
+  fires `OpenViewer` while the app is running.
+
+## 2026-11-07 — macOS hotkey "Test" button (silently-taken combos)
+
+- **Context**: a combo owned by another app (swallowed by a
+  head-insert event tap) records, arms and persists without ever
+  firing — Carbon `RegisterEventHotKey` accepts registrations it
+  cannot detect as taken, so neither the probe nor the re-arm reports
+  it. User hit exactly this with Cmd+Shift+A. An earlier design
+  forced a confirmation press right after each recording — rejected
+  as awkward UX.
+- **Decision**: each bound field on the Hotkeys settings page gets a
+  "Test" button (macOS only). Clicking it opens a 5 s listen window:
+  `Shared::hotkey_verify` holds the combo's id, the listener consumes
+  the matching press WITHOUT dispatching its action, and the field
+  shows "press the shortcut…". A received press toasts "shortcut
+  works"; a timeout toasts "probably used by another application".
+  A combo not yet armed is registered transiently
+  (`register_verify`) for the window; an armed one is only flagged in
+  the consume slot — the lib keeps a single Carbon ref per id, so
+  re-registering would orphan the live registration. No synthetic
+  events, no Accessibility permission — the user's own press is the
+  probe. Windows skips it (`RegisterHotKey` fails when taken).
+- **Consequences**: recording stays one press (no forced confirm);
+  silently-taken bindings are diagnosable on demand instead of being
+  caught at record time. Startup re-arm still cannot detect them.
