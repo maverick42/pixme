@@ -91,9 +91,7 @@ pub fn capture_monitor(id: u32) -> Result<Capture, CaptureError> {
     // scope — a still-tearing-down viewer can't ghost the frame, but
     // screen sharing keeps seeing PixMe (see `platform::`).
     let _excl = crate::platform::capture_exclusion();
-    let image = monitor
-        .capture_image()
-        .map_err(|e| CaptureError::Failed(e.to_string()))?;
+    let image = crate::platform::capture_frame(&monitor).map_err(CaptureError::Failed)?;
     Ok(Capture {
         image: std::sync::Arc::new(image),
         scale_factor: info.scale_factor,
@@ -121,17 +119,18 @@ pub fn capture_all_monitors(
         })
         .flatten();
     let mut out = Vec::with_capacity(list.len());
-    // The OS composites the cursor into `CGWindowListCreateImage` frames:
-    // hide it for the duration of the pass so raw frames are always
-    // cursor-free — the stamp, when wanted, comes from `cursor` at the
-    // selection's click point.
+    // The OS composites the cursor into its captures (`BitBlt` on
+    // Windows, `CGWindowListCreateImage` on the macOS fallback path —
+    // see `platform::capture_frame`): hide it for the duration of the
+    // pass so raw frames are always cursor-free — the stamp, when
+    // wanted, comes from `cursor` at the selection's click point.
     crate::platform::hide_cursor();
     let _excl = crate::platform::capture_exclusion();
     for m in list {
         let Ok(info) = monitor_info(&m) else {
             continue;
         };
-        if let Ok(image) = m.capture_image() {
+        if let Ok(image) = crate::platform::capture_frame(&m) {
             out.push(Capture {
                 image: std::sync::Arc::new(image),
                 scale_factor: info.scale_factor,

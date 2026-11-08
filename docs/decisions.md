@@ -2303,3 +2303,35 @@ Format: date — context — decision — consequences.
 - **Consequences**: recording stays one press (no forced confirm);
   silently-taken bindings are diagnosable on demand instead of being
   caught at record time. Startup re-arm still cannot detect them.
+
+## 2026-11-08 — macOS display captures read the framebuffer (Sidecar cursor)
+
+- **Context**: with an iPad connected via Sidecar, the user's cursor was
+  baked into region captures even though `CGDisplayHideCursor` returned
+  success on every display. Diagnosis pointed at the
+  `CGWindowListCreateImage` window-list composite (`OptionAll`,
+  hardcoded by xcap): Sidecar's cursor mirroring plausibly surfaces as
+  a list entry the hide cannot reach — an unproven theory, but every
+  alternative (wrong display, stale index, second capture path) was
+  ruled out. `CGAssociateMouseAndMouseCursorPosition` was rejected
+  (freezes motion without hiding) and ScreenCaptureKit would add a
+  dependency the user does not want yet.
+- **Decision**: monitor frames on macOS come from
+  `CGDisplayCreateImage` (`platform::macos::capture_frame`) — a
+  framebuffer read with no window list, so no list-resident cursor
+  artifact can leak in. Only what is actually on screen is captured,
+  which also removes the `OptionAll` offscreen-window ghosting. The
+  conversion to RGBA goes through a shared bitmap-context helper
+  (`cg_image_to_rgba`, factored out of `cursor_snapshot`). If a display
+  cannot produce a framebuffer image (some virtual displays), the code
+  falls back to the xcap window-list path. Windows keeps xcap
+  unchanged; window captures (`CGWindowListCreateImage` on a single
+  window) are untouched — there is no framebuffer-level equivalent for
+  one window's backing store.
+- **Consequences**: no new dependency (`core-graphics` was already
+  direct). `capture_exclusion` stays a macOS no-op — framebuffer reads
+  cannot see a torn-down viewer. Needs on-device verification with
+  Sidecar attached: if macOS ever bakes the cursor into the
+  framebuffer itself, the fallback won't help either and
+  ScreenCaptureKit (`showsCursor = false`) becomes the only remaining
+  fix.

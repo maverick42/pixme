@@ -668,9 +668,6 @@ pub fn tick() {
 /// `objc_msgSend`, always linked via `libobjc`) and `core-graphics` (already
 /// a direct dependency) so no extra crate is needed.
 pub fn cursor_snapshot(scale_factor: f32) -> Option<super::CursorSnapshot> {
-    use core_graphics::base::kCGImageAlphaPremultipliedLast;
-    use core_graphics::color_space::CGColorSpace;
-    use core_graphics::context::CGContext;
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
     use core_graphics::sys::CGImageRef;
     use std::ffi::c_void;
@@ -745,37 +742,14 @@ pub fn cursor_snapshot(scale_factor: f32) -> Option<super::CursorSnapshot> {
             return None;
         }
 
-        let cs = CGColorSpace::create_device_rgb();
-        let mut ctx = CGContext::create_bitmap_context(
-            None,
-            w,
-            h,
-            8,
-            w * 4,
-            &cs,
-            kCGImageAlphaPremultipliedLast,
-        );
-        let draw_rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(w as f64, h as f64));
         // `CGImageForProposedRect` returns an autoreleased `CGImageRef`
-        // (get rule) — wrap in `ManuallyDrop<CGImage>` so `draw_image` can
+        // (get rule) — wrap in `ManuallyDrop<CGImage>` so the helper can
         // borrow it without releasing on drop.
         let img = std::mem::ManuallyDrop::new(std::mem::transmute::<
             CGImageRef,
             core_graphics::image::CGImage,
         >(cg_img));
-        ctx.draw_image(draw_rect, &img);
-
-        let mut buf = ctx.data().to_vec();
-        // Un-premultiply RGBA for `image::RgbaImage`.
-        for px in buf.as_chunks_mut::<4>().0 {
-            let a = px[3] as u32;
-            if a > 0 && a < 255 {
-                px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
-                px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
-                px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
-            }
-        }
-        let image = image::RgbaImage::from_raw(w as u32, h as u32, buf)?;
+        let image = cg_image_to_rgba(&img, w, h)?;
         Some(super::CursorSnapshot {
             image,
             position,
@@ -784,6 +758,59 @@ pub fn cursor_snapshot(scale_factor: f32) -> Option<super::CursorSnapshot> {
                 (hotspot.y * scale).round() as i32,
             ),
         })
+    }
+}
+
+/// Rasterizes `img` into a `w`×`h` RGBA8 buffer — the shared tail of
+/// every `CGImage` → `RgbaImage` conversion (cursor sprite, display
+/// frame). The bitmap context normalizes the source's byte order and
+/// alpha mode, so callers never have to inspect its pixel format.
+fn cg_image_to_rgba(
+    img: &core_graphics::image::CGImage,
+    w: usize,
+    h: usize,
+) -> Option<image::RgbaImage> {
+    use core_graphics::base::kCGImageAlphaPremultipliedLast;
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::CGContext;
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+
+    let cs = CGColorSpace::create_device_rgb();
+    let mut ctx =
+        CGContext::create_bitmap_context(None, w, h, 8, w * 4, &cs, kCGImageAlphaPremultipliedLast);
+    let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(w as f64, h as f64));
+    ctx.draw_image(rect, img);
+
+    let mut buf = ctx.data().to_vec();
+    // Un-premultiply RGBA for `image::RgbaImage`.
+    for px in buf.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        if a > 0 && a < 255 {
+            px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+            px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+            px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
+    image::RgbaImage::from_raw(w as u32, h as u32, buf)
+}
+
+/// Full frame of `monitor`'s display as RGBA pixels, captured at the
+/// framebuffer level (`CGDisplayCreateImage`) rather than through
+/// `xcap`'s `CGWindowListCreateImage`: the window-list composite can
+/// carry a cursor replica that `CGDisplayHideCursor` cannot remove —
+/// observed with a Sidecar iPad connected, whose cursor mirroring
+/// survives the hide on every display. A framebuffer read has no
+/// window list at all, so no window-list artifact can leak into the
+/// frozen frame — and only what is actually on screen is captured,
+/// which also keeps a still-tearing-down PixMe window out of it.
+/// Falls back to the xcap path when the display cannot produce a
+/// framebuffer image (some virtual displays).
+pub fn capture_frame(monitor: &xcap::Monitor) -> Result<image::RgbaImage, String> {
+    let id = monitor.id().map_err(|e| e.to_string())?;
+    match core_graphics::display::CGDisplay::new(id).image() {
+        Some(img) => cg_image_to_rgba(&img, img.width(), img.height())
+            .ok_or_else(|| "CGDisplay image rasterization failed".to_string()),
+        None => monitor.capture_image().map_err(|e| e.to_string()),
     }
 }
 

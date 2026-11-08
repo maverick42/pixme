@@ -245,7 +245,9 @@ pub fn strip_undecorated_frame() {}
 /// lifts on drop — error and panic paths included. This keeps a
 /// still-tearing-down viewer out of the frozen frame without hiding
 /// PixMe from screen sharing or other capture tools.
-/// No-op on macOS (CGWindowList captures already exclude us by flag).
+/// No-op on macOS: `capture_frame` reads the framebuffer, which only
+/// ever holds what is on screen — the viewer is already torn down by
+/// the time a frame is frozen, so there is nothing to exclude.
 #[cfg(target_os = "windows")]
 pub use windows::{CaptureExclusionGuard, capture_exclusion};
 /// No-op on macOS (see above) — a unit guard keeps the call sites
@@ -465,6 +467,17 @@ pub use macos::cursor_snapshot;
 /// Captures the current OS mouse cursor (see above).
 #[cfg(target_os = "windows")]
 pub use windows::cursor_snapshot;
+
+/// Full frame of one monitor as RGBA pixels. macOS reads the display
+/// framebuffer (`CGDisplayCreateImage`) instead of xcap's
+/// `CGWindowListCreateImage`, whose window-list composite can bake in
+/// a cursor replica `CGDisplayHideCursor` cannot remove (observed with
+/// a Sidecar iPad connected); Windows keeps the xcap path.
+#[cfg(target_os = "macos")]
+pub use macos::capture_frame;
+/// Full frame of one monitor (see above).
+#[cfg(target_os = "windows")]
+pub use windows::capture_frame;
 
 /// Hides the OS cursor so a screen capture does not bake it into the frame
 /// (the OS composites the cursor on its own). Counter-based — always pair
