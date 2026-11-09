@@ -1,6 +1,6 @@
 [package]
 name = "pixme"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Frédérik Benoist (dev.q2ii.fr)"]
 description = "Screenshot capture and annotation tool"
