@@ -336,6 +336,10 @@ pub struct Viewer {
     rename: Option<RenameState>,
     /// The monitor-rename prompt's draft, open while Some.
     monitor_rename: Option<MonitorRename>,
+    /// Stable ids of monitors seen connected this run — a persisted
+    /// prefs entry only earns a greyed ghost when its monitor
+    /// disconnected mid-session; absent-at-launch entries never show.
+    seen_monitors: std::collections::HashSet<String>,
     /// Disconnected-monitor buttons dismissed this run — the prefs entry
     /// itself is kept, so a reconnect brings the monitor back silently.
     dismissed_monitors: std::collections::HashSet<String>,
@@ -431,6 +435,7 @@ impl Default for Viewer {
             dup_names: false,
             rename: None,
             monitor_rename: None,
+            seen_monitors: std::collections::HashSet::new(),
             dismissed_monitors: std::collections::HashSet::new(),
             protect: None,
             confirm_delete: None,
@@ -485,19 +490,35 @@ struct MonitorRow {
     /// The monitor's bounds — matched against the viewer's monitor by
     /// rect (xcap ids are not stable across enumerations on Windows).
     rect: crate::capture::PhysicalRect,
-    /// `false` for persisted-but-absent monitors (greyed, dismissible).
+    /// `false` for persisted monitors disconnected this run (greyed,
+    /// dismissible) — persisted entries absent since launch never
+    /// produce a row at all.
     connected: bool,
     /// Display-type classification — icon + tooltip only.
     kind: crate::capture::MonitorKind,
+    /// Spatial sort key (centre-x, then y — `sort_monitors_by_position`'s
+    /// rule). For a ghost: its last-known position comes from the saved
+    /// window rect, so the button keeps its physical slot; entries with
+    /// no saved geometry sort last.
+    sort_key: (i64, i64),
 }
 
-/// The status strip's monitor rows: connected monitors in spatial order
-/// (the inventory is sorted by `capture::sort_monitors_by_position`), then
-/// persisted-but-absent entries (unless the user dismissed
-/// them this run — dismissal is visual only, prefs are never dropped).
+/// Same ordering rule as `capture::sort_monitors_by_position`.
+fn monitor_sort_key(x: i32, y: i32, w: i64) -> (i64, i64) {
+    (x as i64 + w / 2, y as i64)
+}
+
+/// The status strip's monitor rows in spatial order (centre-x, then y —
+/// `capture::sort_monitors_by_position`'s rule): connected monitors plus
+/// persisted entries whose monitor disconnected THIS run (`seen`), shown
+/// greyed at their last-known position until the user dismisses them —
+/// persisted monitors absent since launch are never listed (a stale
+/// prefs entry is not a signal), and dismissal is visual only: prefs
+/// are never dropped.
 fn monitor_rows(
     inventory: &[crate::platform::MonitorIdentity],
     prefs: &std::collections::BTreeMap<String, crate::config::MonitorPrefs>,
+    seen: &std::collections::HashSet<String>,
     dismissed: &std::collections::HashSet<String>,
 ) -> Vec<MonitorRow> {
     let mut rows: Vec<MonitorRow> = inventory
@@ -511,10 +532,11 @@ fn monitor_rows(
             rect: m.info.rect,
             connected: true,
             kind: m.kind,
+            sort_key: monitor_sort_key(m.info.rect.x, m.info.rect.y, m.info.rect.width as i64),
         })
         .collect();
     for (id, p) in prefs {
-        if dismissed.contains(id) || rows.iter().any(|r| r.stable_id == *id) {
+        if !seen.contains(id) || dismissed.contains(id) || rows.iter().any(|r| r.stable_id == *id) {
             continue;
         }
         rows.push(MonitorRow {
@@ -526,8 +548,15 @@ fn monitor_rows(
             rect: crate::capture::PhysicalRect::default(),
             connected: false,
             kind: crate::capture::MonitorKind::Unknown,
+            sort_key: p
+                .rect_native
+                .map(|r| monitor_sort_key(r[0], r[1], i64::from(r[2])))
+                .unwrap_or((i64::MAX, i64::MAX)),
         });
     }
+    // Ghosts interleave at their last-known position — a left-side
+    // iPad stays left when it greys out, not appended at the end.
+    rows.sort_by_key(|r| r.sort_key);
     rows
 }
 
@@ -2198,8 +2227,9 @@ impl Viewer {
                 // Monitor group, right-aligned next to the version: ↻
                 // refresh, then one button per known monitor — connected
                 // entries select the viewer's monitor (right-click
-                // renames), persisted-but-absent ones stay greyed until
-                // a click dismisses them (prefs are never dropped).
+                // renames), monitors disconnected this run stay greyed
+                // until a click dismisses them (prefs are never dropped;
+                // entries absent since launch never show).
                 if ui
                     .add_enabled_ui(shared.command_enabled(&Command::RefreshMonitors), |ui| {
                         widgets::icon_button(ui, Icon::RefreshCw, false)
@@ -2210,9 +2240,13 @@ impl Viewer {
                 {
                     shared.push(Command::RefreshMonitors);
                 }
+                let inventory = crate::app::lock(&shared.monitors);
+                self.seen_monitors
+                    .extend(inventory.iter().map(|m| m.stable_id.clone()));
                 let rows = monitor_rows(
-                    &crate::app::lock(&shared.monitors),
+                    &inventory,
                     &shared.lock_settings().monitors,
+                    &self.seen_monitors,
                     &self.dismissed_monitors,
                 );
                 let current = crate::app::lock(&shared.viewer_monitor).clone();
@@ -5097,8 +5131,10 @@ mod tests {
         assert!(v.thumb_queue.is_empty());
     }
 
-    /// Connected inventory rows first, persisted-but-absent after;
-    /// dismissed ghosts stay hidden while their prefs entry survives.
+    /// Connected inventory rows first, then ghosts ONLY for persisted
+    /// monitors seen connected this run: absent-since-launch entries
+    /// never surface, and dismissed ghosts stay hidden while their
+    /// prefs entry survives.
     #[test]
     fn monitor_rows_union_and_dismissal() {
         fn ident(id: &str, x: i32) -> crate::platform::MonitorIdentity {
@@ -5133,18 +5169,33 @@ mod tests {
             "gone".to_owned(),
             crate::config::MonitorPrefs {
                 name: Some("Ancien".into()),
-                rect_native: None,
+                // Saved window rect far left of "a" — the ghost must
+                // keep its spatial slot, not append at the end.
+                rect_native: Some([-2000, 0, 1000, 800]),
                 draw_rect_native: None,
             },
         );
-        let rows = monitor_rows(&inventory, &prefs, &std::collections::HashSet::new());
-        assert_eq!(rows.len(), 2);
+        // A persisted monitor never seen connected this run produces
+        // no row — a stale prefs entry is not a signal.
+        let rows = monitor_rows(
+            &inventory,
+            &prefs,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(rows.len(), 1);
         assert!(rows[0].connected && rows[0].label == "Bureau");
-        assert!(!rows[1].connected && rows[1].label == "Ancien");
+        // Seen earlier this run, now absent → greyed ghost, kept at
+        // its last-known position (left of the connected monitor).
+        let seen: std::collections::HashSet<String> = ["gone".to_owned()].into_iter().collect();
+        let rows = monitor_rows(&inventory, &prefs, &seen, &std::collections::HashSet::new());
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].connected && rows[0].label == "Ancien");
+        assert!(rows[1].connected && rows[1].label == "Bureau");
         // A dismissed ghost disappears — its prefs entry is untouched.
         let dismissed: std::collections::HashSet<String> =
             ["gone".to_owned()].into_iter().collect();
-        let rows = monitor_rows(&inventory, &prefs, &dismissed);
+        let rows = monitor_rows(&inventory, &prefs, &seen, &dismissed);
         assert_eq!(rows.len(), 1);
         assert!(prefs.contains_key("gone"));
     }
