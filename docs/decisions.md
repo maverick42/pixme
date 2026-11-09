@@ -2335,3 +2335,24 @@ Format: date — context — decision — consequences.
   framebuffer itself, the fallback won't help either and
   ScreenCaptureKit (`showsCursor = false`) becomes the only remaining
   fix.
+
+## 2026-11-08 — Monitor ghosts only for mid-session disconnects
+
+- **Context**: every persisted monitor (prefs.json `monitors`) absent
+  from the live inventory produced a greyed status-strip ghost at
+  launch — stale entries accumulated forever (dismissal was
+  runtime-only, so they came back on every start) and even the ↻
+  refresh could not clear them. The "greyed until clicked" rule made
+  sense for a monitor that disappears mid-session but not for entries
+  that were never connected this run.
+- **Decision**: a ghost row now requires the monitor to have been SEEN
+  connected during the current run (`Viewer::seen_monitors`, fed by
+  every inventory that lands). Absent-at-launch prefs entries produce
+  no row at all — the strip effectively verifies monitor presence at
+  startup. Mid-session disconnects keep the greyed-until-clicked
+  affordance, prefs are still never dropped, and a reconnect brings
+  the monitor back as a normal connected button.
+- **Consequences**: `monitor_rows` takes a `seen` set in addition to
+  `dismissed`; the launch-time strip only shows real monitors. Users
+  who want a gone monitor's button back must reconnect it — the
+  rename affordance on never-seen entries is gone with the row.
