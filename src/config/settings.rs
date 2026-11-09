@@ -333,6 +333,11 @@ pub struct Settings {
     /// Last-used Draw tool options (see [`DrawOptions`]).
     #[serde(default)]
     pub draw_opts: DrawOptions,
+    /// Global-hotkey bindings: action → accelerator string (the
+    /// `global-hotkey` crate's format, e.g. `"control+shift+KeyR"`).
+    /// Empty = no hotkey armed — the settings Hotkeys page edits these.
+    #[serde(default)]
+    pub hotkeys: std::collections::BTreeMap<crate::hotkeys::HotkeyAction, String>,
     /// Per-monitor preferences, keyed by stable id — names and saved
     /// window geometry; entries survive disconnects (see [`MonitorPrefs`]).
     #[serde(default)]
@@ -375,6 +380,7 @@ impl Default for Settings {
             appearance: Appearance::default(),
             icon_style: IconStyle::default(),
             draw_opts: DrawOptions::default(),
+            hotkeys: std::collections::BTreeMap::new(),
             include_pointer: false,
             copy_to_clipboard: false,
             capture_delay_secs: 0,

@@ -30,6 +30,7 @@ mod config;
 mod devtools;
 mod editor;
 mod export;
+mod hotkeys;
 mod i18n;
 mod logging;
 mod paths;

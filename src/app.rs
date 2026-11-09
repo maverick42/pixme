@@ -93,6 +93,9 @@ pub enum Command {
     OpenAbout,
     /// The settings window was closed.
     CloseSettings,
+    /// Internal: the settings draft was applied — re-sync the armed
+    /// global hotkeys with `settings.hotkeys`.
+    HotkeysChanged,
     /// Application quit (menu only — never a window-close side effect).
     Quit,
     /// Create a capture document from the clipboard.
@@ -215,6 +218,7 @@ pub fn is_command_enabled(command: &Command, modal: ModalState) -> bool {
         // and pin self-management.
         Command::Quit
         | Command::CloseSettings
+        | Command::HotkeysChanged
         | Command::ConfirmSave
         | Command::ConfirmDiscard
         | Command::ConfirmCancel
@@ -506,6 +510,23 @@ pub struct Shared {
     /// One-shot notice drawn by the first window to appear (the Windows
     /// data/logs fallback message — set at startup, cleared on OK).
     pub startup_notice: Mutex<Option<String>>,
+    /// Armed global hotkeys — `None` when the OS manager failed to
+    /// initialize (the app still runs, hotkeys just do nothing).
+    pub hotkeys: Mutex<Option<crate::hotkeys::HotkeyManager>>,
+    /// Per-action registration errors from the last `HotkeysChanged`
+    /// sync — the settings page renders them as badges.
+    pub hotkey_errors: Mutex<
+        std::collections::BTreeMap<crate::hotkeys::HotkeyAction, crate::hotkeys::HotkeyError>,
+    >,
+    /// The hotkey id the settings page is testing (macOS only): the
+    /// next press of THAT combo must reach the listener — `Some` while
+    /// the test window is open, `None` once the press arrived or the
+    /// window timed out. macOS `RegisterEventHotKey` accepts combos
+    /// another app swallows via an event tap, so the "Test" button
+    /// synthesizes a real press and watches for it here. The event id
+    /// — not the action — is matched, so an older armed combo bound
+    /// to the same action keeps firing normally during the window.
+    pub hotkey_verify: Mutex<Option<u32>>,
 }
 
 /// Where a window must land: `monitor` plus the persisted outer rect
@@ -1069,7 +1090,23 @@ impl Shared {
             Command::CloseSettings => {
                 self.settings_open.store(false, Ordering::Relaxed);
                 *lock(&self.settings_draft) = None;
+                *lock(&self.hotkey_verify) = None;
+                ui::settings::end_recording(ctx);
+                // A field may have been listening — re-arm whatever
+                // was suspended and release any pending verification.
+                if let Some(m) = lock(&self.hotkeys).as_mut() {
+                    m.resume();
+                    m.release_verify();
+                }
                 ctx.repaint_if_live(viewer_id());
+            }
+            Command::HotkeysChanged => {
+                let cfg = lock(&self.settings).hotkeys.clone();
+                let mut errors = std::collections::BTreeMap::new();
+                if let Some(m) = lock(&self.hotkeys).as_mut() {
+                    errors = m.sync(&cfg);
+                }
+                *lock(&self.hotkey_errors) = errors;
             }
             Command::Quit => {
                 // Quit is always live: close the non-Draw modals first so
@@ -1078,6 +1115,14 @@ impl Shared {
                 // `save_session` on the actual quit.
                 self.settings_open.store(false, Ordering::Relaxed);
                 *lock(&self.settings_draft) = None;
+                *lock(&self.hotkey_verify) = None;
+                ui::settings::end_recording(ctx);
+                // A field may have been listening — re-arm whatever
+                // was suspended and release any pending verification.
+                if let Some(m) = lock(&self.hotkeys).as_mut() {
+                    m.resume();
+                    m.release_verify();
+                }
                 if lock(&self.save_dialog).is_some() {
                     *lock(&self.save_dialog) = None;
                 }
@@ -2437,8 +2482,23 @@ impl PixMeApp {
                     )
                     .to_string()
                 })),
+                hotkeys: Mutex::new(None),
+                hotkey_errors: Mutex::new(std::collections::BTreeMap::new()),
+                hotkey_verify: Mutex::new(None),
             }),
         };
+        // Global hotkeys: arm the configured combos, then park the
+        // listener thread that pushes their Commands — same dispatch
+        // path as the resident menu, woken the same way as the writer.
+        if let Ok(mut manager) = crate::hotkeys::HotkeyManager::new() {
+            let cfg = lock(&app.shared.settings).hotkeys.clone();
+            *lock(&app.shared.hotkey_errors) = manager.sync(&cfg);
+            let ids = manager.ids();
+            *lock(&app.shared.hotkeys) = Some(manager);
+            crate::hotkeys::listen(ids, app.shared.clone(), cc.egui_ctx.clone());
+        } else {
+            tracing::warn!("global-hotkey manager unavailable");
+        }
         // Launch lands on the viewer, not resident-idle: it restores
         // the persisted session and gives a visible landing point.
         app.shared.enter(AppState::Viewer, &cc.egui_ctx);
@@ -3543,6 +3603,9 @@ mod tests {
             last_menu_sync: Mutex::new((ModalState::None, false, false, false)),
             viewer_dialog_open: AtomicBool::new(false),
             startup_notice: Mutex::new(None),
+            hotkeys: Mutex::new(None),
+            hotkey_errors: Mutex::new(std::collections::BTreeMap::new()),
+            hotkey_verify: Mutex::new(None),
         };
         (shared, egui::Context::default())
     }

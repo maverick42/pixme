@@ -1273,6 +1273,13 @@ pub fn cursor_snapshot(_scale_factor: f32) -> Option<super::CursorSnapshot> {
     }
 }
 
+/// Full frame of `monitor`'s display as RGBA pixels — xcap's own
+/// capture path. macOS bypasses it for a framebuffer read instead
+/// (see the macOS implementation).
+pub fn capture_frame(monitor: &xcap::Monitor) -> Result<image::RgbaImage, String> {
+    monitor.capture_image().map_err(|e| e.to_string())
+}
+
 /// Hides the OS cursor so a screen capture does not bake it into the frame
 /// (`BitBlt`-style captures composite it on their own). `ShowCursor` is a
 /// counter — always balance [`hide_cursor`] with [`unhide_cursor`].
