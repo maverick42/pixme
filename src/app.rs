@@ -1158,6 +1158,11 @@ impl Shared {
                     drop(viewer);
                     // The confirmation lives in the viewer: surface it.
                     self.enter(AppState::Viewer, ctx);
+                    // A Dock-initiated quit (the intercepted AppKit
+                    // `terminate:`) can catch the viewer minimized or
+                    // behind another app — pull it out and focus it, or
+                    // the Save/Discard/Cancel modal stays invisible.
+                    self.bring_viewer_forward(ctx);
                 } else {
                     // quit_now re-locks the viewer to persist the
                     // session — this guard must be released first.
@@ -2623,17 +2628,13 @@ impl eframe::App for PixMeApp {
     }
 
     /// Last code that runs on every quit path — winit calls
-    /// `process::exit` right after, before any destructor, so the
-    /// measured session-db VACUUM cannot ride `Store::drop`. Queue it
-    /// behind the pending writes on the store thread and wait for the
-    /// drain with the same bound the quit veil uses.
-    /// Last code that runs on every quit path — winit calls
     /// `process::exit` right after, before any destructor, so quit-time
-    /// work cannot ride `Drop` or `Command::Quit` alone (Cmd+Q and the
-    /// window cross never dispatch it). Replays `begin_quit`'s tail:
-    /// pending-Draw commit, Finalize (meta refresh + stale-row prune),
-    /// then the measured session-db VACUUM on the store thread, all
-    /// inside one bounded flush wait.
+    /// work cannot ride `Drop` or `Command::Quit` alone (menu Quit and
+    /// the intercepted AppKit `terminate:` — Dock/Cmd+Q — dispatch the
+    /// command, but the window cross and a hard exit never do). Replays
+    /// `begin_quit`'s tail: pending-Draw commit, Finalize (meta refresh
+    /// and stale-row prune), then the measured session-db VACUUM on the
+    /// store thread, all inside one bounded flush wait.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(mut draw) = lock(&self.shared.draw).take() {
             draw.finalize_pending();
@@ -3865,6 +3866,30 @@ mod tests {
         drive(&shared, &ctx, Command::ConfirmDiscard);
         assert!(lock(&shared.viewer).tabs.is_empty());
         assert!(!lock(&shared.viewer).dirty);
+    }
+
+    /// Scratch reproduction of the real capture path: retention `Never`
+    /// + a real pushed capture + Quit must show the confirmation.
+    #[test]
+    fn repro_quit_never_dirty_capture_shows_confirmation() {
+        let (shared, ctx) = harness();
+        lock(&shared.settings).db_retention = crate::config::DbRetention::Never;
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.push_capture_document(
+                crate::editor::Document::new(crate::app::tests::synthetic_capture(
+                    image::RgbaImage::new(4, 4),
+                )),
+                "shot".to_owned(),
+            );
+            assert!(viewer.dirty, "fresh capture must be dirty");
+        }
+        let state = drive(&shared, &ctx, Command::Quit);
+        assert_eq!(state, AppState::Viewer);
+        assert!(
+            lock(&shared.viewer).confirm_close,
+            "confirmation must be armed for a dirty Never-retention session"
+        );
     }
 
     /// A clean quit writes the session; reopening the viewer brings
