@@ -2419,10 +2419,39 @@ Format: date — context — decision — consequences.
     the settings window's mask editor verbatim, moved out of the
     settings sidebar (the File name page is gone).
 - **Consequences**: purge/retention stays global across workspaces
-  (test-pinned). Counters, masks and save folders are independent per
-  workspace; collisions between workspaces sharing a folder keep the
-  existing `unique_png` `_2`/`_3` suffixing. No keyboard shortcuts,
-  no workspace colours, no moving captures between workspaces.
+  (test-pinned). Counters, masks, save folders and image formats are
+  independent per workspace; collisions between workspaces sharing a
+  folder are resolved at write time by `unique_file`'s `_2`/`_3`
+  suffixing under each workspace's own extension. No keyboard
+  shortcuts, no workspace colours, no moving captures between
+  workspaces.
+
+## 2026-11-11 — Duplicate names are workspace-scoped; per-workspace save format
+
+- **Context**: title uniqueness was global — a capture named `a` in
+  `main` made a capture named `a` in another workspace look
+  "duplicated" (danger-tinted title, read as *unsaved*), even though
+  each bucket may target its own folder. Cross-workspace dup tracking
+  proved too noisy to be useful (the twin lives on a hidden tab).
+- **Decision**: a name clash is only a problem INSIDE one workspace
+  (same name + same folder = a real file collision): `title_taken` /
+  `unique_title_in` filter by the tab's workspace, the tab chip and
+  mosaic caption show an amber `files` icon (`viewer.tab.dup_name`
+  tooltip) instead of the danger title tint, and `save_all` still
+  blocks same-workspace twins behind the rename modal. Different
+  workspaces may reuse names freely — `unique_file` writes
+  `stem.ext`, `stem_2.ext`… under each workspace's `format`
+  (PNG/JPEG/WebP, chosen in the workspace dialog; the single-file
+  save dialog keeps its own format radio, seeded with it). The
+  `files` icon (Lucide) is bundled for the marker. Quit-time
+  `ConfirmSave` is exempt from the rename gate: with
+  `db_retention = Never` the session is wiped on exit, so it is a
+  save-at-all-costs path — same-workspace twins also land via the
+  `_2`/`_3` suffixing instead of trapping the user in a rename loop.
+- **Consequences**: renaming a workspace's output folder or format
+  needs no dedup bookkeeping — clashes are recomputed per frame from
+  (workspace, title) pairs only. Same-workspace duplicate tabs still
+  require a rename before an interactive Save All.
 
 ## 2026-11-11 — macOS AppKit `terminate:` routed through `Command::Quit`
 

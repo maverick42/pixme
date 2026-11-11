@@ -740,12 +740,13 @@ impl Viewer {
 
     /// Adds `doc` as a tab with an explicit title and saved flag — used by
     /// Open (file name, already on disk) and Paste (untitled, unsaved).
-    /// Two captures can never share a name: a clash gets a ` (n)` suffix.
+    /// Two captures in ONE workspace can never share a name: a clash
+    /// gets a ` (n)` suffix; other workspaces may reuse it freely.
     pub fn push_named_document(&mut self, mut doc: Document, title: String, saved: bool) {
         // Every document landing in the viewer belongs to the ACTIVE
         // workspace — the filter must never hide a fresh tab.
         doc.meta.workspace_id = self.ws.clone();
-        let title = self.unique_title(&title);
+        let title = self.unique_title_in(&self.ws, &title);
         let insertion = self.next_insertion;
         self.next_insertion += 1;
         self.tabs.push(Tab {
@@ -823,7 +824,8 @@ impl Viewer {
     #[cfg(test)]
     pub fn push_stub(&mut self, title: &str) {
         use crate::capture::{Capture, MonitorInfo, PhysicalRect};
-        let title = self.unique_title(title);
+        // Stubs land in `main` (the meta default), so they dedupe there.
+        let title = self.unique_title_in(crate::config::workspace::MAIN_ID, title);
         let insertion = self.next_insertion;
         self.next_insertion += 1;
         self.tabs.push(Tab {
@@ -1317,26 +1319,28 @@ impl Viewer {
             .is_some_and(|t| t.doc.meta.is_protected() && !t.unlocked)
     }
 
-    /// `true` when another tab already carries `name` (trimmed,
-    /// case-insensitive) — two captures can never share a name.
-    fn title_taken(&self, name: &str, except: Option<usize>) -> bool {
+    /// `true` when another tab IN THE SAME WORKSPACE already carries
+    /// `name` (trimmed, case-insensitive) — same-name captures are only
+    /// a real clash when they share an output folder, and sharing a
+    /// workspace means sharing a folder. Cross-workspace twins are
+    /// fine: `unique_png` suffixes on disk at save time.
+    fn title_taken(&self, ws: &str, name: &str, except: Option<usize>) -> bool {
         let name = name.trim().to_lowercase();
-        self.tabs
-            .iter()
-            .enumerate()
-            .any(|(i, t)| Some(i) != except && t.title.trim().to_lowercase() == name)
+        self.tabs.iter().enumerate().any(|(i, t)| {
+            Some(i) != except && self.tab_ws(t) == ws && t.title.trim().to_lowercase() == name
+        })
     }
 
-    /// `name` if free, else `name (2)`, `name (3)`, … — the unique-name
-    /// rule enforced at every tab creation path.
-    fn unique_title(&self, base: &str) -> String {
+    /// `name` if free IN WORKSPACE `ws`, else `name (2)`, `name (3)`, …
+    /// — the unique-name rule enforced at every tab creation path.
+    fn unique_title_in(&self, ws: &str, base: &str) -> String {
         let base = base.trim();
-        if !self.title_taken(base, None) {
+        if !self.title_taken(ws, base, None) {
             return base.to_owned();
         }
         for n in 2.. {
             let candidate = format!("{base} ({n})");
-            if !self.title_taken(&candidate, None) {
+            if !self.title_taken(ws, &candidate, None) {
                 return candidate;
             }
         }
@@ -1597,7 +1601,7 @@ impl Viewer {
         // The copy has never been written itself.
         doc.meta.saved_at = None;
         doc.meta.source_path = None;
-        let title = self.unique_title(&src.title);
+        let title = self.unique_title_in(self.tab_ws(src), &src.title);
         self.tabs.push(Tab {
             title,
             doc,
@@ -2956,6 +2960,7 @@ impl Viewer {
                 name,
                 mask,
                 folder,
+                format,
                 presets,
             } => {
                 let mut created = None;
@@ -2972,6 +2977,7 @@ impl Viewer {
                                 w.name = name;
                                 w.name_mask = mask;
                                 w.output_dir = dir;
+                                w.format = format;
                             }
                             tracing::info!(workspace = %id, "workspace_edited");
                         }
@@ -2979,6 +2985,7 @@ impl Viewer {
                             let mut w = crate::config::workspace::Workspace::new(name);
                             w.name_mask = mask;
                             w.output_dir = dir;
+                            w.format = format;
                             created = Some(w.id.clone());
                             // The new workspace becomes the active one
                             // at once — a pushed command could be eaten
@@ -3247,9 +3254,10 @@ impl Viewer {
             tab.store_failed,
         );
         let selected = index == self.active;
-        // A title shared with another tab can't save two files under
-        // one name — it takes the danger tint as an inline warning.
-        let dup = self.title_taken(&title, Some(index));
+        // A title shared within the SAME workspace can't save two
+        // files under one name — the files icon is the inline warning
+        // (cross-workspace twins are fine and stay quiet).
+        let dup = self.title_taken(self.tab_ws(tab), &title, Some(index));
         // The cross is reserved inside the chip but registered and
         // painted AFTER the chip interact, so it sits above it and
         // keeps its own hover/click (egui: the topmost widget wins).
@@ -3292,10 +3300,14 @@ impl Viewer {
                         icons::image(Icon::TriangleAlert, 11.0, t.warning).paint_at(ui, warn_rect);
                         warn_resp.on_hover_text(t!("viewer.tab.write_failed"));
                     }
+                    if dup {
+                        let (dup_rect, dup_resp) =
+                            ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                        icons::image(Icon::Files, 11.0, t.warning).paint_at(ui, dup_rect);
+                        dup_resp.on_hover_text(t!("viewer.tab.dup_name"));
+                    }
                     ui.add(
-                        egui::Label::new(egui::RichText::new(title).color(if dup {
-                            t.danger
-                        } else if selected {
+                        egui::Label::new(egui::RichText::new(title).color(if selected {
                             t.text
                         } else {
                             t.text_dim
@@ -3835,6 +3847,7 @@ impl Viewer {
         let title = tab.title.clone();
         let (dirty, protected, failed) =
             (!tab.saved, tab.doc.meta.is_protected(), tab.store_failed);
+        let dup = self.title_taken(self.tab_ws(tab), &title, Some(index));
         let date = hovered.then(|| {
             tab.doc
                 .meta
@@ -3861,6 +3874,12 @@ impl Viewer {
             let (r, warn_resp) = band_ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
             icons::image(Icon::TriangleAlert, 11.0, t.warning).paint_at(&band_ui, r);
             warn_resp.on_hover_text(t!("viewer.tab.write_failed"));
+        }
+        if dup {
+            // Same workspace-scoped name clash as the tab chip.
+            let (r, dup_resp) = band_ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+            icons::image(Icon::Files, 11.0, t.warning).paint_at(&band_ui, r);
+            dup_resp.on_hover_text(t!("viewer.tab.dup_name"));
         }
         band_ui.add(
             egui::Label::new(egui::RichText::new(title).color(theme::mosaic_chrome::BAND_TEXT))
@@ -4981,12 +5000,34 @@ mod tests {
         let mut v = Viewer::default();
         v.push_stub("Shot");
         v.push_stub("other");
-        assert!(v.title_taken("shot", None));
-        assert!(v.title_taken("  SHOT ", None));
+        let main = crate::config::workspace::MAIN_ID;
+        assert!(v.title_taken(main, "shot", None));
+        assert!(v.title_taken(main, "  SHOT ", None));
         assert!(
-            !v.title_taken("shot", Some(0)),
+            !v.title_taken(main, "shot", Some(0)),
             "a tab may keep its own name"
         );
+    }
+
+    /// Same name in DIFFERENT workspaces is not a clash — each bucket
+    /// may write to its own folder, and a shared one is disambiguated
+    /// by the save-time `_2` suffixing.
+    #[test]
+    fn title_taken_is_workspace_scoped() {
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        // A same-named tab in another workspace does not collide.
+        v.push_stub("a"); // same ws → unique_title_in renames it
+        assert_eq!(v.tabs[1].title, "a (2)");
+        v.ws_known.insert("bee".to_owned());
+        v.tabs[1].title = "a".to_owned();
+        v.tabs[1].doc.meta.workspace_id = "bee".to_owned();
+        let main = crate::config::workspace::MAIN_ID;
+        assert!(
+            !v.title_taken(main, "a", Some(0)),
+            "the twin in 'bee' does not clash with 'a's own workspace"
+        );
+        assert!(v.title_taken("bee", "a", Some(0)), "visible from 'bee'");
     }
 
     #[test]

@@ -33,6 +33,9 @@ pub struct Workspace {
     /// the per-workspace heir of the removed global `last_save_dir`.
     /// `None` falls back to the user's Pictures folder.
     pub output_dir: Option<PathBuf>,
+    /// The image format Save All writes in this workspace — the
+    /// single-file save dialog still leaves the format free.
+    pub format: crate::export::ImageFormat,
     /// Sequential counter consumed by `#` placeholders in `name_mask`.
     pub counter: u64,
 }
@@ -45,6 +48,7 @@ impl Workspace {
             name,
             name_mask: crate::config::settings::default_filename_template(),
             output_dir: None,
+            format: crate::export::ImageFormat::default(),
             counter: 1,
         }
     }
@@ -57,6 +61,7 @@ impl Workspace {
             name: Self::default_name(locale),
             name_mask: crate::config::settings::default_filename_template(),
             output_dir: None,
+            format: crate::export::ImageFormat::default(),
             counter: 1,
         }
     }

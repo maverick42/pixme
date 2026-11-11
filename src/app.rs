@@ -1339,8 +1339,11 @@ impl Shared {
                         })
                     };
                     if let Some(folder) = folder {
-                        *lock(&self.save_dialog) =
-                            Some(crate::ui::save_dialog::SaveDialog::new(capture, folder));
+                        let mut dialog = crate::ui::save_dialog::SaveDialog::new(capture, folder);
+                        // The workspace's format seeds the choice — the
+                        // radio still leaves it free per save.
+                        dialog.format = lock(&self.settings).active_workspace().format;
+                        *lock(&self.save_dialog) = Some(dialog);
                         self.request_focus(save_dialog_id());
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                     }
@@ -1436,6 +1439,9 @@ impl Shared {
                         // and overwrites it; a renamed tab saves under
                         // its new name.
                         dialog.filename = t.title;
+                        // The workspace's format is the default — an
+                        // already-saved file keeps its own extension.
+                        dialog.format = lock(&self.settings).active_workspace().format;
                         if let Some(path) = t.source {
                             if let Some(fmt) = ext_format(&path) {
                                 dialog.format = fmt;
@@ -1680,18 +1686,23 @@ impl Shared {
     fn save_all(&self, ctx: &egui::Context, then_confirm: bool) -> bool {
         let default_folder =
             directories::UserDirs::new().and_then(|d| d.picture_dir().map(|p| p.to_path_buf()));
-        let (active_ws, ws_folders, main_folder) = {
+        let (active_ws, ws_folders, ws_formats, main_folder) = {
             let s = lock(&self.settings);
             let map: std::collections::HashMap<String, Option<std::path::PathBuf>> = s
                 .workspaces
                 .iter()
                 .map(|w| (w.id.clone(), w.output_dir.clone()))
                 .collect();
+            let formats: std::collections::HashMap<String, crate::export::ImageFormat> = s
+                .workspaces
+                .iter()
+                .map(|w| (w.id.clone(), w.format))
+                .collect();
             let main = map
                 .get(crate::config::workspace::MAIN_ID)
                 .cloned()
                 .flatten();
-            (s.active_workspace().id.clone(), map, main)
+            (s.active_workspace().id.clone(), map, formats, main)
         };
         let resolve_ws = |id: &str| -> String {
             if ws_folders.contains_key(id) {
@@ -1707,6 +1718,13 @@ impl Shared {
                 .flatten()
                 .or_else(|| main_folder.clone())
                 .or_else(|| default_folder.clone())
+        };
+        // The format is per workspace — unknown ids write PNG like `main`.
+        let format_for = |ws_id: &str| -> crate::export::ImageFormat {
+            ws_formats
+                .get(&resolve_ws(ws_id))
+                .copied()
+                .unwrap_or_default()
         };
         let ensure_folder = |folder: Option<std::path::PathBuf>| -> Option<std::path::PathBuf> {
             let Some(folder) = folder else {
@@ -1753,46 +1771,43 @@ impl Shared {
         };
 
         // Duplicate titles inside the same workspace are refused until
-        // the user renames — the viewer surfaces the blocking notice
-        // (and switches to the offending workspace if ConfirmSave caught
-        // a clash in a hidden bucket). Cross-workspace collisions in a
-        // shared folder use `unique_png`'s `_2`/`_3` suffixing.
-        let mut seen = std::collections::HashSet::new();
-        let mut clash_ws = None;
-        for t in viewer.tabs.iter().filter(|t| in_scope(t)) {
-            let ws_id = resolve_ws(&t.doc.meta.workspace_id);
-            let stem = crate::config::filename::sanitize_filename(t.title.trim());
-            if !seen.insert((ws_id.clone(), stem)) {
-                clash_ws = Some(ws_id);
-                break;
+        // the user renames — but only for the interactive Save All: the
+        // quit-time ConfirmSave is a "save at all costs" path (the whole
+        // session is about to be wiped, `db_retention = Never`), so
+        // same-workspace twins also land via `unique_file`'s `_2`/`_3`
+        // suffixing rather than trapping the user in a rename loop.
+        if !then_confirm {
+            let mut seen = std::collections::HashSet::new();
+            let mut clash = false;
+            for t in viewer.tabs.iter().filter(|t| in_scope(t)) {
+                let ws_id = resolve_ws(&t.doc.meta.workspace_id);
+                let stem = crate::config::filename::sanitize_filename(t.title.trim());
+                if !seen.insert((ws_id.clone(), stem)) {
+                    clash = true;
+                    break;
+                }
             }
-        }
-        if let Some(ws_id) = clash_ws {
-            tracing::warn!("save-all blocked: duplicate tab titles");
-            viewer.dup_names = true;
-            if ws_id != active_ws {
-                viewer.set_workspace(&ws_id);
+            if clash {
+                tracing::warn!("save-all blocked: duplicate tab titles");
+                viewer.dup_names = true;
                 drop(viewer);
-                let mut s = lock(&self.settings);
-                s.active_workspace_id = ws_id;
-                s.save();
-            } else {
-                drop(viewer);
+                ctx.repaint_if_live(viewer_id());
+                return false;
             }
-            ctx.repaint_if_live(viewer_id());
-            return false;
         }
 
         // Resolve and validate the target folder for each unsaved tab
         // in scope before spawning the worker.
-        let mut targets: std::collections::HashMap<String, std::path::PathBuf> =
-            std::collections::HashMap::new();
+        let mut targets: std::collections::HashMap<
+            String,
+            (std::path::PathBuf, crate::export::ImageFormat),
+        > = std::collections::HashMap::new();
         for t in viewer.tabs.iter().filter(|t| in_scope(t)) {
             let ws_id = resolve_ws(&t.doc.meta.workspace_id);
             let Some(folder) = ensure_folder(folder_for(&ws_id)) else {
                 return false;
             };
-            targets.insert(t.doc.meta.id.clone(), folder);
+            targets.insert(t.doc.meta.id.clone(), (folder, format_for(&ws_id)));
         }
         if targets.is_empty() {
             return true;
@@ -1816,19 +1831,15 @@ impl Shared {
             let mut tabs = tabs;
             let mut saved_paths = Vec::new();
             for tab in &mut tabs {
-                let Some(folder) = targets.get(&tab.doc.meta.id) else {
+                let Some((folder, format)) = targets.get(&tab.doc.meta.id) else {
                     continue;
                 };
                 let stem = crate::config::filename::sanitize_filename(tab.title.trim());
-                let path = unique_png(folder, &stem);
+                let path = unique_file(folder, &stem, format.extension());
                 let mut capture = tab.doc.base.clone();
                 capture.image =
                     std::sync::Arc::new(crate::editor::render::render_to_image(&tab.doc));
-                match crate::export::file::save_capture_to(
-                    &capture,
-                    &path,
-                    crate::export::ImageFormat::Png,
-                ) {
+                match crate::export::file::save_capture_to(&capture, &path, *format) {
                     Ok(()) => {
                         tab.saved = true;
                         tab.doc.meta.source_path = Some(path.clone());
@@ -2396,15 +2407,16 @@ impl Shared {
     }
 }
 
-/// Returns the first `folder/stem.png` that does not exist, suffixing
-/// `_2`, `_3`… on collisions (same-name file already on disk).
-fn unique_png(folder: &std::path::Path, stem: &str) -> std::path::PathBuf {
-    let candidate = folder.join(format!("{stem}.png"));
+/// Returns the first `folder/stem.ext` that does not exist, suffixing
+/// `_2`, `_3`… on collisions (same-name file already on disk — e.g. a
+/// same-named capture saved from another workspace pointing here).
+fn unique_file(folder: &std::path::Path, stem: &str, ext: &str) -> std::path::PathBuf {
+    let candidate = folder.join(format!("{stem}.{ext}"));
     if !candidate.exists() {
         return candidate;
     }
     for n in 2u32.. {
-        let path = folder.join(format!("{stem}_{n}.png"));
+        let path = folder.join(format!("{stem}_{n}.{ext}"));
         if !path.exists() {
             return path;
         }
@@ -4031,6 +4043,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Same-named captures in different workspaces sharing one folder
+    /// are NOT a clash — each writes under its workspace's `format`,
+    /// and a real filename collision suffixes `_2` on disk.
+    #[test]
+    fn save_all_writes_workspace_format_and_suffixes_shared_folder() {
+        let (shared, ctx) = harness();
+        let dir = std::env::temp_dir().join(format!(
+            "pixme-save-twins-{}",
+            crate::editor::meta::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bee_id = {
+            let mut s = lock(&shared.settings);
+            s.active_workspace_mut().output_dir = Some(dir.clone());
+            let mut bee = crate::config::workspace::Workspace::new("Bee".to_owned());
+            bee.output_dir = Some(dir.clone());
+            bee.format = crate::export::ImageFormat::Jpeg;
+            let bee_id = bee.id.clone();
+            s.workspaces.push(bee);
+            bee_id
+        };
+        let push_a = |shared: &Shared| {
+            lock(&shared.viewer).push_capture_document(
+                Document::new(synthetic_capture(image::RgbaImage::new(4, 4))),
+                "a".to_owned(),
+            );
+        };
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.sync_workspace(&lock(&shared.settings));
+        }
+        push_a(&shared);
+        drive(&shared, &ctx, Command::SwitchWorkspace(bee_id.clone()));
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.sync_workspace(&lock(&shared.settings));
+        }
+        push_a(&shared);
+
+        // Bee's Save All writes `a.jpg` (its own format); main's writes
+        // `a.png` — different extensions, no collision, no dup modal.
+        drive(&shared, &ctx, Command::SaveAll);
+        drain_save_all(&shared);
+        drive(
+            &shared,
+            &ctx,
+            Command::SwitchWorkspace(crate::config::workspace::MAIN_ID.to_owned()),
+        );
+        drive(&shared, &ctx, Command::SaveAll);
+        drain_save_all(&shared);
+        assert!(dir.join("a.jpg").exists(), "bee writes JPEG per its format");
+        assert!(dir.join("a.png").exists(), "main writes PNG");
+        assert!(
+            !lock(&shared.viewer).dup_names,
+            "cross-workspace twins never raise the rename modal"
+        );
+
+        // Same format on both sides → the twin suffixes on disk.
+        {
+            let mut s = lock(&shared.settings);
+            s.workspaces
+                .iter_mut()
+                .find(|w| w.id == bee_id)
+                .unwrap()
+                .format = crate::export::ImageFormat::Png;
+        }
+        drive(&shared, &ctx, Command::SwitchWorkspace(bee_id));
+        {
+            // The command only writes prefs — resync before pushing so
+            // the capture lands in `bee`, like the app's own pre-command
+            // sync does.
+            let mut viewer = lock(&shared.viewer);
+            viewer.sync_workspace(&lock(&shared.settings));
+        }
+        push_a(&shared);
+        drive(&shared, &ctx, Command::SaveAll);
+        drain_save_all(&shared);
+        assert!(
+            dir.join("a_2.png").exists(),
+            "same folder + same format suffixes the twin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A clean quit writes the session; reopening the viewer brings
     /// every capture back — silent restore, titles and order included.
     #[test]
@@ -4428,10 +4525,10 @@ mod tests {
     }
 
     /// Save-all composites annotations onto the exported PNG, and a
-    /// duplicate-name clash during ConfirmSave aborts the quit instead of
-    /// wiping the unsaved session.
+    /// duplicate-name clash during ConfirmSave does NOT block the quit:
+    /// the save-at-all-costs path suffixes the twin (`dup_2.png`).
     #[test]
-    fn save_all_renders_annotations_and_confirm_save_respects_clash() {
+    fn save_all_renders_annotations_and_confirm_save_suffixes_clash() {
         let (shared, ctx) = harness();
         let dir =
             std::env::temp_dir().join(format!("pixme-save-all-{}", crate::editor::meta::new_id()));
@@ -4479,24 +4576,26 @@ mod tests {
         drive(&shared, &ctx, Command::Quit);
         assert!(lock(&shared.viewer).confirm_close);
         drive(&shared, &ctx, Command::ConfirmSave);
-        {
-            let viewer = lock(&shared.viewer);
-            assert_eq!(viewer.tabs.len(), 2, "session kept on clash");
-            assert!(viewer.dup_names, "clash modal raised");
-            assert!(!viewer.confirm_close, "confirm modal dismissed");
-        }
-
-        // Rename the second tab and run SaveAll: the first tab's red
-        // annotation must be baked into the written PNG.
-        {
-            let mut viewer = lock(&shared.viewer);
-            viewer.dup_names = false;
-            viewer.tabs[1].title = "unique".to_owned();
-        }
-        drive(&shared, &ctx, Command::SaveAll);
         drain_save_all(&shared);
+
+        // ConfirmSave never blocks on same-workspace twins: `dup.png`
+        // (with the red annotation baked in) and `dup_2.png` both land,
+        // and the session comes back clean so the pump can finish the
+        // quit instead of re-arming the confirmation.
         let saved_img = crate::export::file::load_image(&dir.join("dup.png")).unwrap();
         assert_eq!(saved_img.get_pixel(4, 4).0, [255, 0, 0, 255]);
+        assert!(
+            dir.join("dup_2.png").is_file(),
+            "twin suffixed, not blocked"
+        );
+        assert!(
+            !lock(&shared.viewer).dirty,
+            "clean session lets the quit proceed"
+        );
+        assert!(
+            !lock(&shared.viewer).dup_names,
+            "no rename modal on the quit path"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

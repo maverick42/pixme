@@ -8,6 +8,7 @@ use rust_i18n::t;
 
 use crate::app::Shared;
 use crate::config::workspace::Workspace;
+use crate::export::ImageFormat;
 use crate::ui::{
     icons::{self, Icon},
     theme, widgets,
@@ -24,6 +25,8 @@ pub struct WorkspaceDialog {
     pub mask: String,
     /// Output folder as free text — the Folder icon picks it.
     pub folder: String,
+    /// The image format Save All writes in this workspace.
+    pub format: ImageFormat,
     /// Working copy of the shared preset list (`prefs.filename_templates`):
     /// written back only on confirm, so cancelling leaves it alone.
     pub presets: Vec<String>,
@@ -49,6 +52,7 @@ impl WorkspaceDialog {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            format: s.active_workspace().format,
             presets: s.filename_templates.clone(),
             focused: false,
             error: None,
@@ -66,6 +70,7 @@ impl WorkspaceDialog {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            format: w.format,
             presets: s.filename_templates.clone(),
             focused: false,
             error: None,
@@ -82,6 +87,7 @@ pub enum Outcome {
         name: String,
         mask: String,
         folder: String,
+        format: ImageFormat,
         presets: Vec<String>,
     },
     /// Dismissed — nothing applies.
@@ -123,7 +129,13 @@ pub fn dialog(ui: &mut egui::Ui, state: &mut WorkspaceDialog, shared: &Shared) -
             .map(|w| w.counter)
             .unwrap_or(1)
     };
-    mask_editor(ui, &mut state.mask, &mut state.presets, counter);
+    mask_editor(
+        ui,
+        &mut state.mask,
+        &mut state.presets,
+        counter,
+        state.format,
+    );
     ui.add_space(6.0);
 
     // The output folder — free text + the same picker affordance the
@@ -145,6 +157,15 @@ pub fn dialog(ui: &mut egui::Ui, state: &mut WorkspaceDialog, shared: &Shared) -
                 .pick_folder()
         {
             state.folder = dir.to_string_lossy().into_owned();
+        }
+    });
+    ui.add_space(6.0);
+
+    // The Save All format — a radio row like the pin save dialog.
+    ui.horizontal(|ui| {
+        ui.label(t!("workspace.field_format").to_string());
+        for f in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Webp] {
+            ui.radio_value(&mut state.format, f, f.label());
         }
     });
 
@@ -175,6 +196,7 @@ pub fn dialog(ui: &mut egui::Ui, state: &mut WorkspaceDialog, shared: &Shared) -
                         name: name.to_owned(),
                         mask: state.mask.trim().to_owned(),
                         folder: state.folder.trim().to_owned(),
+                        format: state.format,
                         presets: state.presets.clone(),
                     };
                 }
@@ -190,7 +212,13 @@ pub fn dialog(ui: &mut egui::Ui, state: &mut WorkspaceDialog, shared: &Shared) -
 /// The mask row + preset dropdown + token legend + live example —
 /// the settings window's File-name page moved here verbatim so the
 /// workspace dialog is its only home now.
-pub fn mask_editor(ui: &mut egui::Ui, mask: &mut String, presets: &mut Vec<String>, counter: u64) {
+pub fn mask_editor(
+    ui: &mut egui::Ui,
+    mask: &mut String,
+    presets: &mut Vec<String>,
+    counter: u64,
+    format: ImageFormat,
+) {
     let t = theme::tokens(ui.ctx());
     ui.horizontal(|ui| {
         let editor = egui::TextEdit::singleline(mask)
@@ -243,7 +271,12 @@ pub fn mask_editor(ui: &mut egui::Ui, mask: &mut String, presets: &mut Vec<Strin
         // produced "… .png.png".
         ui.colored_label(
             t.text,
-            t!("settings.filename.example", name = example.as_str()).to_string(),
+            t!(
+                "settings.filename.example",
+                name = example.as_str(),
+                ext = format.extension()
+            )
+            .to_string(),
         );
     }
 }
