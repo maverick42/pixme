@@ -1323,7 +1323,7 @@ impl Viewer {
     /// `name` (trimmed, case-insensitive) — same-name captures are only
     /// a real clash when they share an output folder, and sharing a
     /// workspace means sharing a folder. Cross-workspace twins are
-    /// fine: `unique_png` suffixes on disk at save time.
+    /// fine: `unique_file` suffixes on disk at save time.
     fn title_taken(&self, ws: &str, name: &str, except: Option<usize>) -> bool {
         let name = name.trim().to_lowercase();
         self.tabs.iter().enumerate().any(|(i, t)| {

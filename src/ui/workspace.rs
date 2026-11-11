@@ -267,8 +267,8 @@ pub fn mask_editor(
     if mask.trim().is_empty() {
         ui.colored_label(t.danger, t!("settings.filename.empty").to_string());
     } else {
-        // `.png` already lives in the key — appending it here too
-        // produced "… .png.png".
+        // The key carries both placeholders (`%{name}.%{ext}`) — the
+        // extension follows the dialog's format radio.
         ui.colored_label(
             t.text,
             t!(

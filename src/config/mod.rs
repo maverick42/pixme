@@ -14,6 +14,3 @@ pub use filename::expand_template;
 pub use settings::{
     Appearance, DbRetention, DrawOptions, IconStyle, MonitorPrefs, Settings, TabSort, ToolStyle,
 };
-// Re-exported for the settings and workspace UI.
-#[allow(unused_imports)]
-pub use workspace::Workspace;

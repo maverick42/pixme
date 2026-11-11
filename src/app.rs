@@ -1177,7 +1177,7 @@ impl Shared {
                 if self.save_all(ctx, true) {
                     self.finish_confirmation(ctx);
                 } else if lock(&self.save_all).is_none() {
-                    // Couldn't even start (name clash / no folder).
+                    // Couldn't even start (no writable folder).
                     let mut viewer = lock(&self.viewer);
                     viewer.confirm_close = false;
                     viewer.confirm_then_quit = false;
@@ -1674,7 +1674,8 @@ impl Shared {
     }
 
     /// Writes unsaved tabs to their workspace's output folder (or
-    /// `~/Pictures`) as PNGs with annotations composited — the same
+    /// `~/Pictures`) in the workspace's format with annotations
+    /// composited — the same
     /// sequential write loop as before, just riding a worker thread so
     /// the viewer paints a progress veil (`pump` reattaches the tabs
     /// when the job lands). Toolbar/menu Save All (`then_confirm ==
