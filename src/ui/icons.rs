@@ -58,6 +58,10 @@ pub enum Icon {
     Download,
     /// Open an image file (viewer toolbar).
     FolderOpen,
+    /// Delete a workspace (workspace context menu).
+    Trash,
+    /// Sweep away empty workspaces (workspace context menu).
+    Broom,
     /// Save the active document (floppy).
     Save,
     /// Zoom the canvas in.

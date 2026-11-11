@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::workspace::{MAIN_ID, Workspace};
 use crate::editor::document::{
     AreaShape, BlurStyle, BraceKind, Dash, EraserMode, LineEnd, StepMode, StepSize, StepStyle,
     TextAlign, TipShape,
@@ -302,8 +303,10 @@ pub struct Settings {
     /// is never written to disk — every launch starts with no delay.
     #[serde(skip)]
     pub capture_delay_secs: u32,
-    /// Last folder a capture/document was saved to — reopens the next
-    /// save dialog there (was session-only before prefs persisted it).
+    /// Legacy "last used save folder" — read ONCE by the workspaces
+    /// migration (it seeds `main`'s `output_dir`), never written back:
+    /// the workspaces carry that role per bucket now.
+    #[serde(skip_serializing)]
     pub last_save_dir: Option<PathBuf>,
     /// Last folder a file was opened from — seeds File → Open and the
     /// "open last used folder" menu item.
@@ -321,15 +324,26 @@ pub struct Settings {
     pub db_status: bool,
     /// Tab ordering — `None` = insertion order.
     pub tab_sort: Option<TabSort>,
-    /// Filename template for batch/auto saves ("$Y-$M-$D_$H$N$S").
-    #[serde(default = "default_filename_template")]
+    /// Legacy global filename template — read ONCE by the workspaces
+    /// migration into `main`'s `name_mask`, never written back.
+    #[serde(default = "default_filename_template", skip_serializing)]
     pub filename_template: String,
-    /// Editable filename-template presets shown in the settings dropdown.
+    /// Editable filename-template presets shared by every workspace's
+    /// mask editor (a bank, not a per-workspace value).
     #[serde(default = "default_filename_templates")]
     pub filename_templates: Vec<String>,
-    /// Sequential counter consumed by `#` placeholders in the template.
-    #[serde(default = "default_filename_counter")]
+    /// Legacy global sequential counter — read ONCE by the workspaces
+    /// migration into `main`'s `counter`, never written back.
+    #[serde(default = "default_filename_counter", skip_serializing)]
     pub filename_counter: u64,
+    /// The capture workspaces — at least `main` after
+    /// [`Self::ensure_workspaces`].
+    #[serde(default)]
+    pub workspaces: Vec<Workspace>,
+    /// The workspace new captures land in — unknown ids resolve to
+    /// `main` (repaired at load by `ensure_workspaces`).
+    #[serde(default = "default_active_workspace")]
+    pub active_workspace_id: String,
     /// Last-used Draw tool options (see [`DrawOptions`]).
     #[serde(default)]
     pub draw_opts: DrawOptions,
@@ -348,7 +362,9 @@ pub struct Settings {
     pub last_monitor: Option<String>,
 }
 
-fn default_filename_template() -> String {
+/// The factory naming mask — `main` and new workspaces seed with it;
+/// `pub(crate)` so [`crate::config::workspace`] can build defaults.
+pub(crate) fn default_filename_template() -> String {
     "$Y-$M-$D_$H$N$S".to_owned()
 }
 /// The preset list matches the functional reference's defaults.
@@ -372,6 +388,9 @@ fn default_filename_counter() -> u64 {
 fn default_db_status() -> bool {
     true
 }
+fn default_active_workspace() -> String {
+    MAIN_ID.to_owned()
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -393,6 +412,8 @@ impl Default for Settings {
             filename_template: default_filename_template(),
             filename_templates: default_filename_templates(),
             filename_counter: default_filename_counter(),
+            workspaces: vec![Workspace::main("en")],
+            active_workspace_id: default_active_workspace(),
             monitors: std::collections::BTreeMap::new(),
             last_monitor: None,
         }
@@ -403,8 +424,20 @@ impl Settings {
     /// Reads `prefs.json`; a missing file falls back to a legacy
     /// `prefs.json` copied over once (exe-adjacent or per-user config
     /// dir), then to `settings.toml` (migrated once), then to defaults.
-    /// Any parse error yields defaults and a log warning.
+    /// Any parse error yields defaults and a log warning. The workspaces
+    /// migration/repair runs last — and persists right away when it
+    /// changed something.
     pub fn load() -> Self {
+        let mut settings = Self::load_inner();
+        if settings.ensure_workspaces() {
+            settings.save();
+        }
+        settings
+    }
+
+    /// The load body before the workspaces migration — split out so
+    /// `load` owns the one migration-write entry point.
+    fn load_inner() -> Self {
         let path = config_path();
         if !path.exists() {
             Self::migrate_legacy_prefs(&path);
@@ -431,7 +464,9 @@ impl Settings {
     }
 
     /// Writes the preferences file, creating the directory if needed.
-    /// Failures are logged, not fatal: losing a preference is recoverable.
+    /// The write is ATOMIC — a sibling temp file renamed over the target —
+    /// so a crash mid-write can never truncate the preferences. Failures
+    /// are logged, not fatal: losing a preference is recoverable.
     pub fn save(&self) {
         let path = config_path();
         if let Some(dir) = path.parent()
@@ -440,14 +475,133 @@ impl Settings {
             tracing::warn!("cannot create {}: {err}", crate::paths::file_name(dir));
             return;
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(err) = std::fs::write(&path, text) {
-                    tracing::warn!("cannot write {}: {err}", crate::paths::file_name(&path));
-                }
-            }
-            Err(err) => tracing::warn!("cannot serialize settings: {err}"),
+        let Ok(text) = serde_json::to_string_pretty(self) else {
+            tracing::warn!("cannot serialize settings");
+            return;
+        };
+        let tmp = path.with_file_name("prefs.json.tmp");
+        if let Err(err) = std::fs::write(&tmp, text) {
+            tracing::warn!("cannot write {}: {err}", crate::paths::file_name(&tmp));
+            return;
         }
+        if std::fs::rename(&tmp, &path).is_err() {
+            // `rename` over an existing destination fails on Windows —
+            // drop the target first (the atomicity loss is one unlink deep).
+            let _ = std::fs::remove_file(&path);
+            if let Err(err) = std::fs::rename(&tmp, &path) {
+                tracing::warn!("cannot write {}: {err}", crate::paths::file_name(&path));
+            }
+        }
+    }
+
+    /// `id` when it names a known workspace, else [`MAIN_ID`] — the
+    /// runtime fallback for captures whose workspace vanished from
+    /// prefs (reset, hand-edited file).
+    pub fn resolve_workspace<'a>(&'a self, id: &'a str) -> &'a str {
+        if self.workspaces.iter().any(|w| w.id == id) {
+            id
+        } else {
+            MAIN_ID
+        }
+    }
+
+    /// The workspace new captures land in — `active_workspace_id`
+    /// resolved. `ensure_workspaces` (run at load, guaranteed by
+    /// `Default`) keeps the list non-empty.
+    pub fn active_workspace(&self) -> &Workspace {
+        let id = self.resolve_workspace(&self.active_workspace_id);
+        if let Some(w) = self.workspaces.iter().find(|w| w.id == id) {
+            return w;
+        }
+        if let Some(w) = self.workspaces.iter().find(|w| w.id == MAIN_ID) {
+            return w;
+        }
+        self.workspaces
+            .first()
+            .expect("ensure_workspaces keeps a 'main' workspace")
+    }
+
+    /// Mutable twin of [`Self::active_workspace`] — the capture
+    /// counter and `output_dir` write through it.
+    pub fn active_workspace_mut(&mut self) -> &mut Workspace {
+        let id = self.resolve_workspace(&self.active_workspace_id).to_owned();
+        if self.workspaces.iter().any(|w| w.id == id) {
+            return self.workspaces.iter_mut().find(|w| w.id == id).unwrap();
+        }
+        if self.workspaces.iter().any(|w| w.id == MAIN_ID) {
+            return self
+                .workspaces
+                .iter_mut()
+                .find(|w| w.id == MAIN_ID)
+                .unwrap();
+        }
+        self.workspaces
+            .first_mut()
+            .expect("ensure_workspaces keeps a 'main' workspace")
+    }
+
+    /// `base`, or `base (2)`, `base (3)`… — the first variant not
+    /// already a workspace name (case-insensitive). Pre-fills the
+    /// create dialog so its unique-name rule starts satisfied.
+    pub fn unique_workspace_name(&self, base: &str) -> String {
+        let base = base.trim();
+        if !self.workspace_name_taken(base, None) {
+            return base.to_owned();
+        }
+        for n in 2.. {
+            let candidate = format!("{base} ({n})");
+            if !self.workspace_name_taken(&candidate, None) {
+                return candidate;
+            }
+        }
+        unreachable!()
+    }
+
+    /// `true` when `name` is already a workspace name, compared
+    /// case-insensitively after trimming (`except` = the id being
+    /// edited, so a workspace keeps its own name).
+    pub fn workspace_name_taken(&self, name: &str, except: Option<&str>) -> bool {
+        let name = name.trim().to_lowercase();
+        self.workspaces
+            .iter()
+            .any(|w| Some(w.id.as_str()) != except && w.name.trim().to_lowercase() == name)
+    }
+
+    /// Migration + repair, run at the tail of every load: an absent
+    /// `workspaces` list is created from the legacy global naming
+    /// settings (mask → `main.name_mask`, `last_save_dir` →
+    /// `main.output_dir`, counter → `main.counter`); a list missing
+    /// `main` gets it re-seeded; a dangling `active_workspace_id`
+    /// falls back to `main`. Returns `true` when anything changed —
+    /// the caller persists.
+    pub fn ensure_workspaces(&mut self) -> bool {
+        let mut changed = false;
+        if self.workspaces.is_empty() {
+            let mask = if self.filename_template.trim().is_empty() {
+                default_filename_template()
+            } else {
+                self.filename_template.clone()
+            };
+            let mut main = Workspace::main(self.language.locale());
+            main.name_mask = mask;
+            main.output_dir = self.last_save_dir.take();
+            main.counter = self.filename_counter;
+            self.workspaces.push(main);
+            changed = true;
+            tracing::info!("workspaces: migrated legacy naming settings into 'main'");
+        }
+        if !self.workspaces.iter().any(|w| w.id == MAIN_ID) {
+            self.workspaces
+                .insert(0, Workspace::main(self.language.locale()));
+            changed = true;
+            tracing::info!("workspaces: re-seeded missing 'main' workspace");
+        }
+        let resolved = self.resolve_workspace(&self.active_workspace_id);
+        if resolved != self.active_workspace_id {
+            self.active_workspace_id = resolved.to_owned();
+            changed = true;
+        }
+        changed
     }
 
     /// Pushes `path` to the front of [`Self::recent_files`] (re-pushing an
@@ -590,5 +744,86 @@ mod tests {
         // A prefs file without the key at all still loads (older versions).
         let bare: Settings = serde_json::from_str("{}").unwrap();
         assert!(bare.monitors.is_empty());
+    }
+
+    /// The pre-workspaces migration: no `workspaces` list → `main` is
+    /// seeded from the legacy global naming keys (mask, folder,
+    /// counter), which then stop serializing back.
+    #[test]
+    fn workspaces_migration_seeds_main_from_legacy_globals() {
+        let json = r#"{
+            "last_save_dir": "/tmp/shots",
+            "filename_template": "Shot##",
+            "filename_counter": 7
+        }"#;
+        let mut s: Settings = serde_json::from_str(json).unwrap();
+        assert!(s.workspaces.is_empty());
+        assert!(s.ensure_workspaces());
+        assert_eq!(s.workspaces.len(), 1);
+        let main = &s.workspaces[0];
+        assert_eq!(main.id, MAIN_ID);
+        assert_eq!(main.name_mask, "Shot##");
+        assert_eq!(main.output_dir.as_deref(), Some(Path::new("/tmp/shots")));
+        assert_eq!(main.counter, 7);
+        assert_eq!(s.active_workspace_id, MAIN_ID);
+        // The legacy keys are consumed — a re-save carries none of
+        // them (`filename_templates`, the preset bank, legitimately
+        // stays — it is not a legacy global).
+        let out = serde_json::to_string(&s).unwrap();
+        for key in ["last_save_dir", "filename_template", "filename_counter"] {
+            assert!(
+                !out.contains(&format!("\"{key}\"")),
+                "\"{key}\" must not serialize back"
+            );
+        }
+        assert!(out.contains("\"workspaces\""));
+        assert!(out.contains("\"active_workspace_id\""));
+        // Second pass is a no-op.
+        assert!(!s.ensure_workspaces());
+    }
+
+    /// A prefs file that HAS workspaces keeps them verbatim — the
+    /// migration only seeds a missing list, and a list missing `main`
+    /// gets it back.
+    #[test]
+    fn workspaces_migration_preserves_existing_and_reseeds_main() {
+        let mut s = Settings::default();
+        s.workspaces.clear();
+        let mut w = Workspace::new("Work".to_owned());
+        w.counter = 42;
+        s.workspaces.push(w);
+        assert!(s.ensure_workspaces(), "missing 'main' is re-seeded");
+        assert_eq!(s.workspaces[0].id, MAIN_ID);
+        assert_eq!(s.workspaces[1].name, "Work");
+        assert_eq!(s.workspaces[1].counter, 42, "entries are never rewritten");
+        assert!(!s.ensure_workspaces());
+    }
+
+    /// An `active_workspace_id` pointing nowhere falls back to `main`,
+    /// and `resolve_workspace` never honours an unknown id.
+    #[test]
+    fn unknown_workspace_falls_back_to_main() {
+        let mut s = Settings::default();
+        s.active_workspace_id = "gone".to_owned();
+        assert_eq!(s.resolve_workspace("gone"), MAIN_ID);
+        assert!(s.ensure_workspaces());
+        assert_eq!(s.active_workspace_id, MAIN_ID);
+        assert_eq!(s.active_workspace().id, MAIN_ID);
+    }
+
+    /// Case-insensitive uniqueness — `except` lets the edited
+    /// workspace keep its own name — plus the create-dialog prefill.
+    #[test]
+    fn workspace_name_taken_is_case_insensitive() {
+        let mut s = Settings::default();
+        s.workspaces[0].name = "Main".to_owned();
+        let mut w = Workspace::new("Work".to_owned());
+        w.id = "abc".to_owned();
+        s.workspaces.push(w);
+        assert!(s.workspace_name_taken(" MAIN ", None));
+        assert!(s.workspace_name_taken("work", Some("xyz")));
+        assert!(!s.workspace_name_taken("work", Some("abc")));
+        assert_eq!(s.unique_workspace_name("main"), "main (2)");
+        assert_eq!(s.unique_workspace_name("free"), "free");
     }
 }

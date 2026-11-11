@@ -345,6 +345,19 @@ pub struct Viewer {
     dismissed_monitors: std::collections::HashSet<String>,
     /// The protection dialog (set/change/remove password), open while Some.
     protect: Option<ProtectDialog>,
+    /// The workspace filter in effect — synced from
+    /// `settings.active_workspace_id` at the top of every pass (the
+    /// prefs entry is the single source of truth).
+    ws: String,
+    /// Workspace ids known to prefs — a capture tagged with an unlisted
+    /// id resolves to `main` (a prefs reset never hides captures).
+    ws_known: std::collections::HashSet<String>,
+    /// Last selected tab per workspace, keyed by doc id (indices shift
+    /// on sort/close — ids do not). Recorded when leaving a workspace
+    /// so switching back restores the tab the user was on.
+    ws_last: std::collections::HashMap<String, String>,
+    /// The workspace create/edit dialog draft, open while Some.
+    ws_dialog: Option<crate::ui::workspace::WorkspaceDialog>,
     /// The "delete the file on disk" confirmation, open while Some.
     confirm_delete: Option<DeleteFileDialog>,
     /// Save-all found two unsaved captures sharing a name — show the
@@ -438,6 +451,10 @@ impl Default for Viewer {
             seen_monitors: std::collections::HashSet::new(),
             dismissed_monitors: std::collections::HashSet::new(),
             protect: None,
+            ws: crate::config::workspace::MAIN_ID.to_owned(),
+            ws_known: [crate::config::workspace::MAIN_ID.to_owned()].into(),
+            ws_last: std::collections::HashMap::new(),
+            ws_dialog: None,
             confirm_delete: None,
             unlock_draft: String::new(),
             unlock_error: false,
@@ -656,6 +673,7 @@ impl Tab {
             saved_at: d.meta.saved_at,
             source_path: d.meta.source_path.clone(),
             password_hash: d.meta.password_hash.clone(),
+            workspace_id: d.meta.workspace_id.clone(),
             base: self
                 .base_dirty
                 .then(|| std::sync::Arc::clone(&d.base.image)),
@@ -723,7 +741,10 @@ impl Viewer {
     /// Adds `doc` as a tab with an explicit title and saved flag — used by
     /// Open (file name, already on disk) and Paste (untitled, unsaved).
     /// Two captures can never share a name: a clash gets a ` (n)` suffix.
-    pub fn push_named_document(&mut self, doc: Document, title: String, saved: bool) {
+    pub fn push_named_document(&mut self, mut doc: Document, title: String, saved: bool) {
+        // Every document landing in the viewer belongs to the ACTIVE
+        // workspace — the filter must never hide a fresh tab.
+        doc.meta.workspace_id = self.ws.clone();
         let title = self.unique_title(&title);
         let insertion = self.next_insertion;
         self.next_insertion += 1;
@@ -764,7 +785,8 @@ impl Viewer {
     /// Adds `doc` as a fresh tab with `title` VERBATIM — the capture
     /// naming template may legitimately repeat (duplicates are caught at
     /// save-all, where a rename is the fix).
-    pub fn push_capture_document(&mut self, doc: Document, title: String) {
+    pub fn push_capture_document(&mut self, mut doc: Document, title: String) {
+        doc.meta.workspace_id = self.ws.clone();
         let insertion = self.next_insertion;
         self.next_insertion += 1;
         self.tabs.push(Tab {
@@ -867,13 +889,95 @@ impl Viewer {
         }
     }
 
-    /// Index of the active tab, clamped into range (`None` when empty).
+    /// Index of the visible tab, clamped into range — `None` when the
+    /// active workspace holds no capture (its empty state shows then).
     pub fn active_index(&self) -> Option<usize> {
         if self.tabs.is_empty() {
-            None
-        } else {
-            Some(self.active.min(self.tabs.len() - 1))
+            return None;
         }
+        let i = self.active.min(self.tabs.len() - 1);
+        (self.tab_ws(&self.tabs[i]) == self.ws).then_some(i)
+    }
+
+    /// The workspace `tab` belongs to — an id prefs no longer lists
+    /// resolves to `main`: a prefs reset never hides captures.
+    fn tab_ws<'a>(&self, tab: &'a Tab) -> &'a str {
+        let id = tab.doc.meta.workspace_id.as_str();
+        if self.ws_known.contains(id) {
+            id
+        } else {
+            crate::config::workspace::MAIN_ID
+        }
+    }
+
+    /// The tabs shown right now: `tabs` holds the WHOLE session (the
+    /// workspace switch is a filter, not a reload — every persistence
+    /// path keeps iterating all of them), this selects the visible
+    /// subset in display order.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        (0..self.tabs.len())
+            .filter(|&i| self.tab_ws(&self.tabs[i]) == self.ws)
+            .collect()
+    }
+
+    /// `true` when workspace `id` has no live capture — the deletion
+    /// precondition. Only `main` and non-empty workspaces refuse.
+    fn workspace_empty(&self, id: &str) -> bool {
+        !self.tabs.iter().any(|t| self.tab_ws(t) == id)
+    }
+
+    /// Re-reads the workspace filter from `settings` — the prefs entry
+    /// is the single source of truth (`SwitchWorkspace` writes it, this
+    /// picks it up on the next pass; `ws_known` refreshes with it so
+    /// the unknown→`main` fallback tracks prefs edits too). Also called
+    /// by `Shared::pump` before each command so captures pushed
+    /// mid-drain land in the freshly-switched workspace.
+    pub(crate) fn sync_workspace(&mut self, settings: &Settings) {
+        self.ws_known = settings
+            .workspaces
+            .iter()
+            .map(|w| w.id.clone())
+            .chain(std::iter::once(
+                crate::config::workspace::MAIN_ID.to_owned(),
+            ))
+            .collect();
+        let active = settings
+            .resolve_workspace(&settings.active_workspace_id)
+            .to_owned();
+        if active != self.ws {
+            self.set_workspace(&active);
+        }
+    }
+
+    /// Moves the filter to workspace `id`: remembers the tab left on
+    /// for the outgoing workspace, then selects the incoming one's
+    /// last tab — or its first — so the strip never lands on a hidden
+    /// capture. An empty workspace simply shows the normal empty state.
+    pub fn set_workspace(&mut self, id: &str) {
+        let id = if self.ws_known.contains(id) {
+            id
+        } else {
+            crate::config::workspace::MAIN_ID
+        };
+        if id == self.ws {
+            return;
+        }
+        if let Some(doc_id) = self
+            .active_index()
+            .map(|i| self.tabs[i].doc.meta.id.clone())
+        {
+            self.ws_last.insert(self.ws.clone(), doc_id);
+        }
+        self.ws = id.to_owned();
+        let pick = self
+            .ws_last
+            .get(&self.ws)
+            .and_then(|doc_id| self.tabs.iter().position(|t| t.doc.meta.id == *doc_id))
+            .or_else(|| self.visible_indices().first().copied());
+        if let Some(i) = pick {
+            self.set_active(i);
+        }
+        tracing::info!(workspace = %self.ws, "workspace_active");
     }
 
     /// The active tab's document, for dispatch (`SaveActive`).
@@ -881,7 +985,7 @@ impl Viewer {
         self.active_index().map(|i| &self.tabs[i].doc)
     }
 
-    /// An in-viewer dialog is up (rename, resize, protection,
+    /// An in-viewer dialog is up (rename, resize, protection, workspace,
     /// delete-file, unsaved confirm, dup names) — synced to
     /// `Shared::viewer_dialog_open` every pass so `modal_state()`
     /// never locks the viewer while `show` holds it.
@@ -891,6 +995,7 @@ impl Viewer {
             || self.rename.is_some()
             || self.monitor_rename.is_some()
             || self.protect.is_some()
+            || self.ws_dialog.is_some()
             || self.confirm_delete.is_some()
             || self.dup_names
     }
@@ -1184,20 +1289,24 @@ impl Viewer {
         self.reset_view();
     }
 
-    /// ⌘ (macOS) / Alt (Windows) +←/→ tab navigation: `self.tabs` IS
-    /// the display order — `sort_tabs`
-    /// physically reorders it, so ±1 lands on the visible neighbour
-    /// in the strip and the mosaic alike. Clamped at the ends — no
-    /// wrap-around. `set_active` carries the full click semantics
-    /// (protected tabs re-lock, selection scrolls into view).
+    /// ⌘ (macOS) / Alt (Windows) +←/→ tab navigation, inside the visible
+    /// (active-workspace) set: `self.tabs` IS the display order —
+    /// `sort_tabs` physically reorders it, so ±1 lands on the visible
+    /// neighbour in the strip and the mosaic alike. Clamped at the
+    /// ends — no wrap-around. `set_active` carries the full click
+    /// semantics (protected tabs re-lock, selection scrolls into view).
     fn cycle_tab(&mut self, step: isize) {
-        let n = self.tabs.len() as isize;
-        if n < 2 {
+        let vis = self.visible_indices();
+        if vis.len() < 2 {
             return;
         }
-        let next = (self.active_index().unwrap_or(0) as isize + step).clamp(0, n - 1);
-        if next != self.active_index().unwrap_or(0) as isize {
-            self.set_active(next as usize);
+        let cur = self
+            .active_index()
+            .and_then(|a| vis.iter().position(|&i| i == a))
+            .unwrap_or(0) as isize;
+        let next = (cur + step).clamp(0, vis.len() as isize - 1) as usize;
+        if Some(vis[next]) != self.active_index() {
+            self.set_active(vis[next]);
         }
     }
 
@@ -1266,6 +1375,14 @@ impl Viewer {
                 .active
                 .saturating_sub(below_active)
                 .min(self.tabs.len().saturating_sub(1));
+        }
+        // The index arithmetic above can surface a capture of ANOTHER
+        // workspace (hidden tabs interleave the visible ones) — fall
+        // back to the first visible tab instead.
+        if self.active_index().is_none()
+            && let Some(i) = self.visible_indices().first().copied()
+        {
+            self.active = i;
         }
         self.recompute_dirty();
     }
@@ -1369,6 +1486,17 @@ impl Viewer {
             self.set_active(session.active.min(self.tabs.len() - 1));
         }
         self.sort_tabs();
+        // The stored `active` may name a capture of ANOTHER workspace —
+        // land on the active workspace's last tab (or its first) instead.
+        if self.active_index().is_none()
+            && let Some(i) = self
+                .ws_last
+                .get(&self.ws)
+                .and_then(|id| self.tabs.iter().position(|t| t.doc.meta.id == *id))
+                .or_else(|| self.visible_indices().first().copied())
+        {
+            self.set_active(i);
+        }
         self.recompute_dirty();
         self.persisted_sigs = (!had_live_tabs).then(|| self.sigs());
         // Perf hook (dev-tools builds only): `PIXME_DEBUG_MOSAIC=1`
@@ -1848,6 +1976,9 @@ impl Viewer {
     /// state machine (the deferred-viewport callback cannot borrow the app).
     pub fn show(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let ctx = ui.ctx().clone();
+        // The workspace filter follows the prefs entry — switching is
+        // a `SwitchWorkspace` command write + this per-frame sync.
+        self.sync_workspace(&shared.lock_settings());
         // One frame of lag is fine for menu greying — the atomic keeps
         // `modal_state()` readable while `self` is locked here.
         shared
@@ -1870,6 +2001,7 @@ impl Viewer {
             || self.rename.is_some()
             || self.monitor_rename.is_some()
             || self.protect.is_some()
+            || self.ws_dialog.is_some()
             || self.confirm_delete.is_some()
             || self.dup_names
             || shared.modal_child_open();
@@ -2061,6 +2193,7 @@ impl Viewer {
         self.rename_dialog(&ctx);
         self.monitor_rename_dialog(&ctx, shared);
         self.protect_dialog(&ctx);
+        self.workspace_dialog(&ctx, shared);
         self.delete_file_dialog(&ctx);
         self.dup_names_dialog(&ctx);
         self.settings_window(&ctx, shared);
@@ -2183,8 +2316,19 @@ impl Viewer {
     fn status_strip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
         let t = theme::tokens(ui.ctx());
         ui.horizontal(|ui| {
-            let n = self.tabs.len();
-            let i = self.active_index().map(|x| x + 1).unwrap_or(0);
+            // The workspace chip leads the strip, left of the capture
+            // info; the monitor group stays right-aligned.
+            self.workspace_chip(ui, shared);
+            ui.add_space(8.0);
+            // The counter mirrors what the strip shows: the active
+            // workspace's captures, not the whole session.
+            let vis = self.visible_indices();
+            let n = vis.len();
+            let i = self
+                .active_index()
+                .and_then(|a| vis.iter().position(|&x| x == a))
+                .map(|x| x + 1)
+                .unwrap_or(0);
             ui.label(
                 egui::RichText::new(t!("vbar.status.count", i = i, n = n).to_string())
                     .color(t.text_dim)
@@ -2359,9 +2503,11 @@ impl Viewer {
         let has_doc = self.active_index().is_some();
         // Read once up-front — the Ouvrir menu's last item greys without it.
         let (has_last_dir, icon_style) = {
+            // "Open last used folder" needs either the opened-files
+            // folder or the active workspace's output folder.
             let s = shared.lock_settings();
             (
-                s.last_open_dir.is_some() || s.last_save_dir.is_some(),
+                s.last_open_dir.is_some() || s.active_workspace().output_dir.is_some(),
                 s.icon_style,
             )
         };
@@ -2614,6 +2760,244 @@ impl Viewer {
             });
     }
 
+    /// The workspace chip: a compact bordered pill showing the active
+    /// workspace's name (elided; the full name rides the tooltip).
+    /// Left click lists the workspaces — active one checked, last
+    /// entry opens the create dialog; right click opens the manage
+    /// menu (New / Edit / Delete / Delete empty).
+    fn workspace_chip(&mut self, ui: &mut egui::Ui, shared: &Shared) {
+        let (name, names) = {
+            let s = shared.lock_settings();
+            (
+                s.active_workspace().name.clone(),
+                s.workspaces
+                    .iter()
+                    .map(|w| w.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // The pill is sized for the LONGEST workspace name so switching
+        // never resizes it (names are capped at 30 chars in the dialog).
+        // The active name is measured in the font it actually renders
+        // with — SemiBold when accented — so it never overflows.
+        let accented = self.ws != crate::config::workspace::MAIN_ID;
+        let mut text_w = 0.0_f32;
+        for n in &names {
+            let font = if accented && n == &name {
+                crate::ui::theme::semibold(10.5)
+            } else {
+                egui::FontId::proportional(10.5)
+            };
+            text_w = text_w.max(
+                ui.painter()
+                    .layout_no_wrap(n.clone(), font, egui::Color32::WHITE)
+                    .size()
+                    .x,
+            );
+        }
+        // Non-`main` workspaces wear the accent pill so it is obvious
+        // at a glance that captures land somewhere else than `main`.
+        let resp = crate::ui::workspace::chip_frame(ui, &name, text_w, accented);
+
+        // Left click: the switcher list. `menu` and `context_menu` on
+        // the same response share `resp.id` as their popup id — both
+        // closures would render whenever either opens. Distinct ids
+        // keep them independent.
+        egui::Popup::menu(&resp)
+            .id(resp.id.with("switch"))
+            .show(|ui| {
+                let list: Vec<(String, String)> = shared
+                    .lock_settings()
+                    .workspaces
+                    .iter()
+                    .map(|w| (w.id.clone(), w.name.clone()))
+                    .collect();
+                ui.set_min_width(160.0);
+                for (id, wname) in &list {
+                    let active = *id == self.ws;
+                    let resp = ui.selectable_label(active, wname.as_str());
+                    if resp.clicked() && !active {
+                        shared.push(Command::SwitchWorkspace(id.clone()));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if menu_row(ui, Icon::Plus, t!("workspace.new").to_string(), true).clicked() {
+                    let s = shared.lock_settings();
+                    self.ws_dialog = Some(crate::ui::workspace::WorkspaceDialog::new_create(&s));
+                    ui.close();
+                }
+            });
+
+        // Right click: the manage menu.
+        let active_id = self.ws.clone();
+        egui::Popup::context_menu(&resp)
+            .id(resp.id.with("manage"))
+            .show(|ui| {
+                if menu_row(ui, Icon::Plus, t!("workspace.new").to_string(), true).clicked() {
+                    let s = shared.lock_settings();
+                    self.ws_dialog = Some(crate::ui::workspace::WorkspaceDialog::new_create(&s));
+                    ui.close();
+                }
+                if menu_row(ui, Icon::Pencil, t!("workspace.edit").to_string(), true).clicked() {
+                    let s = shared.lock_settings();
+                    if let Some(w) = s.workspaces.iter().find(|w| w.id == active_id) {
+                        self.ws_dialog =
+                            Some(crate::ui::workspace::WorkspaceDialog::new_edit(w, &s));
+                    }
+                    ui.close();
+                }
+                // Delete: `main` never dies; a workspace holding live
+                // captures greys out with the reason on hover.
+                let empty = self.workspace_empty(&active_id);
+                let deletable = active_id != crate::config::workspace::MAIN_ID && empty;
+                let item = menu_row(
+                    ui,
+                    Icon::Trash,
+                    t!("workspace.delete").to_string(),
+                    deletable,
+                );
+                let tip = if active_id == crate::config::workspace::MAIN_ID {
+                    Some(t!("workspace.delete_main_tip").to_string())
+                } else {
+                    (!empty).then(|| t!("workspace.delete_nonempty_tip").to_string())
+                };
+                let item = match tip {
+                    Some(tip) if !deletable => item.on_hover_text(tip),
+                    _ => item,
+                };
+                if item.clicked() {
+                    self.delete_workspaces(std::slice::from_ref(&active_id), shared);
+                    ui.close();
+                }
+                if menu_row(
+                    ui,
+                    Icon::Broom,
+                    t!("workspace.delete_empty").to_string(),
+                    true,
+                )
+                .clicked()
+                {
+                    let doomed: Vec<String> = shared
+                        .lock_settings()
+                        .workspaces
+                        .iter()
+                        .filter(|w| {
+                            w.id != crate::config::workspace::MAIN_ID && self.workspace_empty(&w.id)
+                        })
+                        .map(|w| w.id.clone())
+                        .collect();
+                    if doomed.is_empty() {
+                        widgets::toast(
+                            ui.ctx(),
+                            widgets::ToastKind::Info,
+                            t!("workspace.none_deleted").to_string(),
+                        );
+                    } else {
+                        widgets::toast(
+                            ui.ctx(),
+                            widgets::ToastKind::Success,
+                            t!("workspace.deleted_toast", count = doomed.len()).to_string(),
+                        );
+                        self.delete_workspaces(&doomed, shared);
+                    }
+                    ui.close();
+                }
+            });
+    }
+
+    /// Removes workspaces `ids` from prefs, hard-deletes their rows
+    /// (the "soft-deleted" leftovers — the session has no live tabs
+    /// for them by precondition) and lands on `main` when the active
+    /// one went away. Files on disk are never touched.
+    fn delete_workspaces(&mut self, ids: &[String], shared: &Shared) {
+        {
+            let mut s = shared.lock_settings();
+            s.workspaces.retain(|w| !ids.contains(&w.id));
+            if ids.iter().any(|id| id == &s.active_workspace_id) {
+                s.active_workspace_id = crate::config::workspace::MAIN_ID.to_owned();
+            }
+            s.save();
+        }
+        for id in ids {
+            tracing::info!(workspace = %id, "workspace_deleted");
+            shared.writer.delete_workspace(id.clone());
+        }
+        self.ws_last.retain(|id, _| !ids.contains(id));
+        self.ws_known.retain(|id| !ids.contains(id));
+    }
+
+    /// The workspace create/edit modal — applies to prefs on confirm.
+    fn workspace_dialog(&mut self, ctx: &egui::Context, shared: &Shared) {
+        let Some(mut state) = self.ws_dialog.take() else {
+            return;
+        };
+        let title_key = if state.id.is_some() {
+            "workspace.edit_title"
+        } else {
+            "workspace.new_title"
+        };
+        let resp = widgets::modal_frame(
+            ctx,
+            egui::Id::new("pixme-workspace"),
+            &t!(title_key),
+            400.0,
+            |ui| crate::ui::workspace::dialog(ui, &mut state, shared),
+        );
+        let closed = resp.should_close() || resp.inner.0;
+        let mut out = resp.inner.1;
+        if closed {
+            out = crate::ui::workspace::Outcome::Cancel;
+        }
+        match out {
+            crate::ui::workspace::Outcome::Open => self.ws_dialog = Some(state),
+            crate::ui::workspace::Outcome::Cancel => {}
+            crate::ui::workspace::Outcome::Confirm {
+                name,
+                mask,
+                folder,
+                presets,
+            } => {
+                let mut created = None;
+                {
+                    let mut s = shared.lock_settings();
+                    let dir = if folder.is_empty() {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(folder))
+                    };
+                    match &state.id {
+                        Some(id) => {
+                            if let Some(w) = s.workspaces.iter_mut().find(|w| &w.id == id) {
+                                w.name = name;
+                                w.name_mask = mask;
+                                w.output_dir = dir;
+                            }
+                            tracing::info!(workspace = %id, "workspace_edited");
+                        }
+                        None => {
+                            let mut w = crate::config::workspace::Workspace::new(name);
+                            w.name_mask = mask;
+                            w.output_dir = dir;
+                            created = Some(w.id.clone());
+                            // The new workspace becomes the active one
+                            // at once — a pushed command could be eaten
+                            // while this dialog still counts as modal.
+                            s.active_workspace_id = w.id.clone();
+                            tracing::info!(workspace = %w.id, "workspace_created");
+                            s.workspaces.push(w);
+                        }
+                    }
+                    s.filename_templates = presets;
+                    s.save();
+                }
+                if let Some(id) = created {
+                    tracing::info!(workspace = %id, "workspace_switched");
+                }
+            }
+        }
+    }
+
     /// The vertical capture bar: the five capture modes, then the delay
     /// and capture-options dropdowns — the only place a capture starts
     /// from. Capture buttons read the shared command table so they grey
@@ -2816,7 +3200,9 @@ impl Viewer {
                     let out = area.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                            for index in 0..self.tabs.len() {
+                            // Only the active workspace's tabs — the
+                            // workspace switch is a filter, not a reload.
+                            for index in self.visible_indices() {
                                 self.tab_item(ui, index, shared);
                             }
                         });
@@ -2961,7 +3347,10 @@ impl Viewer {
     /// plus Protection (no keyboard shortcuts, per spec).
     fn tab_menu(&mut self, ui: &mut egui::Ui, index: usize, shared: &Shared) {
         let has_file = self.tabs[index].doc.meta.source_path.is_some();
-        let has_saved = self.tabs.iter().any(|t| t.saved);
+        // The close-* entries act on the VISIBLE set only: hidden
+        // workspaces' captures must survive a "close all".
+        let vis = self.visible_indices();
+        let has_saved = vis.iter().any(|&i| self.tabs[i].saved);
         let item = |ui: &mut egui::Ui, key: &str| -> Response { ui.button(t!(key).to_string()) };
         if item(ui, "viewer.tab.save").clicked() {
             if index != self.active {
@@ -2993,34 +3382,37 @@ impl Viewer {
             return;
         }
         if item(ui, "viewer.tab.close_others").clicked() {
-            let others: Vec<usize> = (0..self.tabs.len()).filter(|&i| i != index).collect();
+            let others: Vec<usize> = vis.iter().copied().filter(|&i| i != index).collect();
             self.close_tabs(&others);
             ui.close();
             return;
         }
         ui.add_enabled_ui(has_saved, |ui| {
             if item(ui, "viewer.tab.close_saved").clicked() {
-                let saved: Vec<usize> = (0..self.tabs.len())
+                let saved: Vec<usize> = vis
+                    .iter()
+                    .copied()
                     .filter(|&i| self.tabs[i].saved)
                     .collect();
                 self.close_tabs(&saved);
                 ui.close();
             }
         });
-        ui.add_enabled_ui(index > 0, |ui| {
+        let vis_pos = vis.iter().position(|&i| i == index).unwrap_or(0);
+        ui.add_enabled_ui(vis_pos > 0, |ui| {
             if item(ui, "viewer.tab.close_left").clicked() {
-                self.close_tabs(&(0..index).collect::<Vec<_>>());
+                self.close_tabs(&vis[..vis_pos]);
                 ui.close();
             }
         });
-        ui.add_enabled_ui(index + 1 < self.tabs.len(), |ui| {
+        ui.add_enabled_ui(vis_pos + 1 < vis.len(), |ui| {
             if item(ui, "viewer.tab.close_right").clicked() {
-                self.close_tabs(&((index + 1)..self.tabs.len()).collect::<Vec<_>>());
+                self.close_tabs(&vis[vis_pos + 1..]);
                 ui.close();
             }
         });
         if item(ui, "viewer.tab.close_all").clicked() {
-            self.close_tabs(&(0..self.tabs.len()).collect::<Vec<_>>());
+            self.close_tabs(&vis);
             ui.close();
             return;
         }
@@ -3070,7 +3462,10 @@ impl Viewer {
             self.mosaic_content(ui, shared);
             return;
         }
-        if self.tabs.is_empty() {
+        // The empty state covers BOTH no-session and an active
+        // workspace holding no capture — the filter hides every tab
+        // either way.
+        let Some(index) = self.active_index() else {
             let t = theme::tokens(ui.ctx());
             // Restore in flight reads as "loading", not "empty" — the
             // tabs may arrive with it.
@@ -3083,8 +3478,7 @@ impl Viewer {
                 ui.colored_label(t.text_dim, t!(key).to_string());
             });
             return;
-        }
-        let index = self.active.min(self.tabs.len() - 1);
+        };
         // A protected capture only unlocks by password — the canvas
         // (and its marquee/paste interactions) shows nothing until then.
         if self.is_locked(index) {
@@ -3169,6 +3563,7 @@ impl Viewer {
             || self.rename.is_some()
             || self.monitor_rename.is_some()
             || self.protect.is_some()
+            || self.ws_dialog.is_some()
             || self.confirm_delete.is_some()
             || shared.modal_child_open();
         // Base tile 220×160 pt at 100%, scaled by the mosaic zoom.
@@ -3188,12 +3583,16 @@ impl Viewer {
                 // Grid margin — the selected tile's ring must not kiss
                 // the window edge.
                 ui.add_space(spacing);
+                // The grid browses the ACTIVE workspace only — the
+                // other workspaces' captures stay in the session but
+                // never get a tile.
+                let visible = self.visible_indices();
                 let cols = (ui.available_width() / (tile_w + spacing)).floor().max(1.0) as usize;
-                for row in (0..self.tabs.len()).step_by(cols) {
+                for row in (0..visible.len()).step_by(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = spacing;
                         ui.add_space(spacing);
-                        for cell in row..(row + cols).min(self.tabs.len()) {
+                        for &cell in visible.iter().skip(row).take(cols) {
                             self.mosaic_tile(ui, cell, shared, tile_w, tile_h);
                         }
                     });
@@ -5198,5 +5597,104 @@ mod tests {
         let rows = monitor_rows(&inventory, &prefs, &seen, &dismissed);
         assert_eq!(rows.len(), 1);
         assert!(prefs.contains_key("gone"));
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    /// The filter hides the other buckets' tabs; switching restores the
+    /// tab each workspace was last left on — or its first — and an
+    /// unknown id lands on `main`.
+    #[test]
+    fn workspace_filter_selects_a_sensible_tab() {
+        let mut v = Viewer::default();
+        v.ws_known.insert("w2".to_owned());
+        v.push_stub("m1");
+        v.push_stub("w2tab");
+        v.tabs[1].doc.meta.workspace_id = "w2".to_owned();
+        v.push_stub("m3");
+        v.set_active(0);
+        assert_eq!(v.visible_indices(), vec![0, 2]);
+
+        v.set_workspace("w2");
+        assert_eq!(v.ws, "w2");
+        assert_eq!(v.active_index(), Some(1), "w2's first tab");
+        assert_eq!(v.visible_indices(), vec![1]);
+
+        v.set_workspace("main");
+        assert_eq!(
+            v.active_index(),
+            Some(0),
+            "back to the tab main was left on"
+        );
+
+        // An unknown workspace id resolves to `main`.
+        v.set_workspace("nope");
+        assert_eq!(v.ws, crate::config::workspace::MAIN_ID);
+    }
+
+    /// A capture whose workspace vanished from prefs still shows —
+    /// under `main`: a prefs reset must never hide captures.
+    #[test]
+    fn unknown_workspace_tab_resolves_to_main() {
+        let mut v = Viewer::default();
+        v.push_stub("orphan");
+        v.tabs[0].doc.meta.workspace_id = "gone".to_owned();
+        assert_eq!(v.tab_ws(&v.tabs[0]), crate::config::workspace::MAIN_ID);
+        assert_eq!(v.visible_indices(), vec![0]);
+        assert!(v.workspace_empty("gone"));
+    }
+
+    /// "Empty" = no LIVE tab of that workspace: closing its last tab
+    /// (the viewer's delete) makes it empty again — deleted captures
+    /// never block deletion.
+    #[test]
+    fn workspace_empty_counts_only_live_tabs() {
+        let mut v = Viewer::default();
+        v.ws_known.insert("w2".to_owned());
+        assert!(v.workspace_empty("w2"));
+        v.push_stub("ws2");
+        v.tabs[0].doc.meta.workspace_id = "w2".to_owned();
+        assert!(!v.workspace_empty("w2"));
+        v.close_tabs(&[0]);
+        assert!(
+            v.workspace_empty("w2"),
+            "a closed tab leaves the workspace empty"
+        );
+        assert!(v.workspace_empty(crate::config::workspace::MAIN_ID));
+    }
+
+    /// Every push path stamps the ACTIVE workspace on the document —
+    /// a capture can never land in a hidden bucket.
+    #[test]
+    fn pushed_documents_get_the_active_workspace() {
+        let mut v = Viewer::default();
+        v.ws_known.insert("w2".to_owned());
+        v.ws = "w2".to_owned();
+        v.push_stub("x");
+        assert_eq!(v.tabs[0].doc.meta.workspace_id, "main"); // push_stub is a raw helper
+        v.push_named_document(
+            crate::editor::Document::new(crate::capture::Capture {
+                image: std::sync::Arc::new(image::RgbaImage::new(1, 1)),
+                scale_factor: 1.0,
+                monitor: crate::capture::MonitorInfo {
+                    id: 0,
+                    name: String::new(),
+                    rect: crate::capture::PhysicalRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    scale_factor: 1.0,
+                    is_primary: true,
+                },
+            }),
+            "y".to_owned(),
+            false,
+        );
+        assert_eq!(v.tabs[1].doc.meta.workspace_id, "w2");
     }
 }

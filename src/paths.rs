@@ -61,6 +61,23 @@ pub fn init() {
 /// Pure resolution: dev-tools overrides first, then the OS choice.
 /// Parent dirs are created best-effort — later writers re-check anyway.
 fn resolve() -> Paths {
+    // Unit tests compile WITHOUT the dev-tools env override — they would
+    // resolve (and `Settings::save` would CLOBBER) the real user's
+    // `prefs.json`/`session.db`. Redirect to a per-process throwaway dir
+    // so `cargo test` can never touch real data.
+    if cfg!(test) {
+        let data = std::env::temp_dir().join(format!("pixme-test-{}", std::process::id()));
+        let logs = data.join("logs");
+        let _ = std::fs::create_dir_all(&logs);
+        return Paths {
+            base: BaseDirs {
+                data,
+                logs,
+                fallback_from: None,
+            },
+            legacy_data: None,
+        };
+    }
     #[cfg(feature = "dev-tools")]
     if let Some(dir) = std::env::var_os("PIXME_DATA_DIR") {
         let data = PathBuf::from(dir);

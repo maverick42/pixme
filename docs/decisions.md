@@ -2356,3 +2356,59 @@ Format: date — context — decision — consequences.
   `dismissed`; the launch-time strip only shows real monitors. Users
   who want a gone monitor's button back must reconnect it — the
   rename affordance on never-seen entries is gone with the row.
+
+## 2026-11-08 — Workspaces: named capture buckets, filter not reload
+
+- **Context**: every capture lived in one flat pool, with the naming
+  mask, its `#` counter and the last-used save folder all global in
+  `prefs.json`. The feature brief asked for minimal "workspaces" —
+  each with its own mask, counter and output folder — without making
+  daily use more complex.
+- **Decision**:
+  - `Workspace { id, name, name_mask, output_dir, counter }` lives in
+    `prefs.json` (`workspaces` + `active_workspace_id`); `main` is the
+    reserved, undeletable-but-editable default, seeded once from the
+    legacy global `filename_template`/`filename_counter`/`last_save_dir`
+    keys, which are `skip_serializing` now (read once, never written
+    back). The mask preset bank (`filename_templates`) stays a single
+    shared list — presets are a bank, not per-workspace state.
+    `Settings::save` writes atomically (temp file + rename).
+  - `workspace_id` is a REAL SQL column on `documents` (schema 15)
+    with an index — never a postcard field, since extending a
+    postcard struct breaks decoding of old rows. The 14 → 15 upgrade
+    is the first in-place migration: `ALTER TABLE … ADD COLUMN`
+    instead of the drop-and-rebuild every other version bump takes,
+    so existing captures keep their rows (assigned `main`) and no
+    `.bak` is produced.
+  - `last_save_dir` is gone as a concept: the workspace's `output_dir`
+    inherits its role — proposed save folder, updated to the folder
+    actually used after each successful save of one of its tabs.
+    Pin saves seed from the active workspace but update nothing (a
+    pin owns no workspace). There is no auto-save to disk and none is
+    wanted: `output_dir` seeds the save dialog and targets Save All.
+  - The viewer's `tabs` still holds the WHOLE session (persistence,
+    dirty flags, store sigs unchanged); the workspace switch is a
+    filter (`visible_indices`/`tab_ws`), never a reload. Every
+    push path stamps the active workspace on the document; a tab
+    tagged with an id prefs no longer lists resolves to `main` so a
+    prefs reset never hides captures. Close-* menu entries, Save All
+    and tab cycling act on the visible set only — hidden workspaces'
+    captures survive a "close all" / batch save.
+  - "Empty" = zero live tabs; closing tabs frees the workspace for
+    deletion (there is no soft-delete: a closed tab's row is already
+    gone, and `writer.delete_workspace` hard-purges stranded rows as
+    a belt-and-braces `DELETE WHERE workspace_id`). Deletion never
+    touches files or folders on disk.
+  - UI: a compact bordered chip centred in the toolbar strip's free
+    space (the tools scroll left of it) shows the active name elided;
+    left click lists/switches workspaces and offers "+ New
+    workspace…", right click manages (New / Edit / Delete — greyed on
+    `main` or non-empty — / Delete empty workspaces with a toast).
+    The create/edit dialog is an in-app `modal_frame` reusing the
+    settings window's mask editor verbatim, moved out of the
+    settings sidebar (the File name page is gone).
+- **Consequences**: purge/retention stays global across workspaces
+  (test-pinned). Counters, masks and save folders are independent per
+  workspace; collisions between workspaces sharing a folder keep the
+  existing `unique_png` `_2`/`_3` suffixing. No keyboard shortcuts,
+  no workspace colours, no moving captures between workspaces.

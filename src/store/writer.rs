@@ -37,6 +37,9 @@ enum Job {
     },
     /// Delete the rows of closed tabs.
     Delete(Vec<String>),
+    /// Hard-purge every row of a deleted workspace (safety net —
+    /// viewer-side deletion only happens on EMPTY workspaces).
+    DeleteWorkspace(String),
     /// Empty the store (session discard).
     Clear,
     /// Apply the retention policy (startup + settings change).
@@ -98,8 +101,8 @@ pub struct Writer {
     /// `document_count` never waits behind a PNG encode.
     count: Arc<AtomicUsize>,
     /// Write jobs queued or executing — the status strip's WRITE
-    /// indicator: >0 while any Doc/Meta/Session/Delete/Clear/
-    /// Retention/Finalize job is in flight.
+    /// indicator: >0 while any Doc/Meta/Session/Delete/DeleteWorkspace/
+    /// Clear/Retention/Finalize job is in flight.
     pending_writes: Arc<AtomicUsize>,
     /// `true` while a `Load` job runs — the READ indicator.
     reading: Arc<std::sync::atomic::AtomicBool>,
@@ -152,6 +155,7 @@ impl Writer {
                 | Job::Meta(_)
                 | Job::Session { .. }
                 | Job::Delete(_)
+                | Job::DeleteWorkspace(_)
                 | Job::Clear
                 | Job::Retention(_)
                 | Job::Finalize { .. }
@@ -181,6 +185,11 @@ impl Writer {
     /// Delete the rows of closed tabs.
     pub fn delete(&self, ids: Vec<String>) {
         self.send(Job::Delete(ids));
+    }
+
+    /// Purge every row of a deleted workspace.
+    pub fn delete_workspace(&self, id: String) {
+        self.send(Job::DeleteWorkspace(id));
     }
 
     /// Empty the store (session discard).
@@ -359,6 +368,10 @@ fn run(
                 store.delete_documents(ids);
                 true
             }
+            Job::DeleteWorkspace(id) => {
+                store.delete_workspace(id);
+                true
+            }
             Job::Clear => {
                 store.clear();
                 true
@@ -393,7 +406,12 @@ fn run(
     fn mutates(job: &Job) -> bool {
         matches!(
             job,
-            Job::Doc(_) | Job::Delete(_) | Job::Clear | Job::Retention(_) | Job::Finalize { .. }
+            Job::Doc(_)
+                | Job::Delete(_)
+                | Job::DeleteWorkspace(_)
+                | Job::Clear
+                | Job::Retention(_)
+                | Job::Finalize { .. }
         )
     }
 
@@ -406,6 +424,7 @@ fn run(
                 | Job::Meta(_)
                 | Job::Session { .. }
                 | Job::Delete(_)
+                | Job::DeleteWorkspace(_)
                 | Job::Clear
                 | Job::Retention(_)
                 | Job::Finalize { .. }
@@ -476,6 +495,8 @@ fn run(
             parked.retain(|p| !matches!(p, Job::Doc(prev) if prev.id == id));
         } else if let Job::Delete(ids) = &job {
             parked.retain(|p| !matches!(p, Job::Doc(prev) if ids.contains(&prev.id)));
+        } else if let Job::DeleteWorkspace(id) = &job {
+            parked.retain(|p| !matches!(p, Job::Doc(prev) if prev.workspace_id == *id));
         } else if matches!(
             job,
             Job::Clear | Job::Retention(crate::config::DbRetention::Never)

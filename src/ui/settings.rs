@@ -15,14 +15,13 @@ use crate::i18n::Language;
 use crate::ui::icons::Icon;
 use crate::ui::{theme, widgets};
 
-/// Which settings page the sidebar shows.
+/// Which settings page the sidebar shows. The naming mask lives in the
+/// workspace dialog now — it is per-workspace, not a global setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsPage {
     /// Language, appearance and session-database retention.
     #[default]
     General,
-    /// The saved-file filename template and its editable presets.
-    Filename,
     /// OS-wide shortcuts (Open PixMe, region capture).
     Hotkeys,
     /// App identity, version, data/log folder locations, diagnostics.
@@ -102,7 +101,6 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| match page {
                     SettingsPage::General => general_page(ui, draft),
-                    SettingsPage::Filename => filename_page(ui, draft),
                     SettingsPage::Hotkeys => hotkeys_page(ui, draft, shared),
                     SettingsPage::About => about_page(ui),
                 },
@@ -115,17 +113,12 @@ pub fn show(ui: &mut egui::Ui, shared: &Shared) {
     // above is consumed first, so the row never moves between pages.
     ui.add_space((ui.available_height() - 28.0).max(0.0));
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        // An empty template could never produce a file name — OK stays
-        // greyed until the field is usable again.
-        let template_ok = lock(&shared.settings_draft)
-            .as_ref()
-            .is_some_and(|d| !d.filename_template.trim().is_empty());
         // A hotkey recording or a pending confirmation press must
         // resolve first — applying mid-verification would arm a combo
         // that may be silently swallowed by another app, and
         // mid-recording would persist while the armed set is
         // suspended.
-        let ready = template_ok && !hotkey_pending(ui.ctx());
+        let ready = !hotkey_pending(ui.ctx());
         // right_to_left draws rightmost-first: OK first → visual order
         // [Annuler][OK], the primary rightmost like every other dialog.
         ui.add_enabled_ui(ready, |ui| {
@@ -149,7 +142,6 @@ fn sidebar(ui: &mut egui::Ui, page: &mut SettingsPage) {
         ui.spacing_mut().item_spacing.y = 4.0;
         for (value, key) in [
             (SettingsPage::General, "settings.page.general"),
-            (SettingsPage::Filename, "settings.page.filename"),
             (SettingsPage::Hotkeys, "settings.page.hotkeys"),
             (SettingsPage::About, "settings.page.about"),
         ] {
@@ -199,78 +191,6 @@ fn general_page(ui: &mut egui::Ui, draft: &mut Settings) {
                 crate::logging::set_diagnostic(on);
             }
         });
-    });
-}
-
-/// File-name page: editable template, preset dropdown plus +/− to edit
-/// the preset list itself, the placeholder legend and a live example.
-fn filename_page(ui: &mut egui::Ui, draft: &mut Settings) {
-    let t = theme::tokens(ui.ctx());
-    ui.vertical(|ui| {
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(t!("settings.filename.label").to_string());
-            let editor = egui::TextEdit::singleline(&mut draft.filename_template)
-                .desired_width(220.0)
-                .font(egui::TextStyle::Monospace);
-            // Filename-hostile chars would break the save itself —
-            // strip whatever slips through typing or paste.
-            if ui.add(editor).changed() {
-                draft
-                    .filename_template
-                    .retain(|c| !crate::config::filename::is_forbidden_filename_char(c));
-            }
-            let presets_btn = widgets::dropdown_button(ui, "");
-            egui::Popup::menu(&presets_btn).show(|ui| {
-                for preset in &draft.filename_templates {
-                    if ui.button(egui::RichText::new(preset).monospace()).clicked() {
-                        draft.filename_template = preset.clone();
-                        ui.close();
-                    }
-                }
-            });
-            // Editable preset list without a third window: + stores the
-            // field's content, − removes the preset matching it.
-            if widgets::icon_button(ui, Icon::Plus, false)
-                .on_hover_text(t!("settings.filename.add").to_string())
-                .clicked()
-            {
-                let current = draft.filename_template.trim().to_owned();
-                if !current.is_empty() && !draft.filename_templates.contains(&current) {
-                    draft.filename_templates.push(current);
-                }
-            }
-            if widgets::icon_button(ui, Icon::X, false)
-                .on_hover_text(t!("settings.filename.remove").to_string())
-                .clicked()
-            {
-                draft
-                    .filename_templates
-                    .retain(|p| p != &draft.filename_template);
-            }
-        });
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(t!("settings.filename.notes").to_string())
-                .monospace()
-                .color(t.text_dim),
-        );
-        ui.add_space(8.0);
-        let example = crate::config::expand_template(
-            &draft.filename_template,
-            draft.filename_counter,
-            &chrono::Local::now(),
-        );
-        if draft.filename_template.trim().is_empty() {
-            ui.colored_label(t.danger, t!("settings.filename.empty").to_string());
-        } else {
-            // `.png` already lives in the key — appending it here too
-            // produced "… .png.png".
-            ui.colored_label(
-                t.text,
-                t!("settings.filename.example", name = example.as_str()).to_string(),
-            );
-        }
     });
 }
 
@@ -452,7 +372,9 @@ fn log_changes(old: &Settings, new: &Settings) {
         ("draw_opts", |s| {
             format!("{:?}", s.draw_opts.tools.keys().count())
         }),
-        ("filename_template", |s| s.filename_template.clone()),
+        ("filename_templates", |s| {
+            format!("{:?}", s.filename_templates)
+        }),
     ];
     for (name, f) in fields {
         let (a, b) = (f(old), f(new));
