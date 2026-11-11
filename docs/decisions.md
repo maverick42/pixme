@@ -2391,24 +2391,54 @@ Format: date — context — decision — consequences.
     filter (`visible_indices`/`tab_ws`), never a reload. Every
     push path stamps the active workspace on the document; a tab
     tagged with an id prefs no longer lists resolves to `main` so a
-    prefs reset never hides captures. Close-* menu entries, Save All
-    and tab cycling act on the visible set only — hidden workspaces'
-    captures survive a "close all" / batch save.
+    prefs reset never hides captures. Close-* menu entries, toolbar/menu
+    Save All and tab cycling act on the visible set only — hidden
+    workspaces' captures survive a "close all" / batch save. Quit-time
+    `ConfirmSave` (`db_retention = Never`) is the deliberate exception:
+    since quitting discards the entire in-memory session, it writes
+    every unsaved capture across all workspaces into each workspace's
+    own `output_dir`.
   - "Empty" = zero live tabs; closing tabs frees the workspace for
     deletion (there is no soft-delete: a closed tab's row is already
     gone, and `writer.delete_workspace` hard-purges stranded rows as
     a belt-and-braces `DELETE WHERE workspace_id`). Deletion never
     touches files or folders on disk.
-  - UI: a compact bordered chip centred in the toolbar strip's free
-    space (the tools scroll left of it) shows the active name elided;
-    left click lists/switches workspaces and offers "+ New
-    workspace…", right click manages (New / Edit / Delete — greyed on
-    `main` or non-empty — / Delete empty workspaces with a toast).
-    The create/edit dialog is an in-app `modal_frame` reusing the
-    settings window's mask editor verbatim, moved out of the
+  - UI: a compact bordered chip at the leading edge of the status
+    strip (left of the capture counter/metadata) shows the active
+    workspace's name (elided, full name on hover), sized to a fixed
+    width matching the longest workspace name (names are capped at 30
+    characters in the dialog) so switching never shifts the status bar.
+    Whenever the active workspace is not `main`, the chip wears an
+    accent pill (`accent_soft` fill, `accent_border` stroke, `accent`
+    folder icon, Inter SemiBold `accent_text` label measured in the
+    rendered font). Left click lists/switches workspaces and offers
+    "New workspace…"; right click opens the icon-prefixed management
+    menu (`Plus` New / `Pencil` Edit / `Trash` Delete — greyed on
+    `main` or non-empty — / `Broom` Delete empty workspaces with a
+    toast). The create/edit dialog is an in-app `modal_frame` reusing
+    the settings window's mask editor verbatim, moved out of the
     settings sidebar (the File name page is gone).
 - **Consequences**: purge/retention stays global across workspaces
   (test-pinned). Counters, masks and save folders are independent per
   workspace; collisions between workspaces sharing a folder keep the
   existing `unique_png` `_2`/`_3` suffixing. No keyboard shortcuts,
   no workspace colours, no moving captures between workspaces.
+
+## 2026-11-11 — macOS AppKit `terminate:` routed through `Command::Quit`
+
+- **Context**: quitting PixMe from the macOS Dock menu (or a `Cmd+Q`
+  that fell through to AppKit) invoked `-[NSApplication terminate:]`
+  directly. Because `winit` 0.30 does not implement
+  `applicationShouldTerminate:`, the process exited without dispatching
+  `Command::Quit`, bypassing the Save/Discard/Cancel confirmation when
+  `db_retention = Never`.
+- **Decision**: `platform::macos::install_ui` replaces
+  `-[NSApplication terminate:]` via `class_replaceMethod` with a
+  handler that queues `Command::Quit` and wakes the egui viewports;
+  when `Command::Quit` arms the dirty-session confirmation, it also
+  calls `bring_viewer_forward` so a minimized or backgrounded viewer
+  is de-minimized and focused.
+- **Consequences**: every quit gesture on macOS (PixMe menu, `Cmd+Q`,
+  Dock Quit) and Windows (viewer menu, tray "Close PixMe") flows
+  through the same `Command::Quit` funnel and honours the unsaved
+  confirmation.

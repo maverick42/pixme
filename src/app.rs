@@ -1667,72 +1667,137 @@ impl Shared {
         title
     }
 
-    /// Writes every unsaved tab to the last-used folder (or ~/Pictures) as
-    /// PNGs with annotations composited — the same sequential write loop as
-    /// before, just riding a worker thread so the viewer paints a progress
-    /// veil (`pump` reattaches the tabs when the job lands). Returns `true`
-    /// only when the session is clean right away; `then_confirm` marks a
-    /// ConfirmSave batch so its completion runs the saved-session close.
+    /// Writes unsaved tabs to their workspace's output folder (or
+    /// `~/Pictures`) as PNGs with annotations composited — the same
+    /// sequential write loop as before, just riding a worker thread so
+    /// the viewer paints a progress veil (`pump` reattaches the tabs
+    /// when the job lands). Toolbar/menu Save All (`then_confirm ==
+    /// false`) is scoped to the visible workspace; quit-time
+    /// `ConfirmSave` (`then_confirm == true`) covers every unsaved tab
+    /// across ALL workspaces so a hidden bucket's captures are never
+    /// silently dropped or left blocking the exit. Returns `true` only
+    /// when the target set is clean right away.
     fn save_all(&self, ctx: &egui::Context, then_confirm: bool) -> bool {
-        let Some(folder) = ({
+        let default_folder =
+            directories::UserDirs::new().and_then(|d| d.picture_dir().map(|p| p.to_path_buf()));
+        let (active_ws, ws_folders, main_folder) = {
             let s = lock(&self.settings);
-            s.active_workspace().output_dir.clone().or_else(|| {
-                directories::UserDirs::new().and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
-            })
-        }) else {
-            tracing::warn!("save-all: no writable folder known");
-            return false;
+            let map: std::collections::HashMap<String, Option<std::path::PathBuf>> = s
+                .workspaces
+                .iter()
+                .map(|w| (w.id.clone(), w.output_dir.clone()))
+                .collect();
+            let main = map
+                .get(crate::config::workspace::MAIN_ID)
+                .cloned()
+                .flatten();
+            (s.active_workspace().id.clone(), map, main)
         };
-        // A missing or disconnected output folder gets ONE create
-        // attempt; on failure the captures stay in memory (the session
-        // keeps them) and the user is told — they can save later.
-        if !folder.is_dir()
-            && let Err(e) = std::fs::create_dir_all(&folder)
-        {
-            tracing::warn!(folder = %folder.display(), "output folder unreachable: {e}");
-            crate::ui::widgets::toast(
-                ctx,
-                crate::ui::widgets::ToastKind::Error,
-                t!("viewer.toast.folder_unreachable").to_string(),
-            );
-            ctx.repaint_if_live(viewer_id());
+        let resolve_ws = |id: &str| -> String {
+            if ws_folders.contains_key(id) {
+                id.to_owned()
+            } else {
+                crate::config::workspace::MAIN_ID.to_owned()
+            }
+        };
+        let folder_for = |ws_id: &str| -> Option<std::path::PathBuf> {
+            ws_folders
+                .get(ws_id)
+                .cloned()
+                .flatten()
+                .or_else(|| main_folder.clone())
+                .or_else(|| default_folder.clone())
+        };
+        let ensure_folder = |folder: Option<std::path::PathBuf>| -> Option<std::path::PathBuf> {
+            let Some(folder) = folder else {
+                tracing::warn!("save-all: no writable folder known");
+                return None;
+            };
+            // A missing or disconnected output folder gets ONE create
+            // attempt; on failure the captures stay in memory (the
+            // session keeps them) and the user is told — they can save
+            // later.
+            if !folder.is_dir()
+                && let Err(e) = std::fs::create_dir_all(&folder)
+            {
+                tracing::warn!(folder = %folder.display(), "output folder unreachable: {e}");
+                crate::ui::widgets::toast(
+                    ctx,
+                    crate::ui::widgets::ToastKind::Error,
+                    t!("viewer.toast.folder_unreachable").to_string(),
+                );
+                ctx.repaint_if_live(viewer_id());
+                return None;
+            }
+            Some(folder)
+        };
+
+        // Toolbar/menu Save All always validates the active workspace's
+        // folder up-front, even when no tab needs writing.
+        if !then_confirm && ensure_folder(folder_for(&active_ws)).is_none() {
             return false;
         }
+
         let mut viewer = lock(&self.viewer);
-        // Save-all only ever touches what the user SEES — the active
-        // workspace's tabs; the other workspaces' captures stay put.
+        // Toolbar/menu Save All only touches what the user SEES (the
+        // active workspace); ConfirmSave on quit covers the whole
+        // session so hidden workspaces' unsaved captures are saved to
+        // their own output folders before the exit wipes memory.
         let visible: std::collections::HashSet<String> = viewer
             .visible_indices()
             .into_iter()
             .map(|i| viewer.tabs[i].doc.meta.id.clone())
             .collect();
-        // Duplicate titles are legal everywhere but HERE: two files can
-        // never share a name, so the batch is refused until the user
-        // renames — the viewer surfaces the blocking notice.
+        let in_scope = |t: &crate::ui::viewer::Tab| {
+            !t.saved && (then_confirm || visible.contains(&t.doc.meta.id))
+        };
+
+        // Duplicate titles inside the same workspace are refused until
+        // the user renames — the viewer surfaces the blocking notice
+        // (and switches to the offending workspace if ConfirmSave caught
+        // a clash in a hidden bucket). Cross-workspace collisions in a
+        // shared folder use `unique_png`'s `_2`/`_3` suffixing.
         let mut seen = std::collections::HashSet::new();
-        let clash = viewer
-            .tabs
-            .iter()
-            .filter(|t| !t.saved && visible.contains(&t.doc.meta.id))
-            .any(|t| !seen.insert(crate::config::filename::sanitize_filename(t.title.trim())));
-        if clash {
+        let mut clash_ws = None;
+        for t in viewer.tabs.iter().filter(|t| in_scope(t)) {
+            let ws_id = resolve_ws(&t.doc.meta.workspace_id);
+            let stem = crate::config::filename::sanitize_filename(t.title.trim());
+            if !seen.insert((ws_id.clone(), stem)) {
+                clash_ws = Some(ws_id);
+                break;
+            }
+        }
+        if let Some(ws_id) = clash_ws {
             tracing::warn!("save-all blocked: duplicate tab titles");
             viewer.dup_names = true;
+            if ws_id != active_ws {
+                viewer.set_workspace(&ws_id);
+                drop(viewer);
+                let mut s = lock(&self.settings);
+                s.active_workspace_id = ws_id;
+                s.save();
+            } else {
+                drop(viewer);
+            }
             ctx.repaint_if_live(viewer_id());
             return false;
         }
-        if viewer
-            .tabs
-            .iter()
-            .all(|t| t.saved || !visible.contains(&t.doc.meta.id))
-        {
+
+        // Resolve and validate the target folder for each unsaved tab
+        // in scope before spawning the worker.
+        let mut targets: std::collections::HashMap<String, std::path::PathBuf> =
+            std::collections::HashMap::new();
+        for t in viewer.tabs.iter().filter(|t| in_scope(t)) {
+            let ws_id = resolve_ws(&t.doc.meta.workspace_id);
+            let Some(folder) = ensure_folder(folder_for(&ws_id)) else {
+                return false;
+            };
+            targets.insert(t.doc.meta.id.clone(), folder);
+        }
+        if targets.is_empty() {
             return true;
         }
-        let total = viewer
-            .tabs
-            .iter()
-            .filter(|t| !t.saved && visible.contains(&t.doc.meta.id))
-            .count();
+        let total = targets.len();
         // The confirm modal must not linger above the progress veil;
         // `confirm_then_quit` survives for the completion step.
         viewer.confirm_close = false;
@@ -1750,12 +1815,12 @@ impl Shared {
         std::thread::spawn(move || {
             let mut tabs = tabs;
             let mut saved_paths = Vec::new();
-            for tab in tabs
-                .iter_mut()
-                .filter(|t| !t.saved && visible.contains(&t.doc.meta.id))
-            {
+            for tab in &mut tabs {
+                let Some(folder) = targets.get(&tab.doc.meta.id) else {
+                    continue;
+                };
                 let stem = crate::config::filename::sanitize_filename(tab.title.trim());
-                let path = unique_png(&folder, &stem);
+                let path = unique_png(folder, &stem);
                 let mut capture = tab.doc.base.clone();
                 capture.image =
                     std::sync::Arc::new(crate::editor::render::render_to_image(&tab.doc));
@@ -3868,18 +3933,16 @@ mod tests {
         assert!(!lock(&shared.viewer).dirty);
     }
 
-    /// Scratch reproduction of the real capture path: retention `Never`
-    /// + a real pushed capture + Quit must show the confirmation.
+    /// With retention set to `Never`, a fresh capture marks the session
+    /// dirty and `Command::Quit` arms the Save/Discard/Cancel modal.
     #[test]
-    fn repro_quit_never_dirty_capture_shows_confirmation() {
+    fn quit_with_never_retention_and_fresh_capture_shows_confirmation() {
         let (shared, ctx) = harness();
         lock(&shared.settings).db_retention = crate::config::DbRetention::Never;
         {
             let mut viewer = lock(&shared.viewer);
             viewer.push_capture_document(
-                crate::editor::Document::new(crate::app::tests::synthetic_capture(
-                    image::RgbaImage::new(4, 4),
-                )),
+                Document::new(synthetic_capture(image::RgbaImage::new(4, 4))),
                 "shot".to_owned(),
             );
             assert!(viewer.dirty, "fresh capture must be dirty");
@@ -3890,6 +3953,82 @@ mod tests {
             lock(&shared.viewer).confirm_close,
             "confirmation must be armed for a dirty Never-retention session"
         );
+    }
+
+    /// `ConfirmSave` on quit must save unsaved captures across ALL
+    /// workspaces (each to its own `output_dir`), even when the active
+    /// workspace is empty — unlike toolbar Save All, which only writes
+    /// the visible workspace.
+    #[test]
+    fn confirm_save_on_quit_saves_unsaved_captures_across_all_workspaces() {
+        let (shared, ctx) = harness();
+        let base = std::env::temp_dir().join(format!(
+            "pixme-confirm-save-ws-{}",
+            crate::editor::meta::new_id()
+        ));
+        let dir_main = base.join("main");
+        let dir_bee = base.join("bee");
+        let dir_empty = base.join("empty");
+        std::fs::create_dir_all(&dir_main).unwrap();
+        std::fs::create_dir_all(&dir_bee).unwrap();
+        std::fs::create_dir_all(&dir_empty).unwrap();
+
+        let (bee_id, empty_id) = {
+            let mut s = lock(&shared.settings);
+            s.db_retention = crate::config::DbRetention::Never;
+            s.active_workspace_mut().output_dir = Some(dir_main.clone());
+
+            let mut bee = crate::config::workspace::Workspace::new("Bee".to_owned());
+            bee.output_dir = Some(dir_bee.clone());
+            let bee_id = bee.id.clone();
+            s.workspaces.push(bee);
+
+            let mut empty = crate::config::workspace::Workspace::new("Empty".to_owned());
+            empty.output_dir = Some(dir_empty.clone());
+            let empty_id = empty.id.clone();
+            s.workspaces.push(empty);
+            (bee_id, empty_id)
+        };
+
+        // Push an unsaved capture in `main`.
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.sync_workspace(&lock(&shared.settings));
+            viewer.push_capture_document(
+                Document::new(synthetic_capture(image::RgbaImage::new(4, 4))),
+                "main_shot".to_owned(),
+            );
+        }
+        // Switch to `Bee` and push another unsaved capture.
+        drive(&shared, &ctx, Command::SwitchWorkspace(bee_id));
+        {
+            let mut viewer = lock(&shared.viewer);
+            viewer.sync_workspace(&lock(&shared.settings));
+            viewer.push_capture_document(
+                Document::new(synthetic_capture(image::RgbaImage::new(4, 4))),
+                "bee_shot".to_owned(),
+            );
+        }
+        // Switch to `Empty` (0 visible tabs) and quit → ConfirmSave.
+        drive(&shared, &ctx, Command::SwitchWorkspace(empty_id));
+        drive(&shared, &ctx, Command::Quit);
+        assert!(lock(&shared.viewer).confirm_close);
+        drive(&shared, &ctx, Command::ConfirmSave);
+        drain_save_all(&shared);
+
+        assert!(
+            dir_main.join("main_shot.png").exists(),
+            "main workspace capture must be saved to main's output_dir"
+        );
+        assert!(
+            dir_bee.join("bee_shot.png").exists(),
+            "bee workspace capture must be saved to bee's output_dir"
+        );
+        assert!(
+            !lock(&shared.viewer).dirty,
+            "session must be clean after ConfirmSave completes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A clean quit writes the session; reopening the viewer brings

@@ -1,4 +1,4 @@
-//! Workspace UI: the create/edit dialog shown from the toolbar chip.
+//! Workspace UI: the create/edit dialog shown from the status-strip chip.
 //!
 //! The naming-mask editor that used to live in the settings window's
 //! "File name" page moved here — a mask belongs to a workspace now.
@@ -248,9 +248,9 @@ pub fn mask_editor(ui: &mut egui::Ui, mask: &mut String, presets: &mut Vec<Strin
     }
 }
 
-/// The toolbar chip's frame — a compact bordered pill drawn in the
-/// strip's free space; the caller interacts with the returned
-/// `Response` (left-click list, right-click menu).
+/// The status-strip chip's frame — a compact bordered pill drawn at the
+/// leading edge of the status bar; the caller interacts with the
+/// returned `Response` (left-click list, right-click menu).
 pub fn chip_frame(ui: &mut egui::Ui, name: &str, text_w: f32, accented: bool) -> egui::Response {
     let t = theme::tokens(ui.ctx());
     let inner = egui::Frame::default()
