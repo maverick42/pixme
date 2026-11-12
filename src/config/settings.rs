@@ -803,8 +803,10 @@ mod tests {
     /// and `resolve_workspace` never honours an unknown id.
     #[test]
     fn unknown_workspace_falls_back_to_main() {
-        let mut s = Settings::default();
-        s.active_workspace_id = "gone".to_owned();
+        let mut s = Settings {
+            active_workspace_id: "gone".to_owned(),
+            ..Settings::default()
+        };
         assert_eq!(s.resolve_workspace("gone"), MAIN_ID);
         assert!(s.ensure_workspaces());
         assert_eq!(s.active_workspace_id, MAIN_ID);
