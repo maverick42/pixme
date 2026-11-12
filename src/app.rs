@@ -2278,6 +2278,20 @@ impl Shared {
                     }
                     ctx.repaint_if_live(viewer_id());
                 }
+                WriteEvent::MoveFailed { ids, revert_to } => {
+                    tracing::warn!(
+                        ids = ?ids,
+                        workspace = %revert_to,
+                        "workspace move rolled back"
+                    );
+                    lock(&self.viewer).revert_move(&ids, &revert_to);
+                    crate::ui::widgets::toast(
+                        ctx,
+                        crate::ui::widgets::ToastKind::Error,
+                        t!("workspace.move_failed").to_string(),
+                    );
+                    ctx.repaint_if_live(viewer_id());
+                }
             }
         }
         // Closed tabs lose their stored rows — a closed capture stays

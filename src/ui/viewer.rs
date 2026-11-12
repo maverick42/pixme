@@ -928,6 +928,115 @@ impl Viewer {
         !self.tabs.iter().any(|t| self.tab_ws(t) == id)
     }
 
+    /// The in-memory half of a workspace move: retag the captures at
+    /// `indices` and re-aim the selection at the last moved tab's next
+    /// visible neighbour (the previous one at the strip's end) — the
+    /// moved tabs just left the filtered view. Returns the moved doc
+    /// ids; the caller persists them (`move_to_workspace`).
+    fn apply_workspace_move(&mut self, indices: &[usize], ws_id: &str) -> Vec<String> {
+        // Snapshot the visible order BEFORE the filter hides the moved
+        // tabs — "next neighbour" is defined over it.
+        let vis = self.visible_indices();
+        let mut ids = Vec::with_capacity(indices.len());
+        for &i in indices {
+            if let Some(tab) = self.tabs.get_mut(i) {
+                ids.push(tab.doc.meta.id.clone());
+                tab.doc.meta.workspace_id = ws_id.to_owned();
+            }
+        }
+        if ids.is_empty() {
+            return ids;
+        }
+        // A `ws_last` entry naming a moved capture would re-select a
+        // tab its workspace no longer shows.
+        self.ws_last.retain(|_, doc_id| !ids.contains(doc_id));
+        if self.active_index().is_none() {
+            let mut positions: Vec<usize> = indices
+                .iter()
+                .filter_map(|&m| vis.iter().position(|&i| i == m))
+                .collect();
+            positions.sort_unstable();
+            let last_pos = positions.last().copied().unwrap_or(0);
+            let pick = vis
+                .iter()
+                .skip(last_pos + 1)
+                .find(|i| !indices.contains(i))
+                .or_else(|| vis[..last_pos].iter().rev().find(|i| !indices.contains(i)))
+                .copied();
+            if let Some(i) = pick {
+                self.set_active(i);
+            } else {
+                // The workspace is now empty — still re-lock every
+                // protected tab (the moved one included) and reset
+                // the view like `set_active` / `close_tabs` do.
+                for tab in &mut self.tabs {
+                    tab.unlocked = false;
+                    if tab.doc.meta.is_protected() {
+                        tab.thumb = None;
+                    }
+                }
+                self.unlock_draft.clear();
+                self.unlock_error = false;
+                self.reset_view();
+            }
+        }
+        ids
+    }
+
+    /// The tab menu's "Workspace → destination": the in-memory move
+    /// plus the write-through job (one transaction) and the
+    /// confirmation toast. A store failure reports back through
+    /// [`Viewer::revert_move`] — nothing else changes: name,
+    /// annotations, mask counters and files on disk are untouched.
+    fn move_to_workspace(
+        &mut self,
+        indices: &[usize],
+        ws_id: &str,
+        ws_name: &str,
+        shared: &Shared,
+        ctx: &egui::Context,
+    ) {
+        let from = self.ws.clone();
+        let ids = self.apply_workspace_move(indices, ws_id);
+        if ids.is_empty() {
+            return;
+        }
+        tracing::info!(ids = ?ids, from = %from, to = %ws_id, "workspace_move");
+        shared.writer.move_docs(ids, from, ws_id.to_owned());
+        let key = if indices.len() > 1 {
+            "workspace.moved_toast_multi"
+        } else {
+            "workspace.moved_toast"
+        };
+        widgets::toast(
+            ctx,
+            widgets::ToastKind::Success,
+            t!(key, name = ws_name, count = indices.len()).to_string(),
+        );
+    }
+
+    /// A move whose store write failed: put the captures back in the
+    /// workspace the database still records — they reappear in the
+    /// filtered view, selected so the rollback is visible.
+    pub fn revert_move(&mut self, ids: &[String], workspace_id: &str) {
+        let mut first = None;
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if ids.contains(&tab.doc.meta.id) {
+                tab.doc.meta.workspace_id = workspace_id.to_owned();
+                first = first.or(Some(i));
+            }
+        }
+        if self.ws == workspace_id {
+            if let Some(i) = first {
+                self.set_active(i);
+            }
+        } else if self.active_index().is_none()
+            && let Some(i) = self.visible_indices().first().copied()
+        {
+            self.set_active(i);
+        }
+    }
+
     /// Re-reads the workspace filter from `settings` — the prefs entry
     /// is the single source of truth (`SwitchWorkspace` writes it, this
     /// picks it up on the next pass; `ws_known` refreshes with it so
@@ -2810,18 +2919,24 @@ impl Viewer {
         egui::Popup::menu(&resp)
             .id(resp.id.with("switch"))
             .show(|ui| {
-                let list: Vec<(String, String)> = shared
-                    .lock_settings()
-                    .workspaces
-                    .iter()
-                    .map(|w| (w.id.clone(), w.name.clone()))
-                    .collect();
+                // `main` first then alphabetical — the SAME order the
+                // tab menu's "Workspace →" destinations list uses.
+                let list: Vec<(String, String, bool)> = {
+                    let s = shared.lock_settings();
+                    crate::config::workspace::ordered(&s.workspaces)
+                        .into_iter()
+                        .map(|w| (w.id.clone(), w.name.clone(), w.id == self.ws))
+                        .collect()
+                };
                 ui.set_min_width(160.0);
-                for (id, wname) in &list {
-                    let active = *id == self.ws;
-                    let resp = ui.selectable_label(active, wname.as_str());
-                    if resp.clicked() && !active {
-                        shared.push(Command::SwitchWorkspace(id.clone()));
+                for (id, wname, active) in &list {
+                    // The check icon marks the ACTIVE workspace — the
+                    // move submenu needs no marker (it excludes it).
+                    let resp = menu_row(ui, active.then_some(Icon::Check), wname.as_str(), true);
+                    if resp.clicked() {
+                        if !active {
+                            shared.push(Command::SwitchWorkspace(id.clone()));
+                        }
                         ui.close();
                     }
                 }
@@ -3377,6 +3492,33 @@ impl Viewer {
             }
             self.open_rename();
             ui.close();
+        }
+        // "Workspace →" re-buckets the capture: destinations are every
+        // workspace but its own (`main` first, then alphabetical — the
+        // chip switcher's order). Greyed, never hidden, when no
+        // destination exists.
+        let own_ws = self.tab_ws(&self.tabs[index]).to_owned();
+        let destinations: Vec<(String, String)> = {
+            let s = shared.lock_settings();
+            crate::config::workspace::move_destinations(&s.workspaces, &own_ws)
+                .into_iter()
+                .map(|w| (w.id.clone(), w.name.clone()))
+                .collect()
+        };
+        let mut moved = false;
+        ui.add_enabled_ui(!destinations.is_empty(), |ui| {
+            ui.menu_button(t!("viewer.tab.workspace").to_string(), |ui| {
+                for (id, wname) in &destinations {
+                    if ui.button(wname).clicked() {
+                        self.move_to_workspace(&[index], id, wname, shared, ui.ctx());
+                        moved = true;
+                        ui.close();
+                    }
+                }
+            });
+        });
+        if moved {
+            return;
         }
         ui.add_enabled_ui(has_file, |ui| {
             if item(ui, "viewer.tab.delete_file").clicked() {
@@ -4727,9 +4869,20 @@ const CYCLE_TAB_MOD: egui::Modifiers = egui::Modifiers::ALT;
 
 /// One popup-menu row: a leading Lucide icon + label, full-width hover
 /// and click — every caret-menu row carries an icon for scannability.
-fn menu_row(ui: &mut egui::Ui, icon: Icon, text: impl Into<String>, enabled: bool) -> Response {
+/// `None` keeps the icon slot empty so icon-less rows stay aligned.
+fn menu_row(
+    ui: &mut egui::Ui,
+    icon: impl Into<Option<Icon>>,
+    text: impl Into<String>,
+    enabled: bool,
+) -> Response {
     let t = theme::tokens(ui.ctx());
-    let width = ui.available_width();
+    let tint = if enabled { t.icon } else { t.text_faint };
+    let text_col = if enabled { t.text } else { t.text_faint };
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.into(), egui::FontId::proportional(12.0), text_col);
+    let width = ui.available_width().max(32.0 + galley.size().x + 12.0);
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, 24.0),
         if enabled {
@@ -4742,23 +4895,21 @@ fn menu_row(ui: &mut egui::Ui, icon: Icon, text: impl Into<String>, enabled: boo
         ui.painter()
             .rect_filled(rect, CornerRadius::same(t.radius_sm), t.hover);
     }
-    let tint = if enabled { t.icon } else { t.text_faint };
-    let text_col = if enabled { t.text } else { t.text_faint };
-    icons::paint(
-        ui,
-        Rect::from_center_size(
-            rect.left_center() + egui::vec2(14.0, 0.0),
-            egui::Vec2::splat(16.0),
-        ),
-        icon,
-        14.0,
-        tint,
-    );
-    ui.painter().text(
-        rect.left_center() + egui::vec2(32.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        text.into(),
-        egui::FontId::proportional(12.0),
+    if let Some(icon) = icon.into() {
+        icons::paint(
+            ui,
+            Rect::from_center_size(
+                rect.left_center() + egui::vec2(14.0, 0.0),
+                egui::Vec2::splat(16.0),
+            ),
+            icon,
+            14.0,
+            tint,
+        );
+    }
+    ui.painter().galley(
+        rect.left_center() + egui::vec2(32.0, -galley.size().y * 0.5),
+        galley,
         text_col,
     );
     resp
@@ -5737,5 +5888,62 @@ mod workspace_tests {
             false,
         );
         assert_eq!(v.tabs[1].doc.meta.workspace_id, "w2");
+    }
+
+    /// Moving a capture re-tags it in memory and hops the selection
+    /// to its next visible neighbour (the previous one at the strip's
+    /// end) — the name and everything else on the tab stay untouched,
+    /// and `ws_last` never points at a hidden tab afterwards.
+    #[test]
+    fn workspace_move_selects_the_next_neighbour() {
+        let mut v = Viewer::default();
+        v.ws_known.insert("w2".to_owned());
+        v.push_stub("a");
+        v.push_stub("b");
+        v.push_stub("c");
+        // A right-click selects the tab before its menu opens — the
+        // moved one is always the current capture.
+        v.set_active(1);
+        let id_b = v.tabs[1].doc.meta.id.clone();
+        v.ws_last.insert("main".to_owned(), id_b.clone());
+
+        v.apply_workspace_move(&[1], "w2");
+        assert_eq!(v.tabs[1].doc.meta.workspace_id, "w2");
+        assert_eq!(v.tabs[1].title, "b", "the move keeps the name");
+        assert_eq!(v.visible_indices(), vec![0, 2]);
+        assert_eq!(v.active_index(), Some(2), "the next neighbour wins");
+        assert!(
+            !v.ws_last.values().any(|id| id == &id_b),
+            "ws_last forgets a capture that left the workspace"
+        );
+
+        // The strip's last tab has no next — the previous one wins.
+        v.apply_workspace_move(&[2], "w2");
+        assert_eq!(v.active_index(), Some(0));
+
+        // Moving the workspace's last capture leaves it EMPTY — the
+        // normal empty state shows and "Delete" unblocks for it.
+        v.apply_workspace_move(&[0], "w2");
+        assert!(v.active_index().is_none());
+        assert!(v.workspace_empty(crate::config::workspace::MAIN_ID));
+        assert!(!v.workspace_empty("w2"));
+    }
+
+    /// A failed store write rolls the capture back into its source
+    /// workspace — it reappears in the filtered view, selected so the
+    /// rollback is visible.
+    #[test]
+    fn revert_move_restores_the_source_workspace() {
+        let mut v = Viewer::default();
+        v.ws_known.insert("w2".to_owned());
+        v.push_stub("a");
+        v.push_stub("b");
+        let id = v.tabs[0].doc.meta.id.clone();
+        v.apply_workspace_move(&[0], "w2");
+        assert_eq!(v.visible_indices(), vec![1]);
+        v.revert_move(std::slice::from_ref(&id), "main");
+        assert_eq!(v.tabs[0].doc.meta.workspace_id, "main");
+        assert_eq!(v.visible_indices(), vec![0, 1]);
+        assert_eq!(v.active_index(), Some(0));
     }
 }

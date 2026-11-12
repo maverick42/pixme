@@ -77,3 +77,76 @@ impl Workspace {
         .to_owned()
     }
 }
+
+/// The display order every workspace list shares: `main` first, then
+/// the others alphabetically (case-insensitive, id as tie-break). The
+/// status-strip switcher and the tab menu's "Workspace →" destinations
+/// both read it so the two lists never disagree.
+pub fn ordered(workspaces: &[Workspace]) -> Vec<&Workspace> {
+    let mut rest: Vec<&Workspace> = workspaces.iter().filter(|w| w.id != MAIN_ID).collect();
+    rest.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    workspaces
+        .iter()
+        .find(|w| w.id == MAIN_ID)
+        .into_iter()
+        .chain(rest)
+        .collect()
+}
+
+/// The workspaces a capture of `active` may move to — [`ordered`]
+/// minus the workspace it already belongs to. Empty when no
+/// destination exists (only `main`, or `active` is the only one):
+/// the menu entry greys out rather than hiding.
+pub fn move_destinations<'a>(workspaces: &'a [Workspace], active: &str) -> Vec<&'a Workspace> {
+    ordered(workspaces)
+        .into_iter()
+        .filter(|w| w.id != active)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ws(id: &str, name: &str) -> Workspace {
+        Workspace {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            ..Workspace::new(name.to_owned())
+        }
+    }
+
+    /// `main` leads, the rest sorts alphabetically case-insensitively.
+    #[test]
+    fn ordered_puts_main_first_then_alphabetical() {
+        let list = vec![
+            ws("b", "Zulu"),
+            ws("a", "apple"),
+            ws(MAIN_ID, "Main"),
+            ws("c", "Banana"),
+        ];
+        let ids: Vec<&str> = ordered(&list).iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, [MAIN_ID, "a", "c", "b"]);
+    }
+
+    /// The destinations drop the capture's current workspace; a store
+    /// reduced to `main` (or to the active one alone) offers none —
+    /// the caller greys the entry out.
+    #[test]
+    fn move_destinations_exclude_the_active_workspace() {
+        let list = vec![ws("b", "B"), ws("a", "A"), ws(MAIN_ID, "Main")];
+        let ids: Vec<&str> = move_destinations(&list, "a")
+            .iter()
+            .map(|w| w.id.as_str())
+            .collect();
+        assert_eq!(ids, [MAIN_ID, "b"]);
+        assert!(move_destinations(&list[..1], "b").is_empty());
+        let main_only = vec![ws(MAIN_ID, "Main")];
+        assert!(move_destinations(&main_only, MAIN_ID).is_empty());
+    }
+}

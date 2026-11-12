@@ -264,6 +264,25 @@ impl Store {
         }
     }
 
+    /// Reassigns documents to another workspace — ONE transaction, so
+    /// a batch move never lands half-way. A missing row updates
+    /// nothing without failing: a document queued but not inserted yet
+    /// carries its new workspace in its own `DocWrite`.
+    pub fn move_documents(&mut self, ids: &[String], workspace_id: &str) -> anyhow::Result<()> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(());
+        };
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE documents SET workspace_id=?1 WHERE doc_id=?2")?;
+            for id in ids {
+                stmt.execute(params![workspace_id, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Hard-purges every row of a deleted workspace — a safety net:
     /// its tabs' rows are already gone through `delete_documents` (the
     /// viewer only deletes EMPTY workspaces), this covers rows stranded
@@ -398,8 +417,8 @@ impl Store {
                 let n = conn.execute(
                     "UPDATE documents SET
                         ord=?2, title=?3, saved=?4, saved_at=?5,
-                        source_path=?6, password_hash=?7,
-                        next_id=?8, annotations=?9, anno_undo=?10, anno_redo=?11
+                        source_path=?6, password_hash=?7, workspace_id=?8,
+                        next_id=?9, annotations=?10, anno_undo=?11, anno_redo=?12
                      WHERE doc_id=?1",
                     params![
                         w.id,
@@ -409,6 +428,7 @@ impl Store {
                         saved_at,
                         source_path,
                         w.password_hash,
+                        w.workspace_id,
                         w.next_id as i64,
                         annotations,
                         anno_undo,
@@ -715,14 +735,14 @@ fn save_inner(
         let mut meta_only = tx.prepare(
             "UPDATE documents SET
                 ord=?2, title=?3, saved=?4, saved_at=?5,
-                source_path=?6, password_hash=?7
+                source_path=?6, password_hash=?7, workspace_id=?8
              WHERE doc_id=?1",
         )?;
         let mut anno_only = tx.prepare(
             "UPDATE documents SET
                 ord=?2, title=?3, saved=?4, saved_at=?5,
-                source_path=?6, password_hash=?7,
-                next_id=?8, annotations=?9, anno_undo=?10, anno_redo=?11
+                source_path=?6, password_hash=?7, workspace_id=?8,
+                next_id=?9, annotations=?10, anno_undo=?11, anno_redo=?12
              WHERE doc_id=?1",
         )?;
         let mut full = tx.prepare(
@@ -751,6 +771,7 @@ fn save_inner(
                     saved_at,
                     source_path,
                     doc.meta.password_hash,
+                    doc.meta.workspace_id,
                 ])?;
                 if n > 0 {
                     continue;
@@ -764,6 +785,7 @@ fn save_inner(
                     saved_at,
                     source_path,
                     doc.meta.password_hash,
+                    doc.meta.workspace_id,
                     doc.next_id() as i64,
                     postcard::to_allocvec(&doc.annotations)?,
                     postcard::to_allocvec(&tab.anno_undo)?,
@@ -1417,6 +1439,40 @@ mod tests {
         let session = store.load_session();
         assert_eq!(session.tabs[0].doc.meta.workspace_id, "ws-a");
         assert_eq!(session.tabs[1].doc.meta.workspace_id, "ws-b");
+    }
+
+    /// A move re-tags the row's workspace in place — title, pixels
+    /// and annotations stay untouched, and a document queued but not
+    /// inserted yet is skipped rather than failing the transaction.
+    #[test]
+    fn move_documents_retags_only_the_workspace() {
+        let mut store = Store::open_in_memory();
+        let mut viewer = Viewer::default();
+        let a = push_tab(&mut viewer, "a", 4, [0, 0, 0, 255]);
+        let b = push_tab(&mut viewer, "b", 4, [0, 0, 0, 255]);
+        viewer.tabs[b].doc.annotations.push(rect_anno(1));
+        save(&mut store, &viewer);
+        store
+            .move_documents(
+                &[
+                    viewer.tabs[a].doc.meta.id.clone(),
+                    viewer.tabs[b].doc.meta.id.clone(),
+                ],
+                "ws-b",
+            )
+            .expect("move both");
+        let session = store.load_session();
+        assert_eq!(session.tabs[0].doc.meta.workspace_id, "ws-b");
+        assert_eq!(session.tabs[0].title, "a", "the name survives");
+        assert_eq!(session.tabs[1].doc.meta.workspace_id, "ws-b");
+        assert_eq!(
+            session.tabs[1].doc.annotations.len(),
+            1,
+            "the annotations survive"
+        );
+        store
+            .move_documents(&["ghost".to_owned()], "ws-b")
+            .expect("missing rows update nothing");
     }
 
     /// Deleting a workspace hard-purges ITS rows only — `main` keeps

@@ -2471,3 +2471,31 @@ Format: date — context — decision — consequences.
   Dock Quit) and Windows (viewer menu, tray "Close PixMe") flows
   through the same `Command::Quit` funnel and honours the unsaved
   confirmation.
+
+## 2026-11-12 — Moving captures between workspaces
+
+- **Context**: follow-up to the workspaces feature — captures could be
+  bucketed at creation time but never re-assigned afterwards.
+- **Decision**: the capture context menu (tab strip AND mosaic — they
+  already share `Viewer::tab_menu`) grows a "Workspace →" submenu right
+  under "Rename", listing every workspace but the capture's own,
+  `main` first then alphabetical (the new shared
+  `config::workspace::ordered` helper also drives the status-strip
+  switcher, which now marks the active workspace with a check icon).
+  A move updates `doc.meta.workspace_id` in memory and enqueues a
+  dedicated `Job::Move` on the store thread — ONE transaction via
+  `Store::move_documents` — rather than riding the meta-drift path
+  (`MetaRow` deliberately stays workspace-less so a parked meta job
+  can never resurrect a stale bucket; a parked `Doc` snapshot gets
+  its `workspace_id` re-tagged in place). On failure the job is
+  dropped, not parked, and `WriteEvent::MoveFailed` makes the UI roll
+  the capture back into its source workspace behind a localized error
+  toast — a late flush success could contradict what the user sees.
+  Files on disk, names, annotations and mask counters are untouched:
+  a re-save still overwrites `source_path` in place, while Save All
+  already resolves each tab's own workspace folder/format.
+- **Consequences**: the store layer gains a third per-workspace verb
+  (`Move`) with explicit revert semantics; the single-selection
+  viewer applies it to one capture but the job is batch-shaped if a
+  multi-selection ever lands. No undo, no drag-and-drop — out of
+  scope per spec.
