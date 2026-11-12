@@ -5,6 +5,7 @@
 
 pub mod filename;
 mod settings;
+pub mod workspace;
 
 pub use filename::expand_template;
 

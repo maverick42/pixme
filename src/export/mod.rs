@@ -6,9 +6,11 @@ pub mod clipboard;
 pub mod file;
 
 /// Image formats PixMe can write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ImageFormat {
     /// Lossless PNG.
+    #[default]
     Png,
     /// JPEG at 90% quality.
     Jpeg,

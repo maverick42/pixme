@@ -15,6 +15,7 @@ pub mod theme;
 pub mod viewer;
 pub mod viewport_sync;
 pub mod widgets;
+pub mod workspace;
 
 pub(crate) mod icon_data;
 

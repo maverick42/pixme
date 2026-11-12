@@ -30,6 +30,10 @@ pub struct CaptureMeta {
     /// for the password every time it becomes visible. Carried in the
     /// meta so a future database round-trip keeps the protection.
     pub password_hash: Option<String>,
+    /// The capture's workspace (a `Settings::workspaces` id). Set once
+    /// at creation — moving captures between workspaces is out of
+    /// scope; `main` is the fallback for unknown ids.
+    pub workspace_id: String,
 }
 
 impl CaptureMeta {
@@ -41,6 +45,7 @@ impl CaptureMeta {
             saved_at: None,
             source_path: None,
             password_hash: None,
+            workspace_id: crate::config::workspace::MAIN_ID.to_owned(),
         }
     }
 

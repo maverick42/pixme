@@ -31,7 +31,9 @@ use crate::ui::viewer::Tab;
 
 /// Current layout — a file carrying another version is wiped clean
 /// rather than migrated (the session is a convenience, not an archive).
-const SCHEMA_VERSION: i64 = 14;
+/// v15 is the one exception: it only adds `workspace_id`, so a v14 file
+/// is ALTERed in place and keeps every capture (they all land in `main`).
+const SCHEMA_VERSION: i64 = 15;
 
 /// Days a `.bak` recovery copy survives a rebuild — the captures it
 /// contains must not linger forever.
@@ -60,6 +62,7 @@ const DDL_TABLES: &str = "
         saved_at      TEXT,
         source_path   TEXT,
         password_hash TEXT,
+        workspace_id  TEXT    NOT NULL DEFAULT 'main',
         base_png      BLOB    NOT NULL,
         scale_factor  REAL    NOT NULL,
         monitor_json  TEXT    NOT NULL,
@@ -115,6 +118,10 @@ pub struct DocWrite {
     pub source_path: Option<PathBuf>,
     /// Protection hash (`None` = unprotected).
     pub password_hash: Option<String>,
+    /// The capture's workspace — a real SQL column (kept OUT of the
+    /// postcard blobs: adding a field there would break decoding of
+    /// pre-v15 rows).
+    pub workspace_id: String,
     /// `Some` ⇒ the base pixels changed: re-encode and replace
     /// `base_png`. `None` ⇒ keep the stored blob (annotation/meta
     /// edit — the expensive column is untouched).
@@ -257,6 +264,42 @@ impl Store {
         }
     }
 
+    /// Reassigns documents to another workspace — ONE transaction, so
+    /// a batch move never lands half-way. A missing row updates
+    /// nothing without failing: a document queued but not inserted yet
+    /// carries its new workspace in its own `DocWrite`.
+    pub fn move_documents(&mut self, ids: &[String], workspace_id: &str) -> anyhow::Result<()> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(());
+        };
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE documents SET workspace_id=?1 WHERE doc_id=?2")?;
+            for id in ids {
+                stmt.execute(params![workspace_id, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hard-purges every row of a deleted workspace — a safety net:
+    /// its tabs' rows are already gone through `delete_documents` (the
+    /// viewer only deletes EMPTY workspaces), this covers rows stranded
+    /// by a crash between the viewer close and the drain.
+    pub fn delete_workspace(&mut self, id: &str) {
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        match conn.execute("DELETE FROM documents WHERE workspace_id = ?1", params![id]) {
+            Ok(n) if n > 0 => {
+                tracing::info!(workspace = %id, removed = n, "workspace rows purged")
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(workspace = %id, "workspace purge failed: {err}"),
+        }
+    }
+
     /// Deletes the rows of documents whose tabs were closed — their
     /// records must not come back at the next launch.
     pub fn delete_documents(&mut self, ids: &[String]) {
@@ -345,9 +388,10 @@ impl Store {
                     "INSERT OR REPLACE INTO documents (
                         doc_id, ord, title, saved,
                         captured_at, captured_epoch, saved_at, source_path, password_hash,
+                        workspace_id,
                         base_png, scale_factor, monitor_json,
                         next_id, annotations, anno_undo, anno_redo
-                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     params![
                         w.id,
                         w.ord,
@@ -358,6 +402,7 @@ impl Store {
                         saved_at,
                         source_path,
                         w.password_hash,
+                        w.workspace_id,
                         ser::png_encode(image)?,
                         w.scale_factor,
                         serde_json::to_string(&w.monitor)?,
@@ -372,8 +417,8 @@ impl Store {
                 let n = conn.execute(
                     "UPDATE documents SET
                         ord=?2, title=?3, saved=?4, saved_at=?5,
-                        source_path=?6, password_hash=?7,
-                        next_id=?8, annotations=?9, anno_undo=?10, anno_redo=?11
+                        source_path=?6, password_hash=?7, workspace_id=?8,
+                        next_id=?9, annotations=?10, anno_undo=?11, anno_redo=?12
                      WHERE doc_id=?1",
                     params![
                         w.id,
@@ -383,6 +428,7 @@ impl Store {
                         saved_at,
                         source_path,
                         w.password_hash,
+                        w.workspace_id,
                         w.next_id as i64,
                         annotations,
                         anno_undo,
@@ -599,9 +645,21 @@ fn try_open(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// `true` when `table` already has a `column` — makes the v14 → v15
+/// ALTER idempotent so a re-run can never fail into the `.bak` path.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|n| n == column))
+}
+
 /// Brings `conn`'s schema to [`SCHEMA_VERSION`]: unknown versions lose
 /// their data tables and are rebuilt (the session is a convenience,
-/// not an archive).
+/// not an archive) — EXCEPT v14, which is upgraded in place: it only
+/// lacks `workspace_id`, so the column is ALTERed on (every existing
+/// capture takes the `main` default) rather than wiped.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     // Deleted payload bytes are zeroed rather than left in free pages —
     // captures may hold sensitive content.
@@ -616,12 +674,26 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         .optional()?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    if version != SCHEMA_VERSION {
-        // Unknown layout: drop the data tables (not meta itself — it is
-        // recreated by DDL above) and rebuild at the current version.
-        conn.execute_batch("DROP TABLE IF EXISTS documents; DROP TABLE IF EXISTS session;")?;
+    match version {
+        SCHEMA_VERSION => {}
+        14 => {
+            if !column_exists(conn, "documents", "workspace_id")? {
+                conn.execute_batch(
+                    "ALTER TABLE documents ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'main'",
+                )?;
+            }
+            tracing::info!("session db migrated 14 → 15 (workspace_id column)");
+        }
+        _ => {
+            // Unknown layout: drop the data tables (not meta itself — it is
+            // recreated by DDL above) and rebuild at the current version.
+            conn.execute_batch("DROP TABLE IF EXISTS documents; DROP TABLE IF EXISTS session;")?;
+        }
     }
     conn.execute_batch(DDL_TABLES)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS documents_workspace_idx ON documents (workspace_id)",
+    )?;
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -663,23 +735,24 @@ fn save_inner(
         let mut meta_only = tx.prepare(
             "UPDATE documents SET
                 ord=?2, title=?3, saved=?4, saved_at=?5,
-                source_path=?6, password_hash=?7
+                source_path=?6, password_hash=?7, workspace_id=?8
              WHERE doc_id=?1",
         )?;
         let mut anno_only = tx.prepare(
             "UPDATE documents SET
                 ord=?2, title=?3, saved=?4, saved_at=?5,
-                source_path=?6, password_hash=?7,
-                next_id=?8, annotations=?9, anno_undo=?10, anno_redo=?11
+                source_path=?6, password_hash=?7, workspace_id=?8,
+                next_id=?9, annotations=?10, anno_undo=?11, anno_redo=?12
              WHERE doc_id=?1",
         )?;
         let mut full = tx.prepare(
             "INSERT OR REPLACE INTO documents (
                 doc_id, ord, title, saved,
                 captured_at, captured_epoch, saved_at, source_path, password_hash,
+                workspace_id,
                 base_png, scale_factor, monitor_json,
                 next_id, annotations, anno_undo, anno_redo
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
         )?;
         for (ord, tab) in tabs.iter().enumerate() {
             let doc = &tab.doc;
@@ -698,6 +771,7 @@ fn save_inner(
                     saved_at,
                     source_path,
                     doc.meta.password_hash,
+                    doc.meta.workspace_id,
                 ])?;
                 if n > 0 {
                     continue;
@@ -711,6 +785,7 @@ fn save_inner(
                     saved_at,
                     source_path,
                     doc.meta.password_hash,
+                    doc.meta.workspace_id,
                     doc.next_id() as i64,
                     postcard::to_allocvec(&doc.annotations)?,
                     postcard::to_allocvec(&tab.anno_undo)?,
@@ -730,6 +805,7 @@ fn save_inner(
                 saved_at,
                 source_path,
                 doc.meta.password_hash,
+                doc.meta.workspace_id,
                 ser::png_encode(&doc.base.image)?,
                 doc.base.scale_factor,
                 serde_json::to_string(&doc.base.monitor)?,
@@ -754,6 +830,7 @@ struct RawDoc {
     saved_at: Option<String>,
     source_path: Option<String>,
     password_hash: Option<String>,
+    workspace_id: String,
     base_png: Vec<u8>,
     scale_factor: f32,
     monitor_json: String,
@@ -791,6 +868,13 @@ impl RawDoc {
             saved_at,
             source_path: self.source_path.map(PathBuf::from),
             password_hash: self.password_hash,
+            // An empty/unknown id resolves to `main` downstream — the
+            // viewer re-checks against the live workspace list anyway.
+            workspace_id: if self.workspace_id.is_empty() {
+                crate::config::workspace::MAIN_ID.to_owned()
+            } else {
+                self.workspace_id
+            },
         };
         doc.annotations = postcard::from_bytes(&self.annotations)?;
         doc.set_next_id(self.next_id);
@@ -824,7 +908,7 @@ fn load_inner(conn: &Connection) -> anyhow::Result<StoredSession> {
         .unwrap_or((0, 0));
     let mut stmt = conn.prepare(
         "SELECT doc_id, title, saved, captured_at, saved_at, source_path,
-                password_hash, base_png, scale_factor, monitor_json,
+                password_hash, workspace_id, base_png, scale_factor, monitor_json,
                 next_id, annotations, anno_undo, anno_redo
          FROM documents ORDER BY ord",
     )?;
@@ -838,13 +922,14 @@ fn load_inner(conn: &Connection) -> anyhow::Result<StoredSession> {
                 saved_at: row.get(4)?,
                 source_path: row.get(5)?,
                 password_hash: row.get(6)?,
-                base_png: row.get(7)?,
-                scale_factor: row.get(8)?,
-                monitor_json: row.get(9)?,
-                next_id: row.get::<_, i64>(10)? as u64,
-                annotations: row.get(11)?,
-                anno_undo: row.get(12)?,
-                anno_redo: row.get(13)?,
+                workspace_id: row.get(7)?,
+                base_png: row.get(8)?,
+                scale_factor: row.get(9)?,
+                monitor_json: row.get(10)?,
+                next_id: row.get::<_, i64>(11)? as u64,
+                annotations: row.get(12)?,
+                anno_undo: row.get(13)?,
+                anno_redo: row.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1297,5 +1382,135 @@ mod tests {
             [40, 50, 60, 255]
         );
         assert_eq!(back.tabs[1].title, "two-renamed");
+    }
+
+    /// v14 files keep their captures: only `workspace_id` is missing
+    /// there, so the column is ALTERed on (every row takes `main`)
+    /// instead of the file being parked as `.bak` and rebuilt empty.
+    #[test]
+    fn v14_upgrades_in_place_without_bak() {
+        let path = tmp_db();
+        {
+            let mut store = Store::open_at(path.clone());
+            let mut viewer = Viewer::default();
+            push_tab(&mut viewer, "kept", 4, [1, 2, 3, 255]);
+            save(&mut store, &viewer);
+        }
+        // Reshape the file as its v14 self: no column, no index, the
+        // declared version rolled back.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX documents_workspace_idx;
+             ALTER TABLE documents DROP COLUMN workspace_id;
+             UPDATE meta SET value = '14' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open_at(path.clone());
+        let session = store.load_session();
+        assert_eq!(session.tabs.len(), 1, "the v14 capture survives");
+        assert_eq!(session.tabs[0].title, "kept");
+        assert_eq!(
+            session.tabs[0].doc.meta.workspace_id,
+            crate::config::workspace::MAIN_ID,
+            "pre-workspaces captures belong to 'main'"
+        );
+        let bak = {
+            let mut s = path.clone().into_os_string();
+            s.push(".bak");
+            PathBuf::from(s)
+        };
+        assert!(!bak.exists(), "a v14 file is upgraded, never parked");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Workspace ids ride the document row verbatim — the SQL column,
+    /// never the postcard payloads.
+    #[test]
+    fn workspace_id_round_trips() {
+        let mut store = Store::open_in_memory();
+        let mut viewer = Viewer::default();
+        let a = push_tab(&mut viewer, "a", 4, [0, 0, 0, 255]);
+        let b = push_tab(&mut viewer, "b", 4, [0, 0, 0, 255]);
+        viewer.tabs[a].doc.meta.workspace_id = "ws-a".to_owned();
+        viewer.tabs[b].doc.meta.workspace_id = "ws-b".to_owned();
+        save(&mut store, &viewer);
+        let session = store.load_session();
+        assert_eq!(session.tabs[0].doc.meta.workspace_id, "ws-a");
+        assert_eq!(session.tabs[1].doc.meta.workspace_id, "ws-b");
+    }
+
+    /// A move re-tags the row's workspace in place — title, pixels
+    /// and annotations stay untouched, and a document queued but not
+    /// inserted yet is skipped rather than failing the transaction.
+    #[test]
+    fn move_documents_retags_only_the_workspace() {
+        let mut store = Store::open_in_memory();
+        let mut viewer = Viewer::default();
+        let a = push_tab(&mut viewer, "a", 4, [0, 0, 0, 255]);
+        let b = push_tab(&mut viewer, "b", 4, [0, 0, 0, 255]);
+        viewer.tabs[b].doc.annotations.push(rect_anno(1));
+        save(&mut store, &viewer);
+        store
+            .move_documents(
+                &[
+                    viewer.tabs[a].doc.meta.id.clone(),
+                    viewer.tabs[b].doc.meta.id.clone(),
+                ],
+                "ws-b",
+            )
+            .expect("move both");
+        let session = store.load_session();
+        assert_eq!(session.tabs[0].doc.meta.workspace_id, "ws-b");
+        assert_eq!(session.tabs[0].title, "a", "the name survives");
+        assert_eq!(session.tabs[1].doc.meta.workspace_id, "ws-b");
+        assert_eq!(
+            session.tabs[1].doc.annotations.len(),
+            1,
+            "the annotations survive"
+        );
+        store
+            .move_documents(&["ghost".to_owned()], "ws-b")
+            .expect("missing rows update nothing");
+    }
+
+    /// Deleting a workspace hard-purges ITS rows only — `main` keeps
+    /// its captures (the viewer only ever offers deletion on empty
+    /// workspaces; this is the safety net for stranded rows).
+    #[test]
+    fn delete_workspace_purges_only_its_rows() {
+        let mut store = Store::open_in_memory();
+        let mut viewer = Viewer::default();
+        push_tab(&mut viewer, "keep", 4, [0, 0, 0, 255]);
+        let gone = push_tab(&mut viewer, "gone", 4, [0, 0, 0, 255]);
+        viewer.tabs[gone].doc.meta.workspace_id = "doomed".to_owned();
+        save(&mut store, &viewer);
+        store.delete_workspace("doomed");
+        let session = store.load_session();
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.tabs[0].title, "keep");
+    }
+
+    /// Retention is GLOBAL: a `Today` prune drops old rows whatever
+    /// workspace they belong to — the new column must not scope it.
+    #[test]
+    fn retention_stays_global_across_workspaces() {
+        let mut store = Store::open_in_memory();
+        let mut viewer = Viewer::default();
+        let old_a = push_tab(&mut viewer, "old-a", 4, [0, 0, 0, 255]);
+        let old_b = push_tab(&mut viewer, "old-b", 4, [0, 0, 0, 255]);
+        let new = push_tab(&mut viewer, "new", 4, [0, 0, 0, 255]);
+        viewer.tabs[old_a].doc.meta.workspace_id = "ws-a".to_owned();
+        viewer.tabs[old_b].doc.meta.workspace_id = "ws-b".to_owned();
+        viewer.tabs[new].doc.meta.workspace_id = "ws-b".to_owned();
+        for i in [old_a, old_b] {
+            viewer.tabs[i].doc.meta.captured_at = chrono::Local::now() - chrono::Duration::days(2);
+        }
+        save(&mut store, &viewer);
+        store.apply_retention(crate::config::DbRetention::Today);
+        let session = store.load_session();
+        assert_eq!(session.tabs.len(), 1, "every workspace is pruned");
+        assert_eq!(session.tabs[0].title, "new");
     }
 }

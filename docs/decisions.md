@@ -2356,3 +2356,146 @@ Format: date — context — decision — consequences.
   `dismissed`; the launch-time strip only shows real monitors. Users
   who want a gone monitor's button back must reconnect it — the
   rename affordance on never-seen entries is gone with the row.
+
+## 2026-11-08 — Workspaces: named capture buckets, filter not reload
+
+- **Context**: every capture lived in one flat pool, with the naming
+  mask, its `#` counter and the last-used save folder all global in
+  `prefs.json`. The feature brief asked for minimal "workspaces" —
+  each with its own mask, counter and output folder — without making
+  daily use more complex.
+- **Decision**:
+  - `Workspace { id, name, name_mask, output_dir, counter }` lives in
+    `prefs.json` (`workspaces` + `active_workspace_id`); `main` is the
+    reserved, undeletable-but-editable default, seeded once from the
+    legacy global `filename_template`/`filename_counter`/`last_save_dir`
+    keys, which are `skip_serializing` now (read once, never written
+    back). The mask preset bank (`filename_templates`) stays a single
+    shared list — presets are a bank, not per-workspace state.
+    `Settings::save` writes atomically (temp file + rename).
+  - `workspace_id` is a REAL SQL column on `documents` (schema 15)
+    with an index — never a postcard field, since extending a
+    postcard struct breaks decoding of old rows. The 14 → 15 upgrade
+    is the first in-place migration: `ALTER TABLE … ADD COLUMN`
+    instead of the drop-and-rebuild every other version bump takes,
+    so existing captures keep their rows (assigned `main`) and no
+    `.bak` is produced.
+  - `last_save_dir` is gone as a concept: the workspace's `output_dir`
+    inherits its role — proposed save folder, updated to the folder
+    actually used after each successful save of one of its tabs.
+    Pin saves seed from the active workspace but update nothing (a
+    pin owns no workspace). There is no auto-save to disk and none is
+    wanted: `output_dir` seeds the save dialog and targets Save All.
+  - The viewer's `tabs` still holds the WHOLE session (persistence,
+    dirty flags, store sigs unchanged); the workspace switch is a
+    filter (`visible_indices`/`tab_ws`), never a reload. Every
+    push path stamps the active workspace on the document; a tab
+    tagged with an id prefs no longer lists resolves to `main` so a
+    prefs reset never hides captures. Close-* menu entries, toolbar/menu
+    Save All and tab cycling act on the visible set only — hidden
+    workspaces' captures survive a "close all" / batch save. Quit-time
+    `ConfirmSave` (`db_retention = Never`) is the deliberate exception:
+    since quitting discards the entire in-memory session, it writes
+    every unsaved capture across all workspaces into each workspace's
+    own `output_dir`.
+  - "Empty" = zero live tabs; closing tabs frees the workspace for
+    deletion (there is no soft-delete: a closed tab's row is already
+    gone, and `writer.delete_workspace` hard-purges stranded rows as
+    a belt-and-braces `DELETE WHERE workspace_id`). Deletion never
+    touches files or folders on disk.
+  - UI: a compact bordered chip at the leading edge of the status
+    strip (left of the capture counter/metadata) shows the active
+    workspace's name (elided, full name on hover), sized to a fixed
+    width matching the longest workspace name (names are capped at 30
+    characters in the dialog) so switching never shifts the status bar.
+    Whenever the active workspace is not `main`, the chip wears an
+    accent pill (`accent_soft` fill, `accent_border` stroke, `accent`
+    folder icon, Inter SemiBold `accent_text` label measured in the
+    rendered font). Left click lists/switches workspaces and offers
+    "New workspace…"; right click opens the icon-prefixed management
+    menu (`Plus` New / `Pencil` Edit / `Trash` Delete — greyed on
+    `main` or non-empty — / `Broom` Delete empty workspaces with a
+    toast). The create/edit dialog is an in-app `modal_frame` reusing
+    the settings window's mask editor verbatim, moved out of the
+    settings sidebar (the File name page is gone).
+- **Consequences**: purge/retention stays global across workspaces
+  (test-pinned). Counters, masks, save folders and image formats are
+  independent per workspace; collisions between workspaces sharing a
+  folder are resolved at write time by `unique_file`'s `_2`/`_3`
+  suffixing under each workspace's own extension. No keyboard
+  shortcuts, no workspace colours, no moving captures between
+  workspaces.
+
+## 2026-11-11 — Duplicate names are workspace-scoped; per-workspace save format
+
+- **Context**: title uniqueness was global — a capture named `a` in
+  `main` made a capture named `a` in another workspace look
+  "duplicated" (danger-tinted title, read as *unsaved*), even though
+  each bucket may target its own folder. Cross-workspace dup tracking
+  proved too noisy to be useful (the twin lives on a hidden tab).
+- **Decision**: a name clash is only a problem INSIDE one workspace
+  (same name + same folder = a real file collision): `title_taken` /
+  `unique_title_in` filter by the tab's workspace, the tab chip and
+  mosaic caption show an amber `files` icon (`viewer.tab.dup_name`
+  tooltip) instead of the danger title tint, and `save_all` still
+  blocks same-workspace twins behind the rename modal. Different
+  workspaces may reuse names freely — `unique_file` writes
+  `stem.ext`, `stem_2.ext`… under each workspace's `format`
+  (PNG/JPEG/WebP, chosen in the workspace dialog; the single-file
+  save dialog keeps its own format radio, seeded with it). The
+  `files` icon (Lucide) is bundled for the marker. Quit-time
+  `ConfirmSave` is exempt from the rename gate: with
+  `db_retention = Never` the session is wiped on exit, so it is a
+  save-at-all-costs path — same-workspace twins also land via the
+  `_2`/`_3` suffixing instead of trapping the user in a rename loop.
+- **Consequences**: renaming a workspace's output folder or format
+  needs no dedup bookkeeping — clashes are recomputed per frame from
+  (workspace, title) pairs only. Same-workspace duplicate tabs still
+  require a rename before an interactive Save All.
+
+## 2026-11-11 — macOS AppKit `terminate:` routed through `Command::Quit`
+
+- **Context**: quitting PixMe from the macOS Dock menu (or a `Cmd+Q`
+  that fell through to AppKit) invoked `-[NSApplication terminate:]`
+  directly. Because `winit` 0.30 does not implement
+  `applicationShouldTerminate:`, the process exited without dispatching
+  `Command::Quit`, bypassing the Save/Discard/Cancel confirmation when
+  `db_retention = Never`.
+- **Decision**: `platform::macos::install_ui` replaces
+  `-[NSApplication terminate:]` via `class_replaceMethod` with a
+  handler that queues `Command::Quit` and wakes the egui viewports;
+  when `Command::Quit` arms the dirty-session confirmation, it also
+  calls `bring_viewer_forward` so a minimized or backgrounded viewer
+  is de-minimized and focused.
+- **Consequences**: every quit gesture on macOS (PixMe menu, `Cmd+Q`,
+  Dock Quit) and Windows (viewer menu, tray "Close PixMe") flows
+  through the same `Command::Quit` funnel and honours the unsaved
+  confirmation.
+
+## 2026-11-12 — Moving captures between workspaces
+
+- **Context**: follow-up to the workspaces feature — captures could be
+  bucketed at creation time but never re-assigned afterwards.
+- **Decision**: the capture context menu (tab strip AND mosaic — they
+  already share `Viewer::tab_menu`) grows a "Workspace →" submenu right
+  under "Rename", listing every workspace but the capture's own,
+  `main` first then alphabetical (the new shared
+  `config::workspace::ordered` helper also drives the status-strip
+  switcher, which now marks the active workspace with a check icon).
+  A move updates `doc.meta.workspace_id` in memory and enqueues a
+  dedicated `Job::Move` on the store thread — ONE transaction via
+  `Store::move_documents` — rather than riding the meta-drift path
+  (`MetaRow` deliberately stays workspace-less so a parked meta job
+  can never resurrect a stale bucket; a parked `Doc` snapshot gets
+  its `workspace_id` re-tagged in place). On failure the job is
+  dropped, not parked, and `WriteEvent::MoveFailed` makes the UI roll
+  the capture back into its source workspace behind a localized error
+  toast — a late flush success could contradict what the user sees.
+  Files on disk, names, annotations and mask counters are untouched:
+  a re-save still overwrites `source_path` in place, while Save All
+  already resolves each tab's own workspace folder/format.
+- **Consequences**: the store layer gains a third per-workspace verb
+  (`Move`) with explicit revert semantics; the single-selection
+  viewer applies it to one capture but the job is batch-shaped if a
+  multi-selection ever lands. No undo, no drag-and-drop — out of
+  scope per spec.

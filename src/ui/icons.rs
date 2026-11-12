@@ -58,6 +58,10 @@ pub enum Icon {
     Download,
     /// Open an image file (viewer toolbar).
     FolderOpen,
+    /// Delete a workspace (workspace context menu).
+    Trash,
+    /// Sweep away empty workspaces (workspace context menu).
+    Broom,
     /// Save the active document (floppy).
     Save,
     /// Zoom the canvas in.
@@ -132,6 +136,8 @@ pub enum Icon {
     Smile,
     /// Session-store write failure on a tab / mosaic tile.
     TriangleAlert,
+    /// Two same-named captures in one workspace (tab / mosaic tile).
+    Files,
     /// Re-enumerate the connected monitors (status strip).
     RefreshCw,
     /// Built-in laptop display (status-strip monitor icon).

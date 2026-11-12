@@ -37,6 +37,19 @@ enum Job {
     },
     /// Delete the rows of closed tabs.
     Delete(Vec<String>),
+    /// Hard-purge every row of a deleted workspace (safety net —
+    /// viewer-side deletion only happens on EMPTY workspaces).
+    DeleteWorkspace(String),
+    /// Reassign documents to another workspace — one transaction.
+    Move {
+        /// The documents to re-tag.
+        ids: Vec<String>,
+        /// The workspace they came from — echoed back on failure so
+        /// the UI can put them where the database still has them.
+        from: String,
+        /// The destination workspace.
+        to: String,
+    },
     /// Empty the store (session discard).
     Clear,
     /// Apply the retention policy (startup + settings change).
@@ -83,6 +96,15 @@ pub enum WriteEvent {
         /// The document id.
         id: String,
     },
+    /// A workspace move failed even after the in-place retry — the
+    /// job is dropped (never parked): the UI reverts its in-memory
+    /// state, so a late success would contradict what the user sees.
+    MoveFailed {
+        /// The documents that stayed put.
+        ids: Vec<String>,
+        /// The workspace they still belong to.
+        revert_to: String,
+    },
 }
 
 /// The UI-side handle: enqueue jobs, drain events, read the row count.
@@ -98,8 +120,8 @@ pub struct Writer {
     /// `document_count` never waits behind a PNG encode.
     count: Arc<AtomicUsize>,
     /// Write jobs queued or executing — the status strip's WRITE
-    /// indicator: >0 while any Doc/Meta/Session/Delete/Clear/
-    /// Retention/Finalize job is in flight.
+    /// indicator: >0 while any Doc/Meta/Session/Delete/DeleteWorkspace/
+    /// Clear/Retention/Finalize job is in flight.
     pending_writes: Arc<AtomicUsize>,
     /// `true` while a `Load` job runs — the READ indicator.
     reading: Arc<std::sync::atomic::AtomicBool>,
@@ -152,6 +174,8 @@ impl Writer {
                 | Job::Meta(_)
                 | Job::Session { .. }
                 | Job::Delete(_)
+                | Job::DeleteWorkspace(_)
+                | Job::Move { .. }
                 | Job::Clear
                 | Job::Retention(_)
                 | Job::Finalize { .. }
@@ -181,6 +205,18 @@ impl Writer {
     /// Delete the rows of closed tabs.
     pub fn delete(&self, ids: Vec<String>) {
         self.send(Job::Delete(ids));
+    }
+
+    /// Purge every row of a deleted workspace.
+    pub fn delete_workspace(&self, id: String) {
+        self.send(Job::DeleteWorkspace(id));
+    }
+
+    /// Reassign documents to another workspace — one transaction, so
+    /// a batch move never lands half-way. `from` rides along only to
+    /// come back in [`WriteEvent::MoveFailed`].
+    pub fn move_docs(&self, ids: Vec<String>, from: String, to: String) {
+        self.send(Job::Move { ids, from, to });
     }
 
     /// Empty the store (session discard).
@@ -359,6 +395,17 @@ fn run(
                 store.delete_documents(ids);
                 true
             }
+            Job::DeleteWorkspace(id) => {
+                store.delete_workspace(id);
+                true
+            }
+            Job::Move { ids, to, .. } => match store.move_documents(ids, to) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!("workspace move failed: {err:#}");
+                    false
+                }
+            },
             Job::Clear => {
                 store.clear();
                 true
@@ -393,7 +440,13 @@ fn run(
     fn mutates(job: &Job) -> bool {
         matches!(
             job,
-            Job::Doc(_) | Job::Delete(_) | Job::Clear | Job::Retention(_) | Job::Finalize { .. }
+            Job::Doc(_)
+                | Job::Delete(_)
+                | Job::DeleteWorkspace(_)
+                | Job::Move { .. }
+                | Job::Clear
+                | Job::Retention(_)
+                | Job::Finalize { .. }
         )
     }
 
@@ -406,6 +459,8 @@ fn run(
                 | Job::Meta(_)
                 | Job::Session { .. }
                 | Job::Delete(_)
+                | Job::DeleteWorkspace(_)
+                | Job::Move { .. }
                 | Job::Clear
                 | Job::Retention(_)
                 | Job::Finalize { .. }
@@ -435,6 +490,16 @@ fn run(
                     emit(WriteEvent::DocFailed { id: w.id.clone() });
                 }
                 Some(Job::Doc(w))
+            }
+            Job::Move { ids, from, .. } => {
+                // Not parked: the UI reverts its captures on
+                // `MoveFailed` — a retry succeeding at flush would
+                // contradict what the user sees.
+                emit(WriteEvent::MoveFailed {
+                    ids,
+                    revert_to: from,
+                });
+                None
             }
             // Non-document jobs only get the flush retry — no UI flag.
             other => Some(other),
@@ -476,6 +541,18 @@ fn run(
             parked.retain(|p| !matches!(p, Job::Doc(prev) if prev.id == id));
         } else if let Job::Delete(ids) = &job {
             parked.retain(|p| !matches!(p, Job::Doc(prev) if ids.contains(&prev.id)));
+        } else if let Job::DeleteWorkspace(id) = &job {
+            parked.retain(|p| !matches!(p, Job::Doc(prev) if prev.workspace_id == *id));
+        } else if let Job::Move { ids, to, .. } = &job {
+            // A parked snapshot must not resurrect the pre-move
+            // workspace at the flush retry — re-tag it in place.
+            for p in &mut parked {
+                if let Job::Doc(prev) = p
+                    && ids.contains(&prev.id)
+                {
+                    prev.workspace_id = to.clone();
+                }
+            }
         } else if matches!(
             job,
             Job::Clear | Job::Retention(crate::config::DbRetention::Never)
@@ -571,6 +648,45 @@ mod tests {
         writer.delete(vec![viewer.tabs[0].doc.meta.id.clone()]);
         writer.flush().recv().expect("flush reply");
         assert_eq!(writer.document_count(), 1);
+    }
+
+    /// A move lands as one transaction — the rows come back re-tagged.
+    #[test]
+    fn move_retags_documents() {
+        let writer = Writer::spawn(Store::open_in_memory(), None);
+        let viewer = viewer_with(2);
+        for (ord, tab) in viewer.tabs.iter().enumerate() {
+            writer.write_doc(tab.to_doc_write(ord));
+        }
+        let ids: Vec<String> = viewer.tabs.iter().map(|t| t.doc.meta.id.clone()).collect();
+        writer.move_docs(ids, "main".to_owned(), "ws-2".to_owned());
+        writer.flush().recv().expect("flush reply");
+        let session = writer.load().recv().expect("load reply");
+        assert!(
+            session
+                .tabs
+                .iter()
+                .all(|t| t.doc.meta.workspace_id == "ws-2")
+        );
+    }
+
+    /// A move queued BEFORE a document's first insert updates nothing
+    /// — the later `Doc` job still writes the row, carrying the
+    /// workspace the viewer had already moved it to.
+    #[test]
+    fn move_before_first_insert_stays_consistent() {
+        let writer = Writer::spawn(Store::open_in_memory(), None);
+        let mut viewer = viewer_with(1);
+        let id = viewer.tabs[0].doc.meta.id.clone();
+        writer.move_docs(vec![id], "main".to_owned(), "ws-2".to_owned());
+        // The viewer-side move already happened when the Doc snapshot
+        // is taken — like the real flow (`DocWrite` carries `ws-2`).
+        viewer.tabs[0].doc.meta.workspace_id = "ws-2".to_owned();
+        writer.write_doc(viewer.tabs[0].to_doc_write(0));
+        writer.flush().recv().expect("flush reply");
+        let session = writer.load().recv().expect("load reply");
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.tabs[0].doc.meta.workspace_id, "ws-2");
     }
 
     /// `Load` returns the stored session over the reply channel — the

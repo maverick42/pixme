@@ -128,9 +128,59 @@ fn item(
     labels.items.push((item, key, id.to_owned()));
 }
 
+/// The egui context the [`pixme_terminate`] handler wakes after queuing
+/// the quit command — set once from [`install_ui`].
+static TERMINATE_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+/// Replaces `-[NSApplication terminate:]` — the AppKit quit entry the
+/// Dock's "Quit" (and any Cmd+Q the muda item does not claim) sends,
+/// which never reaches the egui command funnel. Routing it into
+/// `Command::Quit` gives the OS quit gestures the same dirty-session
+/// confirmation as the PixMe menu's Quitter item. The original
+/// implementation is deliberately never called back: every quit is
+/// handled by the app funnel, which closes via eframe's own root-close
+/// path (`ViewportCommand::Close`), not AppKit termination.
+unsafe extern "C" fn pixme_terminate(_this: *mut std::ffi::c_void, _cmd: *mut std::ffi::c_void) {
+    super::queue_menu_command(crate::app::Command::Quit);
+    if let Some(ctx) = TERMINATE_CTX.get() {
+        crate::app::wake_viewports(ctx);
+    }
+}
+
+/// Installs the `terminate:` interception. Runs on the main thread from
+/// [`install_ui`]; the swizzle is applied once per process.
+fn install_terminate_intercept(ctx: &egui::Context) {
+    let _ = TERMINATE_CTX.set(ctx.clone());
+    unsafe {
+        unsafe extern "C" {
+            fn objc_getClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+            fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+            fn class_replaceMethod(
+                cls: *mut std::ffi::c_void,
+                sel: *mut std::ffi::c_void,
+                imp: *mut std::ffi::c_void,
+                types: *const std::ffi::c_char,
+            ) -> *mut std::ffi::c_void;
+        }
+        let cls = objc_getClass(c"NSApplication".as_ptr());
+        if cls.is_null() {
+            tracing::warn!("cannot intercept terminate: NSApplication unavailable");
+            return;
+        }
+        let sel = sel_registerName(c"terminate:".as_ptr());
+        let imp = pixme_terminate as *const () as *mut std::ffi::c_void;
+        if class_replaceMethod(cls, sel, imp, c"v@:".as_ptr()).is_null() {
+            tracing::warn!("cannot intercept AppKit terminate: class_replaceMethod failed");
+        } else {
+            tracing::debug!("AppKit terminate: routed through the command funnel");
+        }
+    }
+}
+
 /// Installs the status item, the application menus and the menu-event
 /// handler forwarding clicks as [`crate::app::Command`]s.
 pub fn install_ui(ctx: &egui::Context) {
+    install_terminate_intercept(ctx);
     let repaint_ctx = ctx.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if let Some(command) = super::command_from_menu_id(event.id().0.as_str()) {
