@@ -480,6 +480,9 @@ pub struct DrawSession {
     /// remembered because `hit` reports nothing while the pointer sits
     /// over the popup itself.
     ctx_menu_id: Option<AnnotationId>,
+    /// Clone → source written by [`Self::duplicate_anno`]: undoing the
+    /// clone's `Add` re-selects its original instead of nothing.
+    dup_sources: HashMap<AnnotationId, AnnotationId>,
     drag: Option<Drag>,
     /// The image is bigger than the viewport — Select's empty-canvas
     /// press becomes a pan gesture (set per frame by `canvas`).
@@ -567,6 +570,7 @@ impl DrawSession {
             opts: Opts::from_settings(prefs),
             selected: None,
             ctx_menu_id: None,
+            dup_sources: HashMap::new(),
             drag: None,
             pan_ok: false,
             sel_area: None,
@@ -796,20 +800,33 @@ impl DrawSession {
     pub fn undo_once(&mut self) {
         self.commit_nudge();
         if let Some(edit) = self.undo.pop_back() {
+            // Undoing a duplicate's `Add` drops the clone — selection
+            // falls back to its source (when still in the document).
+            let dup_src = match &edit {
+                AnnoEdit::Add { anno, .. } => self.dup_sources.get(&anno.id).copied(),
+                _ => None,
+            };
             edit.revert(&mut self.doc);
             self.redo.push_back(edit);
             self.doc.revision += 1;
-            self.selected = None;
+            self.selected = dup_src.filter(|&src| self.doc.annotation(src).is_some());
         }
     }
 
     pub fn redo_once(&mut self) {
         self.commit_nudge();
         if let Some(edit) = self.redo.pop_back() {
+            // Re-select the clone when a duplicate's `Add` re-applies.
+            let restore = match &edit {
+                AnnoEdit::Add { anno, .. } if self.dup_sources.contains_key(&anno.id) => {
+                    Some(anno.id)
+                }
+                _ => None,
+            };
             edit.apply(&mut self.doc);
             self.undo.push_back(edit);
             self.doc.revision += 1;
-            self.selected = None;
+            self.selected = restore;
         }
     }
 
@@ -823,6 +840,116 @@ impl DrawSession {
             self.apply(AnnoEdit::Remove { anno, index: idx });
             self.selected = None;
         }
+    }
+
+    /// ⌘/Ctrl+D, the strip's duplicate button and the context-menu
+    /// entry — clones the currently selected object.
+    fn duplicate_selected(&mut self) {
+        if let Some(id) = self.selected {
+            self.duplicate_anno(id);
+        }
+    }
+
+    /// Clones `src` as a new topmost annotation: fresh id, offset
+    /// `DUP_OFFSET` image px down-right (per-axis flipped or clamped so
+    /// the copy stays inside the picture — an offset-less clone would
+    /// paint invisibly on top of its source), and one undoable `Add`.
+    /// A cloned Step badge takes the next counter of its mode instead
+    /// of repeating the original's number. The clone stays selected so
+    /// it can be moved right away — repeated calls staircase off the
+    /// latest copy.
+    fn duplicate_anno(&mut self, src: AnnotationId) {
+        if self.drag.is_some() {
+            return;
+        }
+        self.commit_nudge();
+        self.close_text_panel();
+        let Some(mut anno) = self.doc.annotation(src).cloned() else {
+            return;
+        };
+        let id = self.doc.alloc_id();
+        anno.id = id;
+        let (dx, dy) = dup_delta(
+            &anno.kind.bounds(),
+            self.doc.base.image.width(),
+            self.doc.base.image.height(),
+        );
+        anno.kind.translate(dx, dy);
+        if let AnnotationKind::Step(o) = &mut anno.kind {
+            let (num, letter) = next_step_counters(&self.doc);
+            let mode = o.mode;
+            o.count = match mode {
+                StepMode::Numbers => num,
+                StepMode::Letters => letter,
+            };
+            // Only the cloned badge's mode advances — the other mode's
+            // counter stays wherever the user set it.
+            self.bump_step_counter(mode, o.count + 1);
+        }
+        let index = self.doc.annotations.len();
+        self.apply(AnnoEdit::Add { anno, index });
+        self.dup_sources.insert(id, src);
+        self.selected = Some(id);
+    }
+
+    /// Raises `mode`'s step counter (live field AND the Step tool's
+    /// bank) to at least `min` — never lowering a higher value the
+    /// user set in the options row.
+    fn bump_step_counter(&mut self, mode: StepMode, min: u32) {
+        let next = min
+            .max(match mode {
+                StepMode::Numbers => self.opts.step_next_num,
+                StepMode::Letters => self.opts.step_next_let,
+            })
+            .max(match self.opts.styles.get(&Tool::Step) {
+                Some(bank) => match mode {
+                    StepMode::Numbers => bank.step_next_num,
+                    StepMode::Letters => bank.step_next_let,
+                },
+                None => 1,
+            });
+        let bank = self.opts.bank_mut(Tool::Step);
+        match mode {
+            StepMode::Numbers => bank.step_next_num = next,
+            StepMode::Letters => bank.step_next_let = next,
+        }
+        match mode {
+            StepMode::Numbers => self.opts.step_next_num = next,
+            StepMode::Letters => self.opts.step_next_let = next,
+        }
+    }
+
+    /// Switches a selected Step badge to `mode`, re-numbering it into
+    /// that mode's own sequence: number and letter counters are
+    /// autonomous, so the badge takes the target mode's next slot
+    /// instead of keeping its former count (a duplicated "2" becomes
+    /// "A", not "B"). One undoable `Replace`.
+    fn convert_step_mode(&mut self, id: AnnotationId, mode: StepMode) {
+        let Some(before) = self.doc.annotation(id).cloned() else {
+            return;
+        };
+        let AnnotationKind::Step(o) = &before.kind else {
+            return;
+        };
+        if o.mode == mode {
+            return;
+        }
+        let (num, letter) = next_step_counters(&self.doc);
+        let next = match mode {
+            StepMode::Numbers => num,
+            StepMode::Letters => letter,
+        };
+        let Some(a) = self.doc.annotation_mut(id) else {
+            return;
+        };
+        let AnnotationKind::Step(o) = &mut a.kind else {
+            return;
+        };
+        o.mode = mode;
+        o.count = next;
+        let after = a.clone();
+        self.apply(AnnoEdit::Replace { before, after });
+        self.bump_step_counter(mode, next + 1);
     }
 
     /// Moves `id` to the very top (`front`) or bottom (`back`) of the
@@ -1076,6 +1203,11 @@ impl DrawSession {
         if paste {
             self.sel_paste();
         }
+        // ⌘/Ctrl+D duplicates the selected object — `egui_winit` does
+        // not steal D like C/X/V, so a plain consumed shortcut suffices.
+        if ctx.input_mut(|i| i.consume_shortcut(&DUP_SHORTCUT)) {
+            self.duplicate_selected();
+        }
         if ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
             if self.sel_area.is_some() {
                 self.sel_delete();
@@ -1277,6 +1409,21 @@ impl DrawSession {
                             &render::render_to_image(&self.doc),
                             &self.title,
                         );
+                    }
+                    let dup_tip = format!(
+                        "{} ({})",
+                        t!("draw.duplicate"),
+                        ui.ctx().format_shortcut(&DUP_SHORTCUT)
+                    );
+                    let dup = ui
+                        .add_enabled_ui(self.selected.is_some(), |ui| {
+                            widgets::icon_button(ui, Icon::Copy, false)
+                        })
+                        .inner
+                        .on_hover_text(&dup_tip)
+                        .on_disabled_hover_text(dup_tip);
+                    if dup.clicked() {
+                        self.duplicate_selected();
                     }
                 });
         });
@@ -1669,6 +1816,16 @@ impl DrawSession {
                     }
                     if ui.button(t!("draw.ctx.back").to_string()).clicked() {
                         self.reorder(id, false);
+                        ui.close();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(t!("draw.duplicate").to_string())
+                                .shortcut_text(ui.ctx().format_shortcut(&DUP_SHORTCUT)),
+                        )
+                        .clicked()
+                    {
+                        self.duplicate_anno(id);
                         ui.close();
                     }
                     ui.separator();
@@ -3671,14 +3828,8 @@ impl DrawSession {
                         }
                         if resp.clicked() && !on {
                             self.opts.step_mode = mode;
-                            if let Some(id) = self.selected
-                                && let Some(before) = self.doc.annotation(id).cloned()
-                                && let Some(a) = self.doc.annotation_mut(id)
-                                && let AnnotationKind::Step(o) = &mut a.kind
-                            {
-                                o.mode = mode;
-                                let after = a.clone();
-                                self.apply(AnnoEdit::Replace { before, after });
+                            if let Some(id) = self.selected {
+                                self.convert_step_mode(id, mode);
                             }
                         }
                         self.chip_options_menu(&resp, shared);
@@ -5433,6 +5584,21 @@ fn enum_combo<T: Copy + PartialEq>(
     });
 }
 
+/// Parses what the user types into a Letters step counter: a single
+/// ASCII letter (either case) maps to its 1-based index — the
+/// `lower` checkbox only affects display — anything else falls back
+/// to a plain number so "3" and "C" both work.
+fn parse_step_letter(text: &str) -> Option<f64> {
+    let s = text.trim();
+    if let [c] = s.as_bytes()
+        && c.is_ascii_alphabetic()
+    {
+        Some(f64::from(c.to_ascii_uppercase() - b'A' + 1))
+    } else {
+        s.parse().ok()
+    }
+}
+
 /// Single-row option strip shared by `Tool::Step` and a selected `StepObj`.
 #[allow(clippy::too_many_arguments)]
 fn step_options_row(
@@ -5468,6 +5634,9 @@ fn step_options_row(
                         .map(|c| c.to_string())
                         .unwrap_or_default()
                 })
+                // Without a parser egui cannot turn the typed letter
+                // back into a count and snaps the field back.
+                .custom_parser(parse_step_letter)
             } else {
                 dv
             };
@@ -5552,6 +5721,39 @@ fn step_options_row(
         .checkbox(shadow_on, t!("draw.opt.shadow").to_string())
         .changed();
     changed
+}
+
+/// The ⌘/Ctrl+D shortcut shared by the hotkey handler, the strip
+/// button's tooltip and the context-menu entry.
+const DUP_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::D);
+
+/// A clone's staircase shift, image px — big enough to be obvious,
+/// small enough to stay near the source.
+const DUP_OFFSET: f32 = 24.0;
+
+/// The staircase shift for a duplicated object, image px: `+DUP_OFFSET`
+/// on each axis; when that would push `b` past `img_w`×`img_h` the axis
+/// flips to `-DUP_OFFSET`, and when neither fits (the object nearly
+/// fills the picture) the shift clamps to the furthest in-bounds move.
+/// An object already wider than the image keeps `+DUP_OFFSET` — no
+/// position can hold it fully, so the staircase simply continues.
+fn dup_delta(b: &PhysicalRect, img_w: u32, img_h: u32) -> (f32, f32) {
+    let axis = |start: i32, len: u32, extent: u32| {
+        // Delta putting the copy's start on 0 / flushing its far edge.
+        let lo = -(start as f32);
+        let hi = extent as f32 - len as f32 - start as f32;
+        if lo > hi || DUP_OFFSET <= hi {
+            DUP_OFFSET
+        } else if -DUP_OFFSET >= lo {
+            -DUP_OFFSET
+        } else if lo.abs() > hi.abs() {
+            lo
+        } else {
+            hi
+        }
+    };
+    (axis(b.x, b.width, img_w), axis(b.y, b.height, img_h))
 }
 
 /// The next step counters for `doc` — one past the highest marker in
@@ -6329,5 +6531,396 @@ mod live_drag_tests {
         // The document wins over the persisted 99s.
         assert_eq!(s.opts.step_next_num, 4);
         assert_eq!(s.opts.step_next_let, 27);
+    }
+}
+
+#[cfg(test)]
+mod dup_tests {
+    //! ⌘/Ctrl+D duplication: clone + offset (bounds flip/clamp,
+    //! staircase), step renumbering and the single-undo selection
+    //! restore.
+    use super::*;
+    use crate::capture::{Capture, MonitorInfo};
+    use crate::editor::document::{Dash, Document, RectObj};
+
+    /// An 800×600 session holding one `kind`, already selected.
+    fn session_with(kind: AnnotationKind) -> DrawSession {
+        let doc = Document::new(Capture {
+            image: std::sync::Arc::new(image::RgbaImage::from_pixel(
+                800,
+                600,
+                image::Rgba([30, 30, 30, 255]),
+            )),
+            scale_factor: 1.0,
+            monitor: MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect::default(),
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        });
+        let mut s = DrawSession::open(
+            doc,
+            0,
+            "t".to_owned(),
+            VecDeque::new(),
+            VecDeque::new(),
+            &crate::config::Settings::default(),
+        );
+        let id = s.doc.alloc_id();
+        s.doc.annotations.push(Annotation {
+            id,
+            kind,
+            tool: None,
+        });
+        s.selected = Some(id);
+        s
+    }
+
+    fn rect_kind(x: i32, y: i32, w: u32, h: u32) -> AnnotationKind {
+        AnnotationKind::Rect(RectObj {
+            rect: PhysicalRect {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+            stroke: Color32::RED,
+            stroke_w: 3.0,
+            dash: Dash::Dash,
+            fill: Some(Color32::BLUE),
+            radius: 4.0,
+            outline: 1.0,
+            outline_color: Color32::BLACK,
+            opacity: 0.8,
+            shadow: 2.0,
+        })
+    }
+
+    fn step_kind(x: f32, y: f32, count: u32) -> AnnotationKind {
+        AnnotationKind::Step(StepObj {
+            pos: pos2(x, y),
+            count,
+            mode: StepMode::Numbers,
+            style: StepStyle::Circle,
+            size: StepSize::Medium,
+            bg: Color32::RED,
+            fg: Color32::WHITE,
+            ring: 0.0,
+            ring_color: Color32::WHITE,
+            opacity: 1.0,
+            shadow: 0.0,
+            lower: false,
+        })
+    }
+
+    /// `dup_delta`: `+DUP_OFFSET` when the copy fits; per-axis flip to
+    /// `-DUP_OFFSET` near the far edge; clamped when neither fits;
+    /// wider-than-image keeps the staircase going.
+    #[test]
+    fn dup_delta_offsets_flips_and_clamps() {
+        assert_eq!(
+            dup_delta(
+                &PhysicalRect {
+                    x: 100,
+                    y: 100,
+                    width: 60,
+                    height: 40
+                },
+                800,
+                600
+            ),
+            (DUP_OFFSET, DUP_OFFSET)
+        );
+        // Near the right/bottom edge (10 px < DUP_OFFSET room left):
+        // both axes flip to -DUP_OFFSET.
+        assert_eq!(
+            dup_delta(
+                &PhysicalRect {
+                    x: 770,
+                    y: 570,
+                    width: 20,
+                    height: 20
+                },
+                800,
+                600
+            ),
+            (-DUP_OFFSET, -DUP_OFFSET)
+        );
+        // Right edge only: x flips, y keeps marching down-right.
+        assert_eq!(
+            dup_delta(
+                &PhysicalRect {
+                    x: 780,
+                    y: 100,
+                    width: 20,
+                    height: 20
+                },
+                800,
+                600
+            ),
+            (-DUP_OFFSET, DUP_OFFSET)
+        );
+        // Object nearly covering the image: no ±DUP_OFFSET fits — clamp
+        // to the furthest in-bounds shift (x = 4 ⇒ −4, y = 4 ⇒ +4).
+        assert_eq!(
+            dup_delta(
+                &PhysicalRect {
+                    x: 4,
+                    y: 4,
+                    width: 796,
+                    height: 592
+                },
+                800,
+                600
+            ),
+            (-4.0, 4.0)
+        );
+        // Wider than the image: x keeps the staircase going (+DUP_OFFSET
+        // — no position can hold it anyway); y, exactly image-height,
+        // can only stay put (0 is the sole in-bounds delta).
+        assert_eq!(
+            dup_delta(
+                &PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 900,
+                    height: 600
+                },
+                800,
+                600
+            ),
+            (DUP_OFFSET, 0.0)
+        );
+    }
+
+    /// The clone gets a fresh id, the source's full style,
+    /// `+DUP_OFFSET`/`+DUP_OFFSET` — and becomes the selection behind
+    /// ONE undo step.
+    #[test]
+    fn duplicate_clones_offsets_and_selects() {
+        let mut s = session_with(rect_kind(100, 100, 60, 40));
+        let src = s.selected.unwrap();
+        s.duplicate_selected();
+        assert_eq!(s.doc.annotations.len(), 2);
+        assert_eq!(s.undo.len(), 1, "one duplication = one undo step");
+        let id = s.selected.unwrap();
+        assert_ne!(id, src);
+        let AnnotationKind::Rect(o) = &s.doc.annotation(id).unwrap().kind else {
+            panic!("clone changed kind");
+        };
+        let off = DUP_OFFSET as i32;
+        assert_eq!((o.rect.x, o.rect.y), (100 + off, 100 + off));
+        // Style carried over verbatim.
+        assert_eq!(o.stroke, Color32::RED);
+        assert_eq!(o.fill, Some(Color32::BLUE));
+        assert_eq!(o.dash, Dash::Dash);
+        assert_eq!(o.radius, 4.0);
+        assert_eq!(o.opacity, 0.8);
+        // The source object is untouched.
+        let AnnotationKind::Rect(o) = &s.doc.annotation(src).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!((o.rect.x, o.rect.y), (100, 100));
+    }
+
+    /// Text clones keep content and styling.
+    #[test]
+    fn duplicate_text_keeps_content_and_style() {
+        let mut s = session_with(AnnotationKind::Text(TextObj {
+            a: pos2(50.0, 100.0),
+            b: pos2(200.0, 100.0),
+            ka: pos2(50.0, 100.0),
+            kb: pos2(200.0, 100.0),
+            content: "héllo ¿qué?".to_owned(),
+            font: "Inter".to_owned(),
+            color: Color32::GREEN,
+            size: 28.0,
+            bold: true,
+            italic: true,
+            align: TextAlign::Center,
+            outline: 1.5,
+            outline_color: Color32::BLACK,
+            opacity: 0.9,
+            shadow: 2.0,
+        }));
+        s.duplicate_selected();
+        let id = s.selected.unwrap();
+        let AnnotationKind::Text(o) = &s.doc.annotation(id).unwrap().kind else {
+            panic!("clone changed kind");
+        };
+        assert_eq!(o.content, "héllo ¿qué?");
+        assert_eq!(o.color, Color32::GREEN);
+        assert_eq!(o.size, 28.0);
+        assert!(o.bold && o.italic);
+        assert_eq!(o.align, TextAlign::Center);
+        // Baseline moved down-right by the offset.
+        assert_eq!((o.a.x, o.a.y), (50.0 + DUP_OFFSET, 100.0 + DUP_OFFSET));
+        assert_eq!((o.b.x, o.b.y), (200.0 + DUP_OFFSET, 100.0 + DUP_OFFSET));
+    }
+
+    /// Every duplication offsets from the LATEST copy — a staircase.
+    #[test]
+    fn duplicate_staircases_from_latest_copy() {
+        let mut s = session_with(rect_kind(100, 100, 60, 40));
+        s.duplicate_selected();
+        s.duplicate_selected();
+        assert_eq!(s.doc.annotations.len(), 3);
+        let id = s.selected.unwrap();
+        let AnnotationKind::Rect(o) = &s.doc.annotation(id).unwrap().kind else {
+            unreachable!()
+        };
+        let off = DUP_OFFSET as i32;
+        assert_eq!((o.rect.x, o.rect.y), (100 + 2 * off, 100 + 2 * off));
+    }
+
+    /// A clone at the far edge flips back inside the image.
+    #[test]
+    fn duplicate_at_edge_stays_inside() {
+        let mut s = session_with(rect_kind(770, 570, 30, 30));
+        s.duplicate_selected();
+        let id = s.selected.unwrap();
+        let b = s.doc.annotation(id).unwrap().kind.bounds();
+        assert!(b.x >= 0 && b.y >= 0);
+        assert!(b.x + b.width as i32 <= 800);
+        assert!(b.y + b.height as i32 <= 600);
+        let AnnotationKind::Rect(o) = &s.doc.annotation(id).unwrap().kind else {
+            unreachable!()
+        };
+        let off = DUP_OFFSET as i32;
+        assert_eq!((o.rect.x, o.rect.y), (770 - off, 570 - off));
+    }
+
+    /// A cloned Step takes the next number of its mode — never the
+    /// original's — and leaves the other mode's counter untouched.
+    #[test]
+    fn duplicate_step_renumbers() {
+        let mut s = session_with(step_kind(100.0, 100.0, 3));
+        s.opts.bank_mut(Tool::Step).step_next_let = 9;
+        s.opts.step_next_let = 9;
+        s.duplicate_selected();
+        let id = s.selected.unwrap();
+        let AnnotationKind::Step(o) = &s.doc.annotation(id).unwrap().kind else {
+            panic!("clone changed kind");
+        };
+        assert_eq!(o.count, 4);
+        // Position shifted, numbering advanced in bank and live fields.
+        assert_eq!((o.pos.x, o.pos.y), (100.0 + DUP_OFFSET, 100.0 + DUP_OFFSET));
+        assert_eq!(s.opts.bank_mut(Tool::Step).step_next_num, 5);
+        assert_eq!(s.opts.step_next_num, 5);
+        assert_eq!(s.opts.bank_mut(Tool::Step).step_next_let, 9);
+        assert_eq!(s.opts.step_next_let, 9);
+        // Duplicating the clone produces the next number again.
+        s.duplicate_selected();
+        let AnnotationKind::Step(o) = &s.doc.annotation(s.selected.unwrap()).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(o.count, 5);
+        assert_eq!(s.opts.step_next_num, 6);
+    }
+
+    /// Switching a Step's mode re-numbers it into the target mode's
+    /// own sequence — number and letter counters stay autonomous:
+    /// a duplicated "2" converts to "A", never "B".
+    #[test]
+    fn convert_step_mode_takes_target_sequence() {
+        let mut s = session_with(step_kind(100.0, 100.0, 1));
+        s.duplicate_selected(); // Numbers "2", still selected.
+        let id = s.selected.unwrap();
+        s.convert_step_mode(id, StepMode::Letters);
+        let AnnotationKind::Step(o) = &s.doc.annotation(id).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(o.mode, StepMode::Letters);
+        assert_eq!(o.count, 1); // "A", not "B"
+        assert_eq!(s.opts.step_next_let, 2);
+        assert_eq!(s.opts.bank_mut(Tool::Step).step_next_let, 2);
+        // The number counter keeps counting from where it was.
+        assert_eq!(s.opts.step_next_num, 3);
+        // Converting back takes the freed number slot again.
+        s.convert_step_mode(id, StepMode::Numbers);
+        let AnnotationKind::Step(o) = &s.doc.annotation(id).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(o.count, 2);
+        assert_eq!(s.opts.step_next_num, 3);
+    }
+
+    /// The Letters DragValue parser: a single letter (any case) maps
+    /// to its 1-based index; digits still parse; garbage is rejected.
+    #[test]
+    fn parse_step_letter_accepts_letters_and_digits() {
+        assert_eq!(parse_step_letter("A"), Some(1.0));
+        assert_eq!(parse_step_letter("c"), Some(3.0));
+        assert_eq!(parse_step_letter(" z "), Some(26.0));
+        assert_eq!(parse_step_letter("5"), Some(5.0));
+        assert_eq!(parse_step_letter("AB"), None);
+        assert_eq!(parse_step_letter(""), None);
+    }
+
+    /// Duplicating while the floating text panel is open commits the
+    /// panel edit first so undo order stays chronological.
+    #[test]
+    fn duplicate_flushes_open_text_panel_first() {
+        let mut s = session_with(AnnotationKind::Text(TextObj {
+            a: pos2(50.0, 100.0),
+            b: pos2(200.0, 100.0),
+            ka: pos2(50.0, 100.0),
+            kb: pos2(200.0, 100.0),
+            content: "before".to_owned(),
+            font: "Inter".to_owned(),
+            color: Color32::WHITE,
+            size: 24.0,
+            bold: false,
+            italic: false,
+            align: TextAlign::Left,
+            outline: 0.0,
+            outline_color: Color32::BLACK,
+            opacity: 1.0,
+            shadow: 0.0,
+        }));
+        let src = s.selected.unwrap();
+        s.open_text_panel(src);
+        if let AnnotationKind::Text(o) = &mut s.doc.annotation_mut(src).unwrap().kind {
+            o.content = "after".to_owned();
+        }
+        s.duplicate_selected();
+        assert!(s.text_panel.is_none());
+        assert_eq!(s.undo.len(), 2, "panel Replace then duplicate Add");
+        s.undo_once();
+        assert_eq!(s.doc.annotations.len(), 1);
+        assert_eq!(s.selected, Some(src));
+        s.undo_once();
+        let AnnotationKind::Text(o) = &s.doc.annotation(src).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(o.content, "before");
+    }
+
+    /// ⌘Z removes the clone and restores the previous selection; ⌘Y
+    /// brings the clone back selected — all behind a single edit.
+    #[test]
+    fn duplicate_undo_restores_selection() {
+        let mut s = session_with(rect_kind(100, 100, 60, 40));
+        let src = s.selected.unwrap();
+        s.duplicate_selected();
+        let copy = s.selected.unwrap();
+        s.undo_once();
+        assert_eq!(s.doc.annotations.len(), 1);
+        assert_eq!(s.selected, Some(src), "undo re-selects the source");
+        s.redo_once();
+        assert_eq!(s.doc.annotations.len(), 2);
+        assert_eq!(s.selected, Some(copy), "redo re-selects the clone");
+    }
+
+    /// With nothing selected, duplication is a no-op.
+    #[test]
+    fn duplicate_without_selection_is_noop() {
+        let mut s = session_with(rect_kind(100, 100, 60, 40));
+        s.selected = None;
+        s.duplicate_selected();
+        assert_eq!(s.doc.annotations.len(), 1);
+        assert!(s.undo.is_empty());
     }
 }
