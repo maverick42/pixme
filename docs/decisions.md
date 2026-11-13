@@ -2499,3 +2499,29 @@ Format: date — context — decision — consequences.
   viewer applies it to one capture but the job is batch-shaped if a
   multi-selection ever lands. No undo, no drag-and-drop — out of
   scope per spec.
+
+## 2026-11-12 — Duplicate annotation (Ctrl/Cmd+D)
+
+- **Context**: the draw editor needed a Duplicate action for the
+  selected annotation (hotkey, strip button, context-menu entry) —
+  single selection only.
+- **Decision**: `DrawSession::duplicate_anno` clones the annotation
+  with a fresh id, offsets it `DUP_OFFSET` (24 px — 12 read as nearly
+  invisible at 1:1) down-right in image
+  coordinates — per-axis flipped or clamped by `dup_delta` so the copy
+  stays inside the picture at any zoom — and commits ONE
+  `AnnoEdit::Add`. A cloned Step badge takes the next counter of its
+  mode via `next_step_counters` (bank + live fields reseeded like
+  `open` does). Undoing the clone restores the previous selection
+  through a session-only `dup_sources: HashMap<copy_id, source_id>`
+  consulted in `undo_once`/`redo_once` — chosen over adding a provenance
+  field to `AnnoEdit`, which is postcard-serialized into `session.db`
+  and cannot grow a field without breaking stored undo stacks. The
+  strip button reuses `Icon::Copy` (Lucide overlapping rectangles —
+  the exact duplicate glyph) inside the same `icon_button` widget,
+  greyed via `add_enabled_ui` when nothing is selected.
+- **Consequences**: duplication is a plain reversible edit — undo
+  restores the source selection, redo re-selects the clone; repeated
+  duplications staircase off the latest copy. `dup_sources` is
+  session-scoped: undoing a pre-restore duplicate after re-entering
+  the editor just clears the selection (previous behaviour).
