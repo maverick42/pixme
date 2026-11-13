@@ -922,10 +922,16 @@ impl Viewer {
             .collect()
     }
 
+    /// Live capture count of workspace `id` — `tab_ws` resolves
+    /// unknown ids to `main`, so `main`'s count absorbs orphans.
+    fn ws_count(&self, id: &str) -> usize {
+        self.tabs.iter().filter(|t| self.tab_ws(t) == id).count()
+    }
+
     /// `true` when workspace `id` has no live capture — the deletion
     /// precondition. Only `main` and non-empty workspaces refuse.
     fn workspace_empty(&self, id: &str) -> bool {
-        !self.tabs.iter().any(|t| self.tab_ws(t) == id)
+        self.ws_count(id) == 0
     }
 
     /// The in-memory half of a workspace move: retag the captures at
@@ -2928,11 +2934,46 @@ impl Viewer {
                         .map(|w| (w.id.clone(), w.name.clone(), w.id == self.ws))
                         .collect()
                 };
-                ui.set_min_width(160.0);
+                // Badges only line up when every row spans the same
+                // width — pin the popup to the widest row's own width
+                // (egui would otherwise offer the rest of the screen).
+                let measure = |ui: &egui::Ui, text: &str, count: Option<usize>| {
+                    let w = ui
+                        .painter()
+                        .layout_no_wrap(
+                            text.to_owned(),
+                            egui::FontId::proportional(12.0),
+                            Color32::WHITE,
+                        )
+                        .size()
+                        .x;
+                    menu_row_width(
+                        w,
+                        count.map_or(0.0, |c| count_badge_w(ui, &count_badge_label(c))),
+                    )
+                };
+                let uniform_w = list
+                    .iter()
+                    .map(|(id, wname, _)| measure(ui, wname, Some(self.ws_count(id))))
+                    .chain(std::iter::once(measure(
+                        ui,
+                        t!("workspace.new").as_ref(),
+                        None,
+                    )))
+                    .fold(96.0_f32, f32::max);
+                ui.set_width(uniform_w);
                 for (id, wname, active) in &list {
                     // The check icon marks the ACTIVE workspace — the
                     // move submenu needs no marker (it excludes it).
-                    let resp = menu_row(ui, active.then_some(Icon::Check), wname.as_str(), true);
+                    // The row's right edge carries a count badge pill.
+                    let resp = menu_row_count(
+                        ui,
+                        active.then_some(Icon::Check),
+                        wname.as_str(),
+                        self.ws_count(id),
+                        *active,
+                        true,
+                    );
                     if resp.clicked() {
                         if !active {
                             shared.push(Command::SwitchWorkspace(id.clone()));
@@ -2953,6 +2994,7 @@ impl Viewer {
         egui::Popup::context_menu(&resp)
             .id(resp.id.with("manage"))
             .show(|ui| {
+                ui.set_max_width(MENU_POPUP_MAX_W);
                 if menu_row(ui, Icon::Plus, t!("workspace.new").to_string(), true).clicked() {
                     let s = shared.lock_settings();
                     self.ws_dialog = Some(crate::ui::workspace::WorkspaceDialog::new_create(&s));
@@ -4856,6 +4898,7 @@ fn tool_popup(
         .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
         .show(|ui| {
             ui.set_min_width(200.0);
+            ui.set_max_width(MENU_POPUP_MAX_W);
             add(ui);
         });
 }
@@ -4867,6 +4910,50 @@ const CYCLE_TAB_MOD: egui::Modifiers = egui::Modifiers::COMMAND;
 #[cfg(target_os = "windows")]
 const CYCLE_TAB_MOD: egui::Modifiers = egui::Modifiers::ALT;
 
+/// Bound every popup hosting `menu_row`s sets on itself — egui
+/// offers the rest of the SCREEN to menu popups, so without it a
+/// menu sprawls far past its content.
+const MENU_POPUP_MAX_W: f32 = 240.0;
+
+/// How a `menu_row_count` pill paints: the ACTIVE workspace's row
+/// wears the accent, an EMPTY workspace hollows the pill out —
+/// transparent fill, faint digit — so zero stays scannable, the
+/// rest are neutral.
+#[derive(Clone, Copy)]
+enum BadgeTone {
+    Neutral,
+    Accent,
+    Ghost,
+}
+
+/// Label the count badge carries (`99+` past 99).
+fn count_badge_label(count: usize) -> String {
+    if count > 99 {
+        "99+".to_owned()
+    } else {
+        count.to_string()
+    }
+}
+
+/// Pill width the `menu_row_count` badge takes for `label` (10.5 pt
+/// text + horizontal padding, floored so one digit still reads as a
+/// pill). The switcher pre-measures its rows with this.
+fn count_badge_w(ui: &egui::Ui, label: &str) -> f32 {
+    let g = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(10.5),
+        Color32::WHITE,
+    );
+    (g.size().x + 12.0).max(18.0)
+}
+
+/// The width a `menu_row` allocates for a `text_w`-wide label and an
+/// optional `badge_w` pill: icon gutter + label + right margin + the
+/// badge with its gap.
+fn menu_row_width(text_w: f32, badge_w: f32) -> f32 {
+    32.0 + text_w + 12.0 + badge_w + if badge_w > 0.0 { 24.0 } else { 0.0 }
+}
+
 /// One popup-menu row: a leading Lucide icon + label, full-width hover
 /// and click — every caret-menu row carries an icon for scannability.
 /// `None` keeps the icon slot empty so icon-less rows stay aligned.
@@ -4876,13 +4963,60 @@ fn menu_row(
     text: impl Into<String>,
     enabled: bool,
 ) -> Response {
+    menu_row_impl(ui, icon, text, enabled, None)
+}
+
+/// `menu_row` carrying a count badge pill on its right edge — the
+/// workspace switcher shows how many captures each entry holds.
+/// `accented` tints the pill with the theme's accent (the active
+/// workspace's row).
+fn menu_row_count(
+    ui: &mut egui::Ui,
+    icon: impl Into<Option<Icon>>,
+    text: impl Into<String>,
+    count: usize,
+    accented: bool,
+    enabled: bool,
+) -> Response {
+    let label = count_badge_label(count);
+    let badge_w = count_badge_w(ui, &label);
+    let tone = if count == 0 {
+        BadgeTone::Ghost
+    } else if accented {
+        BadgeTone::Accent
+    } else {
+        BadgeTone::Neutral
+    };
+    menu_row_impl(ui, icon, text, enabled, Some((label, tone, badge_w)))
+}
+
+fn menu_row_impl(
+    ui: &mut egui::Ui,
+    icon: impl Into<Option<Icon>>,
+    text: impl Into<String>,
+    enabled: bool,
+    badge: Option<(String, BadgeTone, f32)>,
+) -> Response {
     let t = theme::tokens(ui.ctx());
     let tint = if enabled { t.icon } else { t.text_faint };
     let text_col = if enabled { t.text } else { t.text_faint };
     let galley =
         ui.painter()
             .layout_no_wrap(text.into(), egui::FontId::proportional(12.0), text_col);
-    let width = ui.available_width().max(32.0 + galley.size().x + 12.0);
+    let badge = badge.map(|(label, tone, badge_w)| {
+        (
+            ui.painter()
+                .layout_no_wrap(label, egui::FontId::proportional(10.5), t.text_dim),
+            tone,
+            badge_w,
+        )
+    });
+    let badge_w = badge.as_ref().map_or(0.0, |(_, _, w)| *w);
+    // Rows stretch to the popup's offered width so hover covers every
+    // line edge-to-edge — each popup is expected to bound itself.
+    let width = ui
+        .available_width()
+        .max(menu_row_width(galley.size().x, badge_w));
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, 24.0),
         if enabled {
@@ -4912,6 +5046,27 @@ fn menu_row(
         galley,
         text_col,
     );
+    if let Some((g, tone, badge_w)) = badge {
+        let (fill, border, tcol) = match tone {
+            BadgeTone::Accent => (t.accent_soft, t.accent_border, t.accent_text),
+            BadgeTone::Neutral => (t.field, t.field_border, t.text_dim),
+            BadgeTone::Ghost => (Color32::TRANSPARENT, t.field_border, t.text_faint),
+        };
+        let bh = 16.0;
+        let brect = Rect::from_center_size(
+            egui::pos2(rect.right() - 10.0 - badge_w * 0.5, rect.center().y),
+            egui::vec2(badge_w, bh),
+        );
+        ui.painter().rect_filled(brect, bh * 0.5, fill);
+        ui.painter().rect_stroke(
+            brect,
+            bh * 0.5,
+            Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter()
+            .galley(brect.center() - g.size() * 0.5, g, tcol);
+    }
     resp
 }
 
@@ -5179,6 +5334,23 @@ mod tests {
             "the twin in 'bee' does not clash with 'a's own workspace"
         );
         assert!(v.title_taken("bee", "a", Some(0)), "visible from 'bee'");
+    }
+
+    /// The chip's per-workspace count: `tab_ws` resolves unknown ids
+    /// to `main`, so `main`'s count absorbs orphan captures too.
+    #[test]
+    fn ws_count_includes_orphans_in_main() {
+        let mut v = Viewer::default();
+        v.push_stub("a");
+        v.push_stub("b");
+        v.push_stub("c");
+        v.ws_known.insert("bee".to_owned());
+        v.tabs[1].doc.meta.workspace_id = "bee".to_owned();
+        v.tabs[2].doc.meta.workspace_id = "gone".to_owned();
+        let main = crate::config::workspace::MAIN_ID;
+        assert_eq!(v.ws_count("bee"), 1);
+        assert_eq!(v.ws_count(main), 2);
+        assert_eq!(v.ws_count("empty"), 0);
     }
 
     #[test]
