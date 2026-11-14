@@ -5733,6 +5733,12 @@ fn color_btn(ui: &mut Ui, shared: &Shared, c: &mut Color32) -> Response {
     }
     *c = Color32::from(hsva);
     ui.ctx().data_mut(|d| d.insert_temp(id, hsva));
+    // Clicking the colour block opens the popup — and abandons any
+    // armed pick (this swatch's or another's), matching how another
+    // swatch's pipette takes over the armed state.
+    if r.clicked() {
+        arm_pick(ui.ctx(), None);
+    }
     let armed = armed_pick(ui.ctx()) == Some(id);
     if pipette_btn(ui, armed, r.rect)
         .on_hover_text(t!("draw.opt.pick").to_string())
