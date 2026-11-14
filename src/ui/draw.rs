@@ -5378,6 +5378,15 @@ pub fn show_pick_overlay(ui: &mut Ui) {
             .and_then(|(x, y)| picker::pick_patch(x, y))
             .map(|p| {
                 let c = picker::patch_centre(&p);
+                // The clipboard write cannot wait for the Draw session's
+                // drain: Draw is occluded by this overlay and its passes
+                // are throttled — the CopyPressed outcome could sit
+                // pending (or be overwritten by the next outcome) while
+                // the loupe already flashes "copié".
+                let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(&hex);
+                }
                 // The pick keeps going: publish the validated patch so
                 // the loupe repaints from exactly the sample that was
                 // applied and copied.
