@@ -2525,3 +2525,34 @@ Format: date — context — decision — consequences.
   duplications staircase off the latest copy. `dup_sources` is
   session-scoped: undoing a pre-restore duplicate after re-entering
   the editor just clears the selection (previous behaviour).
+
+## 2026-11-13 — Full-screen eyedropper via a transparent overlay
+
+- **Context**: the Pipette tool and swatch pickers needed to sample any
+  pixel on the desktop (other apps, menu bar, all monitors) while the
+  Draw window stays visible, with the validating click swallowed and
+  PixMe's own cursor/loupe kept everywhere.
+- **Decision**: interaction lives in a borderless transparent
+  always-on-top deferred viewport (`pixme.pick_overlay`) covering the
+  monitor union — raised only while a pick is armed AND the cursor
+  roams outside the Draw window (inside, the canvas pick path keeps
+  ownership). An alpha-1 veil fills the frame: fully-transparent pixels
+  are click-through on both OSes, so the veil is what actually swallows
+  the click. The overlay paints PixMe's loupe card at the cursor and
+  pushes a `PickOutcome` through ctx data (`PICK_SCREEN_RESULT`) that
+  the Draw session drains. Pixel reads never go through the overlay:
+  `platform::picker` samples the real framebuffer
+  (`CGDisplay::image_for_rect` on macOS — the capture permission path
+  already granted — `GetDC(NULL)`/`GetPixel` on Windows).
+- **Rejected**: `NSColorSampler` (macOS) + `WH_MOUSE_LL` (Windows) —
+  the sampler imposes its own round OS loupe instead of PixMe's cursor,
+  cannot be dismissed programmatically, and a nil callback cannot be
+  told apart from a lost session; the hook needs dedicated-thread
+  plumbing for something the overlay does for free. First implemented
+  then replaced after user testing.
+- **Consequences**: identical interaction on both OSes (one code path);
+  `objc2`/`objc2-app-kit`/`block2` dependencies were added then removed
+  — none shipped. macOS without Screen Recording gets a localized toast
+  pointing at System Settings (`PickOutcome::Denied`). Windows pixel
+  reads use the virtual-screen space (negative coordinates supported);
+  the overlay's rect is re-pinned to the monitor union every frame.

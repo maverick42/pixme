@@ -815,7 +815,7 @@ pub fn cursor_snapshot(scale_factor: f32) -> Option<super::CursorSnapshot> {
 /// every `CGImage` → `RgbaImage` conversion (cursor sprite, display
 /// frame). The bitmap context normalizes the source's byte order and
 /// alpha mode, so callers never have to inspect its pixel format.
-fn cg_image_to_rgba(
+pub(crate) fn cg_image_to_rgba(
     img: &core_graphics::image::CGImage,
     w: usize,
     h: usize,
@@ -1244,6 +1244,84 @@ pub fn elevate_overlay() {
                 send_void_isize(win, sel_set_level, SCREEN_SAVER_LEVEL);
                 send_void_id(win, sel_key_front, std::ptr::null_mut());
             }
+        }
+    }
+}
+
+/// Raises the pick overlay window to `kCGScreenSaverWindowLevel` (1000) —
+/// above the Dock (20), the menu bar (24) and every other surface — so
+/// the validating click lands on the veil no matter what it hovers and
+/// the loupe can draw over system chrome. `elevate_overlay` matches the
+/// capture overlay by `isOpaque`; the pick overlay is transparent, so it
+/// is found by its builder title ("PixMe Pick") instead.
+pub fn elevate_pick_overlay() {
+    use std::ffi::c_void;
+
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendUsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
+    type MsgSendIdUsize = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+    type MsgSendIsize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
+    type MsgSendVoidIsize = unsafe extern "C" fn(*mut c_void, *mut c_void, isize);
+    type MsgSendVoidId = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+
+    const FLOATING_LEVEL: isize = 3;
+    const SCREEN_SAVER_LEVEL: isize = 1000;
+    const PICK_TITLE: &[u8] = b"PixMe Pick";
+
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let send_usize: MsgSendUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_id_usize: MsgSendIdUsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_isize: MsgSendIsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_isize: MsgSendVoidIsize = std::mem::transmute(objc_msgSend as *const ());
+        let send_void_id: MsgSendVoidId = std::mem::transmute(objc_msgSend as *const ());
+
+        let cls = objc_getClass(c"NSApplication".as_ptr());
+        if cls.is_null() {
+            return;
+        }
+        let app = send_id(cls, sel_registerName(c"sharedApplication".as_ptr()));
+        if app.is_null() {
+            return;
+        }
+        let windows = send_id(app, sel_registerName(c"windows".as_ptr()));
+        if windows.is_null() {
+            return;
+        }
+        let count = send_usize(windows, sel_registerName(c"count".as_ptr()));
+        let sel_obj = sel_registerName(c"objectAtIndex:".as_ptr());
+        let sel_title = sel_registerName(c"title".as_ptr());
+        let sel_utf8 = sel_registerName(c"UTF8String".as_ptr());
+        let sel_level = sel_registerName(c"level".as_ptr());
+        let sel_set_level = sel_registerName(c"setLevel:".as_ptr());
+        // `orderFront:`, NOT `makeKeyAndOrderFront:` — the key window
+        // must stay on Draw so Esc keeps landing there (the overlay
+        // handles the presses it gets, and clicks reach it regardless
+        // of key status). Re-asserting key every frame would also steal
+        // focus back mid-pick.
+        let sel_order_front = sel_registerName(c"orderFront:".as_ptr());
+        for i in 0..count {
+            let win = send_id_usize(windows, sel_obj, i);
+            if win.is_null() || send_isize(win, sel_level) != FLOATING_LEVEL {
+                continue;
+            }
+            let title = send_id(win, sel_title);
+            if title.is_null() {
+                continue;
+            }
+            let cstr = send_id(title, sel_utf8) as *const std::ffi::c_char;
+            if cstr.is_null() || std::ffi::CStr::from_ptr(cstr).to_bytes() != PICK_TITLE {
+                continue;
+            }
+            send_void_isize(win, sel_set_level, SCREEN_SAVER_LEVEL);
+            send_void_id(win, sel_order_front, std::ptr::null_mut());
         }
     }
 }

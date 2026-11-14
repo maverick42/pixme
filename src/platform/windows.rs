@@ -1323,6 +1323,11 @@ pub fn dismiss_active_menus() -> bool {
 /// taskbar on creation).
 pub fn elevate_overlay() {}
 
+/// No-op on Windows — a topmost borderless window already covers the
+/// taskbar, there is no higher window band to chase (unlike the macOS
+/// Dock/menu-bar window levels).
+pub fn elevate_pick_overlay() {}
+
 /// No-op on Windows — there is no system chrome to hide during a
 /// capture: the taskbar is simply covered by the topmost overlay (its
 /// frozen pixels stay selectable underneath).

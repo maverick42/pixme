@@ -294,6 +294,11 @@ fn countdown_id() -> egui::ViewportId {
 fn draw_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.draw")
 }
+/// The fullscreen pick overlay — transparent, covers the virtual screen,
+/// swallows the validating click while a colour pick is armed.
+fn pick_overlay_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("pixme.pick_overlay")
+}
 
 /// Wakes every command-pumping viewport from outside a pass (OS menu
 /// callbacks, worker threads): `Context::request_repaint()` alone only
@@ -3347,6 +3352,59 @@ impl eframe::App for PixMeApp {
             });
         }
 
+        // The fullscreen pick overlay: raised while a colour pick is
+        // armed and the cursor roams outside the Draw window. It covers
+        // the virtual screen — every click lands on it, so the app
+        // underneath never sees the validating press — and its rect is
+        // re-pinned to the monitor union each frame (a plug/unplug or
+        // DPI shift mid-pick cannot leave a strip uncovered).
+        if lock(&self.shared.draw)
+            .as_ref()
+            .is_some_and(|d| d.pick_overlay_active())
+        {
+            let shared = Arc::clone(&self.shared);
+            ctx.show_viewport_deferred(
+                pick_overlay_id(),
+                pick_overlay_builder(&ctx),
+                move |ui, _class| {
+                    let ctx = ui.ctx().clone();
+                    shared.pump(&ctx);
+                    ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                    // Re-pin to the monitor union each frame (a
+                    // plug/unplug or DPI shift mid-pick cannot leave a
+                    // strip uncovered) — cached, see `cached_pick_union`.
+                    let union = cached_pick_union(&ctx);
+                    if let Some((l, t, r, b)) = union {
+                        let ppp = platform::window_ppp(&ctx, 1.0);
+                        let want = egui::Rect::from_min_max(
+                            platform::native_to_ui(egui::pos2(l as f32, t as f32), ppp),
+                            platform::native_to_ui(egui::pos2(r as f32, b as f32), ppp),
+                        );
+                        // Tolerance: float round-trips never compare equal,
+                        // so commands would be re-sent every single frame.
+                        let off = ctx
+                            .input(|i| i.viewport().outer_rect)
+                            .map(|cur| {
+                                cur.min.distance(want.min) > 0.5
+                                    || (cur.size() - want.size()).length() > 0.5
+                            })
+                            .unwrap_or(true);
+                        if off {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want.size()));
+                            // AppKit can move the top edge while resizing a
+                            // window that spans monitors. Position it last.
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want.min));
+                        }
+                    }
+                    // Above the Dock and menu bar — macOS floats
+                    // `with_always_on_top` at level 3, under system
+                    // chrome, and a click there would reach it.
+                    platform::elevate_pick_overlay();
+                    ui::draw::show_pick_overlay(ui);
+                },
+            );
+        }
+
         // The pin save-as window: a decorated modal-style panel; its state
         // owns the image so it outlives the pin it came from.
         if lock(&self.shared.save_dialog).is_some() {
@@ -3594,6 +3652,71 @@ fn overlay_builder(
         }
     };
     let _ = winit_idx;
+    builder
+}
+
+/// The fullscreen pick overlay: borderless, transparent, always on top —
+/// the whole virtual screen is its canvas so no click escapes it, and an
+/// alpha-1 veil inside keeps transparent pixels hit-testable. Raised
+/// only while a colour pick is armed and the cursor roams outside the
+/// Draw window.
+/// The monitor union, cached 1 s in ctx data — monitor enumeration is
+/// a WindowServer round-trip, too heavy to run every ROOT pass. The
+/// same key feeds the overlay's own per-frame rect correction, so both
+/// sides share one enumeration.
+fn cached_pick_union(ctx: &egui::Context) -> Option<(i32, i32, i32, i32)> {
+    ctx.data_mut(|d| {
+        let id = egui::Id::new("pick_overlay_union");
+        match d
+            .get_temp::<(std::time::Instant, (i32, i32, i32, i32))>(id)
+            .filter(|(at, _)| at.elapsed().as_millis() < 1000)
+        {
+            Some((_, u)) => Some(u),
+            None => platform::picker::screens_union_native().inspect(|u| {
+                d.insert_temp(id, (std::time::Instant::now(), *u));
+            }),
+        }
+    })
+}
+
+fn pick_overlay_builder(ctx: &egui::Context) -> egui::ViewportBuilder {
+    // Created AT the monitor union: a mid-creation 800×600 would leave
+    // screen strips uncovered (clicks escape, loupe clipped) until the
+    // per-frame correction converged — worse, every close/reopen cycle
+    // replayed that phase. Residual error is still corrected per frame.
+    let (size, pos) = cached_pick_union(ctx)
+        .map(|(l, t, r, b)| {
+            let ppp = crate::capture::screen::monitors()
+                .ok()
+                .and_then(|ms| {
+                    ms.iter()
+                        .find(|m| m.is_primary)
+                        .or(ms.first())
+                        .map(|m| m.scale_factor.max(1.0))
+                })
+                .unwrap_or(1.0);
+            (
+                platform::native_to_ui(egui::pos2((r - l) as f32, (b - t) as f32), ppp).to_vec2(),
+                platform::native_to_ui(egui::pos2(l as f32, t as f32), ppp),
+            )
+        })
+        .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
+    let builder = egui::ViewportBuilder::default()
+        .with_title("PixMe Pick")
+        .with_icon(ui::icons::app_icon_data())
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_resizable(false)
+        .with_always_on_top()
+        .with_has_shadow(false)
+        .with_taskbar(false)
+        .with_active(true)
+        .with_inner_size(size)
+        .with_position(pos);
+    #[cfg(target_os = "windows")]
+    // Hidden until `strip_undecorated_frame` shows it — winit forces
+    // WS_CAPTION at creation; `egui`'s `Visible(true)` would re-apply it.
+    let builder = builder.with_visible(false);
     builder
 }
 

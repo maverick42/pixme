@@ -547,6 +547,16 @@ pub struct DrawSession {
     /// revision frozen until the burst commits — same mechanism as
     /// object drags).
     nudge: Option<NudgeBurst>,
+    /// The full-screen pick overlay is up: a transparent always-on-top
+    /// viewport covering the virtual screen — it swallows the validating
+    /// click, draws our own cursor + loupe and reports through
+    /// [`PICK_SCREEN_RESULT`]. Raised only while the cursor roams
+    /// outside this window; inside, the canvas' own pick path owns it.
+    pick_overlay: bool,
+    /// Set when a pick ends (validated or cancelled) while the cursor is
+    /// outside so the overlay does not instantly re-arm; cleared when
+    /// the cursor re-enters the window.
+    pick_blocked: bool,
 }
 
 impl DrawSession {
@@ -592,6 +602,8 @@ impl DrawSession {
             canvas_scale: 1.0,
             emoji_texs: HashMap::new(),
             emoji_dnd: None,
+            pick_overlay: false,
+            pick_blocked: false,
             emoji_section: 0,
             region_scratch: None,
             preview_tex: None,
@@ -1072,6 +1084,7 @@ impl DrawSession {
     /// The session's frame — strip + canvas + options bar.
     pub fn show(&mut self, ui: &mut Ui, shared: &Shared) {
         self.hotkeys(ui.ctx());
+        self.sync_screen_pick(ui.ctx());
         egui::Panel::left("draw.strip")
             .resizable(false)
             .exact_size(68.0)
@@ -1085,6 +1098,170 @@ impl DrawSession {
         self.quit_dialog(ui.ctx());
         // 62 px bottom option bar + a small gap.
         widgets::paint_toasts_above(ui.ctx(), 70.0);
+    }
+
+    /// Keeps the pick overlay in step with the armed state: drains the
+    /// outcome the overlay viewport pushed into [`PICK_SCREEN_RESULT`],
+    /// and decides whether the overlay should be up — only while the
+    /// cursor roams outside this window, where the canvas' own pick path
+    /// cannot reach. Inside, that path owns clicks and no overlay shows.
+    fn sync_screen_pick(&mut self, ctx: &egui::Context) {
+        use crate::platform::picker::{self, PickOutcome};
+        // Drain first — a stale outcome must never linger and inject a
+        // colour long after the pick ended.
+        let outcome = ctx.data_mut(|d| {
+            let id = egui::Id::new(picker::PICK_SCREEN_RESULT);
+            let v = d.get_temp::<PickOutcome>(id);
+            d.remove::<PickOutcome>(id);
+            v
+        });
+        if let Some(outcome) = outcome {
+            match outcome {
+                PickOutcome::Picked(c) => self.apply_screen_pick(ctx, c),
+                PickOutcome::Cancelled => self.disarm_pick(ctx),
+                PickOutcome::Denied => {
+                    widgets::toast(
+                        ctx,
+                        widgets::ToastKind::Warning,
+                        t!("draw.pick.denied").to_string(),
+                    );
+                    self.disarm_pick(ctx);
+                }
+            }
+            self.set_pick_overlay(ctx, false);
+            return;
+        }
+        let wanted = armed_pick(ctx).is_some()
+            || self.tool == Tool::Pipette
+            || (self.tool == Tool::Eraser && self.opts.eraser_pick);
+        if !wanted {
+            self.pick_blocked = false;
+            self.set_pick_overlay(ctx, false);
+            return;
+        }
+        // A cancel outside blocks re-arming until the cursor re-enters —
+        // Esc actually dismisses the overlay instead of respawning it.
+        // `None` (cursor or window rect unreadable for a pass) must
+        // leave the flag alone — treating it as "inside" flapped the
+        // overlay closed and reopened at builder size every time.
+        let outside = self.cursor_outside(ctx);
+        if let Some(outside) = outside {
+            if !outside {
+                self.pick_blocked = false;
+            }
+            self.set_pick_overlay(ctx, outside && !self.pick_blocked);
+        }
+        // Heartbeat the overlay watches, refreshed every sync so a dead
+        // Draw session strands it for at most the staleness window.
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(picker::PICK_OVERLAY_ALIVE),
+                (std::time::Instant::now(), self.pick_overlay),
+            );
+        });
+        // Keep polling even while the cursor is inside Draw: crossing
+        // the top edge does not always deliver a final pointer event to
+        // Draw, so otherwise leaving after re-entering never re-arms the
+        // overlay. Polling stops as soon as the picker disarms.
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        if self.pick_overlay {
+            // ROOT registers the deferred viewport and can be throttled
+            // while occluded, so keep it awake while the overlay is up.
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+    }
+
+    /// Flips the overlay flag and wakes the ROOT viewport: `App::ui` —
+    /// the only place `show_viewport_deferred` registers/closes the
+    /// overlay — runs exclusively on ROOT repaints, so a flag change
+    /// inside a Draw-window pass would otherwise never be observed.
+    fn set_pick_overlay(&mut self, ctx: &egui::Context, on: bool) {
+        if self.pick_overlay != on {
+            self.pick_overlay = on;
+            crate::app::wake_viewports(ctx);
+            if !on {
+                // The overlay may have become the key window — hand the
+                // focus back or keystrokes (Esc included) keep landing
+                // nowhere after it closes.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+    }
+
+    /// Whether the fullscreen pick overlay should be visible — read by
+    /// `app.rs` each frame to raise/dismiss the deferred viewport.
+    pub fn pick_overlay_active(&self) -> bool {
+        self.pick_overlay
+    }
+
+    /// Every pick landing does what `C` does on top of applying the
+    /// colour: its `#RRGGBB` goes to the clipboard with a toast —
+    /// swatch picks, eraser picks, the Pipette tool and screen picks
+    /// alike.
+    fn copy_pick_colour(&mut self, ctx: &egui::Context, c: Color32) {
+        let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(&hex);
+        }
+        self.copied_at = Some(std::time::Instant::now());
+        widgets::toast(
+            ctx,
+            widgets::ToastKind::Success,
+            t!("draw.pick.copied", hex = hex).to_string(),
+        );
+    }
+
+    /// Applies a colour sampled off-screen to whatever the pick targets
+    /// — the armed swatch, the eraser's colour, or the shared stroke
+    /// colour for the Pipette tool — then copies + toasts like `C`.
+    fn apply_screen_pick(&mut self, ctx: &egui::Context, c: Color32) {
+        if let Some(id) = armed_pick(ctx) {
+            ctx.data_mut(|d| {
+                d.insert_persisted(pick_done_key(id), c);
+            });
+            arm_pick(ctx, None);
+        } else if self.tool == Tool::Eraser && self.opts.eraser_pick {
+            self.opts.eraser_color = c;
+            self.opts.eraser_mode = EraserMode::Color;
+            self.opts.eraser_pick = false;
+        } else {
+            self.opts.color = c;
+        }
+        self.copy_pick_colour(ctx, c);
+    }
+
+    /// Cancels the armed pick: swatch and eraser disarm, and the Pipette
+    /// tool exits to Select — Esc must not leave it armed to re-raise
+    /// the overlay on the next exit (it is a one-shot, like Emoji).
+    fn disarm_pick(&mut self, ctx: &egui::Context) {
+        arm_pick(ctx, None);
+        self.opts.eraser_pick = false;
+        if self.tool == Tool::Pipette {
+            self.set_tool(Tool::Select);
+        }
+        self.pick_blocked = true;
+    }
+
+    /// The draw window's outer rect in OS-native screen units — the
+    /// space [`crate::platform::cursor_position`] reports. `0,0,0,0`
+    /// while egui has not measured the window yet.
+    fn own_native_rect(&self, ctx: &egui::Context) -> [i32; 4] {
+        let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+            return [0, 0, 0, 0];
+        };
+        let ppp = crate::platform::window_ppp(ctx, 1.0);
+        let min = crate::platform::ui_to_native(outer.min, ppp);
+        let max = crate::platform::ui_to_native(outer.max, ppp);
+        [min.x as i32, min.y as i32, max.x as i32, max.y as i32]
+    }
+
+    /// Is the OS cursor outside this window? `None` when either the
+    /// cursor or the window rect is unreadable this pass — the caller
+    /// keeps the previous state rather than flapping the overlay.
+    fn cursor_outside(&self, ctx: &egui::Context) -> Option<bool> {
+        let (cx, cy) = crate::platform::cursor_position()?;
+        let [l, t, r, b] = self.own_native_rect(ctx);
+        (r > l && b > t).then_some(!(l..r).contains(&(cx as i32)) || !(t..b).contains(&(cy as i32)))
     }
 
     /// The unsaved-changes warning — Discard drops the whole clone,
@@ -1177,10 +1354,6 @@ impl DrawSession {
             })
         {
             let c = self.pixel_at(p);
-            let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
-            if let Ok(mut cb) = arboard::Clipboard::new() {
-                let _ = cb.set_text(&hex);
-            }
             if let Some(id) = pick_id {
                 ctx.data_mut(|d| {
                     d.insert_persisted(pick_done_key(id), c);
@@ -1195,7 +1368,7 @@ impl DrawSession {
                     _ => self.opts.color = c,
                 }
             }
-            self.copied_at = Some(std::time::Instant::now());
+            self.copy_pick_colour(ctx, c);
         }
         if cut && self.sel_area.is_some() {
             self.sel_cut();
@@ -1269,9 +1442,14 @@ impl DrawSession {
         self.commit_nudge_due(ctx);
 
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            arm_pick(ctx, None);
-            if self.opts.eraser_pick {
+            if armed_pick(ctx).is_some() {
+                arm_pick(ctx, None);
+            } else if self.opts.eraser_pick {
                 self.opts.eraser_pick = false;
+            } else if self.tool == Tool::Pipette {
+                // Esc quits the Pipette tool like the Emoji tool —
+                // without this it fell through to closing the window.
+                self.set_tool(Tool::Select);
             } else if self.text_panel.is_some() {
                 self.close_text_panel();
             } else if matches!(self.drag, Some(Drag::Shape { .. })) {
@@ -1973,10 +2151,16 @@ impl DrawSession {
         // Right-click an object: it becomes the selection and arms the
         // z-order menu drawn in `canvas` (it must run even while the
         // pointer is off-canvas over the popup, or it would close).
+        // An armed swatch/eraser pick intercepts it first — right-click
+        // cancels the pick, same contract as the screen-pick session.
         if resp.secondary_clicked() {
-            self.ctx_menu_id = hit_id.filter(|_| can_pick_existing);
-            if self.ctx_menu_id.is_some() {
-                self.selected = self.ctx_menu_id;
+            if armed_pick(ui.ctx()).is_some() || self.opts.eraser_pick {
+                self.disarm_pick(ui.ctx());
+            } else {
+                self.ctx_menu_id = hit_id.filter(|_| can_pick_existing);
+                if self.ctx_menu_id.is_some() {
+                    self.selected = self.ctx_menu_id;
+                }
             }
         }
 
@@ -2030,6 +2214,7 @@ impl DrawSession {
                 d.insert_persisted(pick_done_key(id), c);
             });
             arm_pick(ctx, None);
+            self.copy_pick_colour(ctx, c);
             return;
         }
         // Handles of the currently selected object ALWAYS grab first,
@@ -2118,14 +2303,18 @@ impl DrawSession {
             Tool::Text | Tool::Step => {}
             Tool::Pipette => {
                 // A press picks the pixel's colour into the shared
-                // stroke colour — `C` copies its `#RRGGBB`.
-                self.opts.color = self.pixel_at(p);
+                // stroke colour and copies its `#RRGGBB` like `C`.
+                let c = self.pixel_at(p);
+                self.opts.color = c;
+                self.copy_pick_colour(ctx, c);
             }
             Tool::Eraser => {
                 if self.opts.eraser_pick {
-                    self.opts.eraser_color = self.pixel_at(p);
+                    let c = self.pixel_at(p);
+                    self.opts.eraser_color = c;
                     self.opts.eraser_mode = EraserMode::Color;
                     self.opts.eraser_pick = false;
+                    self.copy_pick_colour(ctx, c);
                 } else {
                     self.drag = Some(Drag::Freehand { points: vec![p] });
                 }
@@ -2515,6 +2704,7 @@ impl DrawSession {
                 d.insert_persisted(pick_done_key(id), c);
             });
             arm_pick(ctx, None);
+            self.copy_pick_colour(ctx, c);
             return;
         }
         let had_panel = self.text_panel.is_some();
@@ -2539,15 +2729,19 @@ impl DrawSession {
             Tool::Emoji => self.place_emoji(p),
             Tool::Eraser => {
                 if self.opts.eraser_pick {
-                    self.opts.eraser_color = self.pixel_at(p);
+                    let c = self.pixel_at(p);
+                    self.opts.eraser_color = c;
                     self.opts.eraser_mode = EraserMode::Color;
                     self.opts.eraser_pick = false;
+                    self.copy_pick_colour(ctx, c);
                 } else {
                     self.finish_freehand(vec![p]);
                 }
             }
             Tool::Pipette => {
-                self.opts.color = self.pixel_at(p);
+                let c = self.pixel_at(p);
+                self.opts.color = c;
+                self.copy_pick_colour(ctx, c);
             }
             Tool::SelectArea => {
                 // Inside the frame it stays; a click elsewhere drops it.
@@ -4966,6 +5160,240 @@ fn arm_pick(ctx: &egui::Context, id: Option<egui::Id>) {
     });
 }
 
+/// Bounds of the monitor under the cursor, expressed in overlay-local
+/// points. The union window is larger than any one monitor, so the
+/// union's edges are not useful for deciding where the loupe should flip.
+fn pick_monitor_bounds(ctx: &egui::Context, cx: i32, cy: i32, ppp: f32) -> Option<Rect> {
+    let monitors = ctx.data_mut(|d| {
+        let id = egui::Id::new("draw.pick_monitors");
+        let cached = d.get_temp::<(std::time::Instant, Vec<PhysicalRect>)>(id);
+        if let Some((at, rects)) = &cached
+            && at.elapsed() < std::time::Duration::from_secs(1)
+        {
+            return rects.clone();
+        }
+        let rects: Vec<_> = crate::capture::screen::monitors()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.rect)
+            .collect();
+        d.insert_temp(id, (std::time::Instant::now(), rects.clone()));
+        rects
+    });
+    let m = monitors.into_iter().find(|m| {
+        (m.x..m.x + m.width as i32).contains(&cx) && (m.y..m.y + m.height as i32).contains(&cy)
+    })?;
+    let origin = ctx.input(|i| i.viewport().outer_rect)?.min;
+    let native_origin = crate::platform::ui_to_native(origin, ppp);
+    Some(Rect::from_min_max(
+        crate::platform::native_to_ui(
+            pos2(m.x as f32 - native_origin.x, m.y as f32 - native_origin.y),
+            ppp,
+        ),
+        crate::platform::native_to_ui(
+            pos2(
+                m.x as f32 + m.width as f32 - native_origin.x,
+                m.y as f32 + m.height as f32 - native_origin.y,
+            ),
+            ppp,
+        ),
+    ))
+}
+
+fn pick_loupe_position(hover: Pos2, bounds: Rect, size: Vec2, gap: f32) -> Pos2 {
+    let mut min = hover + Vec2::splat(gap);
+    if min.x + size.x > bounds.max.x - 4.0 {
+        min.x = hover.x - gap - size.x;
+    }
+    if min.y + size.y > bounds.max.y - 4.0 {
+        min.y = hover.y - gap - size.y;
+    }
+    pos2(
+        min.x.clamp(
+            bounds.min.x + 4.0,
+            (bounds.max.x - size.x - 4.0).max(bounds.min.x + 4.0),
+        ),
+        min.y.clamp(
+            bounds.min.y + 4.0,
+            (bounds.max.y - size.y - 4.0).max(bounds.min.y + 4.0),
+        ),
+    )
+}
+
+/// The fullscreen pick overlay's UI — runs inside the transparent
+/// always-on-top viewport `app.rs` raises while a pick is armed and the
+/// cursor roams outside the Draw window. It paints the same loupe card
+/// the canvas shows (patch, centre crosshair, `#RRGGBB`, hint) riding
+/// the cursor, keeps our own crosshair cursor everywhere, and turns the
+/// click into a [`PickOutcome`] pushed into [`PICK_SCREEN_RESULT`] for
+/// the Draw session. Every click lands on THIS window — the app under
+/// the cursor never sees it.
+pub fn show_pick_overlay(ui: &mut Ui) {
+    use crate::platform::picker::{self, PickOutcome};
+    const LOUPE_SIDE: f32 = 126.0;
+    const LOUPE_TEXT_H: f32 = 56.0;
+    const LOUPE_OFF: f32 = 18.0;
+    const LOUPE_CROSS: Color32 = Color32::from_rgb(240, 70, 70);
+
+    let ctx = ui.ctx().clone();
+    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+    let screen = ui.max_rect();
+    // Fully-transparent pixels let clicks pass through the window —
+    // an invisible ~8% veil is what actually swallows the validating
+    // click (alpha 1 sat under the hit-test threshold and let presses
+    // reach the app beneath).
+    ui.painter()
+        .rect_filled(screen, 0.0, Color32::from_black_alpha(20));
+
+    // Self-close on the Draw session's heartbeat going false or stale —
+    // never wait for the ROOT pass (its repaint can be OS-throttled
+    // while occluded, which would strand this click-eating veil).
+    let alive = ctx
+        .data(|d| {
+            d.get_temp::<(std::time::Instant, bool)>(egui::Id::new(picker::PICK_OVERLAY_ALIVE))
+        })
+        .is_some_and(|(at, on)| on && at.elapsed().as_millis() < 500);
+    if !alive {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
+    }
+
+    // WindowServer tracking zones at the screen edges (Dock, menu bar)
+    // starve this window of pointer events — a ~30 Hz tick keeps the
+    // loupe tracking and the heartbeat check running through them.
+    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+
+    // Sample first: a click validates what the cursor sits on RIGHT NOW.
+    // Framebuffer reads hit the WindowServer — pointer events can fire
+    // far past 100 Hz, so the patch is cached and re-read at most every
+    // 33 ms or when the cursor moved since the last read.
+    let cursor =
+        crate::platform::cursor_position().map(|(x, y)| (x.round() as i32, y.round() as i32));
+    let patch = ctx.data_mut(|d| {
+        let id = egui::Id::new("draw.pick_sample");
+        let cached = d.get_temp::<(std::time::Instant, (i32, i32), image::RgbaImage)>(id);
+        let fresh = match (cursor, &cached) {
+            (Some(pos), Some((at, ppos, _))) if *ppos == pos || at.elapsed().as_millis() < 33 => {
+                None
+            }
+            (Some((x, y)), _) => picker::screen_patch(x, y).map(|p| (x, y, p)),
+            _ => None,
+        };
+        match fresh {
+            Some((x, y, p)) => {
+                let v = (std::time::Instant::now(), (x, y), p);
+                d.insert_temp(id, v.clone());
+                Some(v.2)
+            }
+            None => cached.map(|(_, _, p)| p),
+        }
+    });
+
+    // Clicks never reach the app beneath — they land on this window.
+    // Left = validate, right = cancel; Esc cancels from either window.
+    let click = ui.interact(screen, egui::Id::new("pick_overlay"), Sense::click());
+    let outcome = if click.clicked() {
+        cursor
+            .and_then(|(x, y)| picker::screen_pixel(x, y))
+            .map(PickOutcome::Picked)
+            .or(Some(PickOutcome::Denied))
+    } else if click.secondary_clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        Some(PickOutcome::Cancelled)
+    } else {
+        None
+    };
+    if let Some(o) = outcome {
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(picker::PICK_SCREEN_RESULT), o);
+        });
+        // Close OURSELVES: the ROOT pass that would deregister us can be
+        // OS-throttled for an occluded window, and a transparent veil
+        // left up swallows every click on the desktop.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
+    }
+
+    // `pointer.latest_pos` dies in those same edge dead zones (a
+    // `CursorLeft` arrives even under our higher-level window), so the
+    // loupe anchor is the OS cursor read minus our own window origin —
+    // `latest_pos` is only a fallback.
+    let ppp = crate::platform::window_ppp(&ctx, 1.0);
+    let hover = cursor
+        .and_then(|(cx, cy)| {
+            ctx.input(|i| i.viewport().outer_rect).map(|r| {
+                let o = crate::platform::ui_to_native(r.min, ppp);
+                crate::platform::native_to_ui(egui::pos2(cx as f32 - o.x, cy as f32 - o.y), ppp)
+            })
+        })
+        .or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+
+    let (Some(patch), Some(hover)) = (patch, hover) else {
+        return;
+    };
+
+    // The overlay spans the UNION of all displays, but the loupe must
+    // flip at the edge of the display UNDER the cursor. Otherwise the
+    // primary display's bottom is mistaken for empty space on a lower
+    // secondary monitor, and the loupe is drawn off-screen.
+    let bounds = cursor
+        .and_then(|(cx, cy)| pick_monitor_bounds(&ctx, cx, cy, ppp))
+        .map(|r| r.intersect(screen))
+        .filter(|r| r.width() > LOUPE_SIDE && r.height() > LOUPE_SIDE + LOUPE_TEXT_H)
+        .unwrap_or(screen);
+    let size = vec2(LOUPE_SIDE, LOUPE_SIDE + LOUPE_TEXT_H);
+    let min = pick_loupe_position(hover, bounds, size, LOUPE_OFF);
+    let card = Rect::from_min_size(min, size);
+    let zoom_rect = Rect::from_min_size(card.min, Vec2::splat(LOUPE_SIDE));
+    let text_rect = Rect::from_min_max(pos2(card.min.x, zoom_rect.max.y), card.max);
+    let p = ui.painter();
+    p.rect_filled(card, 8.0, Color32::from_black_alpha(235));
+    p.rect_stroke(
+        card,
+        8.0,
+        Stroke::new(1.0, Color32::from_gray(70)),
+        StrokeKind::Outside,
+    );
+
+    let w = patch.width() as usize;
+    let h = patch.height() as usize;
+    let zoomed = ColorImage::from_rgba_unmultiplied([w, h], patch.as_raw());
+    // A fresh texture each frame: a ~22 px patch uploads for nothing,
+    // and a cached handle would need `persisted` data anyway (`temp`
+    // dies at each pass).
+    let tex = ctx.load_texture("draw.pick_loupe", zoomed, TextureOptions::NEAREST);
+    p.image(
+        tex.id(),
+        zoom_rect,
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    let centre = zoom_rect.center();
+    p.hline(zoom_rect.x_range(), centre.y, Stroke::new(1.0, LOUPE_CROSS));
+    p.vline(centre.x, zoom_rect.y_range(), Stroke::new(1.0, LOUPE_CROSS));
+    p.hline(
+        card.x_range(),
+        text_rect.min.y,
+        Stroke::new(1.0, Color32::from_gray(70)),
+    );
+
+    let c = patch.get_pixel(patch.width() / 2, patch.height() / 2).0;
+    let hex = format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+    p.text(
+        pos2(text_rect.center().x, text_rect.min.y + 10.0),
+        egui::Align2::CENTER_TOP,
+        hex,
+        egui::FontId::monospace(13.0),
+        Color32::WHITE,
+    );
+    p.text(
+        pos2(text_rect.center().x, text_rect.min.y + 30.0),
+        egui::Align2::CENTER_TOP,
+        t!("draw.pick.screen_hint").to_string(),
+        egui::FontId::proportional(10.0),
+        Color32::from_gray(160),
+    );
+}
+
 /// Compact pipette riding beside a colour swatch — 15 px with a 10 px
 /// icon, 2 px right of the swatch's top-right corner so it hugs the
 /// picker rather than filling the option line like a toolbar button.
@@ -5917,6 +6345,22 @@ mod tests {
     use super::*;
     use crate::capture::{Capture, MonitorInfo};
     use crate::editor::document::Document;
+
+    #[test]
+    fn pick_loupe_flips_at_the_current_monitor_not_the_union() {
+        // The primary ends at y=1707, but another display extends the
+        // virtual desktop to y=2406. The card must fit on the primary.
+        let primary = Rect::from_min_max(pos2(1133.0, 0.0), pos2(3693.0, 1707.0));
+        let size = vec2(126.0, 182.0);
+        let near_bottom = pick_loupe_position(pos2(2113.0, 1685.0), primary, size, 18.0);
+        assert_eq!(near_bottom.y, 1685.0 - 18.0 - size.y);
+        assert!(near_bottom.y + size.y < primary.max.y);
+
+        let near_top = pick_loupe_position(pos2(2113.0, 2.0), primary, size, 18.0);
+        assert_eq!(near_top.y, 20.0);
+        let near_right = pick_loupe_position(pos2(3685.0, 500.0), primary, size, 18.0);
+        assert_eq!(near_right.x, 3685.0 - 18.0 - size.x);
+    }
 
     /// `emoji_default_side` honouring: a remembered `last` wins but is
     /// still re-bounded to the (scale-scaled) Step-badge range.
