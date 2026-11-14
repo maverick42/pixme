@@ -8,8 +8,6 @@
 //! through it. The pick's click-swallowing lives in that overlay
 //! (`ui::draw::show_pick_overlay`), not in any hook.
 
-use std::ffi::c_void;
-use std::ptr;
 use std::sync::Mutex;
 
 use eframe::egui::Color32;
@@ -24,25 +22,29 @@ const CLR_INVALID: u32 = 0xFFFF_FFFF;
 const WDA_EXCLUDEFROMCAPTURE: u32 = 0x11;
 
 #[repr(C)]
-struct POINT {
+struct Point {
     x: i32,
     y: i32,
 }
 
+// Handles are `isize` here like everywhere else in `src/platform/` —
+// one signature for one symbol (clashing_extern_declarations):
+// `GetWindowTextW` and `SetWindowDisplayAffinity` are also declared in
+// `windows.rs` with `isize` hwnds.
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn GetDC(hwnd: *mut c_void) -> *mut c_void;
-    fn ReleaseDC(hwnd: *mut c_void, hdc: *mut c_void) -> i32;
-    fn WindowFromPoint(pt: POINT) -> *mut c_void;
-    fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
-    fn GetWindowTextW(hwnd: *mut c_void, buf: *mut u16, len: i32) -> i32;
-    fn SetWindowDisplayAffinity(hwnd: *mut c_void, affinity: u32) -> i32;
-    fn IsWindow(hwnd: *mut c_void) -> i32;
+    fn GetDC(hwnd: isize) -> isize;
+    fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+    fn WindowFromPoint(pt: Point) -> isize;
+    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+    fn GetWindowTextW(hwnd: isize, buf: *mut u16, len: i32) -> i32;
+    fn SetWindowDisplayAffinity(hwnd: isize, affinity: u32) -> i32;
+    fn IsWindow(hwnd: isize) -> i32;
 }
 
 #[link(name = "gdi32")]
 unsafe extern "system" {
-    fn GetPixel(hdc: *mut c_void, x: i32, y: i32) -> u32;
+    fn GetPixel(hdc: isize, x: i32, y: i32) -> u32;
 }
 
 /// Mark the "PixMe Pick" overlays `WDA_EXCLUDEFROMCAPTURE` so our reads
@@ -58,15 +60,15 @@ fn exclude_overlay_from_capture(x: i32, y: i32) {
         return;
     };
     unsafe {
-        let hwnd = WindowFromPoint(POINT { x, y });
-        if hwnd.is_null() {
+        let hwnd = WindowFromPoint(Point { x, y });
+        if hwnd == 0 {
             return;
         }
         let h = hwnd as usize;
         if cached.contains(&h) {
             return;
         }
-        cached.retain(|&w| IsWindow(w as *mut c_void) != 0);
+        cached.retain(|&w| IsWindow(w as isize) != 0);
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut pid);
         if pid != std::process::id() {
@@ -87,12 +89,12 @@ fn exclude_overlay_from_capture(x: i32, y: i32) {
 pub fn screen_pixel(x: i32, y: i32) -> Option<Color32> {
     exclude_overlay_from_capture(x, y);
     unsafe {
-        let dc = GetDC(ptr::null_mut());
-        if dc.is_null() {
+        let dc = GetDC(0);
+        if dc == 0 {
             return None;
         }
         let v = GetPixel(dc, x, y);
-        ReleaseDC(ptr::null_mut(), dc);
+        ReleaseDC(0, dc);
         (v != CLR_INVALID).then(|| colorref_to_color32(v))
     }
 }
@@ -103,8 +105,8 @@ pub fn screen_pixel(x: i32, y: i32) -> Option<Color32> {
 pub fn screen_patch(cx: i32, cy: i32) -> Option<RgbaImage> {
     exclude_overlay_from_capture(cx, cy);
     unsafe {
-        let dc = GetDC(ptr::null_mut());
-        if dc.is_null() {
+        let dc = GetDC(0);
+        if dc == 0 {
             return None;
         }
         let half = (PREVIEW_PATCH / 2) as i32;
@@ -121,7 +123,7 @@ pub fn screen_patch(cx: i32, cy: i32) -> Option<RgbaImage> {
                 patch.put_pixel(dx as u32, dy as u32, px);
             }
         }
-        ReleaseDC(ptr::null_mut(), dc);
+        ReleaseDC(0, dc);
         Some(patch)
     }
 }
