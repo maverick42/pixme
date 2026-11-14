@@ -19,9 +19,9 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "macos")]
-pub use macos::{screen_patch, screen_pixel};
+pub use macos::{pick_patch, screen_patch};
 #[cfg(target_os = "windows")]
-pub use windows::{screen_patch, screen_pixel};
+pub use windows::{pick_patch, screen_patch};
 
 /// Raises the sampler worker while a pick overlay is up — the Windows
 /// desktop read can block on the compositor for tens of milliseconds per
@@ -85,6 +85,15 @@ pub const PICK_SCREEN_RESULT: &str = "draw.pick_screen_result";
 /// so the overlay loupe flashes the same "copied!" hint as the canvas
 /// loupe.
 pub const PICK_COPIED_AT: &str = "draw.pick_copied_at";
+
+/// The colour at a sampled patch's centre — the exact pixel the pick
+/// loupe highlights at its cross. Click and `C` validate THIS sample
+/// through [`pick_patch`], never a second independent read: what the
+/// loupe shows is what gets applied or copied.
+pub fn patch_centre(patch: &image::RgbaImage) -> Color32 {
+    let p = patch.get_pixel(patch.width() / 2, patch.height() / 2).0;
+    Color32::from_rgba_unmultiplied(p[0], p[1], p[2], 255)
+}
 
 /// The end state of a pick — written by the overlay viewport into the
 /// shared ctx data, drained by the Draw session.

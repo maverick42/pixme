@@ -2597,8 +2597,9 @@ Format: date — context — decision — consequences.
   copied to clipboard". The Pipette tool ignores clicks entirely —
   canvas and overlay alike — and toasts "Press C…" (throttled to one
   pill per ~1.2 s); its hint now reads "move over a pixel… C picks and
-  copies". `C` off-canvas samples `platform::picker::screen_pixel` at
-  the OS cursor when the pick overlay is up, since `pixel_at` only
+  copies". `C` off-canvas takes the centre of
+  `platform::picker::pick_patch` at the OS cursor when the pick overlay
+  is up — the same sample the loupe highlights — since `pixel_at` only
   knows the document.
 - **Consequences**: click = assign, `C` = copy — the gestures no longer
   overlap; the Pipette tool is a pure hover-and-`C` sampler that works
@@ -2606,7 +2607,10 @@ Format: date — context — decision — consequences.
   lights on real copies. The overlay loupe shows the same "Press C to
   copy" hint as the canvas loupe (`overlay.copy_hint`); and because a
   click makes the overlay the macOS key window, `C` is handled on BOTH
-  sides: the Draw hotkey samples `screen_pixel` while the overlay is
-  up, and the overlay itself forwards a `C` press as
-  `PickOutcome::CopyPressed` — which applies+copies without ending the
-  pick (no heartbeat-off, no flicker).
+  sides: the Draw hotkey reads `pick_patch` while the overlay is up,
+  and the overlay itself forwards a `C` press as
+  `PickOutcome::CopyPressed` — which applies+copies the loupe's
+  highlighted sample without ending the pick (no heartbeat-off, no
+  flicker). Click and `C` never re-sample through an independent path:
+  both reduce the patch the loupe paints via `patch_centre`, so the
+  applied/copied value is always the displayed one.

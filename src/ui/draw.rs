@@ -1279,11 +1279,21 @@ impl DrawSession {
     }
 
     /// `C` while a pick is armed — canvas or screen overlay alike —
-    /// copies the `#RRGGBB` under the cursor and KEEPS picking: the
-    /// armed swatch/eraser/Pipette state is untouched, the "copié"
-    /// flash is the loupe's own feedback. Only a click (apply) or Esc
-    /// (cancel) ends the pick.
+    /// applies AND copies the `#RRGGBB` under the cursor and KEEPS
+    /// picking: the armed swatch/eraser/Pipette state is untouched, the
+    /// "copié" flash is the loupe's own feedback. Only a click (apply)
+    /// or Esc (cancel) ends the pick.
     fn copy_screen_pick(&mut self, ctx: &egui::Context, c: Color32) {
+        if let Some(id) = armed_pick(ctx) {
+            ctx.data_mut(|d| {
+                d.insert_persisted(pick_done_key(id), c);
+            });
+        } else if self.tool == Tool::Eraser && self.opts.eraser_pick {
+            self.opts.eraser_color = c;
+            self.opts.eraser_mode = EraserMode::Color;
+        } else {
+            self.opts.color = c;
+        }
         self.copy_pick_colour(ctx, c);
     }
 
@@ -1414,7 +1424,8 @@ impl DrawSession {
             let _ = crate::platform::picker::take_copy();
             let c = if self.pick_overlay {
                 crate::platform::cursor_position().and_then(|(x, y)| {
-                    crate::platform::picker::screen_pixel(x.round() as i32, y.round() as i32)
+                    crate::platform::picker::pick_patch(x.round() as i32, y.round() as i32)
+                        .map(|p| crate::platform::picker::patch_centre(&p))
                 })
             } else {
                 self.last_pointer.map(|p| self.pixel_at(p))
@@ -5291,7 +5302,7 @@ pub fn show_pick_overlay(ui: &mut Ui) {
     // 33 ms, including while stationary (the desktop can change).
     let cursor =
         crate::platform::cursor_position().map(|(x, y)| (x.round() as i32, y.round() as i32));
-    let patch = ctx.data_mut(|d| {
+    let mut patch = ctx.data_mut(|d| {
         let id = egui::Id::new("draw.pick_sample");
         let cached = d.get_temp::<(std::time::Instant, image::RgbaImage)>(id);
         let fresh = match (cursor, &cached) {
@@ -5316,9 +5327,12 @@ pub fn show_pick_overlay(ui: &mut Ui) {
     let worker_copied = picker::take_copy();
     let click = ui.interact(screen, egui::Id::new("pick_overlay"), Sense::click());
     let outcome = if click.clicked() {
+        // The validating read IS the loupe's sample: `pick_patch`
+        // returns the patch whose centre the loupe highlights, so the
+        // applied colour can never diverge from what was displayed.
         cursor
-            .and_then(|(x, y)| picker::screen_pixel(x, y))
-            .map(PickOutcome::Picked)
+            .and_then(|(x, y)| picker::pick_patch(x, y))
+            .map(|p| PickOutcome::Picked(picker::patch_centre(&p)))
             .or(Some(PickOutcome::Denied))
     } else if click.secondary_clicked()
         || ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -5361,8 +5375,21 @@ pub fn show_pick_overlay(ui: &mut Ui) {
     }) || (worker_copied && !just_copied);
     if cpress {
         let o = cursor
-            .and_then(|(x, y)| picker::screen_pixel(x, y))
-            .map(PickOutcome::CopyPressed)
+            .and_then(|(x, y)| picker::pick_patch(x, y))
+            .map(|p| {
+                let c = picker::patch_centre(&p);
+                // The pick keeps going: publish the validated patch so
+                // the loupe repaints from exactly the sample that was
+                // applied and copied.
+                ctx.data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new("draw.pick_sample"),
+                        (std::time::Instant::now(), p.clone()),
+                    );
+                });
+                patch = Some(p);
+                PickOutcome::CopyPressed(c)
+            })
             .unwrap_or(PickOutcome::Denied);
         ctx.data_mut(|d| {
             if matches!(o, PickOutcome::CopyPressed(_)) {

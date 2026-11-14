@@ -15,7 +15,6 @@ use core_graphics::image::CGImage;
 use core_graphics::window::{
     create_image, kCGWindowImageDefault, kCGWindowListOptionOnScreenBelowWindow,
 };
-use eframe::egui::Color32;
 use image::RgbaImage;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -89,21 +88,11 @@ pub fn screen_patch(cx: i32, cy: i32) -> Option<RgbaImage> {
     super::super::macos::cg_image_to_rgba(&img, img.width(), img.height())
 }
 
-/// The colour of the screen pixel at `(x, y)` — a 1-pt rect read
-/// CENTRED on the point, with the returned bitmap's centre pixel taken:
-/// that is the same sample the pick loupe highlights at its cross
-/// (`screen_patch` reads `± PREVIEW_PATCH/2` and displays `patch[w/2,
-/// h/2]` — a rect starting AT `(x, y)` lands half a point off and picks
-/// the neighbour pixel). The `PREVIEW_PATCH` rect clips at screen
-/// edges, where its centre pixel stops being the cursor's, so the
-/// validating read stays exact.
-pub fn screen_pixel(x: i32, y: i32) -> Option<Color32> {
-    let rect = CGRect::new(
-        &CGPoint::new(f64::from(x) - 0.5, f64::from(y) - 0.5),
-        &CGSize::new(1.0, 1.0),
-    );
-    let img = sample_image(rect, x, y)?;
-    let rgba = super::super::macos::cg_image_to_rgba(&img, img.width(), img.height())?;
-    let p = rgba.get_pixel(rgba.width() / 2, rgba.height() / 2).0;
-    Some(Color32::from_rgba_unmultiplied(p[0], p[1], p[2], 255))
+/// The validating read for a click or `C`: a fresh patch at `(x, y)`
+/// whose centre colour is literally the sample the loupe highlights —
+/// [`super::patch_centre`] reduces it, so applied/copied and displayed
+/// values can never diverge. macOS framebuffer reads are cheap enough
+/// to stay synchronous, so this is exactly [`screen_patch`].
+pub fn pick_patch(cx: i32, cy: i32) -> Option<RgbaImage> {
+    screen_patch(cx, cy)
 }

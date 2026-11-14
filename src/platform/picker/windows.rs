@@ -5,9 +5,10 @@
 //! more under RDP or with the fullscreen overlay composed on top. Those
 //! reads therefore live on a dedicated worker thread: while a pick is
 //! armed it follows the OS cursor and keeps a fresh `PREVIEW_PATCH` patch
-//! in a shared slot. The UI-thread-facing [`screen_patch`] and
-//! [`screen_pixel`] are non-blocking reads of that slot, so no paint or
-//! click ever waits on the compositor.
+//! in a shared slot. The UI-thread-facing [`screen_patch`] is a
+//! non-blocking read of that slot, and [`pick_patch`] only waits on the
+//! bounded click/`C` validation path — no paint ever blocks on the
+//! compositor.
 //!
 //! The overlay is DWM-transparent (alpha 0, still hit-testable) and needs
 //! no capture protection — a `WDA_EXCLUDEFROMCAPTURE` veil would also
@@ -19,7 +20,6 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use eframe::egui::Color32;
 use image::{Rgba, RgbaImage};
 
 use super::PREVIEW_PATCH;
@@ -86,12 +86,11 @@ unsafe extern "system" {
     fn GdiFlush() -> i32;
 }
 
-/// The latest worker sample: the patch centred on the cursor, the exact
-/// colour of its centre pixel and the position it was taken at.
+/// The latest worker sample: the patch centred on the cursor and the
+/// position it was taken at.
 struct Snapshot {
     pos: (i32, i32),
     patch: RgbaImage,
-    colour: Color32,
 }
 
 static SNAP: OnceLock<(Mutex<Option<Snapshot>>, Condvar)> = OnceLock::new();
@@ -170,16 +169,10 @@ fn sampler_loop(my_gen: u64) {
                 break;
             }
             if let Some(patch) = patch {
-                let centre = patch.get_pixel(PREVIEW_PATCH / 2, PREVIEW_PATCH / 2).0;
-                let colour = Color32::from_rgba_unmultiplied(centre[0], centre[1], centre[2], 255);
                 let (m, cv) = snap();
                 {
                     let mut slot = m.lock().unwrap_or_else(|p| p.into_inner());
-                    *slot = Some(Snapshot {
-                        pos: (x, y),
-                        patch,
-                        colour,
-                    });
+                    *slot = Some(Snapshot { pos: (x, y), patch });
                 }
                 cv.notify_all();
                 last = Some((x, y));
@@ -225,14 +218,16 @@ fn latest_snapshot() -> Option<Snapshot> {
     slot.as_ref().map(|s| Snapshot {
         pos: s.pos,
         patch: s.patch.clone(),
-        colour: s.colour,
     })
 }
 
-/// The colour under the cursor — read from the worker's snapshot. The
-/// click path waits briefly for a sample at the exact click position
-/// (bounded; the worker reads on cursor move).
-pub fn screen_pixel(x: i32, y: i32) -> Option<Color32> {
+/// The validating read for a click or `C`: waits briefly for the worker
+/// to have sampled the exact position (bounded; the worker reads on
+/// cursor move), then hands back that patch — [`super::patch_centre`]
+/// reduces it to the colour the loupe highlights, so applied/copied and
+/// displayed values are the same sample. On timeout the latest snapshot
+/// still wins over `None`: it is what the loupe currently paints.
+pub fn pick_patch(x: i32, y: i32) -> Option<RgbaImage> {
     let (m, cv) = snap();
     let slot = m.lock().unwrap_or_else(|p| p.into_inner());
     let (g, _t) = cv
@@ -240,7 +235,7 @@ pub fn screen_pixel(x: i32, y: i32) -> Option<Color32> {
             s.as_ref().map(|s| s.pos) != Some((x, y))
         })
         .unwrap_or_else(|p| p.into_inner());
-    g.as_ref().map(|s| s.colour)
+    g.as_ref().map(|s| s.patch.clone())
 }
 
 /// The `PREVIEW_PATCH`×`PREVIEW_PATCH` pixels centred on the cursor — the
