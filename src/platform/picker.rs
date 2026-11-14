@@ -9,7 +9,7 @@
 //! cannot cover a non-rectangular multi-monitor layout — which catches
 //! every click so the application under the cursor never sees the
 //! validating press, and paints our own loupe + cursor. This module
-//! only provides the OS-level pixel reads and the union rect (tests).
+//! only provides the OS-level pixel reads and shared pick constants.
 
 use eframe::egui::Color32;
 
@@ -29,6 +29,11 @@ pub use windows::{screen_patch, screen_pixel};
 /// the sampled point.
 pub const PREVIEW_PATCH: u32 = 11;
 
+/// Window title shared by every per-monitor pick overlay viewport —
+/// matched by `elevate_pick_overlay` and by the per-OS screen samplers
+/// so our own veil is excluded from pixel reads.
+pub const PICK_OVERLAY_TITLE: &str = "PixMe Pick";
+
 /// The `egui::Id` the pick overlay writes its [`PickOutcome`] into and
 /// the Draw session drains — the two live in different viewports, so
 /// ctx data is the channel.
@@ -37,6 +42,10 @@ pub const PICK_SCREEN_RESULT: &str = "draw.pick_screen_result";
 /// the overlay self-closes when it turns false or goes stale (>500 ms),
 /// so a vanished Draw session can never strand a click-eating veil.
 pub const PICK_OVERLAY_ALIVE: &str = "draw.pick_overlay_alive";
+/// `Instant` of the last `C` copy during a pick — shared via ctx data
+/// so the overlay loupe flashes the same "copied!" hint as the canvas
+/// loupe.
+pub const PICK_COPIED_AT: &str = "draw.pick_copied_at";
 
 /// The end state of a pick — written by the overlay viewport into the
 /// shared ctx data, drained by the Draw session.
@@ -52,27 +61,6 @@ pub enum PickOutcome {
     /// The OS refused to hand out screen pixels (macOS without Screen
     /// Recording) — the UI points at System Settings.
     Denied,
-}
-
-/// The union of every connected monitor's rect in OS-native screen units
-/// `[left, top, right, bottom)` — the area the pick overlay must cover so
-/// no click escapes it.
-pub fn screens_union_native() -> Option<(i32, i32, i32, i32)> {
-    let mut it = crate::capture::screen::monitors().ok()?.into_iter();
-    let first = it.next()?;
-    let (mut l, mut t, mut r, mut b) = (
-        first.rect.x,
-        first.rect.y,
-        first.rect.x + first.rect.width as i32,
-        first.rect.y + first.rect.height as i32,
-    );
-    for m in it {
-        l = l.min(m.rect.x);
-        t = t.min(m.rect.y);
-        r = r.max(m.rect.x + m.rect.width as i32);
-        b = b.max(m.rect.y + m.rect.height as i32);
-    }
-    Some((l, t, r, b))
 }
 
 /// A `COLORREF` (`0x00BBGGRR`, low byte = red) as an opaque `Color32`.
@@ -105,18 +93,5 @@ mod tests {
             Color32::from_rgb(255, 0, 0)
         );
         assert_eq!(colorref_to_color32(0x00FFFFFF), Color32::WHITE);
-    }
-
-    #[test]
-    fn union_covers_every_monitor() {
-        // With monitors unavailable in CI this is a no-op; otherwise the
-        // union must contain each individual rect.
-        if let Some((l, t, r, b)) = screens_union_native() {
-            for m in crate::capture::screen::monitors().unwrap_or_default() {
-                assert!(m.rect.x >= l && m.rect.y >= t);
-                assert!(m.rect.x + m.rect.width as i32 <= r);
-                assert!(m.rect.y + m.rect.height as i32 <= b);
-            }
-        }
     }
 }

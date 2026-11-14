@@ -88,6 +88,10 @@ Defined as constants in `ui/theme.rs`, outside `Tokens`:
 - **Annotation palette** (arrows, shapes, text, step markers, blur handles):
   fixed set (red default, plus yellow/green/blue/white/black), chosen to read
   on arbitrary screenshots.
+- **Colour-picker preset palette** (`theme::picker::BASE`): the functional
+  reference's 48 base colours (6 rows × 8 columns, row-major) shown beside the
+  HSV picker in every Draw colour swatch popup, paired with `CUSTOM_SLOTS = 16`
+  user-defined custom colour slots persisted in `prefs.json` (`draw_opts.custom_colors`).
 
 ## egui `Visuals` mapping (`apply`)
 

@@ -1284,7 +1284,7 @@ pub fn elevate_pick_overlay() {
 
     const FLOATING_LEVEL: isize = 3;
     const SCREEN_SAVER_LEVEL: isize = 1000;
-    const PICK_TITLE: &[u8] = b"PixMe Pick";
+    const PICK_TITLE: &[u8] = super::picker::PICK_OVERLAY_TITLE.as_bytes();
 
     unsafe {
         let send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());

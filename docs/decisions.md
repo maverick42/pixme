@@ -2538,7 +2538,7 @@ Format: date — context — decision — consequences.
   outside the Draw window (inside, the canvas pick path keeps
   ownership). A single union-spanning window was tried first and
   failed on real layouts: AppKit clips an NSWindow's frame to one
-  screen's `visibleFrame` when it exceeds it, so a Sidecar iPad
+  screen's `visibleFrame` when it exceeds it, so a secondary display
   sitting below-left of the main display stayed unveiled (measured:
   `want=(-1133,0,2560,2406)` applied as `(-1133,53)-(2560,1707)`).
   Per-monitor windows also give every overlay its own `ppp`, which
@@ -2562,7 +2562,7 @@ Format: date — context — decision — consequences.
   then sees straight through it. Rasterization uses the source image's own colour
   space so CoreGraphics applies no ColorSync conversion — stored and
   sampled bytes stay framebuffer-verbatim, matching what external
-  tools (iScreen Shooter) read.
+  tools (such as the functional reference) read.
 - **Rejected**: `NSColorSampler` (macOS) + `WH_MOUSE_LL` (Windows) —
   the sampler imposes its own round OS loupe instead of PixMe's cursor,
   cannot be dismissed programmatically, and a nil callback cannot be
@@ -2574,7 +2574,7 @@ Format: date — context — decision — consequences.
   — none shipped. macOS without Screen Recording gets a localized toast
   pointing at System Settings (`PickOutcome::Denied`). Windows pixel
   reads use the virtual-screen space (negative coordinates supported);
-  the overlay's rect is re-pinned to the monitor union every frame.
+  each overlay viewport is re-pinned to its monitor's rect every frame.
 
 ## 2026-11-14 — Pick feedback split: click selects, `C` copies, Pipette clicks are inert
 
@@ -2596,8 +2596,8 @@ Format: date — context — decision — consequences.
 - **Consequences**: click = assign, `C` = copy — the gestures no longer
   overlap; the Pipette tool is a pure hover-and-`C` sampler that works
   on any screen pixel. `copied_at` (the loupe's "copied!" hint) now only
-  lights on real copies. The overlay loupe shows the same "«C» pour
-  copier" hint as the canvas loupe (`overlay.copy_hint`); and because a
+  lights on real copies. The overlay loupe shows the same "Press C to
+  copy" hint as the canvas loupe (`overlay.copy_hint`); and because a
   click makes the overlay the macOS key window, `C` is handled on BOTH
   sides: the Draw hotkey samples `screen_pixel` while the overlay is
   up, and the overlay itself forwards a `C` press as

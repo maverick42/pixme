@@ -550,11 +550,11 @@ pub struct DrawSession {
     /// revision frozen until the burst commits — same mechanism as
     /// object drags).
     nudge: Option<NudgeBurst>,
-    /// The full-screen pick overlay is up: a transparent always-on-top
-    /// viewport covering the virtual screen — it swallows the validating
-    /// click, draws our own cursor + loupe and reports through
-    /// [`PICK_SCREEN_RESULT`]. Raised only while the cursor roams
-    /// outside this window; inside, the canvas' own pick path owns it.
+    /// The full-screen pick overlays are up: transparent always-on-top
+    /// per-monitor viewports that swallow the validating click, draw our
+    /// own cursor + loupe and report through [`PICK_SCREEN_RESULT`].
+    /// Raised only while the cursor roams outside this window; inside,
+    /// the canvas' own pick path owns it.
     pick_overlay: bool,
     /// Set when a pick ends (validated or cancelled) while the cursor is
     /// outside so the overlay does not instantly re-arm; cleared when
@@ -1214,7 +1214,11 @@ impl DrawSession {
         if let Ok(mut cb) = arboard::Clipboard::new() {
             let _ = cb.set_text(&hex);
         }
-        self.copied_at = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.copied_at = Some(now);
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(crate::platform::picker::PICK_COPIED_AT), now);
+        });
         widgets::toast(
             ctx,
             widgets::ToastKind::Success,
@@ -1268,9 +1272,6 @@ impl DrawSession {
             self.pick_selected(ctx, c);
         } else if self.tool == Tool::Pipette {
             self.pick_inert(ctx);
-        } else {
-            self.opts.color = c;
-            self.pick_selected(ctx, c);
         }
     }
 
@@ -1425,21 +1426,7 @@ impl DrawSession {
                 self.last_pointer.map(|p| self.pixel_at(p))
             };
             if let Some(c) = c {
-                if let Some(id) = pick_id {
-                    ctx.data_mut(|d| {
-                        d.insert_persisted(pick_done_key(id), c);
-                    });
-                    arm_pick(ctx, None);
-                } else {
-                    match self.tool {
-                        Tool::Eraser => {
-                            self.opts.eraser_color = c;
-                            self.opts.eraser_mode = EraserMode::Color;
-                        }
-                        _ => self.opts.color = c,
-                    }
-                }
-                self.copy_pick_colour(ctx, c);
+                self.copy_screen_pick(ctx, c);
             } else if self.pick_overlay {
                 widgets::toast(
                     ctx,
@@ -5247,9 +5234,9 @@ fn arm_pick(ctx: &egui::Context, id: Option<egui::Id>) {
     });
 }
 
-/// Bounds of the monitor under the cursor, expressed in overlay-local
-/// points. The union window is larger than any one monitor, so the
-/// union's edges are not useful for deciding where the loupe should flip.
+/// Places the pick loupe card at `(hover + gap)`, flipping across the
+/// cursor when it would cross `bounds`' right or bottom edge and clamping
+/// within a 4 pt margin of the current monitor's overlay viewport.
 fn pick_loupe_position(hover: Pos2, bounds: Rect, size: Vec2, gap: f32) -> Pos2 {
     let mut min = hover + Vec2::splat(gap);
     if min.x + size.x > bounds.max.x - 4.0 {
@@ -5376,6 +5363,12 @@ pub fn show_pick_overlay(ui: &mut Ui) {
             .map(PickOutcome::CopyPressed)
             .unwrap_or(PickOutcome::Denied);
         ctx.data_mut(|d| {
+            if matches!(o, PickOutcome::CopyPressed(_)) {
+                d.insert_temp(
+                    egui::Id::new(picker::PICK_COPIED_AT),
+                    std::time::Instant::now(),
+                );
+            }
             d.insert_temp(egui::Id::new(picker::PICK_SCREEN_RESULT), o);
         });
     }
@@ -5451,10 +5444,18 @@ pub fn show_pick_overlay(ui: &mut Ui) {
         egui::FontId::monospace(13.0),
         Color32::WHITE,
     );
+    let copied = ctx
+        .data(|d| d.get_temp::<std::time::Instant>(egui::Id::new(picker::PICK_COPIED_AT)))
+        .is_some_and(|t| t.elapsed().as_secs_f32() < 1.2);
+    let hint = if copied {
+        t!("overlay.copied").to_string()
+    } else {
+        t!("overlay.copy_hint").to_string()
+    };
     p.text(
         pos2(text_rect.center().x, text_rect.min.y + 30.0),
         egui::Align2::CENTER_TOP,
-        t!("overlay.copy_hint").to_string(),
+        hint,
         egui::FontId::proportional(10.0),
         Color32::from_gray(160),
     );
@@ -5575,17 +5576,21 @@ fn palette_column(
     ui.add_space(6.0);
     ui.label(t!("draw.pick.custom_colors").to_string());
 
+    let mut slots: [Option<Color32>; theme::picker::CUSTOM_SLOTS] = {
+        let s = shared.lock_settings();
+        std::array::from_fn(|i| {
+            s.draw_opts
+                .custom_slot(i)
+                .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+        })
+    };
     let sel_key = custom_sel_key(popup_id);
     let mut sel: Option<usize> = ui.ctx().data_mut(|d| d.get_persisted(sel_key));
     for row in 0..theme::picker::CUSTOM_SLOTS.div_ceil(theme::picker::BASE_COLS) {
         ui.horizontal(|ui| {
             for col in 0..theme::picker::BASE_COLS {
                 let i = row * theme::picker::BASE_COLS + col;
-                let c = shared
-                    .lock_settings()
-                    .draw_opts
-                    .custom_slot(i)
-                    .map(|[r, g, b]| Color32::from_rgb(r, g, b));
+                let c = slots[i];
                 let resp = palette_cell(ui, c, sel == Some(i) || c == Some(cur));
                 let resp = if c.is_some() {
                     resp.on_hover_text(t!("draw.pick.custom_tip").to_string())
@@ -5599,6 +5604,7 @@ fn palette_column(
                         picked = c;
                     }
                 } else if c.is_some() && resp.clicked_by(egui::PointerButton::Secondary) {
+                    slots[i] = None;
                     let mut s = shared.lock_settings();
                     s.draw_opts.set_custom_slot(i, None);
                     s.save();
@@ -5615,12 +5621,7 @@ fn palette_column(
     // "Add to custom colours": the selected slot wins (overwriting a
     // filled slot), else the first empty one; greyed when the bank is
     // full with no slot selected.
-    let target = {
-        let s = shared.lock_settings();
-        sel.or_else(|| {
-            (0..theme::picker::CUSTOM_SLOTS).find(|&i| s.draw_opts.custom_slot(i).is_none())
-        })
-    };
+    let target = sel.or_else(|| (0..theme::picker::CUSTOM_SLOTS).find(|&i| slots[i].is_none()));
     if ui
         .add_enabled(
             target.is_some(),

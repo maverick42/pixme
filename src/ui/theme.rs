@@ -264,6 +264,8 @@ pub mod picker {
         rgb(0x808080),
         rgb(0x408080),
         rgb(0xC0C0C0),
+        // Intentionally repeats 0x400040 (index 38), matching the
+        // classic 48-colour Windows / functional-reference table.
         rgb(0x400040),
         rgb(0xFFFFFF),
     ];

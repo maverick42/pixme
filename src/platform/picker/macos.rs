@@ -20,7 +20,7 @@ use image::RgbaImage;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::PREVIEW_PATCH;
+use super::{PICK_OVERLAY_TITLE, PREVIEW_PATCH};
 
 /// The display id of the monitor containing the native-space point
 /// `(x, y)` (points on macOS), or the primary monitor's id when the
@@ -38,21 +38,25 @@ fn display_at(x: i32, y: i32) -> Option<u32> {
 /// one overlay per monitor, the LOWEST of ours (last in the
 /// front-to-back list) is the reference: a "below window" composite
 /// then excludes every pick overlay. The loupe samples at ~30 Hz, so
-/// the WindowServer enumeration is cached for half a second.
+/// positive WindowServer lookups are cached for half a second (`None`
+/// is never cached so the very first frame before the window appears in
+/// `window_list()` cannot lock in a 500 ms veil-tinted fallback).
 fn overlay_window_id() -> Option<u32> {
-    static CACHE: Mutex<Option<(Instant, Option<u32>)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
     let mut cache = CACHE.lock().ok()?;
     if let Some((refreshed, id)) = *cache
         && refreshed.elapsed() < Duration::from_millis(500)
     {
-        return id;
+        return Some(id);
     }
     let me = std::process::id();
     let id = crate::platform::macos::window_list()
         .into_iter()
-        .rfind(|w| w.pid == me && w.title == "PixMe Pick")
+        .rfind(|w| w.pid == me && w.title == PICK_OVERLAY_TITLE)
         .map(|w| w.id);
-    *cache = Some((Instant::now(), id));
+    if let Some(id) = id {
+        *cache = Some((Instant::now(), id));
+    }
     id
 }
 

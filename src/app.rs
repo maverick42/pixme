@@ -297,8 +297,7 @@ fn draw_id() -> egui::ViewportId {
 /// The fullscreen pick overlays — one transparent viewport per monitor,
 /// swallowing the validating click while a colour pick is armed. A
 /// single union-spanning window cannot cover a non-rectangular
-/// multi-monitor layout: AppKit clips it to one screen's visibleFrame
-/// (the Sidecar iPad stayed unveiled).
+/// multi-monitor layout: AppKit clips it to one screen's visibleFrame.
 fn pick_overlay_id(index: usize) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(("pixme.pick_overlay", index))
 }
@@ -3361,9 +3360,10 @@ impl eframe::App for PixMeApp {
         // the app underneath never sees the validating press. A single
         // union-spanning window would not work: AppKit clips it to one
         // screen's visibleFrame, leaving a non-rectangular layout
-        // (e.g. Sidecar iPad below-left) partly uncovered. Each window
-        // is re-pinned to its monitor's rect every frame (a plug/unplug
-        // or DPI shift mid-pick cannot leave a strip uncovered).
+        // (e.g. a secondary display below-left) partly uncovered. Each
+        // window is re-pinned to its monitor's rect every frame (a
+        // plug/unplug or DPI shift mid-pick cannot leave a strip
+        // uncovered).
         if lock(&self.shared.draw)
             .as_ref()
             .is_some_and(|d| d.pick_overlay_active())
@@ -3658,11 +3658,6 @@ fn overlay_builder(
     builder
 }
 
-/// The fullscreen pick overlay: borderless, transparent, always on top —
-/// the whole virtual screen is its canvas so no click escapes it, and an
-/// alpha-1 veil inside keeps transparent pixels hit-testable. Raised
-/// only while a colour pick is armed and the cursor roams outside the
-/// Draw window.
 /// Each monitor's rect + scale factor, cached 1 s in ctx data —
 /// monitor enumeration is a WindowServer round-trip, too heavy to run
 /// every ROOT pass. The same key feeds every overlay's per-frame rect
@@ -3694,6 +3689,10 @@ fn cached_pick_monitors(ctx: &egui::Context) -> Vec<(i32, i32, i32, i32, f32)> {
     })
 }
 
+/// One monitor's fullscreen pick overlay: borderless, transparent,
+/// always on top — an alpha-20 veil inside keeps transparent pixels
+/// hit-testable so no click escapes it. Raised only while a colour pick
+/// is armed and the cursor roams outside the Draw window.
 fn pick_overlay_builder(rect: (i32, i32, i32, i32, f32)) -> egui::ViewportBuilder {
     // Created AT its monitor's rect: a mid-creation 800×600 would leave
     // screen strips uncovered (clicks escape, loupe clipped) until the
@@ -3703,7 +3702,7 @@ fn pick_overlay_builder(rect: (i32, i32, i32, i32, f32)) -> egui::ViewportBuilde
     let size = platform::native_to_ui(egui::pos2((r - l) as f32, (b - t) as f32), ppp).to_vec2();
     let pos = platform::native_to_ui(egui::pos2(l as f32, t as f32), ppp);
     let builder = egui::ViewportBuilder::default()
-        .with_title("PixMe Pick")
+        .with_title(platform::picker::PICK_OVERLAY_TITLE)
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)

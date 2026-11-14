@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use eframe::egui::Color32;
 use image::{Rgba, RgbaImage};
 
-use super::{PREVIEW_PATCH, colorref_to_color32};
+use super::{PICK_OVERLAY_TITLE, PREVIEW_PATCH, colorref_to_color32};
 
 const CLR_INVALID: u32 = 0xFFFF_FFFF;
 /// `WDA_EXCLUDEFROMCAPTURE` (Windows 10 2004+): the window is absent
@@ -76,7 +76,7 @@ fn exclude_overlay_from_capture(x: i32, y: i32) {
         }
         let mut title = [0u16; 16];
         let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) as usize;
-        if String::from_utf16_lossy(&title[..n.min(title.len())]) != "PixMe Pick" {
+        if String::from_utf16_lossy(&title[..n.min(title.len())]) != PICK_OVERLAY_TITLE {
             return;
         }
         SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
