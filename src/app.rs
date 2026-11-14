@@ -298,7 +298,7 @@ fn draw_id() -> egui::ViewportId {
 /// swallowing the validating click while a colour pick is armed. A
 /// single union-spanning window cannot cover a non-rectangular
 /// multi-monitor layout: AppKit clips it to one screen's visibleFrame.
-fn pick_overlay_id(index: usize) -> egui::ViewportId {
+pub(crate) fn pick_overlay_id(index: usize) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(("pixme.pick_overlay", index))
 }
 
@@ -319,7 +319,7 @@ pub fn wake_viewports(ctx: &egui::Context) {
 /// materializes it as a real window for a frame — the "egui window" flash
 /// seen between the capture click and the crosshair. These helpers no-op
 /// unless the window exists.
-trait ViewportWake {
+pub(crate) trait ViewportWake {
     /// `request_repaint_of(id)` only when `id`'s window exists.
     fn repaint_if_live(&self, id: egui::ViewportId);
     /// `send_viewport_cmd_to(id, cmd)` only when `id`'s window exists.
@@ -3364,47 +3364,127 @@ impl eframe::App for PixMeApp {
         // window is re-pinned to its monitor's rect every frame (a
         // plug/unplug or DPI shift mid-pick cannot leave a strip
         // uncovered).
-        if lock(&self.shared.draw)
-            .as_ref()
-            .is_some_and(|d| d.pick_overlay_active())
+        // `PIXME_PICK_TEST` (Windows): arms the pick overlay without a
+        // Draw session so its rendering/input can be exercised by an
+        // external probe. Emulates the session's heartbeat and stops
+        // re-raising once an outcome lands.
+        #[cfg(target_os = "windows")]
+        let pick_test = std::env::var_os("PIXME_PICK_TEST").is_some() && {
+            let done = ctx.data_mut(|d| {
+                d.get_temp::<platform::picker::PickOutcome>(egui::Id::new(
+                    platform::picker::PICK_SCREEN_RESULT,
+                ))
+            })
+            .is_some_and(|o| {
+                !matches!(o, platform::picker::PickOutcome::CopyPressed(_))
+            });
+            if done {
+                tracing::info!("pick_test_done");
+                platform::picker::stop_worker();
+                false
+            } else {
+                platform::picker::start_worker();
+                true
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let pick_test = false;
+
+        // A terminal outcome pending in ctx data ends the pick even while
+        // the Draw session has not drained it yet — re-registering the
+        // viewport in the meantime would churn create/close cycles.
+        let pick_ended = ctx.data(|d| {
+            d.get_temp::<platform::picker::PickOutcome>(egui::Id::new(
+                platform::picker::PICK_SCREEN_RESULT,
+            ))
+            .is_some_and(|o| !matches!(o, platform::picker::PickOutcome::CopyPressed(_)))
+        });
+        if !pick_ended
+            && (pick_test
+                || lock(&self.shared.draw)
+                    .as_ref()
+                    .is_some_and(|d| d.pick_overlay_active()))
         {
             for (i, rect) in cached_pick_monitors(&ctx).into_iter().enumerate() {
                 let shared = Arc::clone(&self.shared);
-                ctx.show_viewport_deferred(
-                    pick_overlay_id(i),
-                    pick_overlay_builder(rect),
-                    move |ui, _class| {
-                        let ctx = ui.ctx().clone();
-                        shared.pump(&ctx);
-                        ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
-                        let (l, t, r, b, _scale) = rect;
-                        let ppp = platform::window_ppp(&ctx, 1.0);
-                        let want = egui::Rect::from_min_max(
-                            platform::native_to_ui(egui::pos2(l as f32, t as f32), ppp),
-                            platform::native_to_ui(egui::pos2(r as f32, b as f32), ppp),
-                        );
-                        // Tolerance: float round-trips never compare equal,
-                        // so commands would be re-sent every single frame.
-                        let off = ctx
-                            .input(|i| i.viewport().outer_rect)
-                            .map(|cur| {
-                                cur.min.distance(want.min) > 0.5
-                                    || (cur.size() - want.size()).length() > 0.5
-                            })
-                            .unwrap_or(true);
-                        if off {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want.size()));
-                            // AppKit can move the top edge while resizing a
-                            // window that spans monitors. Position it last.
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want.min));
-                        }
-                        // Above the Dock and menu bar — macOS floats
-                        // `with_always_on_top` at level 3, under system
-                        // chrome, and a click there would reach it.
-                        platform::elevate_pick_overlay();
-                        ui::draw::show_pick_overlay(ui);
-                    },
-                );
+                // Esc/C must reach an overlay: grab focus until the
+                // window reports focused (macOS becomes key on click —
+                // harmless there either way).
+                self.shared.request_focus(pick_overlay_id(i));
+                let builder = pick_overlay_builder(rect);
+                ctx.show_viewport_deferred(pick_overlay_id(i), builder, move |ui, _class| {
+                    let ctx = ui.ctx().clone();
+                    shared.pump(&ctx);
+                    shared.maybe_focus(&ctx, pick_overlay_id(i));
+                    ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                    // Armed-state is read straight from the session each
+                    // pass — a heartbeat would strand this click-eating
+                    // window whenever the Draw/ROOT passes throttle. A
+                    // terminal outcome pending in ctx data also ends it:
+                    // this viewport keeps repainting itself even while
+                    // ROOT is throttled, so the outcome check must live
+                    // HERE — returning early composites an empty (fully
+                    // transparent) frame, which clears the loupe pixels
+                    // from the last painted frame before the HWND dies.
+                    let ended = ctx.data(|d| {
+                        d.get_temp::<platform::picker::PickOutcome>(egui::Id::new(
+                            platform::picker::PICK_SCREEN_RESULT,
+                        ))
+                        .is_some_and(|o| {
+                            !matches!(o, platform::picker::PickOutcome::CopyPressed(_))
+                        })
+                    });
+                    let armed = !ended
+                        && (pick_test
+                            || lock(&shared.draw)
+                                .as_ref()
+                                .is_some_and(|d| d.pick_overlay_active()));
+                    if !armed {
+                        // Clicks must reach the desktop the moment the
+                        // pick ends — but only the PARENT's pass can reap
+                        // a deferred viewport, and the hidden 1x1 anchor
+                        // cannot be woken (request_redraw is dropped on
+                        // invisible windows). Passthrough defuses the
+                        // click-eating HWND NOW; `Close` lets the anchor
+                        // destroy it whenever it next passes.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        // A deferred viewport is torn down only when its
+                        // PARENT context runs a pass — the 1x1 anchor
+                        // sleeps while occluded, which would leave this
+                        // invisible click-eating HWND covering the whole
+                        // screen after the pick ended. Wake it so the
+                        // Close is processed and the window destroyed.
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                        return;
+                    }
+                    let (l, t, r, b, _scale) = rect;
+                    let ppp = platform::window_ppp(&ctx, 1.0);
+                    let want = egui::Rect::from_min_max(
+                        platform::native_to_ui(egui::pos2(l as f32, t as f32), ppp),
+                        platform::native_to_ui(egui::pos2(r as f32, b as f32), ppp),
+                    );
+                    // Tolerance: float round-trips never compare equal,
+                    // so commands would be re-sent every single frame.
+                    let off = ctx
+                        .input(|i| i.viewport().outer_rect)
+                        .map(|cur| {
+                            cur.min.distance(want.min) > 0.5
+                                || (cur.size() - want.size()).length() > 0.5
+                        })
+                        .unwrap_or(true);
+                    if off {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want.size()));
+                        // AppKit can move the top edge while resizing a
+                        // window that spans monitors. Position it last.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want.min));
+                    }
+                    // Above the Dock and menu bar — macOS floats
+                    // `with_always_on_top` at level 3, under system
+                    // chrome, and a click there would reach it.
+                    platform::elevate_pick_overlay();
+                    ui::draw::show_pick_overlay(ui);
+                });
             }
         }
 
@@ -3690,8 +3770,8 @@ fn cached_pick_monitors(ctx: &egui::Context) -> Vec<(i32, i32, i32, i32, f32)> {
 }
 
 /// One monitor's fullscreen pick overlay: borderless, transparent,
-/// always on top — an alpha-20 veil inside keeps transparent pixels
-/// hit-testable so no click escapes it. Raised only while a colour pick
+/// always on top, with platform-specific alpha and normal hit testing.
+/// Raised only while a colour pick
 /// is armed and the cursor roams outside the Draw window.
 fn pick_overlay_builder(rect: (i32, i32, i32, i32, f32)) -> egui::ViewportBuilder {
     // Created AT its monitor's rect: a mid-creation 800×600 would leave
@@ -3706,6 +3786,7 @@ fn pick_overlay_builder(rect: (i32, i32, i32, i32, f32)) -> egui::ViewportBuilde
         .with_icon(ui::icons::app_icon_data())
         .with_decorations(false)
         .with_transparent(true)
+        .with_mouse_passthrough(false)
         .with_resizable(false)
         .with_always_on_top()
         .with_has_shadow(false)
@@ -3716,6 +3797,8 @@ fn pick_overlay_builder(rect: (i32, i32, i32, i32, f32)) -> egui::ViewportBuilde
     #[cfg(target_os = "windows")]
     // Hidden until `strip_undecorated_frame` shows it — winit forces
     // WS_CAPTION at creation; `egui`'s `Visible(true)` would re-apply it.
+    // A fullscreen+transparent window does not composite under DWM, so
+    // the pick is a monitor-pinned window like on macOS, not fullscreen.
     let builder = builder.with_visible(false);
     builder
 }
@@ -3848,6 +3931,22 @@ mod tests {
         assert_eq!(viewer_builder(None).visible, None);
         assert_eq!(save_dialog_builder().visible, None);
         assert_eq!(draw_builder("t").visible, None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pick_overlay_is_a_hidden_monitor_pinned_window() {
+        let builder = pick_overlay_builder((-1920, 0, 0, 1080, 1.5));
+        assert_eq!(builder.fullscreen, None);
+        assert_eq!(builder.visible, Some(false));
+        assert_eq!(builder.decorations, Some(false));
+        assert_eq!(builder.transparent, Some(true));
+        assert_eq!(builder.mouse_passthrough, Some(false));
+        assert_eq!(platform::picker::OVERLAY_VEIL_ALPHA, 0);
+        assert_eq!(
+            builder.title.as_deref(),
+            Some(platform::picker::PICK_OVERLAY_TITLE)
+        );
     }
 
     fn harness() -> (Shared, egui::Context) {

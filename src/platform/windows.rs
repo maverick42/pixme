@@ -433,6 +433,10 @@ pub fn strip_undecorated_frame() {
         /// The invisible 1×1 root anchor ("PixMe" + WS_EX_TOPMOST — the
         /// viewer is not topmost, so no other "PixMe" window qualifies).
         Anchor,
+        /// The per-monitor colour-pick veil ("PixMe Pick"): transparent,
+        /// topmost, monitor-pinned — revealed here like every chromeless
+        /// window, and it keeps its title (tests/probes find the HWND).
+        Pick,
     }
 
     thread_local! {
@@ -473,6 +477,9 @@ pub fn strip_undecorated_frame() {
                 m.insert(hwnd, Role::Overlay);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
                 (Some(Role::Overlay), true)
+            } else if title == crate::platform::picker::PICK_OVERLAY_TITLE {
+                m.insert(hwnd, Role::Pick);
+                (Some(Role::Pick), true)
             } else if title == "PixMe" {
                 m.insert(hwnd, Role::Anchor);
                 unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
@@ -500,7 +507,7 @@ pub fn strip_undecorated_frame() {
             return 1;
         };
 
-        if role == Role::Overlay && first_seen {
+        if matches!(role, Role::Overlay | Role::Pick) && first_seen {
             // The taskbar is itself TOPMOST: a later-created topmost
             // window wins the band anyway, but re-asserting precedence
             // here guarantees the frozen frame stays selectable edge to
@@ -510,7 +517,7 @@ pub fn strip_undecorated_frame() {
             }
         }
 
-        if role == Role::Overlay && (first_seen || (style & WS_CHROME) != 0) {
+        if matches!(role, Role::Overlay | Role::Pick) && (first_seen || (style & WS_CHROME) != 0) {
             // Suppress DWM's 1 px accent line at the window's top edge —
             // SetWindowRgn (the countdown/pin fix) would clip real
             // frozen-frame rows. Best-effort: Windows 11 only.
@@ -595,7 +602,10 @@ pub fn strip_undecorated_frame() {
                                 0
                             }
                         }
-                        Role::Overlay => 0,
+                        // Overlay & pick cover their monitor edge to
+                        // edge: no clip region (a clip would eat real
+                        // rows or open click-through holes).
+                        Role::Overlay | Role::Pick => 0,
                     };
                     if rgn != 0 {
                         unsafe {

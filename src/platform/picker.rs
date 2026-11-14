@@ -23,11 +23,53 @@ pub use macos::{screen_patch, screen_pixel};
 #[cfg(target_os = "windows")]
 pub use windows::{screen_patch, screen_pixel};
 
+/// Raises the sampler worker while a pick overlay is up — the Windows
+/// desktop read can block on the compositor for tens of milliseconds per
+/// call (more under RDP), so it must never run on the UI thread. No-op on
+/// macOS, whose framebuffer reads are fast enough to stay synchronous.
+#[cfg(target_os = "macos")]
+pub fn start_worker() {}
+/// Stops the sampler worker (see [`start_worker`]). No-op on macOS.
+#[cfg(target_os = "macos")]
+pub fn stop_worker() {}
+/// Raises the sampler worker while a pick overlay is up (see above).
+#[cfg(target_os = "windows")]
+pub use windows::start_worker;
+/// Stops the sampler worker (see above).
+#[cfg(target_os = "windows")]
+pub use windows::stop_worker;
+/// `true` once per Esc press since the last call — polled physically by
+/// the worker, so it lands even while a foreign window owns key focus.
+/// No-op on macOS (its overlay takes focus and receives key events).
+#[cfg(target_os = "windows")]
+pub use windows::take_cancelled;
+/// `true` once per `C` press since the last call (see [`take_cancelled`]).
+#[cfg(target_os = "windows")]
+pub use windows::take_copy;
+/// `true` once per Esc press since the last call — no-op on macOS.
+#[cfg(target_os = "macos")]
+pub fn take_cancelled() -> bool {
+    false
+}
+/// `true` once per `C` press since the last call — no-op on macOS.
+#[cfg(target_os = "macos")]
+pub fn take_copy() -> bool {
+    false
+}
+
 /// Side of the square screen patch sampled for the pick loupe, in
 /// OS-native screen units (points on macOS, pixels on Windows). The
 /// returned image may be denser on Retina — the centre pixel is always
 /// the sampled point.
 pub const PREVIEW_PATCH: u32 = 11;
+
+/// AppKit needs a nonzero alpha to intercept clicks. DWM transparency
+/// does not: Windows keeps a normal hit-testable HWND without a veil
+/// tinting the desktop or capture protection hiding the loupe over RDP.
+#[cfg(target_os = "macos")]
+pub const OVERLAY_VEIL_ALPHA: u8 = 20;
+#[cfg(target_os = "windows")]
+pub const OVERLAY_VEIL_ALPHA: u8 = 0;
 
 /// Window title shared by every per-monitor pick overlay viewport —
 /// matched by `elevate_pick_overlay` and by the per-OS screen samplers
@@ -38,10 +80,6 @@ pub const PICK_OVERLAY_TITLE: &str = "PixMe Pick";
 /// the Draw session drains — the two live in different viewports, so
 /// ctx data is the channel.
 pub const PICK_SCREEN_RESULT: &str = "draw.pick_screen_result";
-/// `(Instant, bool)` heartbeat the Draw session rewrites every pass —
-/// the overlay self-closes when it turns false or goes stale (>500 ms),
-/// so a vanished Draw session can never strand a click-eating veil.
-pub const PICK_OVERLAY_ALIVE: &str = "draw.pick_overlay_alive";
 /// `Instant` of the last `C` copy during a pick — shared via ctx data
 /// so the overlay loupe flashes the same "copied!" hint as the canvas
 /// loupe.

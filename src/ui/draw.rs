@@ -15,7 +15,7 @@ use egui::{
 };
 use rust_i18n::t;
 
-use crate::app::Shared;
+use crate::app::{Shared, ViewportWake};
 use crate::capture::PhysicalRect;
 use crate::editor::document::{
     Annotation, AnnotationId, AnnotationKind, AreaObj, AreaShape, BlurObj, BlurStyle, BoxObj,
@@ -1162,14 +1162,9 @@ impl DrawSession {
             }
             self.set_pick_overlay(ctx, outside && !self.pick_blocked);
         }
-        // Heartbeat the overlay watches, refreshed every sync so a dead
-        // Draw session strands it for at most the staleness window.
-        ctx.data_mut(|d| {
-            d.insert_temp(
-                egui::Id::new(picker::PICK_OVERLAY_ALIVE),
-                (std::time::Instant::now(), self.pick_overlay),
-            );
-        });
+        // The overlay reads `self.pick_overlay` via `pick_overlay_active()`
+        // every pass (app.rs closure) and self-closes when it turns false —
+        // no heartbeat: a throttled sibling viewport cannot strand it.
         // Keep polling even while the cursor is inside Draw: crossing
         // the top edge does not always deliver a final pointer event to
         // Draw, so otherwise leaving after re-entering never re-arms the
@@ -1190,7 +1185,19 @@ impl DrawSession {
         if self.pick_overlay != on {
             self.pick_overlay = on;
             crate::app::wake_viewports(ctx);
-            if !on {
+            if on {
+                crate::platform::picker::start_worker();
+                // A pick window may outlive its outcome while the anchor
+                // sleeps (see the passthrough note in `show_pick_overlay`)
+                // — wake it and restore hit-testing so the pick works
+                // again without waiting for a ROOT pass to re-register.
+                for i in 0..8 {
+                    let id = crate::app::pick_overlay_id(i);
+                    ctx.cmd_if_live(id, egui::ViewportCommand::MousePassthrough(false));
+                    ctx.repaint_if_live(id);
+                }
+            } else {
+                crate::platform::picker::stop_worker();
                 // The overlay may have become the key window — hand the
                 // focus back or keystrokes (Esc included) keep landing
                 // nowhere after it closes.
@@ -5276,25 +5283,15 @@ pub fn show_pick_overlay(ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
     let screen = ui.max_rect();
-    // Fully-transparent pixels let clicks pass through the window —
-    // an invisible ~8% veil is what actually swallows the validating
-    // click (alpha 1 sat under the hit-test threshold and let presses
-    // reach the app beneath).
-    ui.painter()
-        .rect_filled(screen, 0.0, Color32::from_black_alpha(20));
+    ui.painter().rect_filled(
+        screen,
+        0.0,
+        Color32::from_black_alpha(picker::OVERLAY_VEIL_ALPHA),
+    );
 
-    // Self-close on the Draw session's heartbeat going false or stale —
-    // never wait for the ROOT pass (its repaint can be OS-throttled
-    // while occluded, which would strand this click-eating veil).
-    let alive = ctx
-        .data(|d| {
-            d.get_temp::<(std::time::Instant, bool)>(egui::Id::new(picker::PICK_OVERLAY_ALIVE))
-        })
-        .is_some_and(|(at, on)| on && at.elapsed().as_millis() < 500);
-    if !alive {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        return;
-    }
+    // The caller (app.rs overlay closure) reads the session's armed
+    // flag every pass and closes this window — no heartbeat to go stale
+    // while a sibling viewport's repaints are OS-throttled.
 
     // WindowServer tracking zones at the screen edges (Dock, menu bar)
     // starve this window of pointer events — a ~30 Hz tick keeps the
@@ -5304,16 +5301,14 @@ pub fn show_pick_overlay(ui: &mut Ui) {
     // Sample first: a click validates what the cursor sits on RIGHT NOW.
     // Framebuffer reads hit the WindowServer — pointer events can fire
     // far past 100 Hz, so the patch is cached and re-read at most every
-    // 33 ms or when the cursor moved since the last read.
+    // 33 ms, including while stationary (the desktop can change).
     let cursor =
         crate::platform::cursor_position().map(|(x, y)| (x.round() as i32, y.round() as i32));
     let patch = ctx.data_mut(|d| {
         let id = egui::Id::new("draw.pick_sample");
         let cached = d.get_temp::<(std::time::Instant, (i32, i32), image::RgbaImage)>(id);
         let fresh = match (cursor, &cached) {
-            (Some(pos), Some((at, ppos, _))) if *ppos == pos || at.elapsed().as_millis() < 33 => {
-                None
-            }
+            (Some(_), Some((at, _, _))) if at.elapsed().as_millis() < 33 => None,
             (Some((x, y)), _) => picker::screen_patch(x, y).map(|p| (x, y, p)),
             _ => None,
         };
@@ -5335,18 +5330,30 @@ pub fn show_pick_overlay(ui: &mut Ui) {
             .and_then(|(x, y)| picker::screen_pixel(x, y))
             .map(PickOutcome::Picked)
             .or(Some(PickOutcome::Denied))
-    } else if click.secondary_clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    } else if click.secondary_clicked()
+        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        || picker::take_cancelled()
+    {
         Some(PickOutcome::Cancelled)
     } else {
         None
     };
     if let Some(o) = outcome {
+        tracing::debug!(?o, "pick overlay: outcome stored");
+        // Terminal outcome: the sampler stops NOW — waiting for the Draw
+        // session's (possibly throttled) drain would keep compositor
+        // reads running while the window is already doomed.
+        picker::stop_worker();
         ctx.data_mut(|d| {
             d.insert_temp(egui::Id::new(picker::PICK_SCREEN_RESULT), o);
         });
         // Close OURSELVES: the ROOT pass that would deregister us can be
         // OS-throttled for an occluded window, and a transparent veil
-        // left up swallows every click on the desktop.
+        // left up swallows every click on the desktop. Passthrough is
+        // applied at THIS pass' end (commands need no parent pass) — the
+        // HWND keeps living until the anchor reaps it, but already lets
+        // every click through to the desktop beneath.
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         return;
     }
@@ -5356,7 +5363,7 @@ pub fn show_pick_overlay(ui: &mut Ui) {
     // the heartbeat turning off ends the pick.
     let cpress = ctx.input(|i| {
         i.key_pressed(egui::Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy))
-    });
+    }) || picker::take_copy();
     if cpress {
         let o = cursor
             .and_then(|(x, y)| picker::screen_pixel(x, y))
@@ -6598,6 +6605,22 @@ mod tests {
         assert_eq!(near_top.y, 20.0);
         let near_right = pick_loupe_position(pos2(3685.0, 500.0), primary, size, 18.0);
         assert_eq!(near_right.x, 3685.0 - 18.0 - size.x);
+    }
+
+    #[test]
+    fn pick_loupe_stays_clear_of_the_sampled_pixels() {
+        let bounds = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 480.0));
+        let size = vec2(126.0, 182.0);
+        let half_patch = crate::platform::picker::PREVIEW_PATCH as f32 / 2.0;
+        for y in (0..480).step_by(7) {
+            for x in (0..640).step_by(7) {
+                let cursor = pos2(x as f32, y as f32);
+                let card =
+                    Rect::from_min_size(pick_loupe_position(cursor, bounds, size, 18.0), size);
+                let sample = Rect::from_center_size(cursor, Vec2::splat(half_patch * 2.0));
+                assert!(!card.intersects(sample), "{cursor:?}: {card:?}");
+            }
+        }
     }
 
     /// `emoji_default_side` honouring: a remembered `last` wins but is
