@@ -256,6 +256,33 @@ impl Default for ToolStyle {
 pub struct DrawOptions {
     /// Per-tool option banks, keyed by tool.
     pub tools: std::collections::BTreeMap<crate::ui::draw::Tool, ToolStyle>,
+    /// The colour picker's "custom colours" bank — up to
+    /// [`crate::ui::theme::picker::CUSTOM_SLOTS`] slots, `None` = empty;
+    /// the vec is normalised to the slot count by [`Self::custom_slot`]
+    /// and [`Self::set_custom_slot`] so hand-edited prefs still load.
+    pub custom_colors: Vec<Option<[u8; 3]>>,
+}
+
+impl DrawOptions {
+    /// Slot `i` of the custom-colours bank (`None` when empty or past
+    /// the end of a short/hand-edited list).
+    pub fn custom_slot(&self, i: usize) -> Option<[u8; 3]> {
+        self.custom_colors.get(i).copied().flatten()
+    }
+
+    /// Writes slot `i` of the custom-colours bank, growing the vec to
+    /// the slot count on first use and truncating any surplus a
+    /// hand-edited prefs file may carry.
+    pub fn set_custom_slot(&mut self, i: usize, c: Option<[u8; 3]>) {
+        if i >= crate::ui::theme::picker::CUSTOM_SLOTS {
+            return;
+        }
+        self.custom_colors
+            .resize(crate::ui::theme::picker::CUSTOM_SLOTS, None);
+        self.custom_colors
+            .truncate(crate::ui::theme::picker::CUSTOM_SLOTS);
+        self.custom_colors[i] = c;
+    }
 }
 
 /// Per-monitor persisted preferences, keyed by the monitor's stable id

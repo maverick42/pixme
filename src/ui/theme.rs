@@ -199,6 +199,80 @@ pub mod annotation {
     pub const ALL: [Color32; 7] = [RED, YELLOW, GREEN, BLUE, MAGENTA, WHITE, BLACK];
 }
 
+/// Preset bank shown beside the colour picker's HSV area — the
+/// functional reference's 48 "base colours" (the classic Windows
+/// palette it ships), in row-major order. Theme-independent like the
+/// annotation palette.
+pub mod picker {
+    use egui::Color32;
+
+    const fn rgb(hex: u32) -> Color32 {
+        Color32::from_rgb(
+            ((hex >> 16) & 0xFF) as u8,
+            ((hex >> 8) & 0xFF) as u8,
+            (hex & 0xFF) as u8,
+        )
+    }
+
+    /// Columns per base-colour row.
+    pub const BASE_COLS: usize = 8;
+    /// The 48 base colours, row-major (6 rows × [`BASE_COLS`]).
+    pub const BASE: [Color32; 48] = [
+        rgb(0xFF8080),
+        rgb(0xFFFF80),
+        rgb(0x80FF80),
+        rgb(0x00FF80),
+        rgb(0x80FFFF),
+        rgb(0x0080FF),
+        rgb(0xFF80C0),
+        rgb(0xFF80FF),
+        rgb(0xFF0000),
+        rgb(0xFFFF00),
+        rgb(0x80FF00),
+        rgb(0x00FF40),
+        rgb(0x00FFFF),
+        rgb(0x0080C0),
+        rgb(0x8080C0),
+        rgb(0xFF00FF),
+        rgb(0x804040),
+        rgb(0xFF8040),
+        rgb(0x00FF00),
+        rgb(0x008080),
+        rgb(0x004080),
+        rgb(0x8080FF),
+        rgb(0x800040),
+        rgb(0xFF0080),
+        rgb(0x800000),
+        rgb(0xFF8000),
+        rgb(0x008000),
+        rgb(0x008040),
+        rgb(0x0000FF),
+        rgb(0x0000A0),
+        rgb(0x800080),
+        rgb(0x8000FF),
+        rgb(0x400000),
+        rgb(0x804000),
+        rgb(0x004000),
+        rgb(0x004040),
+        rgb(0x000080),
+        rgb(0x000040),
+        rgb(0x400040),
+        rgb(0x400080),
+        rgb(0x000000),
+        rgb(0x808000),
+        rgb(0x808040),
+        rgb(0x808080),
+        rgb(0x408080),
+        rgb(0xC0C0C0),
+        rgb(0x400040),
+        rgb(0xFFFFFF),
+    ];
+
+    /// Slots in the user-defined "custom colours" bank (persisted in
+    /// `prefs.json`).
+    pub const CUSTOM_SLOTS: usize = 16;
+}
+
 /// Fixed colours for the pinned-window hover chrome: white controls stay
 /// legible on arbitrary screenshots whatever the theme.
 pub mod pin_chrome {

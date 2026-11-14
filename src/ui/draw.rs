@@ -3594,7 +3594,7 @@ impl DrawSession {
     /// colour, outline `*`, font, size, B/I, alignment, outline
     /// width+colour, and the multi-line edit with its Enter note.
     /// Edits land on the object live; closing commits one Replace.
-    fn text_panel_window(&mut self, ctx: &egui::Context, _shared: &Shared) {
+    fn text_panel_window(&mut self, ctx: &egui::Context, shared: &Shared) {
         let Some(panel) = &self.text_panel else {
             return;
         };
@@ -3710,7 +3710,7 @@ impl DrawSession {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.spacing_mut().interact_size.y = 22.0;
-                    if color_btn(ui, color).changed() {
+                    if color_btn(ui, shared, color).changed() {
                         rev = true;
                     }
                     if let Some(font) = &mut font {
@@ -3792,7 +3792,7 @@ impl DrawSession {
                         rev = true;
                     }
                     if let Some(oc) = &mut outline_color
-                        && color_btn(ui, oc).changed()
+                        && color_btn(ui, shared, oc).changed()
                     {
                         rev = true;
                     }
@@ -4203,7 +4203,7 @@ impl DrawSession {
     /// otherwise the armed tool's defaults.
     fn bottom_content(&mut self, ui: &mut Ui, shared: &Shared) {
         if self.sel_area.is_some() {
-            self.sel_options(ui);
+            self.sel_options(ui, shared);
         } else if self.selected.is_some() {
             // A selected emoji keeps the strip up (icons only — no
             // styling options) so the user can arm another one fast.
@@ -4225,7 +4225,7 @@ impl DrawSession {
     /// The marquee's option strip (frame W×H rides the tab title):
     /// blur presets, cut/copy/paste/delete, and a Remplissage button
     /// applying the swatch's colour — the swatch itself just picks it.
-    fn sel_options(&mut self, ui: &mut Ui) {
+    fn sel_options(&mut self, ui: &mut Ui, shared: &Shared) {
         let Some(_sel) = self.sel_area else { return };
         ui.menu_button(t!("draw.opt.blur"), |ui| {
             for pct in [25u8, 50, 75, 100] {
@@ -4250,7 +4250,7 @@ impl DrawSession {
         ui.separator();
         let do_fill = ui
             .horizontal(|ui| {
-                color_btn(ui, &mut self.opts.fill_color);
+                color_btn(ui, shared, &mut self.opts.fill_color);
                 ui.button(t!("draw.opt.fill_c")).clicked()
             })
             .inner;
@@ -4315,6 +4315,7 @@ impl DrawSession {
             Tool::Arrow => {
                 line_options_row(
                     ui,
+                    shared,
                     "draw.bar.line",
                     &mut o.color,
                     &mut o.width,
@@ -4330,6 +4331,7 @@ impl DrawSession {
             Tool::Pencil => {
                 pencil_options_row(
                     ui,
+                    shared,
                     "draw.bar.pencil",
                     &mut o.color,
                     &mut o.width,
@@ -4344,6 +4346,7 @@ impl DrawSession {
             Tool::Brace => {
                 brace_options_row(
                     ui,
+                    shared,
                     "draw.bar.brace",
                     &mut o.color,
                     &mut o.width,
@@ -4358,7 +4361,7 @@ impl DrawSession {
             Tool::Eraser => {
                 ui.horizontal(|ui| {
                     ui.label(t!("draw.opt.color"));
-                    if color_btn(ui, &mut o.eraser_color).changed() {
+                    if color_btn(ui, shared, &mut o.eraser_color).changed() {
                         o.eraser_mode = EraserMode::Color;
                         o.eraser_pick = false;
                     }
@@ -4403,6 +4406,7 @@ impl DrawSession {
                 let mut radius_opt = is_rect.then_some(&mut o.radius);
                 shape_options_row(
                     ui,
+                    shared,
                     "draw.bar.shape",
                     &mut o.color,
                     &mut o.width,
@@ -4421,6 +4425,7 @@ impl DrawSession {
             Tool::HighlightArea => {
                 highlight_area_options_row(
                     ui,
+                    shared,
                     "draw.bar.harea",
                     &mut o.color,
                     &mut o.shape,
@@ -4438,7 +4443,7 @@ impl DrawSession {
                 ch |= ui
                     .horizontal(|ui| {
                         ui.label(t!("draw.opt.color"));
-                        color_btn(ui, &mut o.color).changed()
+                        color_btn(ui, shared, &mut o.color).changed()
                     })
                     .inner;
                 ch |= ui
@@ -4459,7 +4464,7 @@ impl DrawSession {
                     .horizontal(|ui| {
                         ui.label(t!("draw.opt.outline"));
                         outline_combo(ui, "draw.bar.toutline", &mut o.outline_w)
-                            | color_btn(ui, &mut o.outline_color).changed()
+                            | color_btn(ui, shared, &mut o.outline_color).changed()
                     })
                     .inner;
                 ch |= opacity_pct_slider(ui, &mut o.opacity);
@@ -4484,17 +4489,17 @@ impl DrawSession {
                 // Text colour + box interior.
                 ui.horizontal(|ui| {
                     ui.label(t!("draw.opt.fg"));
-                    color_btn(ui, &mut o.outline_color);
+                    color_btn(ui, shared, &mut o.outline_color);
                 });
                 ui.horizontal(|ui| {
                     ui.label(t!("draw.opt.bg"));
-                    color_btn(ui, &mut o.fill_color);
+                    color_btn(ui, shared, &mut o.fill_color);
                 });
                 // Outline: width (1..10) + colour.
                 ui.horizontal(|ui| {
                     ui.label(t!("draw.opt.outline"));
                     outline_combo(ui, "draw.bar.boxw", &mut o.width);
-                    color_btn(ui, &mut o.color);
+                    color_btn(ui, shared, &mut o.color);
                 });
                 ui.add_space(12.0);
                 opacity_pct_slider(ui, &mut o.opacity);
@@ -4506,6 +4511,7 @@ impl DrawSession {
                 };
                 step_options_row(
                     ui,
+                    shared,
                     "draw.bar.step",
                     o.step_mode,
                     count,
@@ -4528,7 +4534,7 @@ impl DrawSession {
     }
 
     /// Style options of the SELECTED object (re-editable, FS-style).
-    fn selected_options(&mut self, ui: &mut Ui, _shared: &Shared) {
+    fn selected_options(&mut self, ui: &mut Ui, shared: &Shared) {
         let Some(id) = self.selected else { return };
         let Some(before) = self.doc.annotation(id).cloned() else {
             return;
@@ -4541,6 +4547,7 @@ impl DrawSession {
                     let mut radius_opt = Some(&mut o.radius);
                     if shape_options_row(
                         ui,
+                        shared,
                         "draw.sel.rect",
                         &mut o.stroke,
                         &mut o.stroke_w,
@@ -4561,6 +4568,7 @@ impl DrawSession {
                     let mut radius_opt: Option<&mut f32> = None;
                     if shape_options_row(
                         ui,
+                        shared,
                         "draw.sel.ellipse",
                         &mut o.stroke,
                         &mut o.stroke_w,
@@ -4580,6 +4588,7 @@ impl DrawSession {
                     let mut sh_on = o.shadow > 0.0;
                     if line_options_row(
                         ui,
+                        shared,
                         "draw.sel.line",
                         &mut o.color,
                         &mut o.width,
@@ -4599,6 +4608,7 @@ impl DrawSession {
                     let mut sh_on = o.shadow > 0.0;
                     if pencil_options_row(
                         ui,
+                        shared,
                         "draw.sel.pencil",
                         &mut o.color,
                         &mut o.width,
@@ -4616,6 +4626,7 @@ impl DrawSession {
                 AnnotationKind::HighlightArea(o) => {
                     if highlight_area_options_row(
                         ui,
+                        shared,
                         "draw.sel.harea",
                         &mut o.color,
                         &mut o.shape,
@@ -4631,7 +4642,7 @@ impl DrawSession {
                     changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.color"));
-                            color_btn(ui, &mut o.color).changed()
+                            color_btn(ui, shared, &mut o.color).changed()
                         })
                         .inner;
                     changed |= ui
@@ -4652,7 +4663,7 @@ impl DrawSession {
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.outline"));
                             outline_combo(ui, "draw.sel.toutline", &mut o.outline)
-                                | color_btn(ui, &mut o.outline_color).changed()
+                                | color_btn(ui, shared, &mut o.outline_color).changed()
                         })
                         .inner;
                     changed |= opacity_pct_slider(ui, &mut o.opacity);
@@ -4666,20 +4677,20 @@ impl DrawSession {
                     changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.fg"));
-                            color_btn(ui, &mut o.fg).changed()
+                            color_btn(ui, shared, &mut o.fg).changed()
                         })
                         .inner;
                     changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.bg"));
-                            color_btn(ui, &mut o.bg).changed()
+                            color_btn(ui, shared, &mut o.bg).changed()
                         })
                         .inner;
                     changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.outline"));
                             outline_combo(ui, "draw.sel.boxw", &mut o.border_w)
-                                | color_btn(ui, &mut o.border).changed()
+                                | color_btn(ui, shared, &mut o.border).changed()
                         })
                         .inner;
                     ui.add_space(12.0);
@@ -4689,6 +4700,7 @@ impl DrawSession {
                     let mut sh_on = o.shadow > 0.0;
                     if step_options_row(
                         ui,
+                        shared,
                         "draw.sel.step",
                         o.mode,
                         &mut o.count,
@@ -4728,6 +4740,7 @@ impl DrawSession {
                     let mut sh_on = o.shadow > 0.0;
                     if brace_options_row(
                         ui,
+                        shared,
                         "draw.sel.brace",
                         &mut o.color,
                         &mut o.width,
@@ -5476,11 +5489,159 @@ fn pipette_btn(ui: &mut Ui, armed: bool, anchor: Rect) -> Response {
     resp
 }
 
-/// Colour swatch button with an explicit border so light swatches
-/// (e.g. white outline) remain visible on the light theme. The trailing
-/// pipette arms a pick targeting THIS swatch.
-fn color_btn(ui: &mut Ui, c: &mut Color32) -> Response {
-    let border = theme::tokens(ui.ctx()).field_border;
+/// The swatch part of [`color_btn`] — egui's `color_edit_button_hsva`
+/// wraps a private button we cannot extend, so the swatch is ours:
+/// solid fill with the field border (light swatches stay visible on
+/// the light theme), accent frame while its popup is open.
+fn swatch_button(ui: &mut Ui, c: Color32, open: bool) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(ui.spacing().interact_size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), CornerRadius::same(2), c);
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(3),
+            Stroke::new(1.0, t.field_border),
+            StrokeKind::Outside,
+        );
+        if open {
+            ui.painter().rect_stroke(
+                rect.expand(1.0),
+                CornerRadius::same(3),
+                Stroke::new(1.0, t.accent_border),
+                StrokeKind::Outside,
+            );
+        }
+    }
+    resp
+}
+
+/// One palette cell — an 18 px colour chip with a thin field border,
+/// accent-framed when it matches the current colour.
+fn palette_cell(ui: &mut Ui, c: Option<Color32>, selected: bool) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(2),
+            c.unwrap_or(t.field_border.linear_multiply(0.35)),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(2),
+            Stroke::new(
+                if selected { 1.5 } else { 1.0 },
+                if selected || resp.hovered() {
+                    t.accent_border
+                } else {
+                    t.field_border
+                },
+            ),
+            StrokeKind::Inside,
+        );
+    }
+    resp
+}
+
+/// Ctx key for the custom slot the "add" button targets — per popup.
+fn custom_sel_key(popup_id: egui::Id) -> egui::Id {
+    popup_id.with("custom_sel")
+}
+
+/// The left column of the colour popup: the functional reference's
+/// 48 base colours, then the persisted custom bank. Returns the
+/// colour to apply when a swatch was clicked — the popup closes on
+/// the caller's side, like the reference's dialog.
+fn palette_column(
+    ui: &mut Ui,
+    shared: &Shared,
+    popup_id: egui::Id,
+    cur: Color32,
+) -> Option<Color32> {
+    let mut picked = None;
+    ui.spacing_mut().item_spacing = Vec2::splat(3.0);
+    ui.label(t!("draw.pick.basic_colors").to_string());
+    for row in theme::picker::BASE.chunks(theme::picker::BASE_COLS) {
+        ui.horizontal(|ui| {
+            for &c in row {
+                if palette_cell(ui, Some(c), c == cur).clicked() {
+                    picked = Some(c);
+                }
+            }
+        });
+    }
+    ui.add_space(6.0);
+    ui.label(t!("draw.pick.custom_colors").to_string());
+
+    let sel_key = custom_sel_key(popup_id);
+    let mut sel: Option<usize> = ui.ctx().data_mut(|d| d.get_persisted(sel_key));
+    for row in 0..theme::picker::CUSTOM_SLOTS.div_ceil(theme::picker::BASE_COLS) {
+        ui.horizontal(|ui| {
+            for col in 0..theme::picker::BASE_COLS {
+                let i = row * theme::picker::BASE_COLS + col;
+                let c = shared
+                    .lock_settings()
+                    .draw_opts
+                    .custom_slot(i)
+                    .map(|[r, g, b]| Color32::from_rgb(r, g, b));
+                let resp = palette_cell(ui, c, sel == Some(i) || c == Some(cur));
+                let resp = if c.is_some() {
+                    resp.on_hover_text(t!("draw.pick.custom_tip").to_string())
+                } else {
+                    resp.on_hover_text(t!("draw.pick.custom_empty").to_string())
+                };
+                if resp.clicked() {
+                    sel = Some(i);
+                    ui.ctx().data_mut(|d| d.insert_persisted(sel_key, i));
+                    if c.is_some() {
+                        picked = c;
+                    }
+                } else if c.is_some() && resp.clicked_by(egui::PointerButton::Secondary) {
+                    let mut s = shared.lock_settings();
+                    s.draw_opts.set_custom_slot(i, None);
+                    s.save();
+                    drop(s);
+                    if sel == Some(i) {
+                        sel = None;
+                        ui.ctx().data_mut(|d| d.remove::<usize>(sel_key));
+                    }
+                }
+            }
+        });
+    }
+
+    // "Add to custom colours": the selected slot wins (overwriting a
+    // filled slot), else the first empty one; greyed when the bank is
+    // full with no slot selected.
+    let target = {
+        let s = shared.lock_settings();
+        sel.or_else(|| {
+            (0..theme::picker::CUSTOM_SLOTS).find(|&i| s.draw_opts.custom_slot(i).is_none())
+        })
+    };
+    if ui
+        .add_enabled(
+            target.is_some(),
+            egui::Button::new(t!("draw.pick.add_custom").to_string()),
+        )
+        .clicked()
+        && let Some(i) = target
+    {
+        let mut s = shared.lock_settings();
+        s.draw_opts
+            .set_custom_slot(i, Some([cur.r(), cur.g(), cur.b()]));
+        s.save();
+    }
+    picked
+}
+
+/// Colour swatch button opening the colour popup: the functional
+/// reference's preset bank (base + persisted custom colours) beside
+/// egui's HSV picker. The trailing pipette arms a pick targeting THIS
+/// swatch.
+fn color_btn(ui: &mut Ui, shared: &Shared, c: &mut Color32) -> Response {
     let id = ui.next_auto_id();
     let mut changed = false;
     // A pick armed for this swatch lands here on the next frame.
@@ -5499,23 +5660,40 @@ fn color_btn(ui: &mut Ui, c: &mut Color32) -> Response {
         .filter(|cached: &egui::epaint::Hsva| Color32::from(*cached) == *c)
         .unwrap_or_else(|| egui::epaint::Hsva::from(*c));
     let old_h = hsva.h;
-    let mut r = egui::widgets::color_picker::color_edit_button_hsva(
+    let popup_id = id.with("popup");
+    let mut r = swatch_button(
         ui,
-        &mut hsva,
-        egui::widgets::color_picker::Alpha::Opaque,
+        Color32::from(hsva),
+        egui::Popup::is_id_open(ui.ctx(), popup_id),
     );
+    egui::Popup::menu(&r)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.spacing_mut().slider_width = 275.0;
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    if let Some(p) = palette_column(ui, shared, popup_id, Color32::from(hsva)) {
+                        hsva = egui::epaint::Hsva::from(p);
+                        r.mark_changed();
+                        egui::Popup::close_id(ui.ctx(), popup_id);
+                    }
+                });
+                if egui::widgets::color_picker::color_picker_hsva_2d(
+                    ui,
+                    &mut hsva,
+                    egui::widgets::color_picker::Alpha::Opaque,
+                ) {
+                    r.mark_changed();
+                }
+            });
+        });
     if (hsva.h - old_h).abs() > 1e-4 && (hsva.s < 0.02 || hsva.v < 0.02) {
         hsva.s = 1.0;
         hsva.v = 1.0;
     }
     *c = Color32::from(hsva);
     ui.ctx().data_mut(|d| d.insert_temp(id, hsva));
-    ui.painter().rect_stroke(
-        r.rect,
-        CornerRadius::same(3),
-        Stroke::new(1.0, border),
-        StrokeKind::Outside,
-    );
     let armed = armed_pick(ui.ctx()) == Some(id);
     if pipette_btn(ui, armed, r.rect)
         .on_hover_text(t!("draw.opt.pick").to_string())
@@ -5616,6 +5794,7 @@ fn dash_combo(ui: &mut Ui, dash: &mut Dash) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn line_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     color: &mut Color32,
     width: &mut f32,
@@ -5643,7 +5822,7 @@ fn line_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.color"));
-            color_btn(ui, color).changed()
+            color_btn(ui, shared, color).changed()
         })
         .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=20.0).changed();
@@ -5680,7 +5859,7 @@ fn line_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.outline"));
-            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+            outline_combo(ui, salt, outline) | color_btn(ui, shared, outline_color).changed()
         })
         .inner;
 
@@ -5695,6 +5874,7 @@ fn line_options_row(
 #[allow(clippy::too_many_arguments)]
 fn pencil_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     color: &mut Color32,
     width: &mut f32,
@@ -5709,7 +5889,7 @@ fn pencil_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.color"));
-            color_btn(ui, color).changed()
+            color_btn(ui, shared, color).changed()
         })
         .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=30.0).changed();
@@ -5723,7 +5903,7 @@ fn pencil_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.outline"));
-            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+            outline_combo(ui, salt, outline) | color_btn(ui, shared, outline_color).changed()
         })
         .inner;
     changed |= opacity_pct_slider(ui, opacity);
@@ -5737,6 +5917,7 @@ fn pencil_options_row(
 #[allow(clippy::too_many_arguments)]
 fn brace_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     color: &mut Color32,
     width: &mut f32,
@@ -5751,7 +5932,7 @@ fn brace_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.color"));
-            color_btn(ui, color).changed()
+            color_btn(ui, shared, color).changed()
         })
         .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=20.0).changed();
@@ -5778,7 +5959,7 @@ fn brace_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.outline"));
-            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+            outline_combo(ui, salt, outline) | color_btn(ui, shared, outline_color).changed()
         })
         .inner;
     changed |= opacity_pct_slider(ui, opacity);
@@ -5836,6 +6017,7 @@ fn brace_kind_button(ui: &mut Ui, kind: BraceKind, selected: bool) -> Response {
 #[allow(clippy::too_many_arguments)]
 fn shape_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     stroke: &mut Color32,
     stroke_w: &mut f32,
@@ -5852,13 +6034,13 @@ fn shape_options_row(
         changed |= ui
             .horizontal(|ui| {
                 ui.label(t!("draw.opt.fill_c"));
-                color_btn(ui, fc).changed()
+                color_btn(ui, shared, fc).changed()
             })
             .inner;
         changed |= ui
             .horizontal(|ui| {
                 ui.label(t!("draw.opt.border"));
-                color_btn(ui, stroke).changed()
+                color_btn(ui, shared, stroke).changed()
             })
             .inner;
         changed |= w_edit(ui, t!("draw.opt.width"), stroke_w, 0.0..=20.0).changed();
@@ -5866,7 +6048,7 @@ fn shape_options_row(
         changed |= ui
             .horizontal(|ui| {
                 ui.label(t!("draw.opt.color"));
-                color_btn(ui, stroke).changed()
+                color_btn(ui, shared, stroke).changed()
             })
             .inner;
         changed |= w_edit(ui, t!("draw.opt.width"), stroke_w, 1.0..=20.0).changed();
@@ -5893,7 +6075,7 @@ fn shape_options_row(
         changed |= ui
             .horizontal(|ui| {
                 ui.label(t!("draw.opt.outline"));
-                outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+                outline_combo(ui, salt, outline) | color_btn(ui, shared, outline_color).changed()
             })
             .inner;
     }
@@ -5923,6 +6105,7 @@ fn tip_combo(ui: &mut Ui, tip: &mut TipShape) -> bool {
 /// Option strip shared by `Tool::HighlightArea` and a selected `AreaObj`.
 fn highlight_area_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     color: &mut Color32,
     shape: &mut AreaShape,
@@ -5932,7 +6115,7 @@ fn highlight_area_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.color"));
-            color_btn(ui, color).changed()
+            color_btn(ui, shared, color).changed()
         })
         .inner;
     changed |= ui
@@ -6084,6 +6267,7 @@ fn parse_step_letter(text: &str) -> Option<f64> {
 #[allow(clippy::too_many_arguments)]
 fn step_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     mode: StepMode,
     count: &mut u32,
@@ -6138,13 +6322,13 @@ fn step_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.bg"));
-            color_btn(ui, bg).changed()
+            color_btn(ui, shared, bg).changed()
         })
         .inner;
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.fg"));
-            color_btn(ui, fg).changed()
+            color_btn(ui, shared, fg).changed()
         })
         .inner;
     changed |= ui
@@ -6194,7 +6378,7 @@ fn step_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.outline"));
-            outline_combo(ui, salt, ring) | color_btn(ui, ring_color).changed()
+            outline_combo(ui, salt, ring) | color_btn(ui, shared, ring_color).changed()
         })
         .inner;
     changed |= opacity_pct_slider(ui, opacity);
