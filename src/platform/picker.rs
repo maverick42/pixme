@@ -4,11 +4,12 @@
 //! while the Draw window stays put.
 //!
 //! There is no per-OS session type: the interaction itself is a
-//! transparent borderless always-on-top viewport covering the virtual
-//! screen (`ui::draw::show_pick_overlay`), which catches every click —
-//! the application under the cursor never sees the validating press —
-//! and paints our own loupe + cursor. This module only provides the
-//! OS-level pixel reads and the union rect the overlay covers.
+//! transparent borderless always-on-top viewport per monitor
+//! (`ui::draw::show_pick_overlay`) — a single union-spanning window
+//! cannot cover a non-rectangular multi-monitor layout — which catches
+//! every click so the application under the cursor never sees the
+//! validating press, and paints our own loupe + cursor. This module
+//! only provides the OS-level pixel reads and the union rect (tests).
 
 use eframe::egui::Color32;
 

@@ -294,10 +294,13 @@ fn countdown_id() -> egui::ViewportId {
 fn draw_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("pixme.draw")
 }
-/// The fullscreen pick overlay — transparent, covers the virtual screen,
-/// swallows the validating click while a colour pick is armed.
-fn pick_overlay_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("pixme.pick_overlay")
+/// The fullscreen pick overlays — one transparent viewport per monitor,
+/// swallowing the validating click while a colour pick is armed. A
+/// single union-spanning window cannot cover a non-rectangular
+/// multi-monitor layout: AppKit clips it to one screen's visibleFrame
+/// (the Sidecar iPad stayed unveiled).
+fn pick_overlay_id(index: usize) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("pixme.pick_overlay", index))
 }
 
 /// Wakes every command-pumping viewport from outside a pass (OS menu
@@ -3352,29 +3355,29 @@ impl eframe::App for PixMeApp {
             });
         }
 
-        // The fullscreen pick overlay: raised while a colour pick is
-        // armed and the cursor roams outside the Draw window. It covers
-        // the virtual screen — every click lands on it, so the app
-        // underneath never sees the validating press — and its rect is
-        // re-pinned to the monitor union each frame (a plug/unplug or
-        // DPI shift mid-pick cannot leave a strip uncovered).
+        // The fullscreen pick overlays: raised while a colour pick is
+        // armed and the cursor roams outside the Draw window — one
+        // viewport per monitor, so every click lands on our chrome and
+        // the app underneath never sees the validating press. A single
+        // union-spanning window would not work: AppKit clips it to one
+        // screen's visibleFrame, leaving a non-rectangular layout
+        // (e.g. Sidecar iPad below-left) partly uncovered. Each window
+        // is re-pinned to its monitor's rect every frame (a plug/unplug
+        // or DPI shift mid-pick cannot leave a strip uncovered).
         if lock(&self.shared.draw)
             .as_ref()
             .is_some_and(|d| d.pick_overlay_active())
         {
-            let shared = Arc::clone(&self.shared);
-            ctx.show_viewport_deferred(
-                pick_overlay_id(),
-                pick_overlay_builder(&ctx),
-                move |ui, _class| {
-                    let ctx = ui.ctx().clone();
-                    shared.pump(&ctx);
-                    ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
-                    // Re-pin to the monitor union each frame (a
-                    // plug/unplug or DPI shift mid-pick cannot leave a
-                    // strip uncovered) — cached, see `cached_pick_union`.
-                    let union = cached_pick_union(&ctx);
-                    if let Some((l, t, r, b)) = union {
+            for (i, rect) in cached_pick_monitors(&ctx).into_iter().enumerate() {
+                let shared = Arc::clone(&self.shared);
+                ctx.show_viewport_deferred(
+                    pick_overlay_id(i),
+                    pick_overlay_builder(rect),
+                    move |ui, _class| {
+                        let ctx = ui.ctx().clone();
+                        shared.pump(&ctx);
+                        ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
+                        let (l, t, r, b, _scale) = rect;
                         let ppp = platform::window_ppp(&ctx, 1.0);
                         let want = egui::Rect::from_min_max(
                             platform::native_to_ui(egui::pos2(l as f32, t as f32), ppp),
@@ -3395,14 +3398,14 @@ impl eframe::App for PixMeApp {
                             // window that spans monitors. Position it last.
                             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want.min));
                         }
-                    }
-                    // Above the Dock and menu bar — macOS floats
-                    // `with_always_on_top` at level 3, under system
-                    // chrome, and a click there would reach it.
-                    platform::elevate_pick_overlay();
-                    ui::draw::show_pick_overlay(ui);
-                },
-            );
+                        // Above the Dock and menu bar — macOS floats
+                        // `with_always_on_top` at level 3, under system
+                        // chrome, and a click there would reach it.
+                        platform::elevate_pick_overlay();
+                        ui::draw::show_pick_overlay(ui);
+                    },
+                );
+            }
         }
 
         // The pin save-as window: a decorated modal-style panel; its state
@@ -3660,47 +3663,45 @@ fn overlay_builder(
 /// alpha-1 veil inside keeps transparent pixels hit-testable. Raised
 /// only while a colour pick is armed and the cursor roams outside the
 /// Draw window.
-/// The monitor union, cached 1 s in ctx data — monitor enumeration is
-/// a WindowServer round-trip, too heavy to run every ROOT pass. The
-/// same key feeds the overlay's own per-frame rect correction, so both
-/// sides share one enumeration.
-fn cached_pick_union(ctx: &egui::Context) -> Option<(i32, i32, i32, i32)> {
+/// Each monitor's rect + scale factor, cached 1 s in ctx data —
+/// monitor enumeration is a WindowServer round-trip, too heavy to run
+/// every ROOT pass. The same key feeds every overlay's per-frame rect
+/// correction, so all viewports share one enumeration.
+fn cached_pick_monitors(ctx: &egui::Context) -> Vec<(i32, i32, i32, i32, f32)> {
     ctx.data_mut(|d| {
-        let id = egui::Id::new("pick_overlay_union");
-        match d
-            .get_temp::<(std::time::Instant, (i32, i32, i32, i32))>(id)
+        let id = egui::Id::new("pick_overlay_monitors");
+        if let Some((_, v)) = d
+            .get_temp::<(std::time::Instant, Vec<(i32, i32, i32, i32, f32)>)>(id)
             .filter(|(at, _)| at.elapsed().as_millis() < 1000)
         {
-            Some((_, u)) => Some(u),
-            None => platform::picker::screens_union_native().inspect(|u| {
-                d.insert_temp(id, (std::time::Instant::now(), *u));
-            }),
+            return v;
         }
+        let v: Vec<_> = crate::capture::screen::monitors()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| {
+                (
+                    m.rect.x,
+                    m.rect.y,
+                    m.rect.x + m.rect.width as i32,
+                    m.rect.y + m.rect.height as i32,
+                    m.scale_factor.max(1.0),
+                )
+            })
+            .collect();
+        d.insert_temp(id, (std::time::Instant::now(), v.clone()));
+        v
     })
 }
 
-fn pick_overlay_builder(ctx: &egui::Context) -> egui::ViewportBuilder {
-    // Created AT the monitor union: a mid-creation 800×600 would leave
+fn pick_overlay_builder(rect: (i32, i32, i32, i32, f32)) -> egui::ViewportBuilder {
+    // Created AT its monitor's rect: a mid-creation 800×600 would leave
     // screen strips uncovered (clicks escape, loupe clipped) until the
     // per-frame correction converged — worse, every close/reopen cycle
     // replayed that phase. Residual error is still corrected per frame.
-    let (size, pos) = cached_pick_union(ctx)
-        .map(|(l, t, r, b)| {
-            let ppp = crate::capture::screen::monitors()
-                .ok()
-                .and_then(|ms| {
-                    ms.iter()
-                        .find(|m| m.is_primary)
-                        .or(ms.first())
-                        .map(|m| m.scale_factor.max(1.0))
-                })
-                .unwrap_or(1.0);
-            (
-                platform::native_to_ui(egui::pos2((r - l) as f32, (b - t) as f32), ppp).to_vec2(),
-                platform::native_to_ui(egui::pos2(l as f32, t as f32), ppp),
-            )
-        })
-        .unwrap_or((egui::vec2(800.0, 600.0), egui::pos2(0.0, 0.0)));
+    let (l, t, r, b, ppp) = rect;
+    let size = platform::native_to_ui(egui::pos2((r - l) as f32, (b - t) as f32), ppp).to_vec2();
+    let pos = platform::native_to_ui(egui::pos2(l as f32, t as f32), ppp);
     let builder = egui::ViewportBuilder::default()
         .with_title("PixMe Pick")
         .with_icon(ui::icons::app_icon_data())

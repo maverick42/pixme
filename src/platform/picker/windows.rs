@@ -45,28 +45,28 @@ unsafe extern "system" {
     fn GetPixel(hdc: *mut c_void, x: i32, y: i32) -> u32;
 }
 
-/// Mark the "PixMe Pick" overlay `WDA_EXCLUDEFROMCAPTURE` so our reads
-/// see the pixels UNDERNEATH its dim veil. `WindowFromPoint` hands us
-/// the topmost HWND at the cursor — ours while the overlay is up — and
-/// both the pid and title are checked before the affinity is set, so
-/// another of our windows (or a foreign one) is never touched. The
-/// HWND is cached; `IsWindow` re-arms the lookup when it is recreated.
+/// Mark the "PixMe Pick" overlays `WDA_EXCLUDEFROMCAPTURE` so our reads
+/// see the pixels UNDERNEATH their dim veil — there is one overlay
+/// window per monitor, so every HWND met at the cursor is marked once
+/// and kept in the set. `WindowFromPoint` hands us the topmost HWND —
+/// ours while a pick is up — and both the pid and title are checked
+/// before the affinity is set, so another of our windows (or a foreign
+/// one) is never touched.
 fn exclude_overlay_from_capture(x: i32, y: i32) {
-    static CACHED: Mutex<Option<usize>> = Mutex::new(None);
+    static CACHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let Ok(mut cached) = CACHED.lock() else {
         return;
     };
     unsafe {
-        if let Some(hwnd) = *cached {
-            if IsWindow(hwnd as *mut c_void) != 0 {
-                return;
-            }
-            *cached = None;
-        }
         let hwnd = WindowFromPoint(POINT { x, y });
         if hwnd.is_null() {
             return;
         }
+        let h = hwnd as usize;
+        if cached.contains(&h) {
+            return;
+        }
+        cached.retain(|&w| IsWindow(w as *mut c_void) != 0);
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut pid);
         if pid != std::process::id() {
@@ -78,7 +78,7 @@ fn exclude_overlay_from_capture(x: i32, y: i32) {
             return;
         }
         SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-        *cached = Some(hwnd as usize);
+        cached.push(h);
     }
 }
 

@@ -34,9 +34,11 @@ fn display_at(x: i32, y: i32) -> Option<u32> {
     inside.or(monitors.first()).map(|m| m.id)
 }
 
-/// `kCGWindowNumber` of the "PixMe Pick" overlay while it is up. The
-/// loupe samples at ~30 Hz, so the WindowServer enumeration is cached
-/// for half a second — the id cannot change mid-session.
+/// `kCGWindowNumber` of the "PixMe Pick" overlay while it is up — with
+/// one overlay per monitor, the LOWEST of ours (last in the
+/// front-to-back list) is the reference: a "below window" composite
+/// then excludes every pick overlay. The loupe samples at ~30 Hz, so
+/// the WindowServer enumeration is cached for half a second.
 fn overlay_window_id() -> Option<u32> {
     static CACHE: Mutex<Option<(Instant, Option<u32>)>> = Mutex::new(None);
     let mut cache = CACHE.lock().ok()?;
@@ -48,7 +50,7 @@ fn overlay_window_id() -> Option<u32> {
     let me = std::process::id();
     let id = crate::platform::macos::window_list()
         .into_iter()
-        .find(|w| w.pid == me && w.title == "PixMe Pick")
+        .rfind(|w| w.pid == me && w.title == "PixMe Pick")
         .map(|w| w.id);
     *cache = Some((Instant::now(), id));
     id

@@ -5237,43 +5237,6 @@ fn arm_pick(ctx: &egui::Context, id: Option<egui::Id>) {
 /// Bounds of the monitor under the cursor, expressed in overlay-local
 /// points. The union window is larger than any one monitor, so the
 /// union's edges are not useful for deciding where the loupe should flip.
-fn pick_monitor_bounds(ctx: &egui::Context, cx: i32, cy: i32, ppp: f32) -> Option<Rect> {
-    let monitors = ctx.data_mut(|d| {
-        let id = egui::Id::new("draw.pick_monitors");
-        let cached = d.get_temp::<(std::time::Instant, Vec<PhysicalRect>)>(id);
-        if let Some((at, rects)) = &cached
-            && at.elapsed() < std::time::Duration::from_secs(1)
-        {
-            return rects.clone();
-        }
-        let rects: Vec<_> = crate::capture::screen::monitors()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| m.rect)
-            .collect();
-        d.insert_temp(id, (std::time::Instant::now(), rects.clone()));
-        rects
-    });
-    let m = monitors.into_iter().find(|m| {
-        (m.x..m.x + m.width as i32).contains(&cx) && (m.y..m.y + m.height as i32).contains(&cy)
-    })?;
-    let origin = ctx.input(|i| i.viewport().outer_rect)?.min;
-    let native_origin = crate::platform::ui_to_native(origin, ppp);
-    Some(Rect::from_min_max(
-        crate::platform::native_to_ui(
-            pos2(m.x as f32 - native_origin.x, m.y as f32 - native_origin.y),
-            ppp,
-        ),
-        crate::platform::native_to_ui(
-            pos2(
-                m.x as f32 + m.width as f32 - native_origin.x,
-                m.y as f32 + m.height as f32 - native_origin.y,
-            ),
-            ppp,
-        ),
-    ))
-}
-
 fn pick_loupe_position(hover: Pos2, bounds: Rect, size: Vec2, gap: f32) -> Pos2 {
     let mut min = hover + Vec2::splat(gap);
     if min.x + size.x > bounds.max.x - 4.0 {
@@ -5294,13 +5257,14 @@ fn pick_loupe_position(hover: Pos2, bounds: Rect, size: Vec2, gap: f32) -> Pos2 
     )
 }
 
-/// The fullscreen pick overlay's UI — runs inside the transparent
-/// always-on-top viewport `app.rs` raises while a pick is armed and the
+/// A pick overlay's UI — runs inside each transparent always-on-top
+/// per-monitor viewport `app.rs` raises while a pick is armed and the
 /// cursor roams outside the Draw window. It paints the same loupe card
 /// the canvas shows (patch, centre crosshair, `#RRGGBB`, hint) riding
 /// the cursor, keeps our own crosshair cursor everywhere, and turns the
 /// click into a [`PickOutcome`] pushed into [`PICK_SCREEN_RESULT`] for
-/// the Draw session. Every click lands on THIS window — the app under
+/// the Draw session. The loupe only draws in the window whose rect
+/// holds the cursor; every click lands on our chrome — the app under
 /// the cursor never sees it.
 pub fn show_pick_overlay(ui: &mut Ui) {
     use crate::platform::picker::{self, PickOutcome};
@@ -5421,15 +5385,14 @@ pub fn show_pick_overlay(ui: &mut Ui) {
         return;
     };
 
-    // The overlay spans the UNION of all displays, but the loupe must
-    // flip at the edge of the display UNDER the cursor. Otherwise the
-    // primary display's bottom is mistaken for empty space on a lower
-    // secondary monitor, and the loupe is drawn off-screen.
-    let bounds = cursor
-        .and_then(|(cx, cy)| pick_monitor_bounds(&ctx, cx, cy, ppp))
-        .map(|r| r.intersect(screen))
-        .filter(|r| r.width() > LOUPE_SIDE && r.height() > LOUPE_SIDE + LOUPE_TEXT_H)
-        .unwrap_or(screen);
+    // One overlay window per monitor: the cursor sits in exactly one of
+    // them — the others must not draw the loupe (`hover` lands outside
+    // their rect), and this window's own rect IS the monitor's bounds
+    // the loupe flips against.
+    if !screen.contains(hover) {
+        return;
+    }
+    let bounds = screen;
     let size = vec2(LOUPE_SIDE, LOUPE_SIDE + LOUPE_TEXT_H);
     let min = pick_loupe_position(hover, bounds, size, LOUPE_OFF);
     let card = Rect::from_min_size(min, size);

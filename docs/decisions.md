@@ -2532,11 +2532,17 @@ Format: date — context — decision — consequences.
   pixel on the desktop (other apps, menu bar, all monitors) while the
   Draw window stays visible, with the validating click swallowed and
   PixMe's own cursor/loupe kept everywhere.
-- **Decision**: interaction lives in a borderless transparent
-  always-on-top deferred viewport (`pixme.pick_overlay`) covering the
-  monitor union — raised only while a pick is armed AND the cursor
-  roams outside the Draw window (inside, the canvas pick path keeps
-  ownership). An alpha-20 veil fills the frame: fully-transparent pixels
+- **Decision**: interaction lives in borderless transparent
+  always-on-top deferred viewports (`pixme.pick_overlay`) — ONE PER
+  MONITOR — raised only while a pick is armed AND the cursor roams
+  outside the Draw window (inside, the canvas pick path keeps
+  ownership). A single union-spanning window was tried first and
+  failed on real layouts: AppKit clips an NSWindow's frame to one
+  screen's `visibleFrame` when it exceeds it, so a Sidecar iPad
+  sitting below-left of the main display stayed unveiled (measured:
+  `want=(-1133,0,2560,2406)` applied as `(-1133,53)-(2560,1707)`).
+  Per-monitor windows also give every overlay its own `ppp`, which
+  fixes mixed-DPI sampling on Windows for free. An alpha-20 veil fills the frame: fully-transparent pixels
   are click-through on both OSes, so the veil is what actually swallows
   the click. The overlay paints PixMe's loupe card at the cursor and
   pushes a `PickOutcome` through ctx data (`PICK_SCREEN_RESULT`) that
