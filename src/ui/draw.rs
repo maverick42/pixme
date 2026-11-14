@@ -502,6 +502,9 @@ pub struct DrawSession {
     rendered_img: Option<image::RgbaImage>,
     loupe_tex: Option<TextureHandle>,
     copied_at: Option<std::time::Instant>,
+    /// Last "press C" nudge for the Pipette tool's inert click —
+    /// throttles the toast so click spam cannot stack pills.
+    inert_toast_at: Option<std::time::Instant>,
     rendered_rev: u64,
     outcome: Option<Outcome>,
     /// The unsaved-changes confirmation is up (Échap/Annuler/close with
@@ -592,6 +595,7 @@ impl DrawSession {
             rendered_img: None,
             loupe_tex: None,
             copied_at: None,
+            inert_toast_at: None,
             rendered_rev: u64::MAX,
             outcome: None,
             confirm_quit: false,
@@ -1118,6 +1122,13 @@ impl DrawSession {
         if let Some(outcome) = outcome {
             match outcome {
                 PickOutcome::Picked(c) => self.apply_screen_pick(ctx, c),
+                PickOutcome::CopyPressed(c) => {
+                    self.copy_screen_pick(ctx, c);
+                    // `C` does not end the pick — leave the overlay up;
+                    // a disarming pick still drops it when the
+                    // heartbeat below turns off.
+                    return;
+                }
                 PickOutcome::Cancelled => self.disarm_pick(ctx),
                 PickOutcome::Denied => {
                     widgets::toast(
@@ -1194,10 +1205,10 @@ impl DrawSession {
         self.pick_overlay
     }
 
-    /// Every pick landing does what `C` does on top of applying the
-    /// colour: its `#RRGGBB` goes to the clipboard with a toast —
-    /// swatch picks, eraser picks, the Pipette tool and screen picks
-    /// alike.
+    /// `C` — the only clipboard path: every pick mode copies the
+    /// `#RRGGBB` and toasts it. Click-landed picks go through
+    /// [`Self::pick_selected`] instead — they apply the colour without
+    /// touching the clipboard.
     fn copy_pick_colour(&mut self, ctx: &egui::Context, c: Color32) {
         let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
         if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -1211,10 +1222,62 @@ impl DrawSession {
         );
     }
 
+    /// A click-landed pick (armed swatch, eraser pick): the colour is
+    /// applied to its target and toasted — the clipboard stays for `C`.
+    fn pick_selected(&mut self, ctx: &egui::Context, c: Color32) {
+        let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+        widgets::toast(
+            ctx,
+            widgets::ToastKind::Info,
+            t!("draw.pick.selected", hex = hex).to_string(),
+        );
+    }
+
+    /// The Pipette tool's click — inert on the canvas and on the screen
+    /// overlay alike: the tool only answers `C`. Throttled so click
+    /// spam cannot stack pills.
+    fn pick_inert(&mut self, ctx: &egui::Context) {
+        if self
+            .inert_toast_at
+            .is_some_and(|t| t.elapsed().as_secs_f32() < 1.2)
+        {
+            return;
+        }
+        self.inert_toast_at = Some(std::time::Instant::now());
+        widgets::toast(
+            ctx,
+            widgets::ToastKind::Info,
+            t!("draw.pick.click_inert").to_string(),
+        );
+    }
+
     /// Applies a colour sampled off-screen to whatever the pick targets
-    /// — the armed swatch, the eraser's colour, or the shared stroke
-    /// colour for the Pipette tool — then copies + toasts like `C`.
+    /// — the armed swatch, the eraser's colour — then toasts like the
+    /// canvas click paths. The Pipette tool ignores clicks entirely.
     fn apply_screen_pick(&mut self, ctx: &egui::Context, c: Color32) {
+        if let Some(id) = armed_pick(ctx) {
+            ctx.data_mut(|d| {
+                d.insert_persisted(pick_done_key(id), c);
+            });
+            arm_pick(ctx, None);
+            self.pick_selected(ctx, c);
+        } else if self.tool == Tool::Eraser && self.opts.eraser_pick {
+            self.opts.eraser_color = c;
+            self.opts.eraser_mode = EraserMode::Color;
+            self.opts.eraser_pick = false;
+            self.pick_selected(ctx, c);
+        } else if self.tool == Tool::Pipette {
+            self.pick_inert(ctx);
+        } else {
+            self.opts.color = c;
+            self.pick_selected(ctx, c);
+        }
+    }
+
+    /// `C` pressed while the pick overlay held key focus: the same
+    /// apply-and-copy as the in-window hotkey — armed swatch, eraser
+    /// pick or the Pipette tool's shared stroke colour.
+    fn copy_screen_pick(&mut self, ctx: &egui::Context, c: Color32) {
         if let Some(id) = armed_pick(ctx) {
             ctx.data_mut(|d| {
                 d.insert_persisted(pick_done_key(id), c);
@@ -1339,36 +1402,51 @@ impl DrawSession {
         if copy && self.sel_area.is_some() {
             self.sel_copy();
         }
-        // Eyedropper mode: pressing `C` copies the hovered `#RRGGBB` and
-        // picks the colour (armed swatch pick, Pipette tool, or the
-        // eraser's pick).
+        // Eyedropper mode: pressing `C` copies the `#RRGGBB` under the
+        // cursor and picks the colour (armed swatch pick, Pipette tool,
+        // or the eraser's pick). Off-canvas the pick overlay is up and
+        // `pixel_at` only knows the document — sample the real screen
+        // pixel under the OS cursor instead.
         let pick_id = armed_pick(ctx);
         let pipetting = pick_id.is_some()
             || self.tool == Tool::Pipette
             || (self.tool == Tool::Eraser && self.opts.eraser_pick);
         if pipetting
-            && let Some(p) = self.last_pointer
             && ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, Key::C)
                     || i.consume_key(egui::Modifiers::COMMAND, Key::C)
             })
         {
-            let c = self.pixel_at(p);
-            if let Some(id) = pick_id {
-                ctx.data_mut(|d| {
-                    d.insert_persisted(pick_done_key(id), c);
-                });
-                arm_pick(ctx, None);
+            let c = if self.pick_overlay {
+                crate::platform::cursor_position().and_then(|(x, y)| {
+                    crate::platform::picker::screen_pixel(x.round() as i32, y.round() as i32)
+                })
             } else {
-                match self.tool {
-                    Tool::Eraser => {
-                        self.opts.eraser_color = c;
-                        self.opts.eraser_mode = EraserMode::Color;
+                self.last_pointer.map(|p| self.pixel_at(p))
+            };
+            if let Some(c) = c {
+                if let Some(id) = pick_id {
+                    ctx.data_mut(|d| {
+                        d.insert_persisted(pick_done_key(id), c);
+                    });
+                    arm_pick(ctx, None);
+                } else {
+                    match self.tool {
+                        Tool::Eraser => {
+                            self.opts.eraser_color = c;
+                            self.opts.eraser_mode = EraserMode::Color;
+                        }
+                        _ => self.opts.color = c,
                     }
-                    _ => self.opts.color = c,
                 }
+                self.copy_pick_colour(ctx, c);
+            } else if self.pick_overlay {
+                widgets::toast(
+                    ctx,
+                    widgets::ToastKind::Warning,
+                    t!("draw.pick.denied").to_string(),
+                );
             }
-            self.copy_pick_colour(ctx, c);
         }
         if cut && self.sel_area.is_some() {
             self.sel_cut();
@@ -2214,7 +2292,7 @@ impl DrawSession {
                 d.insert_persisted(pick_done_key(id), c);
             });
             arm_pick(ctx, None);
-            self.copy_pick_colour(ctx, c);
+            self.pick_selected(ctx, c);
             return;
         }
         // Handles of the currently selected object ALWAYS grab first,
@@ -2302,11 +2380,8 @@ impl DrawSession {
             }
             Tool::Text | Tool::Step => {}
             Tool::Pipette => {
-                // A press picks the pixel's colour into the shared
-                // stroke colour and copies its `#RRGGBB` like `C`.
-                let c = self.pixel_at(p);
-                self.opts.color = c;
-                self.copy_pick_colour(ctx, c);
+                // The Pipette tool answers `C` only — a press is inert.
+                self.pick_inert(ctx);
             }
             Tool::Eraser => {
                 if self.opts.eraser_pick {
@@ -2314,7 +2389,7 @@ impl DrawSession {
                     self.opts.eraser_color = c;
                     self.opts.eraser_mode = EraserMode::Color;
                     self.opts.eraser_pick = false;
-                    self.copy_pick_colour(ctx, c);
+                    self.pick_selected(ctx, c);
                 } else {
                     self.drag = Some(Drag::Freehand { points: vec![p] });
                 }
@@ -2704,7 +2779,7 @@ impl DrawSession {
                 d.insert_persisted(pick_done_key(id), c);
             });
             arm_pick(ctx, None);
-            self.copy_pick_colour(ctx, c);
+            self.pick_selected(ctx, c);
             return;
         }
         let had_panel = self.text_panel.is_some();
@@ -2733,15 +2808,14 @@ impl DrawSession {
                     self.opts.eraser_color = c;
                     self.opts.eraser_mode = EraserMode::Color;
                     self.opts.eraser_pick = false;
-                    self.copy_pick_colour(ctx, c);
+                    self.pick_selected(ctx, c);
                 } else {
                     self.finish_freehand(vec![p]);
                 }
             }
             Tool::Pipette => {
-                let c = self.pixel_at(p);
-                self.opts.color = c;
-                self.copy_pick_colour(ctx, c);
+                // The Pipette tool answers `C` only — a click is inert.
+                self.pick_inert(ctx);
             }
             Tool::SelectArea => {
                 // Inside the frame it stays; a click elsewhere drops it.
@@ -5312,6 +5386,22 @@ pub fn show_pick_overlay(ui: &mut Ui) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         return;
     }
+    // `C` copies like the in-window hotkey — it can land here whenever
+    // this window holds key focus (a click made it key on macOS). It is
+    // not a pick landing: the session stays armed, so no Close — only
+    // the heartbeat turning off ends the pick.
+    let cpress = ctx.input(|i| {
+        i.key_pressed(egui::Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+    });
+    if cpress {
+        let o = cursor
+            .and_then(|(x, y)| picker::screen_pixel(x, y))
+            .map(PickOutcome::CopyPressed)
+            .unwrap_or(PickOutcome::Denied);
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(picker::PICK_SCREEN_RESULT), o);
+        });
+    }
 
     // `pointer.latest_pos` dies in those same edge dead zones (a
     // `CursorLeft` arrives even under our higher-level window), so the
@@ -5388,7 +5478,7 @@ pub fn show_pick_overlay(ui: &mut Ui) {
     p.text(
         pos2(text_rect.center().x, text_rect.min.y + 30.0),
         egui::Align2::CENTER_TOP,
-        t!("draw.pick.screen_hint").to_string(),
+        t!("overlay.copy_hint").to_string(),
         egui::FontId::proportional(10.0),
         Color32::from_gray(160),
     );

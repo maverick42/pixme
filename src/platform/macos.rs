@@ -813,19 +813,30 @@ pub fn cursor_snapshot(scale_factor: f32) -> Option<super::CursorSnapshot> {
 
 /// Rasterizes `img` into a `w`×`h` RGBA8 buffer — the shared tail of
 /// every `CGImage` → `RgbaImage` conversion (cursor sprite, display
-/// frame). The bitmap context normalizes the source's byte order and
-/// alpha mode, so callers never have to inspect its pixel format.
+/// frame, pick patch). The bitmap context normalizes the source's byte
+/// order and alpha mode, so callers never have to inspect its pixel
+/// format.
+///
+/// The destination uses the image's OWN colour space so `draw_image`
+/// is an identity: a foreign space (generic RGB via
+/// `create_device_rgb`) runs a ColorSync transform and shifts every
+/// channel away from the values the framebuffer actually stores —
+/// Display P3 on modern Macs. Captures, the pick loupe and copied
+/// `#RRGGBB`s must report the display's stored bytes, the same numbers
+/// external screen tools read.
 pub(crate) fn cg_image_to_rgba(
     img: &core_graphics::image::CGImage,
     w: usize,
     h: usize,
 ) -> Option<image::RgbaImage> {
     use core_graphics::base::kCGImageAlphaPremultipliedLast;
-    use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 
-    let cs = CGColorSpace::create_device_rgb();
+    // Image masks would return a null space here, but this path only
+    // ever rasterizes colour-managed sources (display frames, window
+    // composites, the cursor sprite).
+    let cs = img.color_space();
     let mut ctx =
         CGContext::create_bitmap_context(None, w, h, 8, w * 4, &cs, kCGImageAlphaPremultipliedLast);
     let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(w as f64, h as f64));

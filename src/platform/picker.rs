@@ -43,6 +43,9 @@ pub const PICK_OVERLAY_ALIVE: &str = "draw.pick_overlay_alive";
 pub enum PickOutcome {
     /// A click landed: the colour under the cursor.
     Picked(Color32),
+    /// `C` pressed while the overlay held key focus: the sampled colour —
+    /// the session applies AND copies it, but the pick does not end.
+    CopyPressed(Color32),
     /// Esc or a right click — nothing was applied.
     Cancelled,
     /// The OS refused to hand out screen pixels (macOS without Screen

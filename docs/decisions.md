@@ -2536,14 +2536,27 @@ Format: date — context — decision — consequences.
   always-on-top deferred viewport (`pixme.pick_overlay`) covering the
   monitor union — raised only while a pick is armed AND the cursor
   roams outside the Draw window (inside, the canvas pick path keeps
-  ownership). An alpha-1 veil fills the frame: fully-transparent pixels
+  ownership). An alpha-20 veil fills the frame: fully-transparent pixels
   are click-through on both OSes, so the veil is what actually swallows
   the click. The overlay paints PixMe's loupe card at the cursor and
   pushes a `PickOutcome` through ctx data (`PICK_SCREEN_RESULT`) that
-  the Draw session drains. Pixel reads never go through the overlay:
-  `platform::picker` samples the real framebuffer
-  (`CGDisplay::image_for_rect` on macOS — the capture permission path
-  already granted — `GetDC(NULL)`/`GetPixel` on Windows).
+  the Draw session drains. Pixel reads must skip that veil: a
+  framebuffer composite (`CGDisplay::image_for_rect` /
+  `CGDisplay::image()`) includes our own window, so the veil tinted
+  every sample ~8 % darker (`#CD3A80` read as `#BD3576` — the veil's
+  exact 235/255 factor, mistaken at first for a Display-P3 conversion).
+  While the overlay is up, `platform::picker` instead composites only
+  the windows BELOW it (`CGWindowListCreateImage` +
+  `kCGWindowListOptionOnScreenBelowWindow`, the overlay's
+  `kCGWindowNumber` found by title+pid in `window_list()`, 500 ms
+  cached); `image_for_rect` remains the no-overlay fallback. On
+  Windows `GetDC`/`GetPixel` reads the composed desktop too, so the
+  overlay's HWND is marked `WDA_EXCLUDEFROMCAPTURE` on first sight
+  (`WindowFromPoint` + pid + title check, cached) — every capture API
+  then sees straight through it. Rasterization uses the source image's own colour
+  space so CoreGraphics applies no ColorSync conversion — stored and
+  sampled bytes stay framebuffer-verbatim, matching what external
+  tools (iScreen Shooter) read.
 - **Rejected**: `NSColorSampler` (macOS) + `WH_MOUSE_LL` (Windows) —
   the sampler imposes its own round OS loupe instead of PixMe's cursor,
   cannot be dismissed programmatically, and a nil callback cannot be
@@ -2556,3 +2569,31 @@ Format: date — context — decision — consequences.
   pointing at System Settings (`PickOutcome::Denied`). Windows pixel
   reads use the virtual-screen space (negative coordinates supported);
   the overlay's rect is re-pinned to the monitor union every frame.
+
+## 2026-11-14 — Pick feedback split: click selects, `C` copies, Pipette clicks are inert
+
+- **Context**: every pick landing used to run the same path — apply the
+  colour AND copy `#RRGGBB` AND toast "copied" — so a swatch click and a
+  `C` press were indistinguishable, and the Pipette tool's canvas click
+  duplicated what `C` already did.
+- **Decision**: three feedback paths through one shared toast
+  component. Clicks that land a pick (armed swatch, eraser pick — on
+  the canvas or the screen overlay) apply the colour and toast
+  "Color #XXX selected" WITHOUT touching the clipboard. `C` stays the
+  only clipboard path in every pick mode: apply + copy + "Color #XXX
+  copied to clipboard". The Pipette tool ignores clicks entirely —
+  canvas and overlay alike — and toasts "Press C…" (throttled to one
+  pill per ~1.2 s); its hint now reads "move over a pixel… C picks and
+  copies". `C` off-canvas samples `platform::picker::screen_pixel` at
+  the OS cursor when the pick overlay is up, since `pixel_at` only
+  knows the document.
+- **Consequences**: click = assign, `C` = copy — the gestures no longer
+  overlap; the Pipette tool is a pure hover-and-`C` sampler that works
+  on any screen pixel. `copied_at` (the loupe's "copied!" hint) now only
+  lights on real copies. The overlay loupe shows the same "«C» pour
+  copier" hint as the canvas loupe (`overlay.copy_hint`); and because a
+  click makes the overlay the macOS key window, `C` is handled on BOTH
+  sides: the Draw hotkey samples `screen_pixel` while the overlay is
+  up, and the overlay itself forwards a `C` press as
+  `PickOutcome::CopyPressed` — which applies+copies without ending the
+  pick (no heartbeat-off, no flicker).
