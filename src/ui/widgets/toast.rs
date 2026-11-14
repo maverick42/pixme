@@ -6,7 +6,9 @@
 
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Area, Color32, Context, CornerRadius, Id, Order, Sense, Vec2, vec2};
+use egui::{
+    Align2, Area, Color32, Context, CornerRadius, Id, Order, Sense, Vec2, ViewportId, vec2,
+};
 
 use crate::ui::{
     icons::{self, Icon},
@@ -33,14 +35,18 @@ pub enum ToastKind {
     Error,
 }
 
-/// Queues `msg` for display. The window must call [`paint_toasts`]
-/// every frame — nothing is painted here, so it is safe to call from
-/// menus, commands or background-landed state.
+/// Queues `msg` for display in the CURRENT viewport. The queue is
+/// shared ctx data, but [`paint_toasts`] only paints entries raised by
+/// the viewport it runs in — a toast never doubles across windows.
+/// Nothing is painted here, so it is safe to call from menus, commands
+/// or background-landed state (those land on `ViewportId::ROOT`).
 pub fn toast(ctx: &Context, kind: ToastKind, msg: impl Into<String>) {
     let key = Id::new(KEY);
+    let vp = ctx.viewport_id();
     ctx.data_mut(|d| {
-        let mut v: Vec<(ToastKind, String, Instant)> = d.get_temp(key).unwrap_or_default();
-        v.push((kind, msg.into(), Instant::now()));
+        let mut v: Vec<(ToastKind, String, Instant, ViewportId)> =
+            d.get_temp(key).unwrap_or_default();
+        v.push((kind, msg.into(), Instant::now(), vp));
         d.insert_temp(key, v);
     });
 }
@@ -52,10 +58,12 @@ pub fn toast(ctx: &Context, kind: ToastKind, msg: impl Into<String>) {
 pub fn paint_toasts_above(ctx: &Context, bottom_margin: f32) {
     let key = Id::new(KEY);
     let now = Instant::now();
-    let mut v: Vec<(ToastKind, String, Instant)> =
+    let this_vp = ctx.viewport_id();
+    let mut v: Vec<(ToastKind, String, Instant, ViewportId)> =
         ctx.data_mut(|d| d.get_temp(key).unwrap_or_default());
-    v.retain(|(_, _, t)| now.duration_since(*t) < TTL);
+    v.retain(|(_, _, t, _)| now.duration_since(*t) < TTL);
     ctx.data_mut(|d| d.insert_temp(key, v.clone()));
+    v.retain(|(.., vp)| *vp == this_vp);
     if v.is_empty() {
         return;
     }
@@ -63,7 +71,7 @@ pub fn paint_toasts_above(ctx: &Context, bottom_margin: f32) {
         .checked_sub(now.duration_since(v[0].2))
         .unwrap_or_default();
     // Repaint continuously while any toast animates, else wake at expiry.
-    if v.iter().any(|(_, _, t)| {
+    if v.iter().any(|(_, _, t, _)| {
         let age = now.duration_since(*t).as_secs_f32();
         age < FADE || age > TTL.as_secs_f32() - FADE
     }) {
@@ -76,7 +84,7 @@ pub fn paint_toasts_above(ctx: &Context, bottom_margin: f32) {
         .order(Order::Foreground)
         .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -bottom_margin))
         .show(ctx, |ui| {
-            for (kind, msg, at) in &v {
+            for (kind, msg, at, _) in &v {
                 let age = now.duration_since(*at).as_secs_f32();
                 let (mut alpha, mut dy) = (1.0f32, 0.0f32);
                 if age < FADE {
