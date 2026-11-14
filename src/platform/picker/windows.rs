@@ -1,6 +1,6 @@
 //! Windows screen sampling for the full-screen pick.
 //!
-//! Desktop pixel reads (`GetDC(NULL)` + `BitBlt`/`GetPixel`) synchronize
+//! Desktop pixel reads (`GetDC(NULL)` + `BitBlt`) synchronize
 //! with the compositor, which can take tens of milliseconds per call —
 //! more under RDP or with the fullscreen overlay composed on top. Those
 //! reads therefore live on a dedicated worker thread: while a pick is
@@ -15,15 +15,15 @@
 //! the sampled pixels.
 
 use core::ffi::c_void;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eframe::egui::Color32;
 use image::{Rgba, RgbaImage};
 
 use super::PREVIEW_PATCH;
 
-const CLR_INVALID: u32 = 0xFFFF_FFFF;
 const SRCCOPY: u32 = 0x00CC_0020;
 const SM_XVIRTUALSCREEN: i32 = 76;
 const SM_YVIRTUALSCREEN: i32 = 77;
@@ -60,7 +60,6 @@ unsafe extern "system" {
 
 #[link(name = "gdi32")]
 unsafe extern "system" {
-    fn GetPixel(hdc: isize, x: i32, y: i32) -> u32;
     fn CreateCompatibleDC(hdc: *mut c_void) -> *mut c_void;
     fn DeleteDC(hdc: *mut c_void) -> i32;
     fn SelectObject(hdc: *mut c_void, h: *mut c_void) -> *mut c_void;
@@ -90,23 +89,23 @@ unsafe extern "system" {
 /// The latest worker sample: the patch centred on the cursor, the exact
 /// colour of its centre pixel and the position it was taken at.
 struct Snapshot {
-    at: Instant,
     pos: (i32, i32),
     patch: RgbaImage,
     colour: Color32,
 }
 
 static SNAP: OnceLock<(Mutex<Option<Snapshot>>, Condvar)> = OnceLock::new();
-/// `true` while the worker must keep sampling. The overlay starts it when
-/// it raises and stops it when it closes (see `start_worker`/`stop_worker`).
-static ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static WORKER: OnceLock<Mutex<Option<std::thread::JoinHandle<()>>>> = OnceLock::new();
+/// Monotonic worker generation: odd = a sampler thread is active for that
+/// generation, even = stopped. Advancing on both start and stop guarantees
+/// a previous worker still inside `read_patch` or its sleep exits as soon
+/// as its iteration finishes, even if a new pick starts before then.
+static GEN: AtomicU64 = AtomicU64::new(0);
 /// Cancel/copy presses latched by the worker's key poll. bit0 = Esc,
 /// bit1 = C. The overlay is raised exactly while the cursor roams over
 /// OTHER windows, so key focus is ambiguous there: `GetAsyncKeyState`
 /// sees the physical press regardless of which window owns the queue —
 /// egui key events still work too (both are OR'd by the caller).
-static KEYS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static KEYS: AtomicU8 = AtomicU8::new(0);
 const VK_ESCAPE: i32 = 0x1B;
 const VK_C: i32 = 0x43;
 
@@ -114,59 +113,62 @@ fn snap() -> &'static (Mutex<Option<Snapshot>>, Condvar) {
     SNAP.get_or_init(|| (Mutex::new(None), Condvar::new()))
 }
 
+fn poll_key_bits() -> u8 {
+    let (esc, c) = unsafe { (GetAsyncKeyState(VK_ESCAPE) < 0, GetAsyncKeyState(VK_C) < 0) };
+    (esc as u8) | ((c as u8) << 1)
+}
+
 /// Raises the sampler worker while the pick overlay is up: it follows the
 /// cursor and keeps the snapshot fresh, so the UI thread never performs a
 /// blocking compositor read.
 pub fn start_worker() {
-    let running = ALIVE.swap(true, std::sync::atomic::Ordering::SeqCst);
-    if running {
+    let cur = GEN.load(Ordering::SeqCst);
+    if cur & 1 == 1 {
         return;
     }
-    let mut guard = WORKER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if guard.is_some() {
+    let my_gen = cur + 1;
+    if GEN
+        .compare_exchange(cur, my_gen, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return;
     }
-    // Keys latched during the previous worker's shutdown tail must not
-    // fire into the next pick (an Esc pressed as the overlay died would
-    // otherwise cancel it instantly).
-    KEYS.store(0, std::sync::atomic::Ordering::SeqCst);
-    let handle = std::thread::Builder::new()
+    // Keys latched during the previous worker's shutdown tail (or a stale
+    // snapshot from an earlier pick) must not leak into the new pick.
+    KEYS.store(0, Ordering::SeqCst);
+    *snap().0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    std::thread::Builder::new()
         .name("pixme-pick-sampler".into())
-        .spawn(sampler_loop)
+        .spawn(move || sampler_loop(my_gen))
         .expect("spawn pick sampler");
-    *guard = Some(handle);
-    tracing::debug!("pick sampler: started");
 }
 
 /// Stops the sampler worker once the overlay is gone. The worker exits on
 /// its own after the current read: the UI thread never joins a thread
 /// that may be mid-compositor-read (that is the freeze to avoid).
 pub fn stop_worker() {
-    ALIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-    let mut guard = WORKER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if let Some(handle) = guard.take() {
-        std::mem::drop(handle);
+    let cur = GEN.load(Ordering::SeqCst);
+    if cur & 1 == 1 {
+        let _ = GEN.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
-fn sampler_loop() {
+fn sampler_loop(my_gen: u64) {
     let mut last = None::<(i32, i32)>;
-    let mut prev = 0i16;
-    while ALIVE.load(std::sync::atomic::Ordering::SeqCst) {
-        let pos =
-            crate::platform::cursor_position().map(|(x, y)| (x.round() as i32, y.round() as i32));
+    // Seed with the keys already down at start so a held key does not
+    // fire a false rising edge on the first poll.
+    let mut prev = poll_key_bits();
+    while GEN.load(Ordering::SeqCst) == my_gen {
+        let pos = cursor_pos();
         // Sample ONLY when the cursor moved: continuous desktop reads
         // (even on a worker thread) keep the compositor busy and freeze
         // RDP sessions. A stationary cursor's patch stays valid.
         if pos.is_some_and(|p| last != Some(p)) {
             let (x, y) = pos.expect("checked");
             let patch = read_patch(x, y);
+            if GEN.load(Ordering::SeqCst) != my_gen {
+                break;
+            }
             if let Some(patch) = patch {
                 let centre = patch.get_pixel(PREVIEW_PATCH / 2, PREVIEW_PATCH / 2).0;
                 let colour = Color32::from_rgba_unmultiplied(centre[0], centre[1], centre[2], 255);
@@ -174,7 +176,6 @@ fn sampler_loop() {
                 {
                     let mut slot = m.lock().unwrap_or_else(|p| p.into_inner());
                     *slot = Some(Snapshot {
-                        at: Instant::now(),
                         pos: (x, y),
                         patch,
                         colour,
@@ -187,34 +188,26 @@ fn sampler_loop() {
         // Edge-detect Esc/C (MSB = currently down) so they latch even
         // while another window holds key focus — the common case while
         // the cursor roams outside our windows.
-        let now = unsafe { (GetAsyncKeyState(VK_ESCAPE) < 0, GetAsyncKeyState(VK_C) < 0) };
-        let mut bits = 0u8;
-        if now.0 && prev & 1 == 0 {
-            bits |= 1;
-        }
-        if now.1 && prev & 2 == 0 {
-            bits |= 2;
-        }
-        prev = (now.0 as i16) | ((now.1 as i16) << 1);
-        if bits != 0 {
-            tracing::debug!(bits, "pick sampler: key latched");
-            KEYS.fetch_or(bits, std::sync::atomic::Ordering::SeqCst);
+        let now = poll_key_bits();
+        let rising = now & !prev;
+        prev = now;
+        if rising != 0 {
+            KEYS.fetch_or(rising, Ordering::SeqCst);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    tracing::debug!("pick sampler: exited");
 }
 
 /// `true` once per Esc press seen by the worker (drains the latch).
 /// macOS relies on the focused-window key path — no-op there.
 pub fn take_cancelled() -> bool {
-    KEYS.fetch_and(!1u8, std::sync::atomic::Ordering::SeqCst) & 1 != 0
+    KEYS.fetch_and(!1u8, Ordering::SeqCst) & 1 != 0
 }
 
 /// `true` once per `C` press seen by the worker (drains the latch).
 /// macOS relies on the focused-window key path — no-op there.
 pub fn take_copy() -> bool {
-    KEYS.fetch_and(!2u8, std::sync::atomic::Ordering::SeqCst) & 2 != 0
+    KEYS.fetch_and(!2u8, Ordering::SeqCst) & 2 != 0
 }
 
 fn cursor_pos() -> Option<(i32, i32)> {
@@ -230,7 +223,6 @@ fn latest_snapshot() -> Option<Snapshot> {
     let (m, _) = snap();
     let slot = m.lock().unwrap_or_else(|p| p.into_inner());
     slot.as_ref().map(|s| Snapshot {
-        at: s.at,
         pos: s.pos,
         patch: s.patch.clone(),
         colour: s.colour,
@@ -243,11 +235,10 @@ fn latest_snapshot() -> Option<Snapshot> {
 pub fn screen_pixel(x: i32, y: i32) -> Option<Color32> {
     let (m, cv) = snap();
     let slot = m.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.as_ref().is_some_and(|s| s.pos == (x, y)) {
-        return slot.as_ref().map(|s| s.colour);
-    }
     let (g, _t) = cv
-        .wait_timeout(slot, CLICK_WAIT)
+        .wait_timeout_while(slot, CLICK_WAIT, |s| {
+            s.as_ref().map(|s| s.pos) != Some((x, y))
+        })
         .unwrap_or_else(|p| p.into_inner());
     g.as_ref().map(|s| s.colour)
 }

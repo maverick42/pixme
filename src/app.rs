@@ -3364,32 +3364,6 @@ impl eframe::App for PixMeApp {
         // window is re-pinned to its monitor's rect every frame (a
         // plug/unplug or DPI shift mid-pick cannot leave a strip
         // uncovered).
-        // `PIXME_PICK_TEST` (Windows): arms the pick overlay without a
-        // Draw session so its rendering/input can be exercised by an
-        // external probe. Emulates the session's heartbeat and stops
-        // re-raising once an outcome lands.
-        #[cfg(target_os = "windows")]
-        let pick_test = std::env::var_os("PIXME_PICK_TEST").is_some() && {
-            let done = ctx.data_mut(|d| {
-                d.get_temp::<platform::picker::PickOutcome>(egui::Id::new(
-                    platform::picker::PICK_SCREEN_RESULT,
-                ))
-            })
-            .is_some_and(|o| {
-                !matches!(o, platform::picker::PickOutcome::CopyPressed(_))
-            });
-            if done {
-                tracing::info!("pick_test_done");
-                platform::picker::stop_worker();
-                false
-            } else {
-                platform::picker::start_worker();
-                true
-            }
-        };
-        #[cfg(not(target_os = "windows"))]
-        let pick_test = false;
-
         // A terminal outcome pending in ctx data ends the pick even while
         // the Draw session has not drained it yet — re-registering the
         // viewport in the meantime would churn create/close cycles.
@@ -3400,22 +3374,16 @@ impl eframe::App for PixMeApp {
             .is_some_and(|o| !matches!(o, platform::picker::PickOutcome::CopyPressed(_)))
         });
         if !pick_ended
-            && (pick_test
-                || lock(&self.shared.draw)
-                    .as_ref()
-                    .is_some_and(|d| d.pick_overlay_active()))
+            && lock(&self.shared.draw)
+                .as_ref()
+                .is_some_and(|d| d.pick_overlay_active())
         {
             for (i, rect) in cached_pick_monitors(&ctx).into_iter().enumerate() {
                 let shared = Arc::clone(&self.shared);
-                // Esc/C must reach an overlay: grab focus until the
-                // window reports focused (macOS becomes key on click —
-                // harmless there either way).
-                self.shared.request_focus(pick_overlay_id(i));
                 let builder = pick_overlay_builder(rect);
                 ctx.show_viewport_deferred(pick_overlay_id(i), builder, move |ui, _class| {
                     let ctx = ui.ctx().clone();
                     shared.pump(&ctx);
-                    shared.maybe_focus(&ctx, pick_overlay_id(i));
                     ui::theme::apply(&ctx, shared.appearance_kind(&ctx));
                     // Armed-state is read straight from the session each
                     // pass — a heartbeat would strand this click-eating
@@ -3435,10 +3403,9 @@ impl eframe::App for PixMeApp {
                         })
                     });
                     let armed = !ended
-                        && (pick_test
-                            || lock(&shared.draw)
-                                .as_ref()
-                                .is_some_and(|d| d.pick_overlay_active()));
+                        && lock(&shared.draw)
+                            .as_ref()
+                            .is_some_and(|d| d.pick_overlay_active());
                     if !armed {
                         // Clicks must reach the desktop the moment the
                         // pick ends — but only the PARENT's pass can reap

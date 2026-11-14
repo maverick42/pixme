@@ -1125,8 +1125,8 @@ impl DrawSession {
                 PickOutcome::CopyPressed(c) => {
                     self.copy_screen_pick(ctx, c);
                     // `C` does not end the pick — leave the overlay up;
-                    // a disarming pick still drops it when the
-                    // heartbeat below turns off.
+                    // a disarming pick (armed swatch, eraser pick) drops
+                    // it on the next pass when `wanted` below turns false.
                     return;
                 }
                 PickOutcome::Cancelled => self.disarm_pick(ctx),
@@ -1213,9 +1213,10 @@ impl DrawSession {
     }
 
     /// `C` — the only clipboard path: every pick mode copies the
-    /// `#RRGGBB` and toasts it. Click-landed picks go through
-    /// [`Self::pick_selected`] instead — they apply the colour without
-    /// touching the clipboard.
+    /// `#RRGGBB` — the "copié" flash lives in the pick loupe itself
+    /// (canvas and screen overlay alike), never in a toast. Click-landed
+    /// picks go through [`Self::pick_selected`] instead — they apply the
+    /// colour without touching the clipboard.
     fn copy_pick_colour(&mut self, ctx: &egui::Context, c: Color32) {
         let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
         if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -1226,11 +1227,6 @@ impl DrawSession {
         ctx.data_mut(|d| {
             d.insert_temp(egui::Id::new(crate::platform::picker::PICK_COPIED_AT), now);
         });
-        widgets::toast(
-            ctx,
-            widgets::ToastKind::Success,
-            t!("draw.pick.copied", hex = hex).to_string(),
-        );
     }
 
     /// A click-landed pick (armed swatch, eraser pick): the colour is
@@ -1282,22 +1278,12 @@ impl DrawSession {
         }
     }
 
-    /// `C` pressed while the pick overlay held key focus: the same
-    /// apply-and-copy as the in-window hotkey — armed swatch, eraser
-    /// pick or the Pipette tool's shared stroke colour.
+    /// `C` while a pick is armed — canvas or screen overlay alike —
+    /// copies the `#RRGGBB` under the cursor and KEEPS picking: the
+    /// armed swatch/eraser/Pipette state is untouched, the "copié"
+    /// flash is the loupe's own feedback. Only a click (apply) or Esc
+    /// (cancel) ends the pick.
     fn copy_screen_pick(&mut self, ctx: &egui::Context, c: Color32) {
-        if let Some(id) = armed_pick(ctx) {
-            ctx.data_mut(|d| {
-                d.insert_persisted(pick_done_key(id), c);
-            });
-            arm_pick(ctx, None);
-        } else if self.tool == Tool::Eraser && self.opts.eraser_pick {
-            self.opts.eraser_color = c;
-            self.opts.eraser_mode = EraserMode::Color;
-            self.opts.eraser_pick = false;
-        } else {
-            self.opts.color = c;
-        }
         self.copy_pick_colour(ctx, c);
     }
 
@@ -1425,6 +1411,7 @@ impl DrawSession {
                     || i.consume_key(egui::Modifiers::COMMAND, Key::C)
             })
         {
+            let _ = crate::platform::picker::take_copy();
             let c = if self.pick_overlay {
                 crate::platform::cursor_position().and_then(|(x, y)| {
                     crate::platform::picker::screen_pixel(x.round() as i32, y.round() as i32)
@@ -5295,7 +5282,7 @@ pub fn show_pick_overlay(ui: &mut Ui) {
 
     // WindowServer tracking zones at the screen edges (Dock, menu bar)
     // starve this window of pointer events — a ~30 Hz tick keeps the
-    // loupe tracking and the heartbeat check running through them.
+    // loupe tracking and the armed-state check running through them.
     ctx.request_repaint_after(std::time::Duration::from_millis(33));
 
     // Sample first: a click validates what the cursor sits on RIGHT NOW.
@@ -5306,24 +5293,27 @@ pub fn show_pick_overlay(ui: &mut Ui) {
         crate::platform::cursor_position().map(|(x, y)| (x.round() as i32, y.round() as i32));
     let patch = ctx.data_mut(|d| {
         let id = egui::Id::new("draw.pick_sample");
-        let cached = d.get_temp::<(std::time::Instant, (i32, i32), image::RgbaImage)>(id);
+        let cached = d.get_temp::<(std::time::Instant, image::RgbaImage)>(id);
         let fresh = match (cursor, &cached) {
-            (Some(_), Some((at, _, _))) if at.elapsed().as_millis() < 33 => None,
-            (Some((x, y)), _) => picker::screen_patch(x, y).map(|p| (x, y, p)),
+            (Some(_), Some((at, _))) if at.elapsed().as_millis() < 33 => None,
+            (Some((x, y)), _) => picker::screen_patch(x, y),
             _ => None,
         };
         match fresh {
-            Some((x, y, p)) => {
-                let v = (std::time::Instant::now(), (x, y), p);
-                d.insert_temp(id, v.clone());
-                Some(v.2)
+            Some(p) => {
+                d.insert_temp(id, (std::time::Instant::now(), p.clone()));
+                Some(p)
             }
-            None => cached.map(|(_, _, p)| p),
+            None => cached.map(|(_, p)| p),
         }
     });
 
     // Clicks never reach the app beneath — they land on this window.
     // Left = validate, right = cancel; Esc cancels from either window.
+    // Drain the worker's key latches unconditionally so a focused-window
+    // event never short-circuits them into firing on the next frame.
+    let worker_cancelled = picker::take_cancelled();
+    let worker_copied = picker::take_copy();
     let click = ui.interact(screen, egui::Id::new("pick_overlay"), Sense::click());
     let outcome = if click.clicked() {
         cursor
@@ -5332,14 +5322,13 @@ pub fn show_pick_overlay(ui: &mut Ui) {
             .or(Some(PickOutcome::Denied))
     } else if click.secondary_clicked()
         || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-        || picker::take_cancelled()
+        || worker_cancelled
     {
         Some(PickOutcome::Cancelled)
     } else {
         None
     };
     if let Some(o) = outcome {
-        tracing::debug!(?o, "pick overlay: outcome stored");
         // Terminal outcome: the sampler stops NOW — waiting for the Draw
         // session's (possibly throttled) drain would keep compositor
         // reads running while the window is already doomed.
@@ -5358,12 +5347,18 @@ pub fn show_pick_overlay(ui: &mut Ui) {
         return;
     }
     // `C` copies like the in-window hotkey — it can land here whenever
-    // this window holds key focus (a click made it key on macOS). It is
-    // not a pick landing: the session stays armed, so no Close — only
-    // the heartbeat turning off ends the pick.
+    // this window holds key focus (a click made it key on macOS) or via
+    // the Windows sampler's physical-key poll. It is not a pick landing:
+    // the Pipette tool stays armed, so no Close — a disarming swatch or
+    // eraser pick closes the overlay on the next pass. A worker latch
+    // arriving within 120 ms of an in-window `C` copy is the same
+    // physical key press observed on the next 10 ms poll tick.
+    let just_copied = ctx
+        .data(|d| d.get_temp::<std::time::Instant>(egui::Id::new(picker::PICK_COPIED_AT)))
+        .is_some_and(|t| t.elapsed().as_millis() < 120);
     let cpress = ctx.input(|i| {
         i.key_pressed(egui::Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy))
-    }) || picker::take_copy();
+    }) || (worker_copied && !just_copied);
     if cpress {
         let o = cursor
             .and_then(|(x, y)| picker::screen_pixel(x, y))

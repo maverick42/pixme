@@ -435,7 +435,7 @@ pub fn strip_undecorated_frame() {
         Anchor,
         /// The per-monitor colour-pick veil ("PixMe Pick"): transparent,
         /// topmost, monitor-pinned — revealed here like every chromeless
-        /// window, and it keeps its title (tests/probes find the HWND).
+        /// window.
         Pick,
     }
 
@@ -479,6 +479,7 @@ pub fn strip_undecorated_frame() {
                 (Some(Role::Overlay), true)
             } else if title == crate::platform::picker::PICK_OVERLAY_TITLE {
                 m.insert(hwnd, Role::Pick);
+                unsafe { SetWindowTextW(hwnd, [0u16].as_ptr()) };
                 (Some(Role::Pick), true)
             } else if title == "PixMe" {
                 m.insert(hwnd, Role::Anchor);

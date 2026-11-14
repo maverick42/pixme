@@ -2542,27 +2542,34 @@ Format: date — context — decision — consequences.
   sitting below-left of the main display stayed unveiled (measured:
   `want=(-1133,0,2560,2406)` applied as `(-1133,53)-(2560,1707)`).
   Per-monitor windows also give every overlay its own `ppp`, which
-  fixes mixed-DPI sampling on Windows for free. An alpha-20 veil fills the frame: fully-transparent pixels
-  are click-through on both OSes, so the veil is what actually swallows
-  the click. The overlay paints PixMe's loupe card at the cursor and
-  pushes a `PickOutcome` through ctx data (`PICK_SCREEN_RESULT`) that
-  the Draw session drains. Pixel reads must skip that veil: a
-  framebuffer composite (`CGDisplay::image_for_rect` /
-  `CGDisplay::image()`) includes our own window, so the veil tinted
-  every sample ~8 % darker (`#CD3A80` read as `#BD3576` — the veil's
-  exact 235/255 factor, mistaken at first for a Display-P3 conversion).
-  While the overlay is up, `platform::picker` instead composites only
-  the windows BELOW it (`CGWindowListCreateImage` +
+  fixes mixed-DPI sampling on Windows for free. On macOS an alpha-20
+  veil (`OVERLAY_VEIL_ALPHA = 20`) fills the frame because fully
+  transparent AppKit pixels are click-through; on Windows DWM keeps an
+  alpha-0 (`OVERLAY_VEIL_ALPHA = 0`) HWND hit-testable without tinting
+  the desktop or needing `WDA_EXCLUDEFROMCAPTURE` (which would hide the
+  loupe over RDP). The overlay paints PixMe's loupe card at the cursor
+  (offset clear of the sampled patch) and pushes a `PickOutcome`
+  through ctx data (`PICK_SCREEN_RESULT`) that the Draw session drains.
+  On macOS pixel reads must skip the alpha-20 veil: a framebuffer
+  composite (`CGDisplay::image_for_rect` / `CGDisplay::image()`)
+  includes our own window, so the veil tinted every sample ~8 % darker
+  (`#CD3A80` read as `#BD3576` — the veil's exact 235/255 factor,
+  mistaken at first for a Display-P3 conversion). While the overlay is
+  up, `platform::picker` on macOS instead composites only the windows
+  BELOW it (`CGWindowListCreateImage` +
   `kCGWindowListOptionOnScreenBelowWindow`, the overlay's
   `kCGWindowNumber` found by title+pid in `window_list()`, 500 ms
-  cached); `image_for_rect` remains the no-overlay fallback. On
-  Windows `GetDC`/`GetPixel` reads the composed desktop too, so the
-  overlay's HWND is marked `WDA_EXCLUDEFROMCAPTURE` on first sight
-  (`WindowFromPoint` + pid + title check, cached) — every capture API
-  then sees straight through it. Rasterization uses the source image's own colour
-  space so CoreGraphics applies no ColorSync conversion — stored and
-  sampled bytes stay framebuffer-verbatim, matching what external
-  tools (such as the functional reference) read.
+  cached); `image_for_rect` remains the no-overlay fallback.
+  Rasterization uses the source image's own colour space so
+  CoreGraphics applies no ColorSync conversion — stored and sampled
+  bytes stay framebuffer-verbatim, matching what external tools (such
+  as the functional reference) read. On Windows desktop reads
+  (`GetDC(NULL)` + `CreateDIBSection` + `BitBlt` + `GdiFlush`) can
+  block on the compositor for tens of milliseconds (more under RDP), so
+  a dedicated sampler worker thread (`start_worker`/`stop_worker`)
+  follows cursor moves, caches the latest `PREVIEW_PATCH` snapshot and
+  polls `GetAsyncKeyState` for `Esc`/`C` while foreign windows hold key
+  focus.
 - **Rejected**: `NSColorSampler` (macOS) + `WH_MOUSE_LL` (Windows) —
   the sampler imposes its own round OS loupe instead of PixMe's cursor,
   cannot be dismissed programmatically, and a nil callback cannot be

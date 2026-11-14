@@ -72,8 +72,9 @@ pub const OVERLAY_VEIL_ALPHA: u8 = 20;
 pub const OVERLAY_VEIL_ALPHA: u8 = 0;
 
 /// Window title shared by every per-monitor pick overlay viewport —
-/// matched by `elevate_pick_overlay` and by the per-OS screen samplers
-/// so our own veil is excluded from pixel reads.
+/// matched by `elevate_pick_overlay`, by `strip_undecorated_frame` on
+/// Windows, and by the macOS screen sampler so its veil is excluded
+/// from pixel reads.
 pub const PICK_OVERLAY_TITLE: &str = "PixMe Pick";
 
 /// The `egui::Id` the pick overlay writes its [`PickOutcome`] into and
@@ -99,37 +100,4 @@ pub enum PickOutcome {
     /// The OS refused to hand out screen pixels (macOS without Screen
     /// Recording) — the UI points at System Settings.
     Denied,
-}
-
-/// A `COLORREF` (`0x00BBGGRR`, low byte = red) as an opaque `Color32`.
-#[cfg(any(target_os = "windows", test))]
-pub(crate) fn colorref_to_color32(v: u32) -> Color32 {
-    Color32::from_rgb(
-        (v & 0xFF) as u8,
-        ((v >> 8) & 0xFF) as u8,
-        ((v >> 16) & 0xFF) as u8,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn colorref_is_bgr_ordered() {
-        // COLORREF packs red in the LOW byte.
-        assert_eq!(
-            colorref_to_color32(0x00FF0000),
-            Color32::from_rgb(0, 0, 255)
-        );
-        assert_eq!(
-            colorref_to_color32(0x0000FF00),
-            Color32::from_rgb(0, 255, 0)
-        );
-        assert_eq!(
-            colorref_to_color32(0x000000FF),
-            Color32::from_rgb(255, 0, 0)
-        );
-        assert_eq!(colorref_to_color32(0x00FFFFFF), Color32::WHITE);
-    }
 }
