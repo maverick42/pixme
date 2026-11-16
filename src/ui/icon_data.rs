@@ -91,6 +91,16 @@ pub(crate) const DATA: &[(Icon, &str, &[u8])] = &[
         include_bytes!("../../assets/icons/chevron-right.svg"),
     ),
     (
+        Icon::ChevronsLeft,
+        "chevrons-left",
+        include_bytes!("../../assets/icons/chevrons-left.svg"),
+    ),
+    (
+        Icon::ChevronsRight,
+        "chevrons-right",
+        include_bytes!("../../assets/icons/chevrons-right.svg"),
+    ),
+    (
         Icon::Check,
         "check",
         include_bytes!("../../assets/icons/check.svg"),

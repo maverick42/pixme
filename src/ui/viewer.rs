@@ -3346,10 +3346,10 @@ impl Viewer {
                 ui.style_mut().always_scroll_the_only_direction = true;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                    // ◀ ▶ only exist while the chips overflow; max_width
+                    // ◀ ▶ « » only exist while the chips overflow; max_width
                     // keeps the scroll area from pushing them off-screen.
                     let step = widgets::BUTTON_SIZE + 4.0;
-                    let right_w = if self.tabs_overflow { 2.0 * step } else { 0.0 };
+                    let right_w = if self.tabs_overflow { 4.0 * step } else { 0.0 };
                     let strip_w = (ui.available_width() - right_w).max(60.0);
                     let mut area = egui::ScrollArea::horizontal()
                         .id_salt("pixme-tabs")
@@ -3376,14 +3376,61 @@ impl Viewer {
                     self.tabs_overflow = out.content_size.x > out.inner_rect.width() + 0.5;
                     if self.tabs_overflow {
                         let max_off = (out.content_size.x - out.inner_rect.width()).max(0.0);
+                        // « » jump the ACTIVE tab to the strip's ends (the
+                        // single chevrons only scroll it) — enabled while a
+                        // tab sits before/after the active one OR the strip
+                        // is scrolled away from that end: with the end tab
+                        // already active they still scroll its chip back
+                        // into view. Laid out « < > », the usual
+                        // first/prev/next/last pattern.
+                        let vis = self.visible_indices();
+                        let active = self.active_index();
+                        let first = vis.first().copied();
+                        let last = vis.last().copied();
+                        let can_first = active != first || self.tab_scroll_pos > 0.5;
+                        let can_last = active != last || self.tab_scroll_pos < max_off - 0.5;
+                        ui.add_enabled_ui(vis.len() > 1 && can_first, |ui| {
+                            if widgets::icon_button(ui, Icon::ChevronsLeft, false)
+                                .on_hover_text(t!("viewer.strip.first_tab"))
+                                .clicked()
+                                && let Some(i) = first
+                            {
+                                // The end tab is active already: jump the
+                                // scroll, not the selection (no view reset).
+                                if active == Some(i) {
+                                    self.tab_scroll_to = Some(0.0);
+                                } else {
+                                    self.set_active(i);
+                                }
+                            }
+                        });
                         ui.add_enabled_ui(self.tab_scroll_pos > 0.5, |ui| {
-                            if widgets::icon_button(ui, Icon::ChevronLeft, false).clicked() {
+                            if widgets::icon_button(ui, Icon::ChevronLeft, false)
+                                .on_hover_text(t!("viewer.strip.scroll_left"))
+                                .clicked()
+                            {
                                 self.tab_scroll_to = Some((self.tab_scroll_pos - 160.0).max(0.0));
                             }
                         });
                         ui.add_enabled_ui(self.tab_scroll_pos < max_off - 0.5, |ui| {
-                            if widgets::icon_button(ui, Icon::ChevronRight, false).clicked() {
+                            if widgets::icon_button(ui, Icon::ChevronRight, false)
+                                .on_hover_text(t!("viewer.strip.scroll_right"))
+                                .clicked()
+                            {
                                 self.tab_scroll_to = Some(self.tab_scroll_pos + 160.0);
+                            }
+                        });
+                        ui.add_enabled_ui(vis.len() > 1 && can_last, |ui| {
+                            if widgets::icon_button(ui, Icon::ChevronsRight, false)
+                                .on_hover_text(t!("viewer.strip.last_tab"))
+                                .clicked()
+                                && let Some(i) = last
+                            {
+                                if active == Some(i) {
+                                    self.tab_scroll_to = Some(max_off);
+                                } else {
+                                    self.set_active(i);
+                                }
                             }
                         });
                     }
