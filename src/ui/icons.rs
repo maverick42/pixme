@@ -44,6 +44,10 @@ pub enum Icon {
     ChevronLeft,
     /// Tab strip scroll-right arrow.
     ChevronRight,
+    /// Tab strip jump-to-first-tab arrow.
+    ChevronsLeft,
+    /// Tab strip jump-to-last-tab arrow.
+    ChevronsRight,
     /// Checkmark (selected menu item).
     Check,
     /// Add a tab / start a new capture (viewer's "+").
