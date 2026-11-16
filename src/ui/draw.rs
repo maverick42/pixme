@@ -995,6 +995,35 @@ impl DrawSession {
         }
     }
 
+    /// Resets a curved Line/Text's inner Bézier knobs to the canonical
+    /// straight position on the `a..b` chord — one undoable `Replace`;
+    /// endpoints, style and text content are untouched.
+    fn straighten_bezier(&mut self, id: AnnotationId) {
+        if self.drag.is_some() {
+            return;
+        }
+        self.commit_nudge();
+        self.close_text_panel();
+        let Some(before) = self.doc.annotation(id).cloned() else {
+            return;
+        };
+        let Some(a) = self.doc.annotation_mut(id) else {
+            return;
+        };
+        match &mut a.kind {
+            AnnotationKind::Line(o) => {
+                (o.ka, o.kb) = bezier_rest_knobs(o.a, o.b);
+            }
+            AnnotationKind::Text(o) => {
+                (o.ka, o.kb) = text_knob_rest(o);
+            }
+            _ => return,
+        }
+        let after = a.clone();
+        self.apply(AnnoEdit::Replace { before, after });
+        self.selected = Some(id);
+    }
+
     /// Adds a finished object and selects it.
     fn add(&mut self, kind: AnnotationKind) {
         let id = self.doc.alloc_id();
@@ -2111,6 +2140,25 @@ impl DrawSession {
                         self.fix_options(id, shared, ui.ctx());
                         ui.close();
                     }
+                    // Only Line/Text carry Bézier knobs: the item is
+                    // hidden on every other kind and greyed while the
+                    // knobs already rest on the a..b chord.
+                    let straighten = self.doc.annotation(id).and_then(|a| match &a.kind {
+                        AnnotationKind::Line(o) => Some(bezier_is_curved(o.a, o.ka, o.kb, o.b)),
+                        AnnotationKind::Text(o) => Some(bezier_is_curved(o.a, o.ka, o.kb, o.b)),
+                        _ => None,
+                    });
+                    if let Some(curved) = straighten
+                        && ui
+                            .add_enabled(
+                                curved,
+                                egui::Button::new(t!("draw.ctx.straighten").to_string()),
+                            )
+                            .clicked()
+                    {
+                        self.straighten_bezier(id);
+                        ui.close();
+                    }
                 });
             });
         // A Select pan drag scrolls the viewport by the pointer delta —
@@ -2468,11 +2516,14 @@ impl DrawSession {
             }) => {
                 let (wb, top) = (*which_b, *top);
                 let snap = self.snap_hv;
+                let snap_d = 7.0 / self.canvas_scale.max(0.05);
                 match &mut live.kind {
                     AnnotationKind::Line(o) => {
+                        let p = snap_bezier_knob(o.a, o.b, top, p, snap_d);
                         drag_bezier_endpoint(&mut o.a, &mut o.ka, &mut o.kb, &mut o.b, wb, top, p);
                     }
                     AnnotationKind::Text(o) => {
+                        let p = snap_bezier_knob(o.a, o.b, top, p, snap_d);
                         drag_bezier_endpoint(&mut o.a, &mut o.ka, &mut o.kb, &mut o.b, wb, top, p);
                     }
                     AnnotationKind::Brace(o) => {
@@ -5170,6 +5221,31 @@ fn bezier_rest_knobs(a: Pos2, b: Pos2) -> (Pos2, Pos2) {
         pos2(a.x + (b.x - a.x) / 3.0, a.y + (b.y - a.y) / 3.0),
         pos2(a.x + (b.x - a.x) * 2.0 / 3.0, a.y + (b.y - a.y) * 2.0 / 3.0),
     )
+}
+
+/// `true` while either inner knob sits off the `a..b` segment (0.5
+/// image px tolerance absorbs float noise).
+fn bezier_is_curved(a: Pos2, ka: Pos2, kb: Pos2, b: Pos2) -> bool {
+    seg_distance(ka, a, b) > 0.5 || seg_distance(kb, a, b) > 0.5
+}
+
+/// Magnetic "drop on the line" snap for the inner Bézier knobs
+/// (`top == false`): within `dist` of the `a..b` chord the knob is
+/// pulled onto its perpendicular foot point, so releasing near the
+/// line leaves that side perfectly straight instead of an invisible
+/// micro-curve. Endpoints (`top == true`) never snap.
+fn snap_bezier_knob(a: Pos2, b: Pos2, top: bool, p: Pos2, dist: f32) -> Pos2 {
+    if top {
+        return p;
+    }
+    let d = b - a;
+    let len2 = d.length_sq();
+    if len2 < 1e-6 {
+        return p;
+    }
+    let t = ((p - a).dot(d) / len2).clamp(0.0, 1.0);
+    let foot = a + d * t;
+    if p.distance(foot) < dist { foot } else { p }
 }
 
 /// Hit-tests the four cubic-Bézier anchors (`a`, `ka`, `kb`, `b`) — green
