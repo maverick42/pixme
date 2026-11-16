@@ -85,6 +85,19 @@ pub enum AreaShape {
     Ellipse,
 }
 
+/// The highlighter's working mode (its options "Style" combo):
+/// zone (`Rect`/`Circle` → `AreaObj`) or freehand stroke (→ `FreeObj`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HlMode {
+    /// Rectangular zone (`AreaShape::Rect`).
+    #[default]
+    Rect,
+    /// Elliptic zone (`AreaShape::Ellipse`).
+    Circle,
+    /// Freehand stroke following the pointer path.
+    Freehand,
+}
+
 /// The blur tool's two modes ("Style" icons).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlurStyle {
@@ -560,9 +573,12 @@ pub enum AnnotationKind {
     Blur(BlurObj),
     /// `{` / `}` / `[` / `]` / `(` / `)` bracket between two anchors.
     Brace(BraceObj),
-    /// 🙂 embedded emoji sticker — LAST variant: postcard encodes the
-    /// variant index, so appending keeps every older blob readable.
+    /// 🙂 embedded emoji sticker.
     Emoji(EmojiObj),
+    /// Translucent freehand highlight (a multiply along the stroke
+    /// footprint) — LAST variant: postcard encodes the variant index,
+    /// so new variants may only ever be appended here, at the end.
+    HighlightStroke(FreeObj),
 }
 
 /// One annotation object.
@@ -604,7 +620,7 @@ impl AnnotationKind {
                     height: ((y2 - y1).max(1.0) as i32 + pad * 2).max(1) as u32,
                 }
             }
-            Self::Freehand(o) => points_bounds(&o.points),
+            Self::Freehand(o) | Self::HighlightStroke(o) => points_bounds(&o.points),
             Self::HighlightArea(o) => o.rect,
             Self::Text(o) => {
                 // Ribbon above the cubic Bézier baseline (`a`, `ka`, `kb`, `b`).
@@ -682,7 +698,7 @@ impl AnnotationKind {
                 shift(&mut o.ka);
                 shift(&mut o.kb);
             }
-            Self::Freehand(o) => {
+            Self::Freehand(o) | Self::HighlightStroke(o) => {
                 for p in &mut o.points {
                     shift(p);
                 }
@@ -742,7 +758,7 @@ impl AnnotationKind {
                 scale_pt(&mut o.ka, &b);
                 scale_pt(&mut o.kb, &b);
             }
-            Self::Freehand(o) => {
+            Self::Freehand(o) | Self::HighlightStroke(o) => {
                 for p in &mut o.points {
                     scale_pt(p, &b);
                 }
