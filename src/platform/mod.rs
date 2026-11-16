@@ -10,6 +10,7 @@
 pub mod drag_out;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod picker;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -484,17 +485,19 @@ pub use windows::capture_frame;
 /// with `unhide_cursor`.
 #[cfg(target_os = "macos")]
 pub use macos::{
-    capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay, hide_cursor,
-    left_mouse_down, unhide_cursor,
+    capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay,
+    elevate_pick_overlay, hide_cursor, left_mouse_down, unhide_cursor,
 };
 /// Hides / unhides the OS cursor and dismisses active popup menus around a
 /// capture (see above). `capture_chrome_*` arms/disarms the capture kiosk
 /// (menu bar + Dock hidden on macOS; no-op on Windows). `left_mouse_down`
 /// polls the physical button so edge-swallowed presses still drag.
+/// `elevate_pick_overlay` is a no-op on Windows: a topmost window already
+/// covers the taskbar.
 #[cfg(target_os = "windows")]
 pub use windows::{
-    capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay, hide_cursor,
-    left_mouse_down, unhide_cursor,
+    capture_chrome_enter, capture_chrome_exit, dismiss_active_menus, elevate_overlay,
+    elevate_pick_overlay, hide_cursor, left_mouse_down, unhide_cursor,
 };
 
 /// Brings the app itself frontmost (dock reopen — `Focus` alone does

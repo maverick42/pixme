@@ -15,7 +15,7 @@ use egui::{
 };
 use rust_i18n::t;
 
-use crate::app::Shared;
+use crate::app::{Shared, ViewportWake};
 use crate::capture::PhysicalRect;
 use crate::editor::document::{
     Annotation, AnnotationId, AnnotationKind, AreaObj, AreaShape, BlurObj, BlurStyle, BoxObj,
@@ -502,6 +502,9 @@ pub struct DrawSession {
     rendered_img: Option<image::RgbaImage>,
     loupe_tex: Option<TextureHandle>,
     copied_at: Option<std::time::Instant>,
+    /// Last "press C" nudge for the Pipette tool's inert click —
+    /// throttles the toast so click spam cannot stack pills.
+    inert_toast_at: Option<std::time::Instant>,
     rendered_rev: u64,
     outcome: Option<Outcome>,
     /// The unsaved-changes confirmation is up (Échap/Annuler/close with
@@ -547,6 +550,16 @@ pub struct DrawSession {
     /// revision frozen until the burst commits — same mechanism as
     /// object drags).
     nudge: Option<NudgeBurst>,
+    /// The full-screen pick overlays are up: transparent always-on-top
+    /// per-monitor viewports that swallow the validating click, draw our
+    /// own cursor + loupe and report through [`PICK_SCREEN_RESULT`].
+    /// Raised only while the cursor roams outside this window; inside,
+    /// the canvas' own pick path owns it.
+    pick_overlay: bool,
+    /// Set when a pick ends (validated or cancelled) while the cursor is
+    /// outside so the overlay does not instantly re-arm; cleared when
+    /// the cursor re-enters the window.
+    pick_blocked: bool,
 }
 
 impl DrawSession {
@@ -582,6 +595,7 @@ impl DrawSession {
             rendered_img: None,
             loupe_tex: None,
             copied_at: None,
+            inert_toast_at: None,
             rendered_rev: u64::MAX,
             outcome: None,
             confirm_quit: false,
@@ -592,6 +606,8 @@ impl DrawSession {
             canvas_scale: 1.0,
             emoji_texs: HashMap::new(),
             emoji_dnd: None,
+            pick_overlay: false,
+            pick_blocked: false,
             emoji_section: 0,
             region_scratch: None,
             preview_tex: None,
@@ -1072,6 +1088,7 @@ impl DrawSession {
     /// The session's frame — strip + canvas + options bar.
     pub fn show(&mut self, ui: &mut Ui, shared: &Shared) {
         self.hotkeys(ui.ctx());
+        self.sync_screen_pick(ui.ctx());
         egui::Panel::left("draw.strip")
             .resizable(false)
             .exact_size(68.0)
@@ -1085,6 +1102,233 @@ impl DrawSession {
         self.quit_dialog(ui.ctx());
         // 62 px bottom option bar + a small gap.
         widgets::paint_toasts_above(ui.ctx(), 70.0);
+    }
+
+    /// Keeps the pick overlay in step with the armed state: drains the
+    /// outcome the overlay viewport pushed into [`PICK_SCREEN_RESULT`],
+    /// and decides whether the overlay should be up — only while the
+    /// cursor roams outside this window, where the canvas' own pick path
+    /// cannot reach. Inside, that path owns clicks and no overlay shows.
+    fn sync_screen_pick(&mut self, ctx: &egui::Context) {
+        use crate::platform::picker::{self, PickOutcome};
+        // Drain first — a stale outcome must never linger and inject a
+        // colour long after the pick ended.
+        let outcome = ctx.data_mut(|d| {
+            let id = egui::Id::new(picker::PICK_SCREEN_RESULT);
+            let v = d.get_temp::<PickOutcome>(id);
+            d.remove::<PickOutcome>(id);
+            v
+        });
+        if let Some(outcome) = outcome {
+            match outcome {
+                PickOutcome::Picked(c) => self.apply_screen_pick(ctx, c),
+                PickOutcome::CopyPressed(c) => {
+                    self.copy_screen_pick(ctx, c);
+                    // `C` does not end the pick — leave the overlay up;
+                    // a disarming pick (armed swatch, eraser pick) drops
+                    // it on the next pass when `wanted` below turns false.
+                    return;
+                }
+                PickOutcome::Cancelled => self.disarm_pick(ctx),
+                PickOutcome::Denied => {
+                    widgets::toast(
+                        ctx,
+                        widgets::ToastKind::Warning,
+                        t!("draw.pick.denied").to_string(),
+                    );
+                    self.disarm_pick(ctx);
+                }
+            }
+            self.set_pick_overlay(ctx, false);
+            return;
+        }
+        let wanted = armed_pick(ctx).is_some()
+            || self.tool == Tool::Pipette
+            || (self.tool == Tool::Eraser && self.opts.eraser_pick);
+        if !wanted {
+            self.pick_blocked = false;
+            self.set_pick_overlay(ctx, false);
+            return;
+        }
+        // A cancel outside blocks re-arming until the cursor re-enters —
+        // Esc actually dismisses the overlay instead of respawning it.
+        // `None` (cursor or window rect unreadable for a pass) must
+        // leave the flag alone — treating it as "inside" flapped the
+        // overlay closed and reopened at builder size every time.
+        let outside = self.cursor_outside(ctx);
+        if let Some(outside) = outside {
+            if !outside {
+                self.pick_blocked = false;
+            }
+            self.set_pick_overlay(ctx, outside && !self.pick_blocked);
+        }
+        // The overlay reads `self.pick_overlay` via `pick_overlay_active()`
+        // every pass (app.rs closure) and self-closes when it turns false —
+        // no heartbeat: a throttled sibling viewport cannot strand it.
+        // Keep polling even while the cursor is inside Draw: crossing
+        // the top edge does not always deliver a final pointer event to
+        // Draw, so otherwise leaving after re-entering never re-arms the
+        // overlay. Polling stops as soon as the picker disarms.
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        if self.pick_overlay {
+            // ROOT registers the deferred viewport and can be throttled
+            // while occluded, so keep it awake while the overlay is up.
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+    }
+
+    /// Flips the overlay flag and wakes the ROOT viewport: `App::ui` —
+    /// the only place `show_viewport_deferred` registers/closes the
+    /// overlay — runs exclusively on ROOT repaints, so a flag change
+    /// inside a Draw-window pass would otherwise never be observed.
+    fn set_pick_overlay(&mut self, ctx: &egui::Context, on: bool) {
+        if self.pick_overlay != on {
+            self.pick_overlay = on;
+            crate::app::wake_viewports(ctx);
+            if on {
+                crate::platform::picker::start_worker();
+                // A pick window may outlive its outcome while the anchor
+                // sleeps (see the passthrough note in `show_pick_overlay`)
+                // — wake it and restore hit-testing so the pick works
+                // again without waiting for a ROOT pass to re-register.
+                for i in 0..8 {
+                    let id = crate::app::pick_overlay_id(i);
+                    ctx.cmd_if_live(id, egui::ViewportCommand::MousePassthrough(false));
+                    ctx.repaint_if_live(id);
+                }
+            } else {
+                crate::platform::picker::stop_worker();
+                // The overlay may have become the key window — hand the
+                // focus back or keystrokes (Esc included) keep landing
+                // nowhere after it closes.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+    }
+
+    /// Whether the fullscreen pick overlay should be visible — read by
+    /// `app.rs` each frame to raise/dismiss the deferred viewport.
+    pub fn pick_overlay_active(&self) -> bool {
+        self.pick_overlay
+    }
+
+    /// `C` — the only clipboard path: every pick mode copies the
+    /// `#RRGGBB` — the "copié" flash lives in the pick loupe itself
+    /// (canvas and screen overlay alike), never in a toast. Click-landed
+    /// picks go through [`Self::pick_selected`] instead — they apply the
+    /// colour without touching the clipboard.
+    fn copy_pick_colour(&mut self, ctx: &egui::Context, c: Color32) {
+        let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(&hex);
+        }
+        let now = std::time::Instant::now();
+        self.copied_at = Some(now);
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(crate::platform::picker::PICK_COPIED_AT), now);
+        });
+    }
+
+    /// A click-landed pick (armed swatch, eraser pick): the colour is
+    /// applied to its target and toasted — the clipboard stays for `C`.
+    fn pick_selected(&mut self, ctx: &egui::Context, c: Color32) {
+        let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+        widgets::toast(
+            ctx,
+            widgets::ToastKind::Info,
+            t!("draw.pick.selected", hex = hex).to_string(),
+        );
+    }
+
+    /// The Pipette tool's click — inert on the canvas and on the screen
+    /// overlay alike: the tool only answers `C`. Throttled so click
+    /// spam cannot stack pills.
+    fn pick_inert(&mut self, ctx: &egui::Context) {
+        if self
+            .inert_toast_at
+            .is_some_and(|t| t.elapsed().as_secs_f32() < 1.2)
+        {
+            return;
+        }
+        self.inert_toast_at = Some(std::time::Instant::now());
+        widgets::toast(
+            ctx,
+            widgets::ToastKind::Info,
+            t!("draw.pick.click_inert").to_string(),
+        );
+    }
+
+    /// Applies a colour sampled off-screen to whatever the pick targets
+    /// — the armed swatch, the eraser's colour — then toasts like the
+    /// canvas click paths. The Pipette tool ignores clicks entirely.
+    fn apply_screen_pick(&mut self, ctx: &egui::Context, c: Color32) {
+        if let Some(id) = armed_pick(ctx) {
+            ctx.data_mut(|d| {
+                d.insert_persisted(pick_done_key(id), c);
+            });
+            arm_pick(ctx, None);
+            self.pick_selected(ctx, c);
+        } else if self.tool == Tool::Eraser && self.opts.eraser_pick {
+            self.opts.eraser_color = c;
+            self.opts.eraser_mode = EraserMode::Color;
+            self.opts.eraser_pick = false;
+            self.pick_selected(ctx, c);
+        } else if self.tool == Tool::Pipette {
+            self.pick_inert(ctx);
+        }
+    }
+
+    /// `C` while a pick is armed — canvas or screen overlay alike —
+    /// applies AND copies the `#RRGGBB` under the cursor and KEEPS
+    /// picking: the armed swatch/eraser/Pipette state is untouched, the
+    /// "copié" flash is the loupe's own feedback. Only a click (apply)
+    /// or Esc (cancel) ends the pick.
+    fn copy_screen_pick(&mut self, ctx: &egui::Context, c: Color32) {
+        if let Some(id) = armed_pick(ctx) {
+            ctx.data_mut(|d| {
+                d.insert_persisted(pick_done_key(id), c);
+            });
+        } else if self.tool == Tool::Eraser && self.opts.eraser_pick {
+            self.opts.eraser_color = c;
+            self.opts.eraser_mode = EraserMode::Color;
+        } else {
+            self.opts.color = c;
+        }
+        self.copy_pick_colour(ctx, c);
+    }
+
+    /// Cancels the armed pick: swatch and eraser disarm, and the Pipette
+    /// tool exits to Select — Esc must not leave it armed to re-raise
+    /// the overlay on the next exit (it is a one-shot, like Emoji).
+    fn disarm_pick(&mut self, ctx: &egui::Context) {
+        arm_pick(ctx, None);
+        self.opts.eraser_pick = false;
+        if self.tool == Tool::Pipette {
+            self.set_tool(Tool::Select);
+        }
+        self.pick_blocked = true;
+    }
+
+    /// The draw window's outer rect in OS-native screen units — the
+    /// space [`crate::platform::cursor_position`] reports. `0,0,0,0`
+    /// while egui has not measured the window yet.
+    fn own_native_rect(&self, ctx: &egui::Context) -> [i32; 4] {
+        let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+            return [0, 0, 0, 0];
+        };
+        let ppp = crate::platform::window_ppp(ctx, 1.0);
+        let min = crate::platform::ui_to_native(outer.min, ppp);
+        let max = crate::platform::ui_to_native(outer.max, ppp);
+        [min.x as i32, min.y as i32, max.x as i32, max.y as i32]
+    }
+
+    /// Is the OS cursor outside this window? `None` when either the
+    /// cursor or the window rect is unreadable this pass — the caller
+    /// keeps the previous state rather than flapping the overlay.
+    fn cursor_outside(&self, ctx: &egui::Context) -> Option<bool> {
+        let (cx, cy) = crate::platform::cursor_position()?;
+        let [l, t, r, b] = self.own_native_rect(ctx);
+        (r > l && b > t).then_some(!(l..r).contains(&(cx as i32)) || !(t..b).contains(&(cy as i32)))
     }
 
     /// The unsaved-changes warning — Discard drops the whole clone,
@@ -1162,40 +1406,39 @@ impl DrawSession {
         if copy && self.sel_area.is_some() {
             self.sel_copy();
         }
-        // Eyedropper mode: pressing `C` copies the hovered `#RRGGBB` and
-        // picks the colour (armed swatch pick, Pipette tool, or the
-        // eraser's pick).
+        // Eyedropper mode: pressing `C` copies the `#RRGGBB` under the
+        // cursor and picks the colour (armed swatch pick, Pipette tool,
+        // or the eraser's pick). Off-canvas the pick overlay is up and
+        // `pixel_at` only knows the document — sample the real screen
+        // pixel under the OS cursor instead.
         let pick_id = armed_pick(ctx);
         let pipetting = pick_id.is_some()
             || self.tool == Tool::Pipette
             || (self.tool == Tool::Eraser && self.opts.eraser_pick);
         if pipetting
-            && let Some(p) = self.last_pointer
             && ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, Key::C)
                     || i.consume_key(egui::Modifiers::COMMAND, Key::C)
             })
         {
-            let c = self.pixel_at(p);
-            let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
-            if let Ok(mut cb) = arboard::Clipboard::new() {
-                let _ = cb.set_text(&hex);
-            }
-            if let Some(id) = pick_id {
-                ctx.data_mut(|d| {
-                    d.insert_persisted(pick_done_key(id), c);
-                });
-                arm_pick(ctx, None);
+            let _ = crate::platform::picker::take_copy();
+            let c = if self.pick_overlay {
+                crate::platform::cursor_position().and_then(|(x, y)| {
+                    crate::platform::picker::pick_patch(x.round() as i32, y.round() as i32)
+                        .map(|p| crate::platform::picker::patch_centre(&p))
+                })
             } else {
-                match self.tool {
-                    Tool::Eraser => {
-                        self.opts.eraser_color = c;
-                        self.opts.eraser_mode = EraserMode::Color;
-                    }
-                    _ => self.opts.color = c,
-                }
+                self.last_pointer.map(|p| self.pixel_at(p))
+            };
+            if let Some(c) = c {
+                self.copy_screen_pick(ctx, c);
+            } else if self.pick_overlay {
+                widgets::toast(
+                    ctx,
+                    widgets::ToastKind::Warning,
+                    t!("draw.pick.denied").to_string(),
+                );
             }
-            self.copied_at = Some(std::time::Instant::now());
         }
         if cut && self.sel_area.is_some() {
             self.sel_cut();
@@ -1269,9 +1512,14 @@ impl DrawSession {
         self.commit_nudge_due(ctx);
 
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            arm_pick(ctx, None);
-            if self.opts.eraser_pick {
+            if armed_pick(ctx).is_some() {
+                arm_pick(ctx, None);
+            } else if self.opts.eraser_pick {
                 self.opts.eraser_pick = false;
+            } else if self.tool == Tool::Pipette {
+                // Esc quits the Pipette tool like the Emoji tool —
+                // without this it fell through to closing the window.
+                self.set_tool(Tool::Select);
             } else if self.text_panel.is_some() {
                 self.close_text_panel();
             } else if matches!(self.drag, Some(Drag::Shape { .. })) {
@@ -1973,10 +2221,16 @@ impl DrawSession {
         // Right-click an object: it becomes the selection and arms the
         // z-order menu drawn in `canvas` (it must run even while the
         // pointer is off-canvas over the popup, or it would close).
+        // An armed swatch/eraser pick intercepts it first — right-click
+        // cancels the pick, same contract as the screen-pick session.
         if resp.secondary_clicked() {
-            self.ctx_menu_id = hit_id.filter(|_| can_pick_existing);
-            if self.ctx_menu_id.is_some() {
-                self.selected = self.ctx_menu_id;
+            if armed_pick(ui.ctx()).is_some() || self.opts.eraser_pick {
+                self.disarm_pick(ui.ctx());
+            } else {
+                self.ctx_menu_id = hit_id.filter(|_| can_pick_existing);
+                if self.ctx_menu_id.is_some() {
+                    self.selected = self.ctx_menu_id;
+                }
             }
         }
 
@@ -2030,6 +2284,7 @@ impl DrawSession {
                 d.insert_persisted(pick_done_key(id), c);
             });
             arm_pick(ctx, None);
+            self.pick_selected(ctx, c);
             return;
         }
         // Handles of the currently selected object ALWAYS grab first,
@@ -2117,15 +2372,16 @@ impl DrawSession {
             }
             Tool::Text | Tool::Step => {}
             Tool::Pipette => {
-                // A press picks the pixel's colour into the shared
-                // stroke colour — `C` copies its `#RRGGBB`.
-                self.opts.color = self.pixel_at(p);
+                // The Pipette tool answers `C` only — a press is inert.
+                self.pick_inert(ctx);
             }
             Tool::Eraser => {
                 if self.opts.eraser_pick {
-                    self.opts.eraser_color = self.pixel_at(p);
+                    let c = self.pixel_at(p);
+                    self.opts.eraser_color = c;
                     self.opts.eraser_mode = EraserMode::Color;
                     self.opts.eraser_pick = false;
+                    self.pick_selected(ctx, c);
                 } else {
                     self.drag = Some(Drag::Freehand { points: vec![p] });
                 }
@@ -2515,6 +2771,7 @@ impl DrawSession {
                 d.insert_persisted(pick_done_key(id), c);
             });
             arm_pick(ctx, None);
+            self.pick_selected(ctx, c);
             return;
         }
         let had_panel = self.text_panel.is_some();
@@ -2539,15 +2796,18 @@ impl DrawSession {
             Tool::Emoji => self.place_emoji(p),
             Tool::Eraser => {
                 if self.opts.eraser_pick {
-                    self.opts.eraser_color = self.pixel_at(p);
+                    let c = self.pixel_at(p);
+                    self.opts.eraser_color = c;
                     self.opts.eraser_mode = EraserMode::Color;
                     self.opts.eraser_pick = false;
+                    self.pick_selected(ctx, c);
                 } else {
                     self.finish_freehand(vec![p]);
                 }
             }
             Tool::Pipette => {
-                self.opts.color = self.pixel_at(p);
+                // The Pipette tool answers `C` only — a click is inert.
+                self.pick_inert(ctx);
             }
             Tool::SelectArea => {
                 // Inside the frame it stays; a click elsewhere drops it.
@@ -3326,7 +3586,7 @@ impl DrawSession {
     /// colour, outline `*`, font, size, B/I, alignment, outline
     /// width+colour, and the multi-line edit with its Enter note.
     /// Edits land on the object live; closing commits one Replace.
-    fn text_panel_window(&mut self, ctx: &egui::Context, _shared: &Shared) {
+    fn text_panel_window(&mut self, ctx: &egui::Context, shared: &Shared) {
         let Some(panel) = &self.text_panel else {
             return;
         };
@@ -3442,7 +3702,7 @@ impl DrawSession {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.spacing_mut().interact_size.y = 22.0;
-                    if color_btn(ui, color).changed() {
+                    if color_btn(ui, shared, color).changed() {
                         rev = true;
                     }
                     if let Some(font) = &mut font {
@@ -3524,7 +3784,7 @@ impl DrawSession {
                         rev = true;
                     }
                     if let Some(oc) = &mut outline_color
-                        && color_btn(ui, oc).changed()
+                        && color_btn(ui, shared, oc).changed()
                     {
                         rev = true;
                     }
@@ -3935,7 +4195,7 @@ impl DrawSession {
     /// otherwise the armed tool's defaults.
     fn bottom_content(&mut self, ui: &mut Ui, shared: &Shared) {
         if self.sel_area.is_some() {
-            self.sel_options(ui);
+            self.sel_options(ui, shared);
         } else if self.selected.is_some() {
             // A selected emoji keeps the strip up (icons only — no
             // styling options) so the user can arm another one fast.
@@ -3957,7 +4217,7 @@ impl DrawSession {
     /// The marquee's option strip (frame W×H rides the tab title):
     /// blur presets, cut/copy/paste/delete, and a Remplissage button
     /// applying the swatch's colour — the swatch itself just picks it.
-    fn sel_options(&mut self, ui: &mut Ui) {
+    fn sel_options(&mut self, ui: &mut Ui, shared: &Shared) {
         let Some(_sel) = self.sel_area else { return };
         ui.menu_button(t!("draw.opt.blur"), |ui| {
             for pct in [25u8, 50, 75, 100] {
@@ -3982,7 +4242,7 @@ impl DrawSession {
         ui.separator();
         let do_fill = ui
             .horizontal(|ui| {
-                color_btn(ui, &mut self.opts.fill_color);
+                color_btn(ui, shared, &mut self.opts.fill_color);
                 ui.button(t!("draw.opt.fill_c")).clicked()
             })
             .inner;
@@ -4047,6 +4307,7 @@ impl DrawSession {
             Tool::Arrow => {
                 line_options_row(
                     ui,
+                    shared,
                     "draw.bar.line",
                     &mut o.color,
                     &mut o.width,
@@ -4062,6 +4323,7 @@ impl DrawSession {
             Tool::Pencil => {
                 pencil_options_row(
                     ui,
+                    shared,
                     "draw.bar.pencil",
                     &mut o.color,
                     &mut o.width,
@@ -4076,6 +4338,7 @@ impl DrawSession {
             Tool::Brace => {
                 brace_options_row(
                     ui,
+                    shared,
                     "draw.bar.brace",
                     &mut o.color,
                     &mut o.width,
@@ -4090,7 +4353,7 @@ impl DrawSession {
             Tool::Eraser => {
                 ui.horizontal(|ui| {
                     ui.label(t!("draw.opt.color"));
-                    if color_btn(ui, &mut o.eraser_color).changed() {
+                    if color_btn(ui, shared, &mut o.eraser_color).changed() {
                         o.eraser_mode = EraserMode::Color;
                         o.eraser_pick = false;
                     }
@@ -4135,6 +4398,7 @@ impl DrawSession {
                 let mut radius_opt = is_rect.then_some(&mut o.radius);
                 shape_options_row(
                     ui,
+                    shared,
                     "draw.bar.shape",
                     &mut o.color,
                     &mut o.width,
@@ -4153,6 +4417,7 @@ impl DrawSession {
             Tool::HighlightArea => {
                 highlight_area_options_row(
                     ui,
+                    shared,
                     "draw.bar.harea",
                     &mut o.color,
                     &mut o.shape,
@@ -4170,7 +4435,7 @@ impl DrawSession {
                 ch |= ui
                     .horizontal(|ui| {
                         ui.label(t!("draw.opt.color"));
-                        color_btn(ui, &mut o.color).changed()
+                        color_btn(ui, shared, &mut o.color).changed()
                     })
                     .inner;
                 ch |= ui
@@ -4191,7 +4456,7 @@ impl DrawSession {
                     .horizontal(|ui| {
                         ui.label(t!("draw.opt.outline"));
                         outline_combo(ui, "draw.bar.toutline", &mut o.outline_w)
-                            | color_btn(ui, &mut o.outline_color).changed()
+                            | color_btn(ui, shared, &mut o.outline_color).changed()
                     })
                     .inner;
                 ch |= opacity_pct_slider(ui, &mut o.opacity);
@@ -4216,17 +4481,17 @@ impl DrawSession {
                 // Text colour + box interior.
                 ui.horizontal(|ui| {
                     ui.label(t!("draw.opt.fg"));
-                    color_btn(ui, &mut o.outline_color);
+                    color_btn(ui, shared, &mut o.outline_color);
                 });
                 ui.horizontal(|ui| {
                     ui.label(t!("draw.opt.bg"));
-                    color_btn(ui, &mut o.fill_color);
+                    color_btn(ui, shared, &mut o.fill_color);
                 });
                 // Outline: width (1..10) + colour.
                 ui.horizontal(|ui| {
                     ui.label(t!("draw.opt.outline"));
                     outline_combo(ui, "draw.bar.boxw", &mut o.width);
-                    color_btn(ui, &mut o.color);
+                    color_btn(ui, shared, &mut o.color);
                 });
                 ui.add_space(12.0);
                 opacity_pct_slider(ui, &mut o.opacity);
@@ -4238,6 +4503,7 @@ impl DrawSession {
                 };
                 step_options_row(
                     ui,
+                    shared,
                     "draw.bar.step",
                     o.step_mode,
                     count,
@@ -4260,7 +4526,7 @@ impl DrawSession {
     }
 
     /// Style options of the SELECTED object (re-editable, FS-style).
-    fn selected_options(&mut self, ui: &mut Ui, _shared: &Shared) {
+    fn selected_options(&mut self, ui: &mut Ui, shared: &Shared) {
         let Some(id) = self.selected else { return };
         let Some(before) = self.doc.annotation(id).cloned() else {
             return;
@@ -4273,6 +4539,7 @@ impl DrawSession {
                     let mut radius_opt = Some(&mut o.radius);
                     if shape_options_row(
                         ui,
+                        shared,
                         "draw.sel.rect",
                         &mut o.stroke,
                         &mut o.stroke_w,
@@ -4293,6 +4560,7 @@ impl DrawSession {
                     let mut radius_opt: Option<&mut f32> = None;
                     if shape_options_row(
                         ui,
+                        shared,
                         "draw.sel.ellipse",
                         &mut o.stroke,
                         &mut o.stroke_w,
@@ -4312,6 +4580,7 @@ impl DrawSession {
                     let mut sh_on = o.shadow > 0.0;
                     if line_options_row(
                         ui,
+                        shared,
                         "draw.sel.line",
                         &mut o.color,
                         &mut o.width,
@@ -4331,6 +4600,7 @@ impl DrawSession {
                     let mut sh_on = o.shadow > 0.0;
                     if pencil_options_row(
                         ui,
+                        shared,
                         "draw.sel.pencil",
                         &mut o.color,
                         &mut o.width,
@@ -4348,6 +4618,7 @@ impl DrawSession {
                 AnnotationKind::HighlightArea(o) => {
                     if highlight_area_options_row(
                         ui,
+                        shared,
                         "draw.sel.harea",
                         &mut o.color,
                         &mut o.shape,
@@ -4363,7 +4634,7 @@ impl DrawSession {
                     changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.color"));
-                            color_btn(ui, &mut o.color).changed()
+                            color_btn(ui, shared, &mut o.color).changed()
                         })
                         .inner;
                     changed |= ui
@@ -4384,7 +4655,7 @@ impl DrawSession {
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.outline"));
                             outline_combo(ui, "draw.sel.toutline", &mut o.outline)
-                                | color_btn(ui, &mut o.outline_color).changed()
+                                | color_btn(ui, shared, &mut o.outline_color).changed()
                         })
                         .inner;
                     changed |= opacity_pct_slider(ui, &mut o.opacity);
@@ -4398,20 +4669,20 @@ impl DrawSession {
                     changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.fg"));
-                            color_btn(ui, &mut o.fg).changed()
+                            color_btn(ui, shared, &mut o.fg).changed()
                         })
                         .inner;
                     changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.bg"));
-                            color_btn(ui, &mut o.bg).changed()
+                            color_btn(ui, shared, &mut o.bg).changed()
                         })
                         .inner;
                     changed |= ui
                         .horizontal(|ui| {
                             ui.label(t!("draw.opt.outline"));
                             outline_combo(ui, "draw.sel.boxw", &mut o.border_w)
-                                | color_btn(ui, &mut o.border).changed()
+                                | color_btn(ui, shared, &mut o.border).changed()
                         })
                         .inner;
                     ui.add_space(12.0);
@@ -4421,6 +4692,7 @@ impl DrawSession {
                     let mut sh_on = o.shadow > 0.0;
                     if step_options_row(
                         ui,
+                        shared,
                         "draw.sel.step",
                         o.mode,
                         &mut o.count,
@@ -4460,6 +4732,7 @@ impl DrawSession {
                     let mut sh_on = o.shadow > 0.0;
                     if brace_options_row(
                         ui,
+                        shared,
                         "draw.sel.brace",
                         &mut o.color,
                         &mut o.width,
@@ -4966,6 +5239,266 @@ fn arm_pick(ctx: &egui::Context, id: Option<egui::Id>) {
     });
 }
 
+/// Places the pick loupe card at `(hover + gap)`, flipping across the
+/// cursor when it would cross `bounds`' right or bottom edge and clamping
+/// within a 4 pt margin of the current monitor's overlay viewport.
+fn pick_loupe_position(hover: Pos2, bounds: Rect, size: Vec2, gap: f32) -> Pos2 {
+    let mut min = hover + Vec2::splat(gap);
+    if min.x + size.x > bounds.max.x - 4.0 {
+        min.x = hover.x - gap - size.x;
+    }
+    if min.y + size.y > bounds.max.y - 4.0 {
+        min.y = hover.y - gap - size.y;
+    }
+    pos2(
+        min.x.clamp(
+            bounds.min.x + 4.0,
+            (bounds.max.x - size.x - 4.0).max(bounds.min.x + 4.0),
+        ),
+        min.y.clamp(
+            bounds.min.y + 4.0,
+            (bounds.max.y - size.y - 4.0).max(bounds.min.y + 4.0),
+        ),
+    )
+}
+
+/// A pick overlay's UI — runs inside each transparent always-on-top
+/// per-monitor viewport `app.rs` raises while a pick is armed and the
+/// cursor roams outside the Draw window. It paints the same loupe card
+/// the canvas shows (patch, centre crosshair, `#RRGGBB`, hint) riding
+/// the cursor, keeps our own crosshair cursor everywhere, and turns the
+/// click into a [`PickOutcome`] pushed into [`PICK_SCREEN_RESULT`] for
+/// the Draw session. The loupe only draws in the window whose rect
+/// holds the cursor; every click lands on our chrome — the app under
+/// the cursor never sees it.
+pub fn show_pick_overlay(ui: &mut Ui) {
+    use crate::platform::picker::{self, PickOutcome};
+    const LOUPE_SIDE: f32 = 126.0;
+    const LOUPE_TEXT_H: f32 = 56.0;
+    const LOUPE_OFF: f32 = 18.0;
+    const LOUPE_CROSS: Color32 = Color32::from_rgb(240, 70, 70);
+
+    let ctx = ui.ctx().clone();
+    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+    let screen = ui.max_rect();
+    ui.painter().rect_filled(
+        screen,
+        0.0,
+        Color32::from_black_alpha(picker::OVERLAY_VEIL_ALPHA),
+    );
+
+    // The caller (app.rs overlay closure) reads the session's armed
+    // flag every pass and closes this window — no heartbeat to go stale
+    // while a sibling viewport's repaints are OS-throttled.
+
+    // WindowServer tracking zones at the screen edges (Dock, menu bar)
+    // starve this window of pointer events — a ~30 Hz tick keeps the
+    // loupe tracking and the armed-state check running through them.
+    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+
+    // Sample first: a click validates what the cursor sits on RIGHT NOW.
+    // Framebuffer reads hit the WindowServer — pointer events can fire
+    // far past 100 Hz, so the patch is cached and re-read at most every
+    // 33 ms, including while stationary (the desktop can change).
+    let cursor =
+        crate::platform::cursor_position().map(|(x, y)| (x.round() as i32, y.round() as i32));
+    let mut patch = ctx.data_mut(|d| {
+        let id = egui::Id::new("draw.pick_sample");
+        let cached = d.get_temp::<(std::time::Instant, image::RgbaImage)>(id);
+        let fresh = match (cursor, &cached) {
+            (Some(_), Some((at, _))) if at.elapsed().as_millis() < 33 => None,
+            (Some((x, y)), _) => picker::screen_patch(x, y),
+            _ => None,
+        };
+        match fresh {
+            Some(p) => {
+                d.insert_temp(id, (std::time::Instant::now(), p.clone()));
+                Some(p)
+            }
+            None => cached.map(|(_, p)| p),
+        }
+    });
+
+    // Clicks never reach the app beneath — they land on this window.
+    // Left = validate, right = cancel; Esc cancels from either window.
+    // Drain the worker's key latches unconditionally so a focused-window
+    // event never short-circuits them into firing on the next frame.
+    let worker_cancelled = picker::take_cancelled();
+    let worker_copied = picker::take_copy();
+    let click = ui.interact(screen, egui::Id::new("pick_overlay"), Sense::click());
+    let outcome = if click.clicked() {
+        // The validating read IS the loupe's sample: `pick_patch`
+        // returns the patch whose centre the loupe highlights, so the
+        // applied colour can never diverge from what was displayed.
+        cursor
+            .and_then(|(x, y)| picker::pick_patch(x, y))
+            .map(|p| PickOutcome::Picked(picker::patch_centre(&p)))
+            .or(Some(PickOutcome::Denied))
+    } else if click.secondary_clicked()
+        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        || worker_cancelled
+    {
+        Some(PickOutcome::Cancelled)
+    } else {
+        None
+    };
+    if let Some(o) = outcome {
+        // Terminal outcome: the sampler stops NOW — waiting for the Draw
+        // session's (possibly throttled) drain would keep compositor
+        // reads running while the window is already doomed.
+        picker::stop_worker();
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(picker::PICK_SCREEN_RESULT), o);
+        });
+        // Close OURSELVES: the ROOT pass that would deregister us can be
+        // OS-throttled for an occluded window, and a transparent veil
+        // left up swallows every click on the desktop. Passthrough is
+        // applied at THIS pass' end (commands need no parent pass) — the
+        // HWND keeps living until the anchor reaps it, but already lets
+        // every click through to the desktop beneath.
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
+    }
+    // `C` copies like the in-window hotkey — it can land here whenever
+    // this window holds key focus (a click made it key on macOS) or via
+    // the Windows sampler's physical-key poll. It is not a pick landing:
+    // the Pipette tool stays armed, so no Close — a disarming swatch or
+    // eraser pick closes the overlay on the next pass. A worker latch
+    // arriving within 120 ms of an in-window `C` copy is the same
+    // physical key press observed on the next 10 ms poll tick.
+    let just_copied = ctx
+        .data(|d| d.get_temp::<std::time::Instant>(egui::Id::new(picker::PICK_COPIED_AT)))
+        .is_some_and(|t| t.elapsed().as_millis() < 120);
+    let cpress = ctx.input(|i| {
+        i.key_pressed(egui::Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+    }) || (worker_copied && !just_copied);
+    if cpress {
+        let o = cursor
+            .and_then(|(x, y)| picker::pick_patch(x, y))
+            .map(|p| {
+                let c = picker::patch_centre(&p);
+                // The clipboard write cannot wait for the Draw session's
+                // drain: Draw is occluded by this overlay and its passes
+                // are throttled — the CopyPressed outcome could sit
+                // pending (or be overwritten by the next outcome) while
+                // the loupe already flashes "copié".
+                let hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(&hex);
+                }
+                // The pick keeps going: publish the validated patch so
+                // the loupe repaints from exactly the sample that was
+                // applied and copied.
+                ctx.data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new("draw.pick_sample"),
+                        (std::time::Instant::now(), p.clone()),
+                    );
+                });
+                patch = Some(p);
+                PickOutcome::CopyPressed(c)
+            })
+            .unwrap_or(PickOutcome::Denied);
+        ctx.data_mut(|d| {
+            if matches!(o, PickOutcome::CopyPressed(_)) {
+                d.insert_temp(
+                    egui::Id::new(picker::PICK_COPIED_AT),
+                    std::time::Instant::now(),
+                );
+            }
+            d.insert_temp(egui::Id::new(picker::PICK_SCREEN_RESULT), o);
+        });
+    }
+
+    // `pointer.latest_pos` dies in those same edge dead zones (a
+    // `CursorLeft` arrives even under our higher-level window), so the
+    // loupe anchor is the OS cursor read minus our own window origin —
+    // `latest_pos` is only a fallback.
+    let ppp = crate::platform::window_ppp(&ctx, 1.0);
+    let hover = cursor
+        .and_then(|(cx, cy)| {
+            ctx.input(|i| i.viewport().outer_rect).map(|r| {
+                let o = crate::platform::ui_to_native(r.min, ppp);
+                crate::platform::native_to_ui(egui::pos2(cx as f32 - o.x, cy as f32 - o.y), ppp)
+            })
+        })
+        .or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+
+    let (Some(patch), Some(hover)) = (patch, hover) else {
+        return;
+    };
+
+    // One overlay window per monitor: the cursor sits in exactly one of
+    // them — the others must not draw the loupe (`hover` lands outside
+    // their rect), and this window's own rect IS the monitor's bounds
+    // the loupe flips against.
+    if !screen.contains(hover) {
+        return;
+    }
+    let bounds = screen;
+    let size = vec2(LOUPE_SIDE, LOUPE_SIDE + LOUPE_TEXT_H);
+    let min = pick_loupe_position(hover, bounds, size, LOUPE_OFF);
+    let card = Rect::from_min_size(min, size);
+    let zoom_rect = Rect::from_min_size(card.min, Vec2::splat(LOUPE_SIDE));
+    let text_rect = Rect::from_min_max(pos2(card.min.x, zoom_rect.max.y), card.max);
+    let p = ui.painter();
+    p.rect_filled(card, 8.0, Color32::from_black_alpha(235));
+    p.rect_stroke(
+        card,
+        8.0,
+        Stroke::new(1.0, Color32::from_gray(70)),
+        StrokeKind::Outside,
+    );
+
+    let w = patch.width() as usize;
+    let h = patch.height() as usize;
+    let zoomed = ColorImage::from_rgba_unmultiplied([w, h], patch.as_raw());
+    // A fresh texture each frame: a ~22 px patch uploads for nothing,
+    // and a cached handle would need `persisted` data anyway (`temp`
+    // dies at each pass).
+    let tex = ctx.load_texture("draw.pick_loupe", zoomed, TextureOptions::NEAREST);
+    p.image(
+        tex.id(),
+        zoom_rect,
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    let centre = zoom_rect.center();
+    p.hline(zoom_rect.x_range(), centre.y, Stroke::new(1.0, LOUPE_CROSS));
+    p.vline(centre.x, zoom_rect.y_range(), Stroke::new(1.0, LOUPE_CROSS));
+    p.hline(
+        card.x_range(),
+        text_rect.min.y,
+        Stroke::new(1.0, Color32::from_gray(70)),
+    );
+
+    let c = patch.get_pixel(patch.width() / 2, patch.height() / 2).0;
+    let hex = format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+    p.text(
+        pos2(text_rect.center().x, text_rect.min.y + 10.0),
+        egui::Align2::CENTER_TOP,
+        hex,
+        egui::FontId::monospace(13.0),
+        Color32::WHITE,
+    );
+    let copied = ctx
+        .data(|d| d.get_temp::<std::time::Instant>(egui::Id::new(picker::PICK_COPIED_AT)))
+        .is_some_and(|t| t.elapsed().as_secs_f32() < 1.2);
+    let hint = if copied {
+        t!("overlay.copied").to_string()
+    } else {
+        t!("overlay.copy_hint").to_string()
+    };
+    p.text(
+        pos2(text_rect.center().x, text_rect.min.y + 30.0),
+        egui::Align2::CENTER_TOP,
+        hint,
+        egui::FontId::proportional(10.0),
+        Color32::from_gray(160),
+    );
+}
+
 /// Compact pipette riding beside a colour swatch — 15 px with a 10 px
 /// icon, 2 px right of the swatch's top-right corner so it hugs the
 /// picker rather than filling the option line like a toolbar button.
@@ -4995,11 +5528,159 @@ fn pipette_btn(ui: &mut Ui, armed: bool, anchor: Rect) -> Response {
     resp
 }
 
-/// Colour swatch button with an explicit border so light swatches
-/// (e.g. white outline) remain visible on the light theme. The trailing
-/// pipette arms a pick targeting THIS swatch.
-fn color_btn(ui: &mut Ui, c: &mut Color32) -> Response {
-    let border = theme::tokens(ui.ctx()).field_border;
+/// The swatch part of [`color_btn`] — egui's `color_edit_button_hsva`
+/// wraps a private button we cannot extend, so the swatch is ours:
+/// solid fill with the field border (light swatches stay visible on
+/// the light theme), accent frame while its popup is open.
+fn swatch_button(ui: &mut Ui, c: Color32, open: bool) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(ui.spacing().interact_size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), CornerRadius::same(2), c);
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(3),
+            Stroke::new(1.0, t.field_border),
+            StrokeKind::Outside,
+        );
+        if open {
+            ui.painter().rect_stroke(
+                rect.expand(1.0),
+                CornerRadius::same(3),
+                Stroke::new(1.0, t.accent_border),
+                StrokeKind::Outside,
+            );
+        }
+    }
+    resp
+}
+
+/// One palette cell — an 18 px colour chip with a thin field border,
+/// accent-framed when it matches the current colour.
+fn palette_cell(ui: &mut Ui, c: Option<Color32>, selected: bool) -> Response {
+    let t = theme::tokens(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(2),
+            c.unwrap_or(t.field_border.linear_multiply(0.35)),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(2),
+            Stroke::new(
+                if selected { 1.5 } else { 1.0 },
+                if selected || resp.hovered() {
+                    t.accent_border
+                } else {
+                    t.field_border
+                },
+            ),
+            StrokeKind::Inside,
+        );
+    }
+    resp
+}
+
+/// Ctx key for the custom slot the "add" button targets — per popup.
+fn custom_sel_key(popup_id: egui::Id) -> egui::Id {
+    popup_id.with("custom_sel")
+}
+
+/// The left column of the colour popup: the functional reference's
+/// 48 base colours, then the persisted custom bank. Returns the
+/// colour to apply when a swatch was clicked — the popup closes on
+/// the caller's side, like the reference's dialog.
+fn palette_column(
+    ui: &mut Ui,
+    shared: &Shared,
+    popup_id: egui::Id,
+    cur: Color32,
+) -> Option<Color32> {
+    let mut picked = None;
+    ui.spacing_mut().item_spacing = Vec2::splat(3.0);
+    ui.label(t!("draw.pick.basic_colors").to_string());
+    for row in theme::picker::BASE.chunks(theme::picker::BASE_COLS) {
+        ui.horizontal(|ui| {
+            for &c in row {
+                if palette_cell(ui, Some(c), c == cur).clicked() {
+                    picked = Some(c);
+                }
+            }
+        });
+    }
+    ui.add_space(6.0);
+    ui.label(t!("draw.pick.custom_colors").to_string());
+
+    let mut slots: [Option<Color32>; theme::picker::CUSTOM_SLOTS] = {
+        let s = shared.lock_settings();
+        std::array::from_fn(|i| {
+            s.draw_opts
+                .custom_slot(i)
+                .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+        })
+    };
+    let sel_key = custom_sel_key(popup_id);
+    let mut sel: Option<usize> = ui.ctx().data_mut(|d| d.get_persisted(sel_key));
+    for row in 0..theme::picker::CUSTOM_SLOTS.div_ceil(theme::picker::BASE_COLS) {
+        ui.horizontal(|ui| {
+            for col in 0..theme::picker::BASE_COLS {
+                let i = row * theme::picker::BASE_COLS + col;
+                let c = slots[i];
+                let resp = palette_cell(ui, c, sel == Some(i) || c == Some(cur));
+                let resp = if c.is_some() {
+                    resp.on_hover_text(t!("draw.pick.custom_tip").to_string())
+                } else {
+                    resp.on_hover_text(t!("draw.pick.custom_empty").to_string())
+                };
+                if resp.clicked() {
+                    sel = Some(i);
+                    ui.ctx().data_mut(|d| d.insert_persisted(sel_key, i));
+                    if c.is_some() {
+                        picked = c;
+                    }
+                } else if c.is_some() && resp.clicked_by(egui::PointerButton::Secondary) {
+                    slots[i] = None;
+                    let mut s = shared.lock_settings();
+                    s.draw_opts.set_custom_slot(i, None);
+                    s.save();
+                    drop(s);
+                    if sel == Some(i) {
+                        sel = None;
+                        ui.ctx().data_mut(|d| d.remove::<usize>(sel_key));
+                    }
+                }
+            }
+        });
+    }
+
+    // "Add to custom colours": the selected slot wins (overwriting a
+    // filled slot), else the first empty one; greyed when the bank is
+    // full with no slot selected.
+    let target = sel.or_else(|| (0..theme::picker::CUSTOM_SLOTS).find(|&i| slots[i].is_none()));
+    if ui
+        .add_enabled(
+            target.is_some(),
+            egui::Button::new(t!("draw.pick.add_custom").to_string()),
+        )
+        .clicked()
+        && let Some(i) = target
+    {
+        let mut s = shared.lock_settings();
+        s.draw_opts
+            .set_custom_slot(i, Some([cur.r(), cur.g(), cur.b()]));
+        s.save();
+    }
+    picked
+}
+
+/// Colour swatch button opening the colour popup: the functional
+/// reference's preset bank (base + persisted custom colours) beside
+/// egui's HSV picker. The trailing pipette arms a pick targeting THIS
+/// swatch.
+fn color_btn(ui: &mut Ui, shared: &Shared, c: &mut Color32) -> Response {
     let id = ui.next_auto_id();
     let mut changed = false;
     // A pick armed for this swatch lands here on the next frame.
@@ -5018,23 +5699,46 @@ fn color_btn(ui: &mut Ui, c: &mut Color32) -> Response {
         .filter(|cached: &egui::epaint::Hsva| Color32::from(*cached) == *c)
         .unwrap_or_else(|| egui::epaint::Hsva::from(*c));
     let old_h = hsva.h;
-    let mut r = egui::widgets::color_picker::color_edit_button_hsva(
+    let popup_id = id.with("popup");
+    let mut r = swatch_button(
         ui,
-        &mut hsva,
-        egui::widgets::color_picker::Alpha::Opaque,
+        Color32::from(hsva),
+        egui::Popup::is_id_open(ui.ctx(), popup_id),
     );
+    egui::Popup::menu(&r)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.spacing_mut().slider_width = 275.0;
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    if let Some(p) = palette_column(ui, shared, popup_id, Color32::from(hsva)) {
+                        hsva = egui::epaint::Hsva::from(p);
+                        r.mark_changed();
+                        egui::Popup::close_id(ui.ctx(), popup_id);
+                    }
+                });
+                if egui::widgets::color_picker::color_picker_hsva_2d(
+                    ui,
+                    &mut hsva,
+                    egui::widgets::color_picker::Alpha::Opaque,
+                ) {
+                    r.mark_changed();
+                }
+            });
+        });
     if (hsva.h - old_h).abs() > 1e-4 && (hsva.s < 0.02 || hsva.v < 0.02) {
         hsva.s = 1.0;
         hsva.v = 1.0;
     }
     *c = Color32::from(hsva);
     ui.ctx().data_mut(|d| d.insert_temp(id, hsva));
-    ui.painter().rect_stroke(
-        r.rect,
-        CornerRadius::same(3),
-        Stroke::new(1.0, border),
-        StrokeKind::Outside,
-    );
+    // Clicking the colour block opens the popup — and abandons any
+    // armed pick (this swatch's or another's), matching how another
+    // swatch's pipette takes over the armed state.
+    if r.clicked() {
+        arm_pick(ui.ctx(), None);
+    }
     let armed = armed_pick(ui.ctx()) == Some(id);
     if pipette_btn(ui, armed, r.rect)
         .on_hover_text(t!("draw.opt.pick").to_string())
@@ -5135,6 +5839,7 @@ fn dash_combo(ui: &mut Ui, dash: &mut Dash) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn line_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     color: &mut Color32,
     width: &mut f32,
@@ -5162,7 +5867,7 @@ fn line_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.color"));
-            color_btn(ui, color).changed()
+            color_btn(ui, shared, color).changed()
         })
         .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=20.0).changed();
@@ -5199,7 +5904,7 @@ fn line_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.outline"));
-            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+            outline_combo(ui, salt, outline) | color_btn(ui, shared, outline_color).changed()
         })
         .inner;
 
@@ -5214,6 +5919,7 @@ fn line_options_row(
 #[allow(clippy::too_many_arguments)]
 fn pencil_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     color: &mut Color32,
     width: &mut f32,
@@ -5228,7 +5934,7 @@ fn pencil_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.color"));
-            color_btn(ui, color).changed()
+            color_btn(ui, shared, color).changed()
         })
         .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=30.0).changed();
@@ -5242,7 +5948,7 @@ fn pencil_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.outline"));
-            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+            outline_combo(ui, salt, outline) | color_btn(ui, shared, outline_color).changed()
         })
         .inner;
     changed |= opacity_pct_slider(ui, opacity);
@@ -5256,6 +5962,7 @@ fn pencil_options_row(
 #[allow(clippy::too_many_arguments)]
 fn brace_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     color: &mut Color32,
     width: &mut f32,
@@ -5270,7 +5977,7 @@ fn brace_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.color"));
-            color_btn(ui, color).changed()
+            color_btn(ui, shared, color).changed()
         })
         .inner;
     changed |= w_edit(ui, t!("draw.opt.width"), width, 1.0..=20.0).changed();
@@ -5297,7 +6004,7 @@ fn brace_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.outline"));
-            outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+            outline_combo(ui, salt, outline) | color_btn(ui, shared, outline_color).changed()
         })
         .inner;
     changed |= opacity_pct_slider(ui, opacity);
@@ -5355,6 +6062,7 @@ fn brace_kind_button(ui: &mut Ui, kind: BraceKind, selected: bool) -> Response {
 #[allow(clippy::too_many_arguments)]
 fn shape_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     stroke: &mut Color32,
     stroke_w: &mut f32,
@@ -5371,13 +6079,13 @@ fn shape_options_row(
         changed |= ui
             .horizontal(|ui| {
                 ui.label(t!("draw.opt.fill_c"));
-                color_btn(ui, fc).changed()
+                color_btn(ui, shared, fc).changed()
             })
             .inner;
         changed |= ui
             .horizontal(|ui| {
                 ui.label(t!("draw.opt.border"));
-                color_btn(ui, stroke).changed()
+                color_btn(ui, shared, stroke).changed()
             })
             .inner;
         changed |= w_edit(ui, t!("draw.opt.width"), stroke_w, 0.0..=20.0).changed();
@@ -5385,7 +6093,7 @@ fn shape_options_row(
         changed |= ui
             .horizontal(|ui| {
                 ui.label(t!("draw.opt.color"));
-                color_btn(ui, stroke).changed()
+                color_btn(ui, shared, stroke).changed()
             })
             .inner;
         changed |= w_edit(ui, t!("draw.opt.width"), stroke_w, 1.0..=20.0).changed();
@@ -5412,7 +6120,7 @@ fn shape_options_row(
         changed |= ui
             .horizontal(|ui| {
                 ui.label(t!("draw.opt.outline"));
-                outline_combo(ui, salt, outline) | color_btn(ui, outline_color).changed()
+                outline_combo(ui, salt, outline) | color_btn(ui, shared, outline_color).changed()
             })
             .inner;
     }
@@ -5442,6 +6150,7 @@ fn tip_combo(ui: &mut Ui, tip: &mut TipShape) -> bool {
 /// Option strip shared by `Tool::HighlightArea` and a selected `AreaObj`.
 fn highlight_area_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     color: &mut Color32,
     shape: &mut AreaShape,
@@ -5451,7 +6160,7 @@ fn highlight_area_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.color"));
-            color_btn(ui, color).changed()
+            color_btn(ui, shared, color).changed()
         })
         .inner;
     changed |= ui
@@ -5603,6 +6312,7 @@ fn parse_step_letter(text: &str) -> Option<f64> {
 #[allow(clippy::too_many_arguments)]
 fn step_options_row(
     ui: &mut Ui,
+    shared: &Shared,
     salt: &'static str,
     mode: StepMode,
     count: &mut u32,
@@ -5657,13 +6367,13 @@ fn step_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.bg"));
-            color_btn(ui, bg).changed()
+            color_btn(ui, shared, bg).changed()
         })
         .inner;
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.fg"));
-            color_btn(ui, fg).changed()
+            color_btn(ui, shared, fg).changed()
         })
         .inner;
     changed |= ui
@@ -5713,7 +6423,7 @@ fn step_options_row(
     changed |= ui
         .horizontal(|ui| {
             ui.label(t!("draw.opt.outline"));
-            outline_combo(ui, salt, ring) | color_btn(ui, ring_color).changed()
+            outline_combo(ui, salt, ring) | color_btn(ui, shared, ring_color).changed()
         })
         .inner;
     changed |= opacity_pct_slider(ui, opacity);
@@ -5917,6 +6627,38 @@ mod tests {
     use super::*;
     use crate::capture::{Capture, MonitorInfo};
     use crate::editor::document::Document;
+
+    #[test]
+    fn pick_loupe_flips_at_the_current_monitor_not_the_union() {
+        // The primary ends at y=1707, but another display extends the
+        // virtual desktop to y=2406. The card must fit on the primary.
+        let primary = Rect::from_min_max(pos2(1133.0, 0.0), pos2(3693.0, 1707.0));
+        let size = vec2(126.0, 182.0);
+        let near_bottom = pick_loupe_position(pos2(2113.0, 1685.0), primary, size, 18.0);
+        assert_eq!(near_bottom.y, 1685.0 - 18.0 - size.y);
+        assert!(near_bottom.y + size.y < primary.max.y);
+
+        let near_top = pick_loupe_position(pos2(2113.0, 2.0), primary, size, 18.0);
+        assert_eq!(near_top.y, 20.0);
+        let near_right = pick_loupe_position(pos2(3685.0, 500.0), primary, size, 18.0);
+        assert_eq!(near_right.x, 3685.0 - 18.0 - size.x);
+    }
+
+    #[test]
+    fn pick_loupe_stays_clear_of_the_sampled_pixels() {
+        let bounds = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 480.0));
+        let size = vec2(126.0, 182.0);
+        let half_patch = crate::platform::picker::PREVIEW_PATCH as f32 / 2.0;
+        for y in (0..480).step_by(7) {
+            for x in (0..640).step_by(7) {
+                let cursor = pos2(x as f32, y as f32);
+                let card =
+                    Rect::from_min_size(pick_loupe_position(cursor, bounds, size, 18.0), size);
+                let sample = Rect::from_center_size(cursor, Vec2::splat(half_patch * 2.0));
+                assert!(!card.intersects(sample), "{cursor:?}: {card:?}");
+            }
+        }
+    }
 
     /// `emoji_default_side` honouring: a remembered `last` wins but is
     /// still re-bounded to the (scale-scaled) Step-badge range.

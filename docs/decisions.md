@@ -2525,3 +2525,92 @@ Format: date — context — decision — consequences.
   duplications staircase off the latest copy. `dup_sources` is
   session-scoped: undoing a pre-restore duplicate after re-entering
   the editor just clears the selection (previous behaviour).
+
+## 2026-11-13 — Full-screen eyedropper via a transparent overlay
+
+- **Context**: the Pipette tool and swatch pickers needed to sample any
+  pixel on the desktop (other apps, menu bar, all monitors) while the
+  Draw window stays visible, with the validating click swallowed and
+  PixMe's own cursor/loupe kept everywhere.
+- **Decision**: interaction lives in borderless transparent
+  always-on-top deferred viewports (`pixme.pick_overlay`) — ONE PER
+  MONITOR — raised only while a pick is armed AND the cursor roams
+  outside the Draw window (inside, the canvas pick path keeps
+  ownership). A single union-spanning window was tried first and
+  failed on real layouts: AppKit clips an NSWindow's frame to one
+  screen's `visibleFrame` when it exceeds it, so a secondary display
+  sitting below-left of the main display stayed unveiled (measured:
+  `want=(-1133,0,2560,2406)` applied as `(-1133,53)-(2560,1707)`).
+  Per-monitor windows also give every overlay its own `ppp`, which
+  fixes mixed-DPI sampling on Windows for free. On macOS an alpha-20
+  veil (`OVERLAY_VEIL_ALPHA = 20`) fills the frame because fully
+  transparent AppKit pixels are click-through; on Windows DWM keeps an
+  alpha-0 (`OVERLAY_VEIL_ALPHA = 0`) HWND hit-testable without tinting
+  the desktop or needing `WDA_EXCLUDEFROMCAPTURE` (which would hide the
+  loupe over RDP). The overlay paints PixMe's loupe card at the cursor
+  (offset clear of the sampled patch) and pushes a `PickOutcome`
+  through ctx data (`PICK_SCREEN_RESULT`) that the Draw session drains.
+  On macOS pixel reads must skip the alpha-20 veil: a framebuffer
+  composite (`CGDisplay::image_for_rect` / `CGDisplay::image()`)
+  includes our own window, so the veil tinted every sample ~8 % darker
+  (`#CD3A80` read as `#BD3576` — the veil's exact 235/255 factor,
+  mistaken at first for a Display-P3 conversion). While the overlay is
+  up, `platform::picker` on macOS instead composites only the windows
+  BELOW it (`CGWindowListCreateImage` +
+  `kCGWindowListOptionOnScreenBelowWindow`, the overlay's
+  `kCGWindowNumber` found by title+pid in `window_list()`, 500 ms
+  cached); `image_for_rect` remains the no-overlay fallback.
+  Rasterization uses the source image's own colour space so
+  CoreGraphics applies no ColorSync conversion — stored and sampled
+  bytes stay framebuffer-verbatim, matching what external tools (such
+  as the functional reference) read. On Windows desktop reads
+  (`GetDC(NULL)` + `CreateDIBSection` + `BitBlt` + `GdiFlush`) can
+  block on the compositor for tens of milliseconds (more under RDP), so
+  a dedicated sampler worker thread (`start_worker`/`stop_worker`)
+  follows cursor moves, caches the latest `PREVIEW_PATCH` snapshot and
+  polls `GetAsyncKeyState` for `Esc`/`C` while foreign windows hold key
+  focus.
+- **Rejected**: `NSColorSampler` (macOS) + `WH_MOUSE_LL` (Windows) —
+  the sampler imposes its own round OS loupe instead of PixMe's cursor,
+  cannot be dismissed programmatically, and a nil callback cannot be
+  told apart from a lost session; the hook needs dedicated-thread
+  plumbing for something the overlay does for free. First implemented
+  then replaced after user testing.
+- **Consequences**: identical interaction on both OSes (one code path);
+  `objc2`/`objc2-app-kit`/`block2` dependencies were added then removed
+  — none shipped. macOS without Screen Recording gets a localized toast
+  pointing at System Settings (`PickOutcome::Denied`). Windows pixel
+  reads use the virtual-screen space (negative coordinates supported);
+  each overlay viewport is re-pinned to its monitor's rect every frame.
+
+## 2026-11-14 — Pick feedback split: click selects, `C` copies, Pipette clicks are inert
+
+- **Context**: every pick landing used to run the same path — apply the
+  colour AND copy `#RRGGBB` AND toast "copied" — so a swatch click and a
+  `C` press were indistinguishable, and the Pipette tool's canvas click
+  duplicated what `C` already did.
+- **Decision**: three feedback paths through one shared toast
+  component. Clicks that land a pick (armed swatch, eraser pick — on
+  the canvas or the screen overlay) apply the colour and toast
+  "Color #XXX selected" WITHOUT touching the clipboard. `C` stays the
+  only clipboard path in every pick mode: apply + copy + "Color #XXX
+  copied to clipboard". The Pipette tool ignores clicks entirely —
+  canvas and overlay alike — and toasts "Press C…" (throttled to one
+  pill per ~1.2 s); its hint now reads "move over a pixel… C picks and
+  copies". `C` off-canvas takes the centre of
+  `platform::picker::pick_patch` at the OS cursor when the pick overlay
+  is up — the same sample the loupe highlights — since `pixel_at` only
+  knows the document.
+- **Consequences**: click = assign, `C` = copy — the gestures no longer
+  overlap; the Pipette tool is a pure hover-and-`C` sampler that works
+  on any screen pixel. `copied_at` (the loupe's "copied!" hint) now only
+  lights on real copies. The overlay loupe shows the same "Press C to
+  copy" hint as the canvas loupe (`overlay.copy_hint`); and because a
+  click makes the overlay the macOS key window, `C` is handled on BOTH
+  sides: the Draw hotkey reads `pick_patch` while the overlay is up,
+  and the overlay itself forwards a `C` press as
+  `PickOutcome::CopyPressed` — which applies+copies the loupe's
+  highlighted sample without ending the pick (no heartbeat-off, no
+  flicker). Click and `C` never re-sample through an independent path:
+  both reduce the patch the loupe paints via `patch_centre`, so the
+  applied/copied value is always the displayed one.
