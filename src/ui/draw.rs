@@ -19,8 +19,9 @@ use crate::app::{Shared, ViewportWake};
 use crate::capture::PhysicalRect;
 use crate::editor::document::{
     Annotation, AnnotationId, AnnotationKind, AreaObj, AreaShape, BlurObj, BlurStyle, BoxObj,
-    BraceKind, BraceObj, Dash, Document, EllipseObj, EmojiObj, EraserMode, FreeObj, LineEnd,
-    LineObj, PicObj, RectObj, StepMode, StepObj, StepSize, StepStyle, TextAlign, TextObj, TipShape,
+    BraceKind, BraceObj, Dash, Document, EllipseObj, EmojiObj, EraserMode, FreeObj, HlMode,
+    LineEnd, LineObj, PicObj, RectObj, StepMode, StepObj, StepSize, StepStyle, TextAlign, TextObj,
+    TipShape,
 };
 use crate::editor::history::{ANNO_HISTORY_CAP, AnnoEdit};
 use crate::editor::render;
@@ -126,6 +127,10 @@ struct Opts {
     shape: AreaShape,
     /// Line / area highlighter coverage (defaults translucent).
     hl_opacity: f32,
+    /// Highlighter working mode (zone or freehand stroke).
+    hl_mode: HlMode,
+    /// Freehand highlighter stroke width px.
+    hl_width: f32,
     // Eraser tool.
     eraser_color: Color32,
     eraser_size: f32,
@@ -202,6 +207,8 @@ impl Opts {
             brace_kind: self.brace_kind,
             shape: self.shape,
             hl_opacity: self.hl_opacity,
+            hl_mode: self.hl_mode,
+            hl_width: self.hl_width,
             eraser_color: c(self.eraser_color),
             eraser_size: self.eraser_size,
             eraser_mode: self.eraser_mode,
@@ -249,6 +256,8 @@ impl Opts {
         self.brace_kind = s.brace_kind;
         self.shape = s.shape;
         self.hl_opacity = s.hl_opacity;
+        self.hl_mode = s.hl_mode;
+        self.hl_width = s.hl_width;
         self.eraser_color = rgb(s.eraser_color);
         self.eraser_size = s.eraser_size;
         self.eraser_mode = s.eraser_mode;
@@ -339,6 +348,8 @@ impl Default for Opts {
             brace_kind: BraceKind::CurlyLeft,
             shape: AreaShape::Rect,
             hl_opacity: 1.0,
+            hl_mode: HlMode::Rect,
+            hl_width: 14.0,
             eraser_color: Color32::WHITE,
             eraser_size: 12.0,
             eraser_mode: EraserMode::Color,
@@ -997,6 +1008,13 @@ impl DrawSession {
         self.selected = Some(id);
     }
 
+    /// `true` while the highlighter works in freehand mode — a pure
+    /// paint tool then: presses never grab or select existing objects
+    /// (same exemption as the eraser), they always lay down highlight.
+    fn hl_freehand(&self) -> bool {
+        self.tool == Tool::HighlightArea && self.opts.hl_mode == HlMode::Freehand
+    }
+
     /// Topmost annotation under `p` (image coords), inflated by stroke.
     fn hit(&self, p: Pos2, scale: f32) -> Option<AnnotationId> {
         let live = self.live_anno();
@@ -1027,7 +1045,9 @@ impl DrawSession {
                 }
                 AnnotationKind::Rect(o) => o.stroke_w * 0.5 + o.outline + 6.0,
                 AnnotationKind::Ellipse(o) => o.stroke_w * 0.5 + o.outline + 6.0,
-                AnnotationKind::Freehand(o) => o.width / 2.0 + 4.0,
+                AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => {
+                    o.width / 2.0 + 4.0
+                }
                 AnnotationKind::Text(o) => {
                     // Anchor dots can sit right on the AABB edge — count
                     // them in, the bounds test below covers the body.
@@ -1068,7 +1088,7 @@ impl DrawSession {
                         }
                     }
                     AnnotationKind::Text(_) => return Some(a.id),
-                    AnnotationKind::Freehand(o) => {
+                    AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => {
                         let hit = o
                             .points
                             .windows(2)
@@ -2198,6 +2218,7 @@ impl DrawSession {
         // The marquee tool works on regions, not objects — it never
         // picks them (same for the pure pixel tools).
         let can_pick_existing = !matches!(self.tool, Tool::Eraser | Tool::SelectArea)
+            && !self.hl_freehand()
             && !matches!(self.drag, Some(Drag::Shape { .. } | Drag::Freehand { .. }));
         let in_sel = self.sel_area.is_some_and(|s| s.rect.contains(img_p));
         let cursor = if on_handle {
@@ -2327,9 +2348,11 @@ impl DrawSession {
             self.close_text_panel();
         }
         // Dragging over an existing object selects and moves it, regardless
-        // of which creation tool is armed (except pure pixel tools and the
-        // marquee, which frames regions rather than grabbing objects).
+        // of which creation tool is armed (except pure pixel tools, the
+        // marquee and the freehand highlighter — a marker paints OVER
+        // annotations, it never grabs them).
         if !matches!(self.tool, Tool::Eraser | Tool::SelectArea | Tool::Pipette)
+            && !self.hl_freehand()
             && let Some(id) = self.hit(p, self.canvas_scale)
             && let Some(before) = self.doc.annotation(id).cloned()
         {
@@ -2389,6 +2412,9 @@ impl DrawSession {
             Tool::Pencil => {
                 self.drag = Some(Drag::Freehand { points: vec![p] });
             }
+            Tool::HighlightArea if self.opts.hl_mode == HlMode::Freehand => {
+                self.drag = Some(Drag::Freehand { points: vec![p] });
+            }
             _ => self.drag = Some(Drag::Shape { anchor: p }),
         }
     }
@@ -2405,7 +2431,17 @@ impl DrawSession {
         // Needed inside the `&mut self.drag` match — fetch it first.
         let emoji_cap = self.emoji_side_cap();
         match &mut self.drag {
-            Some(Drag::Freehand { points }) => points.push(p),
+            Some(Drag::Freehand { points }) => {
+                // Freehand highlight honours the Shift/Ctrl H/V lock:
+                // each new point snaps onto the dominant axis through
+                // the stroke's start (a straight marker swipe).
+                let p = if self.tool == Tool::HighlightArea && self.snap_hv {
+                    snap_hv_pt(points[0], p, true)
+                } else {
+                    p
+                };
+                points.push(p);
+            }
             // Object drags mutate `live` ONLY — the document (and its
             // revision, and the thumbnail key) stays frozen until the
             // release commits one Replace. The overlay paints `live`.
@@ -2544,11 +2580,27 @@ impl DrawSession {
     // last_pointer is declared below on the struct… see impl note.
     /// Turns a finished freehand stroke into an object.
     fn finish_freehand(&mut self, points: Vec<Pos2>) {
-        if points.is_empty() || (self.tool != Tool::Eraser && points.len() < 2) {
+        // Eraser and freehand highlighter accept a lone point (a tap
+        // paints a dot); the pencil needs a real stroke.
+        let dot_ok = matches!(self.tool, Tool::Eraser | Tool::HighlightArea);
+        if points.is_empty() || (!dot_ok && points.len() < 2) {
             return;
         }
         let is_eraser = self.tool == Tool::Eraser;
         let kind = match self.tool {
+            Tool::HighlightArea => AnnotationKind::HighlightStroke(FreeObj {
+                points: stabilize_hl(points, self.opts.hl_width),
+                color: self.opts.color,
+                width: self.opts.hl_width,
+                tip: TipShape::Round,
+                dash: Dash::Solid,
+                outline: 0.0,
+                outline_color: Color32::WHITE,
+                shadow: 0.0,
+                eraser_mode: EraserMode::Color,
+                soft: false,
+                opacity: self.opts.hl_opacity,
+            }),
             Tool::Eraser => AnnotationKind::Freehand(FreeObj {
                 points,
                 color: self.opts.eraser_color,
@@ -2686,7 +2738,10 @@ impl DrawSession {
             Tool::HighlightArea => AnnotationKind::HighlightArea(AreaObj {
                 rect: r,
                 color: o.color,
-                shape: o.shape,
+                shape: match o.hl_mode {
+                    HlMode::Rect => AreaShape::Rect,
+                    _ => AreaShape::Ellipse,
+                },
                 border: None,
                 dash: Dash::Solid,
                 soft: false,
@@ -2779,6 +2834,7 @@ impl DrawSession {
             self.close_text_panel();
         }
         if !matches!(self.tool, Tool::Eraser | Tool::SelectArea | Tool::Pipette)
+            && !self.hl_freehand()
             && let Some(id) = self.hit(p, self.canvas_scale)
         {
             self.selected = Some(id);
@@ -2814,6 +2870,11 @@ impl DrawSession {
                 if self.sel_area.is_some_and(|s| !s.rect.contains(p)) {
                     self.sel_area = None;
                 }
+            }
+            Tool::HighlightArea if self.opts.hl_mode == HlMode::Freehand => {
+                // A tap drops a marker dot — same contract as the
+                // eraser's click.
+                self.finish_freehand(vec![p]);
             }
             Tool::Text => {
                 let id = self.doc.alloc_id();
@@ -2969,6 +3030,11 @@ impl DrawSession {
                     };
                     (preview_col, (o.eraser_size * scale).max(2.0), 0.0)
                 }
+                Tool::HighlightArea => (
+                    o.color.gamma_multiply(o.hl_opacity),
+                    (o.hl_width * scale).max(2.0),
+                    0.0,
+                ),
                 _ => (
                     o.color.gamma_multiply(o.opacity),
                     (o.width * scale).max(1.0),
@@ -3080,7 +3146,7 @@ impl DrawSession {
                     // solid wall — a 12% tint + accent outline keeps the
                     // zone (and its colour) visible at any opacity.
                     let fill_col = o.color.gamma_multiply(0.12);
-                    if o.shape == AreaShape::Rect {
+                    if o.hl_mode == HlMode::Rect {
                         painter.rect_filled(r, CornerRadius::ZERO, fill_col);
                         painter.rect_stroke(
                             r,
@@ -3983,6 +4049,7 @@ impl DrawSession {
                 AnnotationKind::Line(_) => t!("draw.tool.arrow"),
                 AnnotationKind::Freehand(_) => t!("draw.tool.pencil"),
                 AnnotationKind::HighlightArea(_) => t!("draw.tool.harea"),
+                AnnotationKind::HighlightStroke(_) => t!("draw.tool.hline"),
                 AnnotationKind::Rect(o) => {
                     if o.fill.is_some() {
                         t!("draw.tool.rectfill")
@@ -4415,12 +4482,13 @@ impl DrawSession {
                 }
             }
             Tool::HighlightArea => {
-                highlight_area_options_row(
+                highlight_options_row(
                     ui,
                     shared,
                     "draw.bar.harea",
                     &mut o.color,
-                    &mut o.shape,
+                    &mut o.hl_mode,
+                    Some(&mut o.hl_width),
                     &mut o.hl_opacity,
                 );
             }
@@ -4533,6 +4601,9 @@ impl DrawSession {
         };
         let mut changed = false;
         if let Some(a) = self.doc.annotation_mut(id) {
+            // A kind-replacing option (highlight stroke → zone) parks
+            // its result here — `a.kind` stays borrowed by the match.
+            let mut convert: Option<AnnotationKind> = None;
             match &mut a.kind {
                 AnnotationKind::Rect(o) => {
                     let mut sh_on = o.shadow > 0.0;
@@ -4625,6 +4696,54 @@ impl DrawSession {
                         &mut o.opacity,
                     ) {
                         changed = true;
+                    }
+                }
+                AnnotationKind::HighlightStroke(o) => {
+                    let mut mode = HlMode::Freehand;
+                    if highlight_options_row(
+                        ui,
+                        shared,
+                        "draw.sel.hline",
+                        &mut o.color,
+                        &mut mode,
+                        Some(&mut o.width),
+                        &mut o.opacity,
+                    ) {
+                        changed = true;
+                    }
+                    // Picking a zone mode converts the stroke into an
+                    // area covering its painted band.
+                    if mode != HlMode::Freehand && !o.points.is_empty() {
+                        let pad = o.width * 0.5;
+                        let (mut x1, mut y1, mut x2, mut y2) = (
+                            f32::INFINITY,
+                            f32::INFINITY,
+                            f32::NEG_INFINITY,
+                            f32::NEG_INFINITY,
+                        );
+                        for p in &o.points {
+                            x1 = x1.min(p.x);
+                            y1 = y1.min(p.y);
+                            x2 = x2.max(p.x);
+                            y2 = y2.max(p.y);
+                        }
+                        convert = Some(AnnotationKind::HighlightArea(AreaObj {
+                            rect: PhysicalRect {
+                                x: (x1 - pad).floor() as i32,
+                                y: (y1 - pad).floor() as i32,
+                                width: (x2 - x1 + pad * 2.0).ceil().max(1.0) as u32,
+                                height: (y2 - y1 + pad * 2.0).ceil().max(1.0) as u32,
+                            },
+                            color: o.color,
+                            shape: match mode {
+                                HlMode::Rect => AreaShape::Rect,
+                                _ => AreaShape::Ellipse,
+                            },
+                            border: None,
+                            dash: Dash::Solid,
+                            soft: false,
+                            opacity: o.opacity,
+                        }));
                     }
                 }
                 AnnotationKind::Text(o) => {
@@ -4747,6 +4866,9 @@ impl DrawSession {
                         changed = true;
                     }
                 }
+            }
+            if let Some(kind) = convert {
+                a.kind = kind;
             }
         }
         if changed && let Some(after) = self.doc.annotation(id).cloned() {
@@ -4986,6 +5108,60 @@ fn snap_hv_pt(anchor: Pos2, p: Pos2, snap: bool) -> Pos2 {
     } else {
         pos2(anchor.x, p.y)
     }
+}
+
+/// The freehand highlighter's built-in stabilizer — always on, no
+/// setting: a light 5-point moving average irons out hand jitter,
+/// then a stroke that lands nearly horizontal (or vertical) relative
+/// to its own width is flattened onto its mean axis — the "marker
+/// swipe" reads perfectly straight. Endpoints are preserved by the
+/// smoothing so the band still starts/stops where the pointer did.
+fn stabilize_hl(points: Vec<Pos2>, width: f32) -> Vec<Pos2> {
+    let n = points.len();
+    if n < 3 {
+        return points;
+    }
+    // 1) Light smoothing: centred mean over a ±2-point window,
+    //    endpoints anchored.
+    let mut out = points.clone();
+    for (i, p) in out.iter_mut().enumerate().take(n - 1).skip(1) {
+        let lo = i.saturating_sub(2);
+        let hi = (i + 2).min(n - 1);
+        let mut acc = Vec2::ZERO;
+        for q in &points[lo..=hi] {
+            acc += q.to_vec2();
+        }
+        *p = (acc / (hi - lo + 1) as f32).to_pos2();
+    }
+    // 2) Axis snap: the stroke's own bounding box decides — a clearly
+    //    dominant direction plus a cross-deviation within ~1.5 widths
+    //    is intent, not a wobbly diagonal.
+    let (mut x1, mut y1, mut x2, mut y2) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
+    for p in &out {
+        x1 = x1.min(p.x);
+        y1 = y1.min(p.y);
+        x2 = x2.max(p.x);
+        y2 = y2.max(p.y);
+    }
+    let (w, h) = (x2 - x1, y2 - y1);
+    let tol = width.max(1.0) * 1.5;
+    if w > 0.0 && h <= w * 0.35 && h <= tol {
+        let my = out.iter().map(|p| p.y).sum::<f32>() / n as f32;
+        for p in &mut out {
+            p.y = my;
+        }
+    } else if h > 0.0 && w <= h * 0.35 && w <= tol {
+        let mx = out.iter().map(|p| p.x).sum::<f32>() / n as f32;
+        for p in &mut out {
+            p.x = mx;
+        }
+    }
+    out
 }
 
 /// Default 1/3 and 2/3 cubic-Bézier control points along `a..b`.
@@ -6147,7 +6323,8 @@ fn tip_combo(ui: &mut Ui, tip: &mut TipShape) -> bool {
     *tip != cur
 }
 
-/// Option strip shared by `Tool::HighlightArea` and a selected `AreaObj`.
+/// Option strip for a selected `AreaObj` (zone shapes only — a region
+/// has no polyline to convert into a freehand stroke).
 fn highlight_area_options_row(
     ui: &mut Ui,
     shared: &Shared,
@@ -6198,6 +6375,60 @@ fn highlight_area_options_row(
         .inner;
     changed |= opacity_pct_slider(ui, opacity);
     changed
+}
+
+/// Option strip shared by `Tool::HighlightArea` and a selected
+/// `HighlightStroke`: colour, mode combo (Rectangle / Circle /
+/// Freehand), stroke width (freehand mode only) and coverage opacity.
+fn highlight_options_row(
+    ui: &mut Ui,
+    shared: &Shared,
+    salt: &'static str,
+    color: &mut Color32,
+    mode: &mut HlMode,
+    width: Option<&mut f32>,
+    opacity: &mut f32,
+) -> bool {
+    let mut changed = false;
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.color"));
+            color_btn(ui, shared, color).changed()
+        })
+        .inner;
+    changed |= ui
+        .horizontal(|ui| {
+            ui.label(t!("draw.opt.style"));
+            let cur = *mode;
+            let mut picked = cur;
+            egui::ComboBox::from_id_salt((salt, "mode"))
+                .selected_text(hl_mode_label(cur).to_string())
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    for m in [HlMode::Rect, HlMode::Circle, HlMode::Freehand] {
+                        ui.selectable_value(&mut picked, m, hl_mode_label(m).to_string());
+                    }
+                });
+            *mode = picked;
+            picked != cur
+        })
+        .inner;
+    if *mode == HlMode::Freehand
+        && let Some(width) = width
+    {
+        changed |= w_edit(ui, t!("draw.opt.width"), width, 2.0..=60.0).changed();
+    }
+    changed |= opacity_pct_slider(ui, opacity);
+    changed
+}
+
+/// Translated label of a highlighter mode.
+fn hl_mode_label(m: HlMode) -> std::borrow::Cow<'static, str> {
+    match m {
+        HlMode::Rect => t!("draw.shape.rect"),
+        HlMode::Circle => t!("draw.shape.circle"),
+        HlMode::Freehand => t!("draw.shape.freehand"),
+    }
 }
 
 /// Area-shape combo.
@@ -6500,7 +6731,9 @@ fn fix_bank_tool(a: &Annotation) -> Option<Tool> {
         AnnotationKind::Brace(_) => Tool::Brace,
         AnnotationKind::Text(_) => Tool::Text,
         AnnotationKind::Step(_) => Tool::Step,
-        AnnotationKind::HighlightArea(_) => Tool::HighlightArea,
+        AnnotationKind::HighlightArea(_) | AnnotationKind::HighlightStroke(_) => {
+            Tool::HighlightArea
+        }
         AnnotationKind::Blur(_) => Tool::Blur,
         AnnotationKind::Picture(_) | AnnotationKind::Emoji(_) => return None,
     })
@@ -6564,6 +6797,16 @@ fn bank_from_obj(bank: &mut crate::config::ToolStyle, kind: &AnnotationKind) {
         AnnotationKind::HighlightArea(o) => {
             bank.color = rgb(o.color);
             bank.shape = o.shape;
+            bank.hl_mode = match o.shape {
+                AreaShape::Rect => HlMode::Rect,
+                _ => HlMode::Circle,
+            };
+            bank.hl_opacity = o.opacity;
+        }
+        AnnotationKind::HighlightStroke(o) => {
+            bank.color = rgb(o.color);
+            bank.hl_mode = HlMode::Freehand;
+            bank.hl_width = o.width;
             bank.hl_opacity = o.opacity;
         }
         AnnotationKind::Blur(o) => {
@@ -7664,5 +7907,60 @@ mod dup_tests {
         s.duplicate_selected();
         assert_eq!(s.doc.annotations.len(), 1);
         assert!(s.undo.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hl_tests {
+    //! Freehand highlighter stabilizer: light smoothing keeps
+    //! endpoints and intent, near-axis strokes flatten onto their
+    //! mean axis, real diagonals survive untouched.
+    use super::*;
+
+    fn ys(points: &[Pos2]) -> Vec<f32> {
+        points.iter().map(|p| p.y).collect()
+    }
+
+    /// A wobbly horizontal swipe flattens to a single-y polyline whose
+    /// endpoints stay where the pointer started and ended.
+    #[test]
+    fn stabilize_flattens_near_horizontal() {
+        let pts: Vec<Pos2> = (0..=20)
+            .map(|i| pos2(i as f32 * 10.0, 100.0 + (i % 3) as f32 * 4.0 - 4.0))
+            .collect();
+        let out = stabilize_hl(pts, 14.0);
+        assert!(out.iter().all(|p| p.y == out[0].y));
+        assert!(out.len() == 21);
+    }
+
+    /// The mirror case: a wobbly vertical swipe flattens onto mean x.
+    #[test]
+    fn stabilize_flattens_near_vertical() {
+        let pts: Vec<Pos2> = (0..=20)
+            .map(|i| pos2(50.0 + (i % 3) as f32 * 4.0 - 4.0, i as f32 * 10.0))
+            .collect();
+        let out = stabilize_hl(pts, 14.0);
+        assert!(out.iter().all(|p| p.x == out[0].x));
+    }
+
+    /// A genuine diagonal is neither flattened nor crushed: every
+    /// point keeps moving in both axes.
+    #[test]
+    fn stabilize_keeps_diagonals() {
+        let pts: Vec<Pos2> = (0..=20)
+            .map(|i| pos2(i as f32 * 10.0, i as f32 * 8.0))
+            .collect();
+        let before: Vec<f32> = ys(&pts);
+        let out = stabilize_hl(pts, 14.0);
+        assert_ne!(ys(&out), vec![out[0].y; 21]);
+        assert_eq!(out.first().map(|p| p.y), before.first().copied());
+        assert_eq!(out.last().map(|p| p.y), before.last().copied());
+    }
+
+    /// Short strokes (fewer than 3 points) pass through verbatim.
+    #[test]
+    fn stabilize_short_stroke_passthrough() {
+        let pts = vec![pos2(1.0, 2.0), pos2(3.0, 4.0)];
+        assert_eq!(stabilize_hl(pts.clone(), 14.0), pts);
     }
 }

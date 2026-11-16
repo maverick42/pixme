@@ -186,6 +186,8 @@ fn render_one(img: &mut RgbaImage, scratch: &mut ScratchLayer, anno: &Annotation
         // black text stays black, white takes the colour — it must
         // read the base pixels, so it renders as a region effect.
         AnnotationKind::HighlightArea(o) => apply_highlight(img, o),
+        // Same multiply, along a freehand stroke footprint.
+        AnnotationKind::HighlightStroke(o) => apply_highlight_stroke(img, o),
         AnnotationKind::Freehand(o) if o.eraser_mode != super::document::EraserMode::Color => {
             apply_freehand_effect(img, o);
         }
@@ -274,7 +276,9 @@ impl DragPreview {
             AnnotationKind::Blur(_) => return None,
             // The multiply highlighter reads the base — no layered
             // patch exists for it (same as Blur: outline preview).
-            AnnotationKind::HighlightArea(_) => return None,
+            AnnotationKind::HighlightArea(_) | AnnotationKind::HighlightStroke(_) => {
+                return None;
+            }
             AnnotationKind::Freehand(o) if o.eraser_mode != super::document::EraserMode::Color => {
                 return None;
             }
@@ -361,6 +365,9 @@ impl DragPreview {
                 match &shifted.kind {
                     AnnotationKind::Blur(o) => apply_blur(&mut patch, o),
                     AnnotationKind::HighlightArea(o) => apply_highlight(&mut patch, o),
+                    AnnotationKind::HighlightStroke(o) => {
+                        apply_highlight_stroke(&mut patch, o);
+                    }
                     AnnotationKind::Freehand(o) => {
                         apply_freehand_effect(&mut patch, o);
                     }
@@ -474,12 +481,13 @@ pub(crate) fn union_rect(
 }
 
 /// True for annotations that read/write the base directly (Blur,
-/// blur/pixelate eraser strokes, the multiply zone highlighter)
-/// rather than compositing a layer.
+/// blur/pixelate eraser strokes, the multiply zone and freehand
+/// highlighters) rather than compositing a layer.
 pub(crate) fn region_effect(anno: &Annotation) -> bool {
     match &anno.kind {
         AnnotationKind::Blur(_) => true,
         AnnotationKind::HighlightArea(_) => true,
+        AnnotationKind::HighlightStroke(_) => true,
         AnnotationKind::Freehand(o) => o.eraser_mode != super::document::EraserMode::Color,
         _ => false,
     }
@@ -499,7 +507,7 @@ pub(crate) fn effect_footprint(
     let pad = match &anno.kind {
         AnnotationKind::Blur(_) => 4.0,
         AnnotationKind::HighlightArea(_) => 2.0,
-        AnnotationKind::Freehand(o) => o.width + 8.0,
+        AnnotationKind::Freehand(o) | AnnotationKind::HighlightStroke(o) => o.width + 8.0,
         _ => return None,
     };
     let b = anno.kind.bounds();
@@ -562,6 +570,7 @@ pub(crate) fn layer_bounds(anno: &Annotation, iw: u32, ih: u32) -> Option<(u32, 
         AnnotationKind::Ellipse(o) => o.stroke_w * 0.5 + o.outline + o.shadow,
         AnnotationKind::Line(o) => o.shadow,
         AnnotationKind::Freehand(o) => o.width + o.outline + o.shadow + 2.0,
+        AnnotationKind::HighlightStroke(o) => o.width + 2.0,
         AnnotationKind::HighlightArea(_) => 0.0,
         AnnotationKind::Text(o) => {
             // Glyphs wider than the baseline spill past `b` (the
@@ -608,7 +617,7 @@ fn shadow_opacity(anno: &Annotation) -> (f32, f32) {
         AnnotationKind::TextBox(o) => (o.shadow, o.opacity),
         AnnotationKind::Step(o) => (0.0, o.opacity),
         AnnotationKind::Picture(o) => (o.shadow, o.opacity),
-        AnnotationKind::Blur(_) => (0.0, 1.0),
+        AnnotationKind::Blur(_) | AnnotationKind::HighlightStroke(_) => (0.0, 1.0),
         AnnotationKind::Brace(o) => (0.0, o.opacity),
         AnnotationKind::Emoji(_) => (0.0, 1.0),
     }
@@ -667,7 +676,7 @@ fn object_layer(layer: &mut RgbaImage, anno: &Annotation) -> (f32, f32) {
         AnnotationKind::TextBox(o) => draw_textbox(layer, o),
         AnnotationKind::Step(o) => draw_step(layer, o),
         AnnotationKind::Picture(o) => draw_picture(layer, o),
-        AnnotationKind::Blur(_) => {}
+        AnnotationKind::Blur(_) | AnnotationKind::HighlightStroke(_) => {}
         AnnotationKind::Brace(o) => draw_brace(layer, o),
         AnnotationKind::Emoji(o) => draw_emoji(layer, o),
     }
@@ -1517,7 +1526,7 @@ fn draw_brace(img: &mut RgbaImage, o: &BraceObj) {
     stroke_freehand(img, &free);
 }
 
-/// Pencil/eraser freehand stroke with SDF anti-aliasing,
+/// Pencil/eraser/highlight freehand stroke with SDF anti-aliasing,
 /// dashing, unified outline (0–10), soft edge feathering and drop shadow.
 fn stroke_freehand(img: &mut RgbaImage, o: &super::document::FreeObj) {
     if o.points.is_empty() {
@@ -2643,6 +2652,68 @@ fn apply_highlight(img: &mut RgbaImage, o: &super::document::AreaObj) {
     }
 }
 
+/// Freehand highlighter: the same multiply as [`apply_highlight`],
+/// along the stroke's footprint. The coverage mask is rasterized by
+/// the very `stroke_freehand` the pencil uses — one SDF path for all
+/// polylines — so the band follows the polyline exactly, caps and
+/// joints included; `opacity` scales the effect strength.
+fn apply_highlight_stroke(img: &mut RgbaImage, o: &super::document::FreeObj) {
+    if o.points.is_empty() {
+        return;
+    }
+    let hw = o.width.max(1.0) * 0.5;
+    let (mut x0f, mut y0f, mut x1f, mut y1f) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
+    for p in &o.points {
+        x0f = x0f.min(p.x);
+        y0f = y0f.min(p.y);
+        x1f = x1f.max(p.x);
+        y1f = y1f.max(p.y);
+    }
+    let pad = (hw + 3.0).ceil() as i32;
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let x0 = (x0f.floor() as i32 - pad).max(0);
+    let y0 = (y0f.floor() as i32 - pad).max(0);
+    let x1 = (x1f.ceil() as i32 + pad).min(iw - 1);
+    let y1 = (y1f.ceil() as i32 + pad).min(ih - 1);
+    if x1 < x0 || y1 < y0 {
+        return;
+    }
+    let (rw, rh) = ((x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32);
+    let mut mask = RgbaImage::new(rw, rh);
+    let mut local = o.clone();
+    for p in &mut local.points {
+        p.x -= x0 as f32;
+        p.y -= y0 as f32;
+    }
+    // Only the footprint matters: colour is irrelevant (alpha carries
+    // coverage), outline/shadow/dash forced off.
+    local.color = Color32::WHITE;
+    local.outline = 0.0;
+    local.shadow = 0.0;
+    local.dash = Dash::Solid;
+    stroke_freehand(&mut mask, &local);
+    let strength = o.opacity.clamp(0.0, 1.0);
+    let col = c32(o.color).0;
+    for py in 0..rh {
+        for px in 0..rw {
+            let cov = mask.get_pixel(px, py).0[3] as f32 / 255.0 * strength;
+            if cov <= 0.0 {
+                continue;
+            }
+            let d = img.get_pixel_mut((x0 + px as i32) as u32, (y0 + py as i32) as u32);
+            for (d_ch, c) in d.0.iter_mut().take(3).zip(col.iter().take(3)) {
+                let m = *d_ch as f32 * *c as f32 / 255.0;
+                *d_ch = (m * cov + *d_ch as f32 * (1.0 - cov)) as u8;
+            }
+        }
+    }
+}
+
 /// Block-average mosaic for the pixelate blur style.
 fn pixelate(src: &RgbaImage, block: u32) -> RgbaImage {
     let (w, h) = (src.width(), src.height());
@@ -2891,6 +2962,7 @@ mod tests {
         match &anno.kind {
             AnnotationKind::Blur(o) => apply_blur(img, o),
             AnnotationKind::HighlightArea(o) => apply_highlight(img, o),
+            AnnotationKind::HighlightStroke(o) => apply_highlight_stroke(img, o),
             AnnotationKind::Freehand(o)
                 if o.eraser_mode != super::super::document::EraserMode::Color =>
             {

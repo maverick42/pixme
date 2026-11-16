@@ -2614,3 +2614,34 @@ Format: date — context — decision — consequences.
   flicker). Click and `C` never re-sample through an independent path:
   both reduce the patch the loupe paints via `patch_centre`, so the
   applied/copied value is always the displayed one.
+
+## 2026-11-16 — Freehand highlighter mode with built-in stabilizer
+
+- **Context**: the line highlighter removed on 2026-10-26 came back as a
+  user request — a third choice in the highlighter's style combo
+  (Rectangle / Circle / Freehand) — plus an always-on "stabilizer" so a
+  horizontal marker swipe does not wobble.
+- **Decision**: a new `AnnotationKind::HighlightStroke(FreeObj)` —
+  appended as the LAST enum variant because postcard encodes the variant
+  index (existing session blobs stay readable, no SCHEMA_VERSION bump)
+  — rendered as a region effect by `apply_highlight_stroke`: the same
+  multiply formula as `apply_highlight`, with the coverage mask drawn
+  by the very `stroke_freehand` the pencil uses (one SDF path for all
+  polylines). The tool's mode is a new persisted `HlMode` (`Rect`,
+  `Circle`, `Freehand`) alongside `hl_width` in `ToolStyle` (struct-level
+  `#[serde(default)]` migrates old prefs). The stabilizer lives in
+  `stabilize_hl`, applied at stroke release: a 5-point moving average
+  (endpoints anchored) then an axis snap — a stroke whose cross-axis
+  deviation stays within 1.5 widths and 35% of its length flattens onto
+  its mean axis. Shift/Ctrl also locks the stroke to the dominant axis
+  live, reusing the existing `snap_hv` convention. While in `Freehand`
+  mode the highlighter acts as a pure paint tool like the eraser:
+  presses/clicks never grab or select existing annotations (they paint
+  over them), and a single click lays down a marker dot. Selecting a
+  stroke exposes the same option strip; picking Rect/Circle converts it
+  to an `AreaObj` covering the painted band (one undoable Replace).
+- **Consequences**: freehand marks get the true highlighter multiply
+  look identical to the zone highlighter; the stabilizer needs no
+  setting (conservative thresholds protect real diagonals); old
+  sessions and prefs load unchanged; session files written with a
+  stroke become unreadable only to pre-Feature binaries.

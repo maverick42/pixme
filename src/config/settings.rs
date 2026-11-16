@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::workspace::{MAIN_ID, Workspace};
 use crate::editor::document::{
-    AreaShape, BlurStyle, BraceKind, Dash, EraserMode, LineEnd, StepMode, StepSize, StepStyle,
-    TextAlign, TipShape,
+    AreaShape, BlurStyle, BraceKind, Dash, EraserMode, HlMode, LineEnd, StepMode, StepSize,
+    StepStyle, TextAlign, TipShape,
 };
 use crate::i18n::Language;
 use crate::ui::theme::ThemeKind;
@@ -147,6 +147,10 @@ pub struct ToolStyle {
     pub shape: AreaShape,
     /// Highlighter coverage opacity.
     pub hl_opacity: f32,
+    /// Highlighter working mode (zone or freehand stroke).
+    pub hl_mode: HlMode,
+    /// Freehand highlighter stroke width px.
+    pub hl_width: f32,
     /// Eraser colour.
     pub eraser_color: [u8; 3],
     /// Eraser size px.
@@ -219,6 +223,8 @@ impl Default for ToolStyle {
             brace_kind: BraceKind::CurlyLeft,
             shape: AreaShape::Rect,
             hl_opacity: 1.0,
+            hl_mode: HlMode::Rect,
+            hl_width: 14.0,
             eraser_color: [255, 255, 255],
             eraser_size: 12.0,
             eraser_mode: EraserMode::Color,
