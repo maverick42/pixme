@@ -274,8 +274,8 @@ impl DragPreview {
     pub fn render(&mut self, anno: &Annotation) -> Option<(RgbaImage, u32, u32)> {
         match &anno.kind {
             AnnotationKind::Blur(_) => return None,
-            // The multiply highlighter reads the base — no layered
-            // patch exists for it (same as Blur: outline preview).
+            // The multiply highlighter reads the base — no standalone
+            // layer exists; `highlight_patch` crops `rendered_img` instead.
             AnnotationKind::HighlightArea(_) | AnnotationKind::HighlightStroke(_) => {
                 return None;
             }
@@ -3931,6 +3931,79 @@ mod region_tests {
             }),
         ));
         assert!(expand_for_effects(&doc, (10, 10, 20, 20), iw, ih, 0.5).is_none());
+    }
+
+    /// `highlight_patch` on the displayed composite matches the same
+    /// crop of `render_to_image` bit-for-bit across rect/ellipse zones
+    /// (including edge-clipped) and freehand strokes.
+    #[test]
+    fn highlight_patch_matches_full_render_crop() {
+        let base_doc = varied_doc(42);
+        let composite = render_to_image(&base_doc);
+        let cases = [
+            anno(
+                99,
+                AnnotationKind::HighlightArea(crate::editor::document::AreaObj {
+                    rect: PhysicalRect {
+                        x: 40,
+                        y: 30,
+                        width: 140,
+                        height: 70,
+                    },
+                    color: Color32::from_rgb(255, 235, 60),
+                    shape: crate::editor::document::AreaShape::Rect,
+                    border: None,
+                    dash: Dash::Solid,
+                    soft: false,
+                    opacity: 0.65,
+                }),
+            ),
+            anno(
+                100,
+                AnnotationKind::HighlightArea(crate::editor::document::AreaObj {
+                    rect: PhysicalRect {
+                        x: -20,
+                        y: 150,
+                        width: 160,
+                        height: 90,
+                    },
+                    color: Color32::from_rgb(80, 220, 120),
+                    shape: crate::editor::document::AreaShape::Ellipse,
+                    border: None,
+                    dash: Dash::Solid,
+                    soft: false,
+                    opacity: 1.0,
+                }),
+            ),
+            anno(
+                101,
+                AnnotationKind::HighlightStroke(crate::editor::document::FreeObj {
+                    points: (0..15)
+                        .map(|i| pos2(30.0 + i as f32 * 14.0, 90.0 + (i % 3) as f32 * 6.0))
+                        .collect(),
+                    color: Color32::from_rgb(255, 120, 180),
+                    width: 18.0,
+                    tip: crate::editor::document::TipShape::Round,
+                    dash: Dash::Solid,
+                    outline: 0.0,
+                    outline_color: Color32::WHITE,
+                    shadow: 0.0,
+                    eraser_mode: crate::editor::document::EraserMode::Color,
+                    soft: false,
+                    opacity: 0.8,
+                }),
+            ),
+        ];
+        for hl in cases {
+            let (patch, rx, ry) =
+                highlight_patch(&composite, &hl).expect("in-bounds highlight produces a patch");
+            let mut full_doc = base_doc.clone();
+            full_doc.annotations.push(hl);
+            let full = render_to_image(&full_doc);
+            let expect =
+                image::imageops::crop_imm(&full, rx, ry, patch.width(), patch.height()).to_image();
+            assert_same_pixels(&patch, &expect);
+        }
     }
 }
 
