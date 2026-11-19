@@ -4,6 +4,45 @@ Toutes les modifications notables de PixMe sont documentées dans ce
 fichier, mis à jour à chaque bump de version — en anglais, français et
 espagnol (`CHANGELOG.md`, `CHANGELOG-fr.md`, `CHANGELOG-es.md`).
 
+## [0.3.1] - 2026-11-19
+
+### Ajouté
+
+- Surligneur à main levée : un mode « Surligneur (main levée) »
+  rejoint le surligneur de zone, avec un stabilisateur qui lisse le
+  tracé.
+- Pipette plein écran : un prélèvement de couleur armé continue de
+  fonctionner quand le curseur quitte la fenêtre Draw — un overlay
+  par moniteur affiche la loupe sur le bureau en direct et
+  échantillonne la vraie couleur de l'écran ; `C` applique et copie
+  `#RRGGBB` sans terminer le prélèvement.
+- Sélecteur de couleur : chaque popup de nuancier affiche désormais
+  les 48 couleurs de base dans une grille fixe, plus une banque
+  persistée de 16 couleurs personnalisées (ajouter la couleur
+  courante, clic droit pour vider un emplacement), à côté du
+  sélecteur HSV.
+- Redresser : les poignées de Bézier intérieures s'aimantent sur la
+  corde quand on les glisse à quelques pixels d'elle, et une entrée
+  « Redresser » du menu contextuel de l'annotation restaure une
+  ligne ou une ligne de base de texte en une étape annulable.
+- Le bouton OK de Draw copie désormais le rendu annoté dans le
+  presse-papiers quand l'option « copier dans le presse-papiers » de
+  la barre de capture est activée.
+- Barre d'onglets : les boutons « » sautent au premier et au dernier
+  onglet quand les puces débordent (les chevrons < > continuent de
+  faire défiler) ; les quatre boutons ont des infobulles.
+
+### Corrigé
+
+- L'aperçu du surligneur pendant le glisser rend désormais le vrai
+  produit multiply à toutes les opacités — l'aperçu correspond au
+  trait final, et un fin contour garde les bornes du glisser visibles
+  sur les pixels sombres.
+- Windows : une fenêtre fantôme n'apparaît plus quand l'overlay de
+  capture reprend le focus.
+- Les toasts n'apparaissent désormais que dans la fenêtre qui les a
+  émis.
+
 ## [0.3.0] - 2026-11-13
 
 ### Ajouté

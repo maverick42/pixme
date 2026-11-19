@@ -4,6 +4,44 @@ Todos los cambios notables de PixMe se documentan en este archivo, que
 se actualiza en cada bump de versión — en inglés, francés y español
 (`CHANGELOG.md`, `CHANGELOG-fr.md`, `CHANGELOG-es.md`).
 
+## [0.3.1] - 2026-11-19
+
+### Añadido
+
+- Resaltador a mano alzada: un modo «Resaltador (a mano alzada)» se
+  une al resaltador de zona, con un estabilizador que suaviza el
+  trazo.
+- Cuentagotas a pantalla completa: una selección de color armada
+  sigue funcionando cuando el cursor sale de la ventana Draw — una
+  superposición por monitor muestra la lupa sobre el escritorio en
+  vivo y muestrea el color real de la pantalla; `C` aplica y copia
+  `#RRGGBB` sin terminar la selección.
+- Selector de color: cada ventana emergente de muestra de color
+  muestra ahora los 48 colores base en una cuadrícula fija, más un
+  banco persistido de 16 colores personalizados (añadir el color
+  actual, clic derecho para vaciar un espacio), junto al selector
+  HSV.
+- Enderezar: los tiradores interiores de Bézier se atraen a la cuerda
+  al arrastrarlos a unos píxeles de ella, y una entrada «Enderezar»
+  del menú contextual de la anotación restaura una línea o la línea
+  base de un texto en un paso deshacible.
+- El botón OK de Draw copia ahora el render anotado al portapapeles
+  cuando la opción «copiar al portapapeles» de la barra de captura
+  está activada.
+- Tira de pestañas: los botones « » saltan a la primera y a la
+  última pestaña cuando las fichas desbordan (los chevrones < >
+  siguen desplazando); los cuatro botones tienen tooltips.
+
+### Corregido
+
+- La vista previa del resaltador durante el arrastre muestra ahora el
+  verdadero resultado multiply a todas las opacidades — la vista
+  previa coincide con el trazo final, y un fino contorno mantiene
+  visibles los límites del arrastre sobre píxeles oscuros.
+- Windows: ya no parpadea una ventana fantasma cuando la
+  superposición de captura recupera el foco.
+- Los toasts aparecen ahora solo en la ventana que los generó.
+
 ## [0.3.0] - 2026-11-13
 
 ### Añadido

@@ -4,6 +4,37 @@ All notable changes to PixMe are documented in this file. It is updated
 as part of every version bump, in English, French and Spanish
 (`CHANGELOG.md`, `CHANGELOG-fr.md`, `CHANGELOG-es.md`).
 
+## [0.3.1] - 2026-11-19
+
+### Added
+
+- Freehand highlighter: a "Freehand highlighter" mode joins the area
+  highlighter, with a stroke stabilizer smoothing the trace.
+- Fullscreen eyedropper: an armed colour pick keeps working when the
+  cursor leaves the Draw window — one overlay per monitor paints the
+  loupe over the live desktop and samples the real screen colour;
+  `C` applies and copies `#RRGGBB` without ending the pick.
+- Colour picker: every swatch popup now shows the 48 base colours in
+  a fixed grid plus a persisted 16-slot custom colour bank (add the
+  current colour, right-click to clear a slot) beside the HSV picker.
+- Straighten: inner Bézier knobs snap onto the chord when dragged a
+  few pixels from it, and a "Straighten" entry in the annotation
+  context menu restores a line or text baseline in one undoable step.
+- Draw's OK button now copies the annotated render to the clipboard
+  when the capture bar's "copy to clipboard" option is enabled.
+- Tab strip: « » buttons jump to the first and last tab when the
+  chips overflow (the < > chevrons keep scrolling); all four buttons
+  carry tooltips.
+
+### Fixed
+
+- Highlighter drag previews now render the real multiply result at
+  every opacity — the live preview matches the committed stroke, and
+  a thin outline keeps the drag bounds visible over dark pixels.
+- Windows: a phantom window no longer flashes when the capture
+  overlay regains focus.
+- Toasts now appear only in the window that raised them.
+
 ## [0.3.0] - 2026-11-13
 
 ### Added
