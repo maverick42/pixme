@@ -17,6 +17,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
 
 use super::PlatformServices;
+use crate::app::ViewportWake;
 use crate::capture::CaptureError;
 use crate::ui::icons;
 
@@ -1429,7 +1430,10 @@ pub(crate) fn stable_monitor_id(monitor: &crate::capture::MonitorInfo) -> Option
 /// Best-effort: Windows may refuse the raise (`SetForegroundWindow`
 /// rules), but clicks anywhere still reach the fullscreen overlay.
 pub fn refocus_capture_overlay(ctx: &egui::Context, id: egui::ViewportId) {
-    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+    // `send_viewport_cmd_to` on a not-yet-created viewport inserts a
+    // default `ViewportState` (a decorated "egui window") that flashes on
+    // screen — and inside the frozen frame during `Step::Freeze`.
+    ctx.cmd_if_live(id, egui::ViewportCommand::Focus);
 }
 
 /// Classifies `info` for the status-strip icon via
