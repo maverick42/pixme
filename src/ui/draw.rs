@@ -707,6 +707,19 @@ impl DrawSession {
         from_drag.or_else(|| self.nudge.as_ref().map(|n| &n.live))
     }
 
+    /// `true` while a highlight creation drag has a live preview to paint.
+    /// Cheap check so `draw_overlay` only builds [`Self::hl_preview_anno`]
+    /// (which clones and stabilizes the polyline) when `preview_dirty`
+    /// is set.
+    fn has_hl_drag(&self) -> bool {
+        self.tool == Tool::HighlightArea
+            && match &self.drag {
+                Some(Drag::Freehand { points }) => !points.is_empty() && self.hl_freehand(),
+                Some(Drag::Shape { .. }) => self.last_pointer.is_some(),
+                _ => false,
+            }
+    }
+
     /// The in-flight highlight drag as the annotation its release will
     /// commit. The multiply reads the base pixels — an overlay colour
     /// can only fake it — so `draw_overlay` previews the REAL effect
@@ -1051,7 +1064,9 @@ impl DrawSession {
         self.selected = Some(id);
     }
 
-    /// Adds a finished object and selects it.
+    /// Adds a finished object, selects it and patches its painted
+    /// region into the canvas texture on the same frame (no 1-frame
+    /// blink on drag release, no full-canvas re-render when bounded).
     fn add(&mut self, kind: AnnotationKind) {
         let id = self.doc.alloc_id();
         let anno = Annotation {
@@ -1059,9 +1074,20 @@ impl DrawSession {
             kind,
             tool: Some(self.tool),
         };
+        let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
+        let bounds = render::layer_bounds(&anno, iw, ih);
         let index = self.doc.annotations.len();
         self.apply(AnnoEdit::Add { anno, index });
         self.selected = Some(id);
+        if self.rendered_img.is_some() && self.rendered_rev + 1 == self.doc.revision {
+            match bounds {
+                Some(b) => match render::expand_for_effects(&self.doc, b, iw, ih, 0.5) {
+                    Some(region) => self.patch_canvas_region(region, None),
+                    None => self.render_canvas_filtered(None),
+                },
+                None => self.rendered_rev = self.doc.revision,
+            }
+        }
     }
 
     /// `true` while the highlighter works in freehand mode — a pure
@@ -2271,6 +2297,12 @@ impl DrawSession {
         };
         self.canvas_scale = scale;
         let img_p = to_img(hover);
+        if self.tool == Tool::HighlightArea
+            && matches!(self.drag, Some(Drag::Shape { .. }))
+            && self.last_pointer != Some(img_p)
+        {
+            self.preview_dirty = true;
+        }
         self.last_pointer = Some(img_p);
         self.snap_hv = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.shift);
 
@@ -2489,8 +2521,14 @@ impl DrawSession {
             }
             Tool::HighlightArea if self.opts.hl_mode == HlMode::Freehand => {
                 self.drag = Some(Drag::Freehand { points: vec![p] });
+                self.preview_dirty = true;
             }
-            _ => self.drag = Some(Drag::Shape { anchor: p }),
+            _ => {
+                self.drag = Some(Drag::Shape { anchor: p });
+                if self.tool == Tool::HighlightArea {
+                    self.preview_dirty = true;
+                }
+            }
         }
     }
 
@@ -2515,7 +2553,12 @@ impl DrawSession {
                 } else {
                     p
                 };
-                points.push(p);
+                if points.last() != Some(&p) {
+                    points.push(p);
+                    if self.tool == Tool::HighlightArea {
+                        self.preview_dirty = true;
+                    }
+                }
             }
             // Object drags mutate `live` ONLY — the document (and its
             // revision, and the thumbnail key) stays frozen until the
@@ -2726,12 +2769,7 @@ impl DrawSession {
     /// same preview-sharing rationale as [`Self::hl_stroke_obj`].
     fn hl_area_obj(&self, a: Pos2, b: Pos2) -> AreaObj {
         AreaObj {
-            rect: PhysicalRect {
-                x: a.x.min(b.x) as i32,
-                y: a.y.min(b.y) as i32,
-                width: (a.x - b.x).abs().max(1.0) as u32,
-                height: (a.y - b.y).abs().max(1.0) as u32,
-            },
+            rect: drag_rect(a, b),
             color: self.opts.color,
             shape: match self.opts.hl_mode {
                 HlMode::Rect => AreaShape::Rect,
@@ -2746,12 +2784,7 @@ impl DrawSession {
 
     /// Builds a shape annotation from the drag rectangle/segment.
     fn create_shape(&mut self, a: Pos2, b: Pos2) {
-        let r = PhysicalRect {
-            x: a.x.min(b.x) as i32,
-            y: a.y.min(b.y) as i32,
-            width: (a.x - b.x).abs().max(1.0) as u32,
-            height: (a.y - b.y).abs().max(1.0) as u32,
-        };
+        let r = drag_rect(a, b);
         let o = &self.opts;
         // The emoji arm can't write `self.opts.emoji_size` while `o`
         // borrows `self.opts` — stashed here, applied after the match.
@@ -3313,44 +3346,49 @@ impl DrawSession {
         // render — z-order is the one documented approximation). Region
         // effects (blur) have no layered render → their live selection
         // chrome below frames the moved bounds.
-        // A highlight BEING DRAWN (freehand band or rect/ellipse zone)
-        // rides the same patch path through a temporary annotation:
-        // the multiply reads the base pixels, so the real effect is
-        // replayed on a `rendered_img` crop — an overlay colour could
-        // only fake it. Re-rendered every frame: the patch IS the
-        // honest result, never a place-holder a dirty flag could
-        // leave stale.
-        let hl_drag = self.hl_preview_anno();
-        if self.live_anno().is_some() || hl_drag.is_some() {
-            if self.preview_dirty || self.preview_tex.is_none() || hl_drag.is_some() {
-                let anno = self.live_anno().cloned();
-                self.preview_patch = if let Some(hl) = &hl_drag {
-                    self.rendered_img
-                        .as_ref()
-                        .and_then(|img| render::highlight_patch(img, hl))
-                } else {
-                    let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
-                    let scratch = self
-                        .region_scratch
-                        .get_or_insert_with(|| render::DragPreview::new(iw, ih));
-                    anno.as_ref().and_then(|a| scratch.render(a))
-                }
-                .map(|(patch, ox, oy)| {
-                    let (pw, ph) = (patch.width(), patch.height());
-                    let ci = egui::ColorImage::from_rgba_unmultiplied(
-                        [pw as usize, ph as usize],
-                        patch.as_raw(),
-                    );
-                    let tex = self.preview_tex.get_or_insert_with(|| {
-                        painter.ctx().load_texture(
-                            "draw-live-preview",
-                            egui::ColorImage::filled([1, 1], Color32::TRANSPARENT),
-                            egui::TextureOptions::LINEAR,
-                        )
+        // Highlights (both in-flight creation drags and moved/resized/
+        // nudged committed highlights, whose old spot was already
+        // cleared from `rendered_img` by `begin_nudge_live`) replay the
+        // real multiply on a `rendered_img` crop via `highlight_patch`,
+        // gated by `preview_dirty` so stationary frames neither clone
+        // polylines nor re-upload the texture.
+        let in_hl_drag = self.has_hl_drag();
+        if self.live_anno().is_some() || in_hl_drag {
+            if self.preview_dirty || self.preview_tex.is_none() {
+                let anno = self.live_anno().cloned().or_else(|| self.hl_preview_anno());
+                self.preview_patch = anno
+                    .as_ref()
+                    .and_then(|a| match &a.kind {
+                        AnnotationKind::HighlightArea(_) | AnnotationKind::HighlightStroke(_) => {
+                            self.rendered_img
+                                .as_ref()
+                                .and_then(|img| render::highlight_patch(img, a))
+                        }
+                        _ => {
+                            let (iw, ih) =
+                                (self.doc.base.image.width(), self.doc.base.image.height());
+                            let scratch = self
+                                .region_scratch
+                                .get_or_insert_with(|| render::DragPreview::new(iw, ih));
+                            scratch.render(a)
+                        }
+                    })
+                    .map(|(patch, ox, oy)| {
+                        let (pw, ph) = (patch.width(), patch.height());
+                        let ci = egui::ColorImage::from_rgba_unmultiplied(
+                            [pw as usize, ph as usize],
+                            patch.as_raw(),
+                        );
+                        let tex = self.preview_tex.get_or_insert_with(|| {
+                            painter.ctx().load_texture(
+                                "draw-live-preview",
+                                egui::ColorImage::filled([1, 1], Color32::TRANSPARENT),
+                                egui::TextureOptions::LINEAR,
+                            )
+                        });
+                        tex.set(ci, egui::TextureOptions::LINEAR);
+                        (ox, oy, pw, ph)
                     });
-                    tex.set(ci, egui::TextureOptions::LINEAR);
-                    (ox, oy, pw, ph)
-                });
                 self.preview_dirty = false;
             }
             if let (Some(tex), Some((ox, oy, pw, ph))) = (&self.preview_tex, self.preview_patch) {
@@ -3369,6 +3407,39 @@ impl DrawSession {
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
+            }
+            // Zone highlighter creation drag: frame the target rect or
+            // ellipse in `accent` above the multiply patch so the bounds
+            // stay readable over dark regions (where 0 × colour = 0).
+            if self.tool == Tool::HighlightArea
+                && let Some(Drag::Shape { anchor }) = &self.drag
+                && let Some(end) = self.last_pointer
+            {
+                let b = drag_rect(*anchor, end);
+                let cb = Rect::from_min_max(
+                    pos2(
+                        img_rect.min.x + b.x as f32 * scale,
+                        img_rect.min.y + b.y as f32 * scale,
+                    ),
+                    pos2(
+                        img_rect.min.x + (b.x + b.width as i32) as f32 * scale,
+                        img_rect.min.y + (b.y + b.height as i32) as f32 * scale,
+                    ),
+                );
+                if self.opts.hl_mode == HlMode::Rect {
+                    painter.rect_stroke(
+                        cb,
+                        CornerRadius::ZERO,
+                        Stroke::new(1.0, accent),
+                        StrokeKind::Outside,
+                    );
+                } else {
+                    painter.add(egui::epaint::EllipseShape::stroke(
+                        cb.center(),
+                        cb.size() / 2.0,
+                        Stroke::new(1.0, accent),
+                    ));
+                }
             }
         }
         // Eraser brush circle or eyedropper magnifier under the cursor.
@@ -5134,6 +5205,16 @@ fn emoji_cell(ui: &mut Ui, tex: TextureId, size: f32, selected: bool) -> Respons
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "emoji")
     });
     response
+}
+
+/// Converts a two-point drag span into a non-empty [`PhysicalRect`].
+fn drag_rect(a: Pos2, b: Pos2) -> PhysicalRect {
+    PhysicalRect {
+        x: a.x.min(b.x) as i32,
+        y: a.y.min(b.y) as i32,
+        width: (a.x - b.x).abs().max(1.0) as u32,
+        height: (a.y - b.y).abs().max(1.0) as u32,
+    }
 }
 
 /// Applies handle `h` drag of `p` onto rect `r`.
@@ -8070,5 +8151,66 @@ mod hl_tests {
     fn stabilize_short_stroke_passthrough() {
         let pts = vec![pos2(1.0, 2.0), pos2(3.0, 4.0)];
         assert_eq!(stabilize_hl(pts.clone(), 14.0), pts);
+    }
+
+    /// Highlight creation drag tracks `preview_dirty` without redundant
+    /// duplicate points and patches `rendered_img` on the release frame.
+    #[test]
+    fn highlight_drag_and_release_patch_same_frame() {
+        let doc = crate::editor::document::Document::new(crate::capture::Capture {
+            image: std::sync::Arc::new(image::RgbaImage::from_pixel(
+                320,
+                240,
+                image::Rgba([220, 210, 200, 255]),
+            )),
+            scale_factor: 1.0,
+            monitor: crate::capture::MonitorInfo {
+                id: 0,
+                name: String::new(),
+                rect: PhysicalRect::default(),
+                scale_factor: 1.0,
+                is_primary: true,
+            },
+        });
+        let mut s = DrawSession::open(
+            doc,
+            0,
+            "t".to_owned(),
+            VecDeque::new(),
+            VecDeque::new(),
+            &crate::config::Settings::default(),
+        );
+        s.rendered_img = Some(render::render_to_image(&s.doc));
+        s.rendered_rev = s.doc.revision;
+        s.tool = Tool::HighlightArea;
+        s.opts.hl_mode = HlMode::Freehand;
+
+        let ctx = egui::Context::default();
+        s.start_drag(pos2(40.0, 80.0), &ctx);
+        assert!(s.has_hl_drag());
+        assert!(s.preview_dirty);
+
+        s.preview_dirty = false;
+        // Stationary drag event at the same point must not dirty or push a duplicate point.
+        s.continue_drag(pos2(40.0, 80.0));
+        assert!(!s.preview_dirty);
+
+        s.continue_drag(pos2(120.0, 82.0));
+        assert!(s.preview_dirty);
+        let preview = s.hl_preview_anno().expect("in-flight highlight anno");
+
+        let drag = s.drag.take().unwrap();
+        s.finish_drag(drag);
+        assert_eq!(s.doc.annotations.len(), 1);
+        assert_eq!(
+            postcard::to_allocvec(&s.doc.annotations[0].kind).unwrap(),
+            postcard::to_allocvec(&preview.kind).unwrap()
+        );
+        assert_eq!(
+            s.rendered_rev, s.doc.revision,
+            "release must patch rendered_img on the same frame"
+        );
+        let expect = render::render_to_image(&s.doc);
+        assert_eq!(s.rendered_img.as_ref().unwrap().as_raw(), expect.as_raw());
     }
 }
