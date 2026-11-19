@@ -2645,3 +2645,28 @@ Format: date — context — decision — consequences.
   setting (conservative thresholds protect real diagonals); old
   sessions and prefs load unchanged; session files written with a
   stroke become unreadable only to pre-Feature binaries.
+
+## 2026-11-19 — Live multiply preview while drawing a highlight
+
+- **Context**: drawing a highlight (rect, ellipse or freehand band)
+  showed a fake preview — an alpha-blended egui stroke for the band
+  (`color × hl_opacity`, a solid wall at 100%), a 12% tint + accent
+  outline for zones — so the release's multiply recalculation always
+  changed the picture under the pointer.
+- **Decision**: the drag previews the REAL pixels. `hl_stroke_obj` /
+  `hl_area_obj` factor the exact objects the release commits;
+  `hl_preview_anno` wraps the in-flight drag in a temporary
+  annotation (`id: u64::MAX`); `render::highlight_patch` crops the
+  annotation's `effect_footprint` off `rendered_img` (the displayed
+  composite), translates the kind and replays the very
+  `apply_highlight` / `apply_highlight_stroke` the committed render
+  uses — bit-identical pixels, the same translate-and-replay pattern
+  `DragPreview::render_region` already uses for region effects. The
+  patch uploads to the existing `preview_tex`/`preview_patch`
+  machinery in `draw_overlay` (re-rendered every frame while the drag
+  lives); the egui tint/alpha arms in `preview()` are gone.
+- **Consequences**: WYSIWYG at every opacity — what is seen while
+  dragging is what is committed; pencil/eraser keep their alpha
+  stroke preview (correct for a plain paint); moved/resized committed
+  highlights keep the outline-only preview since their multiply is
+  already baked into `rendered_img` at the old spot.

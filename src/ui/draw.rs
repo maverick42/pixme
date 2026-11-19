@@ -707,6 +707,33 @@ impl DrawSession {
         from_drag.or_else(|| self.nudge.as_ref().map(|n| &n.live))
     }
 
+    /// The in-flight highlight drag as the annotation its release will
+    /// commit. The multiply reads the base pixels — an overlay colour
+    /// can only fake it — so `draw_overlay` previews the REAL effect
+    /// through the patch machinery instead of `preview()`'s shapes.
+    fn hl_preview_anno(&self) -> Option<Annotation> {
+        if self.tool != Tool::HighlightArea {
+            return None;
+        }
+        let kind = match &self.drag {
+            Some(Drag::Freehand { points }) if !points.is_empty() && self.hl_freehand() => {
+                AnnotationKind::HighlightStroke(self.hl_stroke_obj(points.clone()))
+            }
+            Some(Drag::Shape { anchor }) => {
+                // Off-canvas mid-drag → no pointer, no patch (the
+                // shape preview above goes silent on the same cue).
+                let end = self.last_pointer?;
+                AnnotationKind::HighlightArea(self.hl_area_obj(*anchor, end))
+            }
+            _ => return None,
+        };
+        Some(Annotation {
+            id: u64::MAX,
+            kind,
+            tool: Some(self.tool),
+        })
+    }
+
     /// Re-composites `region` (absolute image px, already expanded)
     /// into `rendered_img` and uploads JUST that rect to the texture —
     /// the bounded re-render behind live drags, nudges, cancels and
@@ -2565,6 +2592,7 @@ impl DrawSession {
 
     /// Release: convert the drag into one chronological edit.
     fn finish_drag(&mut self, drag: Drag) {
+        self.preview_patch = None;
         match drag {
             Drag::Moving {
                 id,
@@ -2637,21 +2665,10 @@ impl DrawSession {
         if points.is_empty() || (!dot_ok && points.len() < 2) {
             return;
         }
+        self.preview_patch = None;
         let is_eraser = self.tool == Tool::Eraser;
         let kind = match self.tool {
-            Tool::HighlightArea => AnnotationKind::HighlightStroke(FreeObj {
-                points: stabilize_hl(points, self.opts.hl_width),
-                color: self.opts.color,
-                width: self.opts.hl_width,
-                tip: TipShape::Round,
-                dash: Dash::Solid,
-                outline: 0.0,
-                outline_color: Color32::WHITE,
-                shadow: 0.0,
-                eraser_mode: EraserMode::Color,
-                soft: false,
-                opacity: self.opts.hl_opacity,
-            }),
+            Tool::HighlightArea => AnnotationKind::HighlightStroke(self.hl_stroke_obj(points)),
             Tool::Eraser => AnnotationKind::Freehand(FreeObj {
                 points,
                 color: self.opts.eraser_color,
@@ -2684,6 +2701,47 @@ impl DrawSession {
             self.sel_patches.push(id);
         }
         self.selected = None;
+    }
+
+    /// The stroke object a freehand highlighter release commits —
+    /// shared with the drag preview so what the pointer paints is
+    /// what the commit rasterizes.
+    fn hl_stroke_obj(&self, points: Vec<Pos2>) -> FreeObj {
+        FreeObj {
+            points: stabilize_hl(points, self.opts.hl_width),
+            color: self.opts.color,
+            width: self.opts.hl_width,
+            tip: TipShape::Round,
+            dash: Dash::Solid,
+            outline: 0.0,
+            outline_color: Color32::WHITE,
+            shadow: 0.0,
+            eraser_mode: EraserMode::Color,
+            soft: false,
+            opacity: self.opts.hl_opacity,
+        }
+    }
+
+    /// The zone object a rect/ellipse highlighter release commits —
+    /// same preview-sharing rationale as [`Self::hl_stroke_obj`].
+    fn hl_area_obj(&self, a: Pos2, b: Pos2) -> AreaObj {
+        AreaObj {
+            rect: PhysicalRect {
+                x: a.x.min(b.x) as i32,
+                y: a.y.min(b.y) as i32,
+                width: (a.x - b.x).abs().max(1.0) as u32,
+                height: (a.y - b.y).abs().max(1.0) as u32,
+            },
+            color: self.opts.color,
+            shape: match self.opts.hl_mode {
+                HlMode::Rect => AreaShape::Rect,
+                _ => AreaShape::Ellipse,
+            },
+            border: None,
+            dash: Dash::Solid,
+            soft: false,
+            opacity: self.opts.hl_opacity,
+        }
     }
 
     /// Builds a shape annotation from the drag rectangle/segment.
@@ -2786,18 +2844,7 @@ impl DrawSession {
                     shadow: if o.line_shadow { 3.0 } else { 0.0 },
                 })
             }
-            Tool::HighlightArea => AnnotationKind::HighlightArea(AreaObj {
-                rect: r,
-                color: o.color,
-                shape: match o.hl_mode {
-                    HlMode::Rect => AreaShape::Rect,
-                    _ => AreaShape::Ellipse,
-                },
-                border: None,
-                dash: Dash::Solid,
-                soft: false,
-                opacity: o.hl_opacity,
-            }),
+            Tool::HighlightArea => AnnotationKind::HighlightArea(self.hl_area_obj(a, b)),
             Tool::Blur => AnnotationKind::Blur(BlurObj {
                 rect: r,
                 style: o.blur_style,
@@ -3064,9 +3111,13 @@ impl DrawSession {
             sel_chrome(painter, r, theme::tokens(painter.ctx()).accent);
             return;
         }
-        // Live freehand stroke preview while dragging pencil / eraser / highlighter.
+        // Live freehand stroke preview while dragging pencil / eraser.
+        // The freehand highlighter is absent on purpose: its multiply
+        // reads the base pixels — `draw_overlay` paints the real
+        // effect patch instead of an alpha line that can never match.
         if let Drag::Freehand { points } = drag
             && !points.is_empty()
+            && self.tool != Tool::HighlightArea
         {
             let o = &self.opts;
             let img_rect = self.img_rect;
@@ -3081,11 +3132,6 @@ impl DrawSession {
                     };
                     (preview_col, (o.eraser_size * scale).max(2.0), 0.0)
                 }
-                Tool::HighlightArea => (
-                    o.color.gamma_multiply(o.hl_opacity),
-                    (o.hl_width * scale).max(2.0),
-                    0.0,
-                ),
                 _ => (
                     o.color.gamma_multiply(o.opacity),
                     (o.width * scale).max(1.0),
@@ -3115,7 +3161,10 @@ impl DrawSession {
             }
             return;
         }
-        // Shapes preview from anchor → current point.
+        // Shapes preview from anchor → current point. The highlighter
+        // zone (Tool::HighlightArea) has no arm: its multiply reads
+        // the base pixels — `draw_overlay` paints the real effect
+        // patch instead of a tint that can never match.
         if let Drag::Shape { anchor } = drag {
             let o = &self.opts;
             let img_rect = self.img_rect;
@@ -3188,35 +3237,6 @@ impl DrawSession {
                                 );
                             }
                         }
-                    }
-                }
-                Tool::HighlightArea => {
-                    let r = Rect::from_two_pos(ca, cb);
-                    // Zone-definition preview, NOT the result: the real
-                    // highlight is a multiply that can never read as a
-                    // solid wall — a 12% tint + accent outline keeps the
-                    // zone (and its colour) visible at any opacity.
-                    let fill_col = o.color.gamma_multiply(0.12);
-                    if o.hl_mode == HlMode::Rect {
-                        painter.rect_filled(r, CornerRadius::ZERO, fill_col);
-                        painter.rect_stroke(
-                            r,
-                            CornerRadius::ZERO,
-                            Stroke::new(1.5, accent),
-                            StrokeKind::Inside,
-                        );
-                    } else {
-                        let radii = r.size() / 2.0;
-                        painter.add(egui::epaint::EllipseShape::filled(
-                            r.center(),
-                            radii,
-                            fill_col,
-                        ));
-                        painter.add(egui::epaint::EllipseShape::stroke(
-                            r.center(),
-                            radii,
-                            Stroke::new(1.5, accent),
-                        ));
                     }
                 }
                 Tool::Blur | Tool::TextBoxRect | Tool::TextBoxOval => {
@@ -3293,32 +3313,44 @@ impl DrawSession {
         // render — z-order is the one documented approximation). Region
         // effects (blur) have no layered render → their live selection
         // chrome below frames the moved bounds.
-        if self.live_anno().is_some() {
-            if self.preview_dirty || self.preview_tex.is_none() {
-                let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
+        // A highlight BEING DRAWN (freehand band or rect/ellipse zone)
+        // rides the same patch path through a temporary annotation:
+        // the multiply reads the base pixels, so the real effect is
+        // replayed on a `rendered_img` crop — an overlay colour could
+        // only fake it. Re-rendered every frame: the patch IS the
+        // honest result, never a place-holder a dirty flag could
+        // leave stale.
+        let hl_drag = self.hl_preview_anno();
+        if self.live_anno().is_some() || hl_drag.is_some() {
+            if self.preview_dirty || self.preview_tex.is_none() || hl_drag.is_some() {
                 let anno = self.live_anno().cloned();
-                let scratch = self
-                    .region_scratch
-                    .get_or_insert_with(|| render::DragPreview::new(iw, ih));
-                self.preview_patch =
-                    anno.as_ref()
-                        .and_then(|a| scratch.render(a))
-                        .map(|(patch, ox, oy)| {
-                            let (pw, ph) = (patch.width(), patch.height());
-                            let ci = egui::ColorImage::from_rgba_unmultiplied(
-                                [pw as usize, ph as usize],
-                                patch.as_raw(),
-                            );
-                            let tex = self.preview_tex.get_or_insert_with(|| {
-                                painter.ctx().load_texture(
-                                    "draw-live-preview",
-                                    egui::ColorImage::filled([1, 1], Color32::TRANSPARENT),
-                                    egui::TextureOptions::LINEAR,
-                                )
-                            });
-                            tex.set(ci, egui::TextureOptions::LINEAR);
-                            (ox, oy, pw, ph)
-                        });
+                self.preview_patch = if let Some(hl) = &hl_drag {
+                    self.rendered_img
+                        .as_ref()
+                        .and_then(|img| render::highlight_patch(img, hl))
+                } else {
+                    let (iw, ih) = (self.doc.base.image.width(), self.doc.base.image.height());
+                    let scratch = self
+                        .region_scratch
+                        .get_or_insert_with(|| render::DragPreview::new(iw, ih));
+                    anno.as_ref().and_then(|a| scratch.render(a))
+                }
+                .map(|(patch, ox, oy)| {
+                    let (pw, ph) = (patch.width(), patch.height());
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                        [pw as usize, ph as usize],
+                        patch.as_raw(),
+                    );
+                    let tex = self.preview_tex.get_or_insert_with(|| {
+                        painter.ctx().load_texture(
+                            "draw-live-preview",
+                            egui::ColorImage::filled([1, 1], Color32::TRANSPARENT),
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+                    tex.set(ci, egui::TextureOptions::LINEAR);
+                    (ox, oy, pw, ph)
+                });
                 self.preview_dirty = false;
             }
             if let (Some(tex), Some((ox, oy, pw, ph))) = (&self.preview_tex, self.preview_patch) {
