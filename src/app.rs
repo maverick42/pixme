@@ -3342,6 +3342,17 @@ impl eframe::App for PixMeApp {
                     if outcome == crate::ui::draw::Outcome::Ok {
                         tracing::info!("draw_committed");
                         session.finalize_pending();
+                        // The gear-menu "copy to clipboard" option also
+                        // applies to the Draw OK: the annotated render
+                        // replaces the raw capture the capture-time copy
+                        // left on the clipboard. Rendered BEFORE
+                        // `commit_draw` consumes `session.doc`.
+                        if lock(&shared.settings).copy_to_clipboard {
+                            let img = crate::editor::render::render_to_image(&session.doc);
+                            if let Err(e) = crate::export::clipboard::copy_image(&img) {
+                                tracing::warn!("draw clipboard copy failed: {e}");
+                            }
+                        }
                         lock(&shared.viewer).commit_draw(
                             session.tab,
                             session.doc,
