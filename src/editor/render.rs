@@ -2714,6 +2714,31 @@ fn apply_highlight_stroke(img: &mut RgbaImage, o: &super::document::FreeObj) {
     }
 }
 
+/// Live-drag preview of a multiply highlighter (`HighlightArea` zone
+/// or `HighlightStroke` freehand band): the effect reads the base
+/// pixels, so no alpha overlay can fake it — the real
+/// [`apply_highlight`]/[`apply_highlight_stroke`] is replayed on a
+/// crop of the displayed composite. Returns `(patch, x, y)` in
+/// absolute image px. Bit-identical to the same crop of
+/// [`render_to_image`]: same function, integer translation only — the
+/// exact pattern [`DragPreview::render_region`] uses for committed
+/// region effects.
+pub(crate) fn highlight_patch(
+    base: &RgbaImage,
+    anno: &Annotation,
+) -> Option<(RgbaImage, u32, u32)> {
+    let (rx, ry, rw, rh) = effect_footprint(anno, base.width(), base.height())?;
+    let mut patch = image::imageops::crop_imm(base, rx, ry, rw, rh).to_image();
+    let mut local = anno.clone();
+    local.kind.translate(-(rx as f32), -(ry as f32));
+    match &local.kind {
+        AnnotationKind::HighlightArea(o) => apply_highlight(&mut patch, o),
+        AnnotationKind::HighlightStroke(o) => apply_highlight_stroke(&mut patch, o),
+        _ => return None,
+    }
+    Some((patch, rx, ry))
+}
+
 /// Block-average mosaic for the pixelate blur style.
 fn pixelate(src: &RgbaImage, block: u32) -> RgbaImage {
     let (w, h) = (src.width(), src.height());
